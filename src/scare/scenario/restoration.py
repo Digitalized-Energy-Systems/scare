@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from mango import agent_composed_of, connect_topologies, mark_as_connector
+from mango import RoleAgent, connect_topologies, mark_as_connector
 from mango.agent.core import State
 from mango.express.topology import Topology, create_topology, modify_topology
 from mango.simulation.world import (
@@ -28,6 +28,8 @@ from mango_energy_environments.environments.restoration.multi_energy_monee impor
 )
 
 from scare.base.model import (
+    ConstraintViolation,
+    ReconfigurationCompletedEvent,
     Sector,
     SystemStrategy,
 )
@@ -36,18 +38,31 @@ from scare.base.util import (
     create_g2p_admm_flex_actor,
     create_p2g_admm_flex_actor,
     get_by_branch_id,
-    obs_sector,
+    register_sector,
+    sector_from_grid,
 )
+from scare.community.holonic import HolonicCommunityRole
 from scare.detection.role import ProblemDetector
 from scare.service.balance import EnergyBalanceNegotiator, create_energy_balance_role
+from scare.service.constraints import GridConstraintMonitor
 from scare.service.cp import EnergyConverterRole
+from scare.service.islanding import IslandingFallbackRole
 from scare.service.reconfiguration import GridReconfigurator, GridTieSwitchOperator
 from scare.service.stability import GenerationController
 
 logger = logging.getLogger(__name__)
 
 _SECTORS = [Sector.ELECTRICITY, Sector.GAS, Sector.HEAT]
-_SECTOR_STRINGS = [s.value for s in _SECTORS]
+# Substrings of the grid repr used by ``topology_based_on_grid_groups`` to
+# split nodes into per-sector groups.  Monee tags grids as PowerGrid /
+# GasGrid / WaterGrid, so Sector.value alone ("electricity" / "heat")
+# would never match — we have to map to the grid-object name.
+_SECTOR_GRID_MATCH: dict[Sector, str] = {
+    Sector.ELECTRICITY: "power",
+    Sector.GAS: "gas",
+    Sector.HEAT: "water",
+}
+_SECTOR_STRINGS = [_SECTOR_GRID_MATCH[s] for s in _SECTORS]
 
 _CP_BRANCH_TYPES = ("powertogasmodel", "gastopower", "chpmodel", "heatexchangermodel")
 
@@ -91,9 +106,13 @@ def create_restoration_scenario_world(
 ) -> SimulationWorld:
     priorities = priorities or {}
 
+    # with_communication=True installs a Poisson delay provider with mean
+    # 20 s/hop, which silently overrides ``static_delay_s`` and makes the
+    # ms-scale ``base_delay_ms`` inert.  Keep the static delay active so the
+    # configured delay is what actually runs.
     world = create_restoration_world(
         monee_net,
-        with_communication=True,
+        with_communication=False,
         static_delay_s=base_delay_ms / 1000.0,
     )
 
@@ -130,10 +149,12 @@ def _populate_world(
     from distributed_resource_optimization import (
         create_sharing_target_distance_admm_coordinator,
     )
-    from distributed_resource_optimization.carrier.mango import (
-        CoordinatorRole,
-        DistributedOptimizationRole,
+    from distributed_resource_optimization.carrier.mango import CoordinatorRole
+
+    from scare.base.admm import (
+        ScareDistributedOptimizationRole as DistributedOptimizationRole,
     )
+
 
     centrality = edge_centrality(monee_net)
 
@@ -143,7 +164,8 @@ def _populate_world(
         # to have run (initialize()), which only happens when the simulation starts.
         parent_node = monee_net.node_by_id(child.node_id)
         obs = {**dict(parent_node.model.values), **dict(child.model.values)}
-        sector = obs_sector(obs)
+        sector = sector_from_grid(parent_node.grid)
+        register_sector(behavior, aid, sector)
         explicit_priority = priorities.get(aid)
 
         roles = []
@@ -154,13 +176,19 @@ def _populate_world(
                 )
             )
             roles.append(GenerationController(behavior, sector))
+            # Grid constraint monitoring (voltage / pressure / temperature)
+            roles.append(
+                GridConstraintMonitor(behavior, sector, node_id=child.node_id)
+            )
 
-        agent = agent_composed_of(*roles, suggested_aid=aid)
-        world.register(agent, suggested_aid=aid)
+        agent = world.register(RoleAgent(), suggested_aid=aid)
+        for role in roles:
+            agent.add_role(role)
         behavior.install(agent, id=child.id, type="child")
 
     for node in monee_net.nodes:
         aid = _node_aid(node.id)
+        register_sector(behavior, aid, sector_from_grid(node.grid))
         roles: list[Any] = [
             ProblemDetector(behavior, node.id),
             GridReconfigurator(behavior, node.id),
@@ -179,8 +207,9 @@ def _populate_world(
                     CoordinatorRole(create_sharing_target_distance_admm_coordinator())
                 )
 
-        agent = agent_composed_of(*roles, suggested_aid=aid)
-        world.register(agent, suggested_aid=aid)
+        agent = world.register(RoleAgent(), suggested_aid=aid)
+        for role in roles:
+            agent.add_role(role)
         behavior.install(agent, id=node.id, type="node")
 
     for branch in monee_net.branches:
@@ -221,8 +250,9 @@ def _populate_world(
             roles.append(GridTieSwitchOperator(behavior, branch.id, centrality=cent))
 
         if roles:
-            agent = agent_composed_of(*roles, suggested_aid=aid)
-            world.register(agent, suggested_aid=aid)
+            agent = world.register(RoleAgent(), suggested_aid=aid)
+            for role in roles:
+                agent.add_role(role)
             behavior.install(agent, id=branch.id, type="branch")
 
 
@@ -299,13 +329,42 @@ def _build_topologies(
     # has started (energyflow has not run yet at this point).
     from mango.express.topology import topology_characteristic
 
+    group_leaders_by_sector: dict[str, list] = {}
+
     for aid, agent in world._agents.items():
         if topology_characteristic(agent, tid="groups") != "leader":
             continue
         for role in getattr(agent, "roles", []):
             if isinstance(role, EnergyBalanceNegotiator):
                 mark_as_connector(agent, connector_type=role.sector.value)
+                group_leaders_by_sector.setdefault(role.sector.value, []).append(agent)
+                # Attach holonic coordination only to group leaders
+                agent.add_role(HolonicCommunityRole(role.sector))
+                # Attach islanding fallback for unresolved negotiation deficits
+                agent.add_role(IslandingFallbackRole(behavior, role.sector))
                 break
+
+    # --- Holonic topology: connect group leaders of the same sector so
+    # they can form super-communities (holons).  This implements the
+    # "Hierarchical clustering" CAN-level recommendation from
+    # improvements.txt §5.
+    #
+    # Uses the proper mango topology API: ``Topology.add_node(*agents)``
+    # returns a node ID, and ``Topology.add_edge(nid_a, nid_b)`` links
+    # them.  The context manager ``create_topology`` injects neighbour
+    # information into agents on exit.
+    with create_topology(tid="holons") as holon_topo:
+        for sector_str, leaders in group_leaders_by_sector.items():
+            if len(leaders) < 2:
+                continue
+            leader_nids = []
+            for leader in leaders:
+                nid = holon_topo.add_node(leader)
+                leader_nids.append(nid)
+            # Fully connect leaders of same sector
+            for i, nid_a in enumerate(leader_nids):
+                for nid_b in leader_nids[i + 1:]:
+                    holon_topo.add_edge(nid_a, nid_b)
 
     # Mark CP branch agents as connectors for the sectors they bridge.
     for branch in monee_net.branches:
@@ -409,6 +468,24 @@ def _add_system_behaviors(
             role_types=EnergyConverterRole,
         )
 
+    # Constraint violations also trigger rebalancing so the group can
+    # shed load or adjust generation to restore feasibility.
+    behavior_in(
+        world,
+        _trigger_balance,
+        on_global_event=ConstraintViolation,
+        role_types=EnergyBalanceNegotiator,
+    )
+
+    # After grid reconfiguration closes tie switches, new resources may
+    # become reachable — trigger balance negotiation to exploit them.
+    behavior_in(
+        world,
+        _trigger_balance,
+        on_global_event=ReconfigurationCompletedEvent,
+        role_types=EnergyBalanceNegotiator,
+    )
+
 
 def _register_recordings(
     world: SimulationWorld,
@@ -437,14 +514,38 @@ def _register_recordings(
         lambda agent: float((behavior.observe(agent.aid) or {}).get("regulation", 0.0)),
     )
 
+    # Record constraint-related metrics when the observations expose them.
+    def _avg_constraint(child_aids: list[str], key: str) -> float:
+        vals = []
+        for aid in child_aids:
+            obs = behavior.observe(aid)
+            if obs and key in obs:
+                vals.append(float(obs[key]))
+        return sum(vals) / len(vals) if vals else 0.0
+
+    record_world(
+        world,
+        "avg_vm_pu",
+        lambda: _avg_constraint(el_child_aids, "vm_pu"),
+    )
+    record_world(
+        world,
+        "avg_pressure_pu",
+        lambda: _avg_constraint(gas_child_aids, "pressure_pu"),
+    )
+    record_world(
+        world,
+        "avg_t_k",
+        lambda: _avg_constraint(heat_child_aids, "t_k"),
+    )
+
 
 def _child_aids_for_sector(monee_net: Any, sector: Sector) -> list[str]:
     aids = []
     for child in monee_net.childs:
         try:
             node = monee_net.node_by_id(child.node_id)
-            grid = str(node.grid) if not isinstance(node.grid, str) else node.grid
-            if sector.value in grid.lower():
+            if sector_from_grid(node.grid) == sector:
                 aids.append(_child_aid(child.id))
         except Exception as exc:
             logger.debug("Could not determine sector for child %s: %s", child.id, exc)

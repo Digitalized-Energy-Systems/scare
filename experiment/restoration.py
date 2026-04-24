@@ -1,7 +1,8 @@
 import asyncio
 import logging
 
-from mango_energy_environments import fetch_example_net
+from monee.model.formulation import MISOCP_NETWORK_FORMULATION
+from monee.network import create_urban_district_net
 
 from scare.base.util import create_failures
 from scare.base.visu import visualize_results
@@ -10,15 +11,17 @@ from scare.scenario.restoration import (
     start_restoration_simulation,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s [%(name)s] %(message)s")
+logging.getLogger("scare").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 SIMULATION_DURATION_S = 30.0
 FAILURE_DELAY_S = 2.0
 
-
 async def run() -> None:
-    net = fetch_example_net()
+    net = create_urban_district_net()
+    net.apply_formulation(MISOCP_NETWORK_FORMULATION)
 
     logger.info("Building restoration world …")
     world = create_restoration_scenario_world(

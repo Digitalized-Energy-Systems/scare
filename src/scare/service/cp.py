@@ -21,7 +21,7 @@ from scare.base.model import (
     Sector,
     StartBalanceNegotiation,
 )
-from scare.base.util import kgps_to_mw, mw_to_kgps, obs_setpoint
+from scare.base.util import clamp_to_constraints, kgps_to_mw, mw_to_kgps, obs_setpoint
 
 if TYPE_CHECKING:
     from distributed_resource_optimization import ADMMFlexActor
@@ -61,19 +61,24 @@ class EnergyConverterRole(Role):
         self._flex_expected: int = 0
 
     def setup(self) -> None:
+        def _wrap(coro_fn):
+            def _sync(msg, meta):
+                self.context.schedule_instant_task(coro_fn(msg, meta))
+            return _sync
+
         self.context.subscribe_message(
             self,
-            self._handle_ask_energy,
+            _wrap(self._handle_ask_energy),
             lambda msg, meta: isinstance(msg, AskEnergyMessage),
         )
         self.context.subscribe_message(
             self,
-            self._handle_negotiation_finished,
+            _wrap(self._handle_negotiation_finished),
             lambda msg, meta: isinstance(msg, NegotiationFinishedEvent),
         )
         self.context.subscribe_message(
             self,
-            self._handle_flex_answer,
+            _wrap(self._handle_flex_answer),
             lambda msg, meta: isinstance(msg, AvailableFlexAnswer),
         )
 
@@ -139,29 +144,55 @@ class EnergyConverterRole(Role):
             start_coordinated_optimization,
         )
 
+        from scare.base.util import aggregate_priority_weight
+
         answers = self._flex_answers[:]
         self._flex_answers = []
         self._flex_expected = 0
 
-        flex_by_sector: dict[Sector, float] = {}
+        imbalance_by_sector: dict[Sector, float] = {}
+        # Aggregate priority urgency per sector from all responding groups.
+        sector_priority_weight: dict[Sector, float] = {}
         for answer in answers:
-            flex_by_sector[answer.sector] = (
-                flex_by_sector.get(answer.sector, 0.0) + answer.flex + answer.balance
+            # Use balance (net setpoint = generation + load) as the sector
+            # imbalance.  Negative balance = excess generation, positive =
+            # unmet demand.  The CP should shift its operating point to
+            # compensate for the imbalance, not the total capacity.
+            imbalance_by_sector[answer.sector] = (
+                imbalance_by_sector.get(answer.sector, 0.0) + answer.balance
+            )
+            w = aggregate_priority_weight(
+                answer.demand_by_priority, answer.served_by_priority
+            )
+            sector_priority_weight[answer.sector] = (
+                sector_priority_weight.get(answer.sector, 0.0) + w
             )
 
-        flex_el = flex_by_sector.get(Sector.ELECTRICITY, 0.0)
-        flex_heat = flex_by_sector.get(Sector.HEAT, 0.0)
-        flex_gas = flex_by_sector.get(Sector.GAS, 0.0)
+        imb_el = imbalance_by_sector.get(Sector.ELECTRICITY, 0.0)
+        imb_heat = imbalance_by_sector.get(Sector.HEAT, 0.0)
+        imb_gas = imbalance_by_sector.get(Sector.GAS, 0.0)
 
-        T = np.array([flex_el, flex_heat / 1e6, kgps_to_mw(flex_gas)])
+        T = np.array([imb_el, imb_heat / 1e6, kgps_to_mw(imb_gas)])
 
         if np.all(T >= 0) or np.all(T <= 0):
             logger.debug("[%s] ADMM skipped: T=%s (same sign)", self.context.aid, T)
             self._active = False
             return
 
+        # Per-sector priority weights for the ADMM sharing problem.
+        # Sectors with higher-priority unserved demand get stronger
+        # weight, biasing the CP operating point toward those sectors.
+        w_el = sector_priority_weight.get(Sector.ELECTRICITY, 1.0)
+        w_heat = sector_priority_weight.get(Sector.HEAT, 1.0)
+        w_gas = sector_priority_weight.get(Sector.GAS, 1.0)
+        w_max = max(w_el, w_heat, w_gas, 1e-9)
+        priorities = np.array([w_el, w_heat, w_gas]) / w_max  # normalise to [0, 1]
+        priorities = np.maximum(priorities, 0.01)  # floor to avoid zero-weight
+
         coordinator = create_sharing_target_distance_admm_coordinator()
-        start_msg = create_admm_start(create_admm_sharing_data(T.tolist()))
+        start_msg = create_admm_start(
+            create_admm_sharing_data(T.tolist(), priorities=priorities.tolist())
+        )
 
         try:
             await start_coordinated_optimization(
@@ -175,12 +206,24 @@ class EnergyConverterRole(Role):
                 await self.context.send_message(StartBalanceNegotiation(), receiver_addr=addr)
         except Exception as exc:
             logger.error("[%s] ADMM failed: %s", self.context.aid, exc)
+            # Fallback: trigger intra-group gossip so groups can still
+            # rebalance locally even though cross-sector optimisation failed.
+            for addr in topology_connectors(self, tid="cps"):
+                await self.context.send_message(
+                    StartBalanceNegotiation(), receiver_addr=addr
+                )
 
         self._active = False
 
     def _apply_result(self, result: list[float]) -> None:
         obs = self.behavior.observe(self.context.aid) or {}
         # result layout: [0=EL, 1=HEAT, 2=GAS]
+        # A CP has a single regulation knob.  Compute a factor per sector
+        # and apply the one with the strongest signal (largest |value/cap|
+        # ratio after clamping).  This ensures the most constrained or
+        # most demanded sector drives the operating point.
+        best_factor: float | None = None
+        best_weight = -1.0
         for sector, idx in _RESULT_INDEX.items():
             key = _ACCESS_KEYS[sector]
             if key not in obs or idx >= len(result):
@@ -188,10 +231,17 @@ class EnergyConverterRole(Role):
             value = result[idx]
             if sector == Sector.GAS:
                 value = mw_to_kgps(value)
+            value = clamp_to_constraints(value, obs, sector)
             cap = float(obs.get(key, 0.0))
             if cap == 0.0:
                 continue
             factor = max(0.0, min(1.0, abs(value / cap)))
-            if self.behavior.has_action(self.context.aid, "regulate"):
-                self.behavior.act(self.context.aid, "regulate", factor)
-            break
+            weight = abs(value)
+            if weight > best_weight:
+                best_weight = weight
+                best_factor = factor
+
+        if best_factor is not None and self.behavior.has_action(
+            self.context.aid, "regulate"
+        ):
+            self.behavior.act(self.context.aid, "regulate", best_factor)

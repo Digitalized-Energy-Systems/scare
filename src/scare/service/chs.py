@@ -30,14 +30,19 @@ class CHSRole(Role):
         self._pending_joins: dict[UUID, dict[str, bool | None]] = {}
 
     def setup(self) -> None:
+        def _wrap(coro_fn):
+            def _sync(msg, meta):
+                self.context.schedule_instant_task(coro_fn(msg, meta))
+            return _sync
+
         self.context.subscribe_message(
             self,
-            self._handle_join_request,
+            _wrap(self._handle_join_request),
             lambda msg, meta: isinstance(msg, CHSJoinRequest),
         )
         self.context.subscribe_message(
             self,
-            self._handle_join_answer,
+            _wrap(self._handle_join_answer),
             lambda msg, meta: isinstance(msg, CHSJoinRequestAnswer),
         )
         self.context.schedule_periodic_task(

@@ -11,6 +11,7 @@ from scare.base.model import (
     GridPathMessage,
     GridPathResult,
     LineFailure,
+    ReconfigurationCompletedEvent,
 )
 
 if TYPE_CHECKING:
@@ -34,14 +35,19 @@ class GridReconfigurator(Role):
         self._asked_by_search: dict[str, set] = {}
 
     def setup(self) -> None:
+        def _wrap(coro_fn):
+            def _sync(msg, meta):
+                self.context.schedule_instant_task(coro_fn(msg, meta))
+            return _sync
+
         self.context.subscribe_message(
             self,
-            self._handle_path_message,
+            _wrap(self._handle_path_message),
             lambda msg, meta: isinstance(msg, GridPathMessage),
         )
         self.context.subscribe_message(
             self,
-            self._handle_path_result,
+            _wrap(self._handle_path_result),
             lambda msg, meta: isinstance(msg, GridPathResult),
         )
         self.context.subscribe_event(self, LineFailure, self._on_line_failure)
@@ -72,16 +78,10 @@ class GridReconfigurator(Role):
         self._pending_searches[search_id] = fut
         self._asked_by_search[search_id] = {self.context.addr}
 
-        target_aid = f"node-{to_node_id}"
-        target_addr = None
-        for a in grid_neighbours:
-            if a.aid == target_aid:
-                target_addr = a
-                break
-
         msg = GridPathMessage(
             source_addr=self.context.addr,
-            target_addr=target_addr,
+            target_addr=None,  # unused — termination is by node_id
+            target_node_id=to_node_id,
             path=[self.context.addr],
             asked_agents=[self.context.addr],
             uncertain_connections=[],
@@ -96,11 +96,16 @@ class GridReconfigurator(Role):
             logger.info(
                 "[%s] reconfiguration path found: %s  uncertain: %s",
                 self.context.aid,
-                result.path,
-                result.uncertain_connections,
+                [_addr_aid(a) for a in result.path],
+                [(_addr_aid(a), _addr_aid(b)) for a, b in result.uncertain_connections],
             )
             if result.uncertain_connections:
                 await self._close_tie_switches(result.uncertain_connections)
+                self.context.emit_event(
+                    ReconfigurationCompletedEvent(
+                        closed_switches=len(result.uncertain_connections)
+                    )
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "[%s] path search %s timed out", self.context.aid, search_id[:8]
@@ -116,7 +121,14 @@ class GridReconfigurator(Role):
         new_path = message.path + [my_addr]
         already_asked = set(message.asked_agents) | {my_addr}
 
-        if message.target_addr is not None and my_addr == message.target_addr:
+        # Termination by node_id: any agent whose local node_id matches
+        # the target is a valid terminator, even if it's not currently
+        # reachable as a direct grid neighbour of the initiator (the
+        # failed branch normally severs that direct edge).
+        if (
+            message.target_node_id is not None
+            and self.node_id == message.target_node_id
+        ):
             result = GridPathResult(
                 path=new_path,
                 uncertain_connections=message.uncertain_connections,
@@ -124,7 +136,6 @@ class GridReconfigurator(Role):
             await self.context.send_message(result, receiver_addr=message.source_addr)
             return
 
-        forwarded = False
         for addr in grid_neighbours:
             if addr in already_asked:
                 continue
@@ -135,16 +146,16 @@ class GridReconfigurator(Role):
             fwd = GridPathMessage(
                 source_addr=message.source_addr,
                 target_addr=message.target_addr,
+                target_node_id=message.target_node_id,
                 path=new_path,
                 asked_agents=list(already_asked | {addr}),
                 uncertain_connections=new_uncertain,
             )
             await self.context.send_message(fwd, receiver_addr=addr)
-            forwarded = True
-
-        if not forwarded:
-            result = GridPathResult(path=[], uncertain_connections=[])
-            await self.context.send_message(result, receiver_addr=message.source_addr)
+        # Dead-end branches stay silent — the initiator's timeout handles
+        # the case where no path exists; sending empty results caused the
+        # initiator to prematurely abandon searches that other branches
+        # would have completed.
 
     async def _handle_path_result(self, message: GridPathResult, meta: dict) -> None:
         for search_id, fut in list(self._pending_searches.items()):
@@ -166,6 +177,10 @@ class GridReconfigurator(Role):
             if self.behavior.has_action(branch_aid, "switch"):
                 self.behavior.act(branch_aid, "switch")
                 logger.info("[%s] closed tie switch %s", self.context.aid, branch_aid)
+
+
+def _addr_aid(addr: Any) -> str:
+    return getattr(addr, "aid", str(addr))
 
 
 def _branch_aid_from_addrs(addr_a: Any, addr_b: Any) -> str:

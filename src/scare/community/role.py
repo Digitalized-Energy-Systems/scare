@@ -25,14 +25,19 @@ class Community(Role):
         self._collected: dict[str, list[NegotiationResult]] = {}
 
     def setup(self) -> None:
+        def _wrap(coro_fn):
+            def _sync(msg, meta):
+                self.context.schedule_instant_task(coro_fn(msg, meta))
+            return _sync
+
         self.context.subscribe_message(
             self,
-            self._handle_negotiation_result,
+            _wrap(self._handle_negotiation_result),
             lambda msg, meta: isinstance(msg, NegotiationResult),
         )
         self.context.subscribe_message(
             self,
-            self._handle_balance_start,
+            _wrap(self._handle_balance_start),
             lambda msg, meta: isinstance(msg, BalanceNegotiationStart),
         )
 
