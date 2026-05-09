@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from uuid import UUID
 
 from mango import Role
 from mango.express.topology import topology_neighbors
@@ -15,6 +16,29 @@ from scare.base.model import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class PreAssignedCommunityRole(Role):
+    """Writes a pre-computed ``CommunityAssignment`` into the agent's
+    context at startup.
+
+    Used when groups are formed offline (e.g., via label-propagation in
+    the scenario builder) instead of through the runtime CHS gossip
+    protocol — it primes the same ``CommunityAssignment`` model that
+    ``CHSRole`` would otherwise populate, so downstream roles like
+    :class:`HolonicCommunityRole` can find a non-empty community at
+    setup time.
+    """
+
+    def __init__(self, community_id: UUID) -> None:
+        super().__init__()
+        self._community_id = community_id
+
+    def setup(self) -> None:
+        assignment = self.context.get_or_create_model(CommunityAssignment)
+        assignment.community_id = self._community_id
+        assignment.neighbors = list(topology_neighbors(self, tid="groups"))
+        self.context.update(assignment)
 
 
 class Community(Role):

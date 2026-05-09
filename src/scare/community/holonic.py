@@ -53,6 +53,9 @@ _FLEX_TIMEOUT_DEFAULT_S = 5.0
 _FLEX_TIMEOUT_PER_MEMBER_S = 0.5  # added per expected member group
 
 
+DEFAULT_MAX_HOLON_SIZE: int = 4
+
+
 class HolonicCommunityRole(Role):
     """Manages holonic (super-community) formation and inter-group
     coordination using DRO-based ADMM optimisation.
@@ -77,7 +80,7 @@ class HolonicCommunityRole(Role):
         sector: Sector,
         *,
         formation_period_s: float = 8.0,
-        max_holon_size: int = 4,
+        max_holon_size: int = DEFAULT_MAX_HOLON_SIZE,
         rebalance_period_s: float = 10.0,
         flex_timeout_s: float = 5.0,
     ) -> None:
@@ -88,11 +91,31 @@ class HolonicCommunityRole(Role):
         self.rebalance_period_s = rebalance_period_s
         self.flex_timeout_s = flex_timeout_s
 
-        self._pending_proposals: dict[UUID, dict[str, bool | None]] = {}
+        # holon_id -> {sender_key: (addr, accept_or_None)}.  Storing the
+        # address alongside the response so we can build the resolved
+        # member list for flex collection without re-resolving from a
+        # topology lookup.
+        self._pending_proposals: dict[UUID, dict[str, tuple[Any, bool | None]]] = {}
         # Collected flex answers from member groups for inter-holon ADMM
         self._flex_answers: list[AvailableFlexAnswer] = []
         self._flex_expected: int = 0
         self._rebalance_active: bool = False
+
+        # Resolved holon membership on the leader side.  Populated when
+        # ``_handle_join_answer`` confirms acceptances; consulted by
+        # ``_try_rebalance`` so flex requests target *only* holon members
+        # (not every leader in the holons-topology neighbourhood).  This
+        # makes ``_flex_expected`` scale with chunk size, not clique size.
+        self._holon_member_addrs: list[Any] = []
+        self._holon_member_keys: set[str] = set()
+
+        # Throttling flags so the early-return paths in ``_try_rebalance``
+        # (no holon yet, not leader, no neighbours) surface once at INFO
+        # per leader instead of either (a) being silent at DEBUG or (b)
+        # spamming on every periodic tick.
+        self._logged_no_holon: bool = False
+        self._logged_not_leader: bool = False
+        self._logged_no_neighbours: bool = False
 
     def setup(self) -> None:
         self.context.schedule_periodic_task(
@@ -147,9 +170,20 @@ class HolonicCommunityRole(Role):
         if not neighbours:
             return
 
+        # Symmetry-breaking: in a clique of same-sector leaders, every
+        # member would otherwise simultaneously initiate and end up
+        # accepting each other's competing requests, leaving everyone
+        # with parent_addr set and no leader to drive ADMM rebalancing.
+        # Only the lexicographically smallest aid initiates; the rest
+        # wait passively for the join request.
+        if any(addr.aid < self.context.aid for addr in neighbours):
+            return
+
         candidates = neighbours[: self.max_holon_size - 1]
         holon_id = uuid4()
-        self._pending_proposals[holon_id] = {str(a): None for a in candidates}
+        self._pending_proposals[holon_id] = {
+            str(a): (a, None) for a in candidates
+        }
 
         req = HolonicJoinRequest(
             holon_id=holon_id,
@@ -195,17 +229,24 @@ class HolonicCommunityRole(Role):
             return
 
         sender_key = str(mango_sender_addr(meta))
-        self._pending_proposals[hid][sender_key] = message.accept
+        existing = self._pending_proposals[hid].get(sender_key)
+        addr = existing[0] if existing else mango_sender_addr(meta)
+        self._pending_proposals[hid][sender_key] = (addr, message.accept)
 
         responses = self._pending_proposals[hid]
-        if not all(v is not None for v in responses.values()):
+        if not all(ok is not None for _, ok in responses.values()):
             return
 
-        accepted = [addr for addr, ok in responses.items() if ok]
+        accepted_addrs = [a for _, (a, ok) in responses.items() if ok]
         del self._pending_proposals[hid]
 
-        if not accepted:
+        if not accepted_addrs:
             return
+
+        # Record the resolved member set (initiator + acceptors) so
+        # ``_try_rebalance`` can target only actual holon peers.
+        self._holon_member_addrs = list(accepted_addrs)
+        self._holon_member_keys = {str(a) for a in accepted_addrs}
 
         community = self.context.get_or_create_model(CommunityAssignment)
         assignment = self.context.get_or_create_model(HolonicAssignment)
@@ -220,7 +261,16 @@ class HolonicCommunityRole(Role):
             "[%s] holon %s formed with %d member groups",
             self.context.aid,
             hid,
-            len(accepted) + 1,
+            len(accepted_addrs) + 1,
+        )
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=self.context.current_timestamp,
+            kind="holon_formed",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=f"members={len(accepted_addrs) + 1}",
         )
 
     # ------------------------------------------------------------------
@@ -232,27 +282,65 @@ class HolonicCommunityRole(Role):
         and runs ADMM to optimally redistribute resources."""
         assignment = self.context.get_or_create_model(HolonicAssignment)
         if assignment.holon_id is None:
+            if not self._logged_no_holon:
+                logger.info(
+                    "[%s] holon rebalance idle: no holon assigned (sector=%s)",
+                    self.context.aid,
+                    self.sector.value,
+                )
+                self._logged_no_holon = True
             return
         if assignment.parent_addr is not None:
-            return  # not the holon leader
+            if not self._logged_not_leader:
+                logger.info(
+                    "[%s] holon rebalance idle: not leader (sector=%s)",
+                    self.context.aid,
+                    self.sector.value,
+                )
+                self._logged_not_leader = True
+            return
         if self._rebalance_active:
+            logger.debug("[%s] rebalance skipped: active", self.context.aid)
             return
 
-        try:
-            neighbours = topology_neighbors(self, tid="holons")
-        except Exception:
-            return
-        if not neighbours:
+        # Prefer the resolved member list (populated when the holon was
+        # formed); fall back to topology neighbours only if formation
+        # didn't track member addresses (legacy path).  Targeting members
+        # directly keeps ``_flex_expected`` proportional to chunk size,
+        # not clique size, so the timeout fits inside the simulation.
+        if self._holon_member_addrs:
+            members = list(self._holon_member_addrs)
+        else:
+            try:
+                members = topology_neighbors(self, tid="holons")
+            except Exception:
+                return
+        if not members:
+            if not self._logged_no_neighbours:
+                logger.info(
+                    "[%s] holon rebalance idle: no neighbours (sector=%s)",
+                    self.context.aid,
+                    self.sector.value,
+                )
+                self._logged_no_neighbours = True
             return
 
         self._rebalance_active = True
         self._flex_answers = []
-        self._flex_expected = len(neighbours)
+        # The leader contributes its own group's flex too — without that
+        # ADMM would be a single-actor problem and bail out early.
+        self._flex_expected = len(members) + 1
 
         from scare.base.model import AskForAvailableFlex
 
+        logger.info(
+            "[%s] holon rebalance: asking %d members (+self) for flex",
+            self.context.aid,
+            len(members),
+        )
         msg = AskForAvailableFlex(include_connectors=False)
-        for addr in neighbours:
+        await self.context.send_message(msg, receiver_addr=self.context.addr)
+        for addr in members:
             await self.context.send_message(msg, receiver_addr=addr)
 
         # Schedule a timeout: if not all answers arrive within the
@@ -260,7 +348,7 @@ class HolonicCommunityRole(Role):
         # release the lock so the next cycle can retry.
         # Adaptive: base per sector + per-member scaling.
         base = _FLEX_TIMEOUT_BASE_S.get(self.sector, _FLEX_TIMEOUT_DEFAULT_S)
-        timeout = base + len(neighbours) * _FLEX_TIMEOUT_PER_MEMBER_S
+        timeout = base + len(members) * _FLEX_TIMEOUT_PER_MEMBER_S
         deadline = self.context.current_timestamp + timeout
         self.context.schedule_timestamp_task(
             self._flex_collection_timeout(), timestamp=deadline
@@ -286,6 +374,16 @@ class HolonicCommunityRole(Role):
     ) -> None:
         if not self._rebalance_active:
             return
+        # Defensive: ignore answers from non-members.  ``_handle_ask_flex``
+        # answers any sender, so if a stray flex request reaches a leader
+        # outside the holon its reply could otherwise inflate the count.
+        if self._holon_member_keys:
+            sender_key = str(mango_sender_addr(meta))
+            if (
+                sender_key != str(self.context.addr)
+                and sender_key not in self._holon_member_keys
+            ):
+                return
         self._flex_answers.append(message)
 
         if len(self._flex_answers) >= self._flex_expected:
@@ -370,8 +468,21 @@ class HolonicCommunityRole(Role):
 
             group_bounds.append((lb, ub))
 
+        if not np.all(np.isfinite(total_T)):
+            logger.warning(
+                "[%s] holon ADMM skipped: non-finite target T=%s",
+                self.context.aid,
+                total_T.tolist(),
+            )
+            self._rebalance_active = False
+            return
+
         if np.all(np.abs(total_T) < 1e-6):
-            logger.debug("[%s] holon ADMM skipped: balanced", self.context.aid)
+            logger.info(
+                "[%s] holon ADMM skipped: balanced (sectors=%s)",
+                self.context.aid,
+                all_sectors,
+            )
             self._rebalance_active = False
             return
 
@@ -417,10 +528,20 @@ class HolonicCommunityRole(Role):
                         S = np.full(n_dims, -pull / n_dims)
                 else:
                     S[0] = -pull
+            lb = np.nan_to_num(lb, nan=0.0, posinf=0.0, neginf=0.0)
+            ub = np.nan_to_num(ub, nan=1e-6, posinf=1e6, neginf=1e-6)
+            S = np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
             actors.append(ADMMFlexActor(lb=lb, u=ub, C=C, d=d, S=S))
 
         coordinator = create_sharing_target_distance_admm_coordinator()
+        # Tight iter cap so concurrent holon ADMMs across sectors don't
+        # block discrete-time progress: 1000 is the package default and
+        # is wall-time prohibitive when several leaders rebalance per
+        # simulation step.
+        coordinator.max_iters = 50
         start_msg = create_admm_start(create_admm_sharing_data(total_T.tolist()))
+
+        from scare.base.diagnostics import record_event
 
         try:
             await start_coordinated_optimization(actors, coordinator, start_msg)
@@ -432,17 +553,34 @@ class HolonicCommunityRole(Role):
                 results,
                 total_T.tolist(),
             )
+            record_event(
+                t=self.context.current_timestamp,
+                kind="holon_admm_result",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=f"sectors={all_sectors} T={total_T.tolist()}",
+            )
         except Exception as exc:
             logger.error("[%s] holon ADMM failed: %s", self.context.aid, exc)
+            record_event(
+                t=self.context.current_timestamp,
+                kind="holon_admm_failed",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=str(exc),
+            )
             # Fallback: still trigger intra-group gossip so member groups
             # can rebalance locally even without inter-group redistribution.
 
         # Trigger intra-group rebalancing in all member groups (both on
         # success and on failure — groups should always get a chance to
         # re-negotiate after a holon-level event).
-        try:
-            neighbours = topology_neighbors(self, tid="holons")
-        except Exception:
-            neighbours = []
-        for addr in neighbours:
+        if self._holon_member_addrs:
+            triggers = list(self._holon_member_addrs)
+        else:
+            try:
+                triggers = topology_neighbors(self, tid="holons")
+            except Exception:
+                triggers = []
+        for addr in triggers:
             await self.context.send_message(StartBalanceNegotiation(), receiver_addr=addr)

@@ -116,8 +116,17 @@ class IslandingFallbackRole(Role):
             current_sp = abs(obs_setpoint(obs))
             new_factor = min(1.0, (current_sp + share) / cap) if cap > 0 else 0.0
 
-            if self.behavior.has_action(aid, "regulate"):
-                self.behavior.act(aid, "regulate", new_factor)
+            from scare.base.util import apply_regulate
+
+            applied = apply_regulate(
+                self.behavior,
+                aid,
+                new_factor,
+                sector=self.sector.value,
+                reason="islanding",
+                timestamp=self.context.current_timestamp,
+            )
+            if applied:
                 covered += share
                 logger.info(
                     "[%s] islanding: DG %s ramped to %.1f%% (share=%.4f)",
@@ -133,4 +142,13 @@ class IslandingFallbackRole(Role):
             covered,
             deficit,
             self.sector.value,
+        )
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=self.context.current_timestamp,
+            kind="islanding_covered",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=f"covered={covered:.4f} of deficit={deficit:.4f}",
         )

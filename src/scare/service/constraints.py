@@ -25,10 +25,18 @@ from scare.base.model import (
     ConstraintStateMessage,
     ConstraintViolation,
     ConstraintWarning,
+    CurtailmentBid,
+    CurtailmentNeed,
     CurtailmentRequest,
     Sector,
 )
-from scare.base.util import constraint_utilization, obs_constraint_values
+from scare.base.util import obs_priority
+from scare.base.util import (
+    constraint_utilization,
+    obs_capacity,
+    obs_constraint_values,
+    obs_setpoint,
+)
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -37,6 +45,35 @@ logger = logging.getLogger(__name__)
 
 # How many hops constraint state information propagates.
 _DEFAULT_MAX_HOPS = 3
+
+# EMA smoothing factor for the local sensitivity estimate (dV / dP).
+# 0 = never update, 1 = replace with latest sample.  A low value keeps
+# noisy single samples from swinging the estimate, but high enough that
+# the agent can adapt when topology changes after a failure.
+_SENSITIVITY_EMA_ALPHA: float = 0.2
+
+# Minimum |ΔP| required before a sample is used — below this the
+# corresponding ΔV is dominated by measurement noise and would produce
+# spurious sensitivity estimates.  Per sector.
+_SENSITIVITY_MIN_DP: dict[Sector, float] = {
+    Sector.ELECTRICITY: 0.01,   # MW
+    Sector.GAS: 1e-4,           # kg/s
+    Sector.HEAT: 0.5,           # W or kg/s scaled
+}
+
+# Default sensitivity used before any samples have been collected.
+_SENSITIVITY_DEFAULT: dict[Sector, float] = {
+    Sector.ELECTRICITY: 0.01,   # p.u. voltage per MW
+    Sector.GAS: 0.5,            # p.u. pressure per kg/s
+    Sector.HEAT: 1e-5,          # K per W
+}
+
+# Primary constraint variable per sector for sensitivity tracking.
+_SECTOR_PRIMARY_VAR: dict[Sector, str] = {
+    Sector.ELECTRICITY: "vm_pu",
+    Sector.GAS: "pressure_pu",
+    Sector.HEAT: "t_k",
+}
 
 
 class GridConstraintMonitor(Role):
@@ -65,12 +102,18 @@ class GridConstraintMonitor(Role):
         node_id: Any = None,
         *,
         max_hops: int = _DEFAULT_MAX_HOPS,
+        enable_curtailment_auction: bool = True,
+        enable_multihop_constraint: bool = True,
+        enable_heat_recovery: bool = True,
     ) -> None:
         super().__init__()
         self.behavior = behavior
         self.sector = sector
         self.node_id = node_id
         self.max_hops = max_hops
+        self.enable_curtailment_auction = enable_curtailment_auction
+        self.enable_multihop_constraint = enable_multihop_constraint
+        self.enable_heat_recovery = enable_heat_recovery
 
         # Neighbour constraint state cache:
         # (origin_addr_str, variable) -> ConstraintStateMessage
@@ -87,9 +130,33 @@ class GridConstraintMonitor(Role):
         # avoid flooding.
         self._violation_emitted: set[str] = set()
 
+        # --- Local power-flow sensitivity estimate ---
+        # EMA of |dV/dP| observed from this agent's own (P, V) history.
+        # Used by the curtailment auction so agents near the violated
+        # variable bid more aggressively than those with little
+        # influence.  No Jacobian / central view required.
+        self._sensitivity: float = _SENSITIVITY_DEFAULT.get(sector, 1e-3)
+        self._last_p: float | None = None
+        self._last_v: float | None = None
+
+        # --- Curtailment auction state (auctioneer side) ---
+        # auction_id -> {"bids": {sender_key: willingness}, "total": float,
+        #                "neighbours_contacted": int, "deadline": float}
+        self._open_auctions: dict[str, dict[str, Any]] = {}
+
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
         self.context.schedule_periodic_task(self._monitor, delay=poll)
+        # Heat sector: gradually un-shed previously curtailed loads once
+        # the local thermal stress has cleared.  The Level-1 gossip
+        # produces shed-only deltas during a violation; without an
+        # explicit recovery loop the load stays at the reduced factor
+        # forever.  Run at the heat poll period, slightly slower than
+        # the monitor so the violation flag has time to drop.
+        if self.sector == Sector.HEAT and self.enable_heat_recovery:
+            self.context.schedule_periodic_task(
+                self._heat_recovery, delay=poll * 1.5
+            )
 
         def _wrap(coro_fn):
             def _sync(msg, meta):
@@ -108,6 +175,18 @@ class GridConstraintMonitor(Role):
             lambda msg, meta: isinstance(msg, CurtailmentRequest)
             and msg.sector == self.sector,
         )
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_curtailment_need),
+            lambda msg, meta: isinstance(msg, CurtailmentNeed)
+            and msg.sector == self.sector,
+        )
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_curtailment_bid),
+            lambda msg, meta: isinstance(msg, CurtailmentBid)
+            and msg.sector == self.sector,
+        )
 
     # ------------------------------------------------------------------
     # Periodic monitoring
@@ -124,6 +203,9 @@ class GridConstraintMonitor(Role):
         # Reset deduplication table each monitoring cycle so fresh
         # information can propagate.
         self._forwarded.clear()
+
+        # Update local sensitivity estimate from own (P, V) history.
+        self._update_sensitivity(obs)
 
         for var, val in values.items():
             # Skip readings the solver hasn't populated (post-failure
@@ -155,6 +237,15 @@ class GridConstraintMonitor(Role):
                         lo,
                         hi,
                     )
+                    from scare.base.diagnostics import record_event
+
+                    record_event(
+                        t=self.context.current_timestamp,
+                        kind="constraint_violation",
+                        aid=self.context.aid,
+                        sector=self.sector.value,
+                        detail=f"{var}={val:.4f} bounds=[{lo:.4f},{hi:.4f}]",
+                    )
                     self.context.emit_event(violation)
                     self.context.emit_event(
                         BalanceProblem(
@@ -162,7 +253,8 @@ class GridConstraintMonitor(Role):
                             imbalance=val - hi if val > hi else lo - val,
                         )
                     )
-                    await self._request_curtailment(var, val, lo, hi)
+                    if self.enable_curtailment_auction:
+                        await self._request_curtailment(var, val, lo, hi)
             else:
                 self._violation_emitted.discard(var)
 
@@ -187,7 +279,8 @@ class GridConstraintMonitor(Role):
                 )
 
             # --- Propagate state to neighbours ---
-            await self._propagate_state(var, val, util)
+            if self.enable_multihop_constraint:
+                await self._propagate_state(var, val, util)
 
     # ------------------------------------------------------------------
     # Multi-hop state propagation with deduplication
@@ -255,6 +348,11 @@ class GridConstraintMonitor(Role):
     # the response ratchets up. Prevents one-shot over-curtailment.
     _CURTAILMENT_GAIN: float = 0.3
 
+    # How long the auctioneer waits for bids before allocating with
+    # whatever it has.  Short — the monitor re-fires on the next cycle
+    # if the violation persists.
+    _AUCTION_TIMEOUT_S: float = 2.0
+
     async def _request_curtailment(
         self, variable: str, value: float, lo: float, hi: float
     ) -> None:
@@ -267,15 +365,119 @@ class GridConstraintMonitor(Role):
         if not neighbors:
             return
 
-        # Total fractional reduction across the group, split evenly so
-        # aggregate curtailment tracks the overshoot instead of scaling
-        # with fan-out. Floor keeps tiny overshoots from being ignored.
+        # Total fractional reduction needed across the group.  Announced
+        # via a two-phase auction: broadcast the *need*, collect bids,
+        # then allocate proportional to each neighbour's self-reported
+        # willingness (priority × local sensitivity × reducible output).
         total_amount = max(0.02, min(1.0, self._CURTAILMENT_GAIN * overshoot))
-        per_neighbor = total_amount / len(neighbors)
 
-        msg = CurtailmentRequest(sector=self.sector, amount=per_neighbor)
+        import uuid
+        auction_id = str(uuid.uuid4())
+        self._open_auctions[auction_id] = {
+            "bids": {},
+            "total": total_amount,
+            "neighbours_contacted": len(neighbors),
+            "bidders": {},  # sender_key -> addr
+        }
+
+        need_msg = CurtailmentNeed(
+            sector=self.sector,
+            total_amount=total_amount,
+            auction_id=auction_id,
+        )
         for addr in neighbors:
-            await self.context.send_message(msg, receiver_addr=addr)
+            await self.context.send_message(need_msg, receiver_addr=addr)
+
+        deadline = (
+            self.context.current_timestamp + self._AUCTION_TIMEOUT_S
+        )
+        self.context.schedule_timestamp_task(
+            self._close_auction(auction_id), timestamp=deadline
+        )
+
+    async def _handle_curtailment_need(
+        self, message: CurtailmentNeed, meta: dict
+    ) -> None:
+        if not self.behavior.has_action(self.context.aid, "regulate"):
+            return
+        obs = self.behavior.observe(self.context.aid)
+        if not obs:
+            return
+
+        # Willingness: bigger = more happy / more effective at absorbing
+        # curtailment.  Combines three purely local signals:
+        #   - priority tier (higher number = lower priority = more shed-friendly)
+        #   - local |dV/dP| sensitivity (high = curtailment here cheaply
+        #     moves the violated variable)
+        #   - current reducible output magnitude (nothing to curtail → nothing
+        #     to contribute).
+        prio_tier = max(1, obs_priority(obs))
+        reducible = abs(obs_setpoint(obs))
+        willingness = prio_tier * self._sensitivity * reducible
+        if not math.isfinite(willingness) or willingness <= 0.0:
+            willingness = 1e-9
+
+        reply = CurtailmentBid(
+            auction_id=message.auction_id,
+            willingness=willingness,
+            sector=self.sector,
+        )
+        await self.context.send_message(
+            reply, receiver_addr=mango_sender_addr(meta)
+        )
+
+    async def _handle_curtailment_bid(
+        self, message: CurtailmentBid, meta: dict
+    ) -> None:
+        auction = self._open_auctions.get(message.auction_id)
+        if auction is None:
+            return
+        sender = mango_sender_addr(meta)
+        sender_key = str(sender)
+        auction["bids"][sender_key] = message.willingness
+        auction["bidders"][sender_key] = sender
+
+        if len(auction["bids"]) >= auction["neighbours_contacted"]:
+            await self._allocate_auction(message.auction_id)
+
+    async def _close_auction(self, auction_id: str) -> None:
+        if auction_id in self._open_auctions:
+            await self._allocate_auction(auction_id)
+
+    async def _allocate_auction(self, auction_id: str) -> None:
+        auction = self._open_auctions.pop(auction_id, None)
+        if auction is None:
+            return
+        bids: dict[str, float] = auction["bids"]
+        bidders: dict[str, Any] = auction["bidders"]
+        total_amount: float = auction["total"]
+
+        if not bids:
+            return
+
+        sum_w = sum(bids.values())
+        if sum_w <= 0.0:
+            # All willingness scores zero — fall back to an even split
+            # so at least something curtails and the violation can clear.
+            share = total_amount / len(bids)
+            for key, addr in bidders.items():
+                await self.context.send_message(
+                    CurtailmentRequest(sector=self.sector, amount=share),
+                    receiver_addr=addr,
+                )
+            return
+
+        for key, w in bids.items():
+            addr = bidders.get(key)
+            if addr is None:
+                continue
+            share = total_amount * (w / sum_w)
+            if share <= 0.0:
+                continue
+            await self.context.send_message(
+                CurtailmentRequest(sector=self.sector, amount=share),
+                receiver_addr=addr,
+            )
 
     async def _handle_curtailment_request(
         self, message: CurtailmentRequest, meta: dict
@@ -294,14 +496,95 @@ class GridConstraintMonitor(Role):
         amount = max(0.0, min(1.0, message.amount))
         new_factor = max(0.0, current * (1.0 - amount))
 
-        self.behavior.act(self.context.aid, "regulate", new_factor)
-        logger.info(
-            "[%s] curtailed by %.1f%% (regulation %.3f -> %.3f)",
+        from scare.base.util import apply_regulate
+
+        applied = apply_regulate(
+            self.behavior,
             self.context.aid,
-            amount * 100,
-            current,
             new_factor,
+            sector=self.sector.value,
+            reason="curtail",
+            timestamp=self.context.current_timestamp,
         )
+        if applied:
+            logger.info(
+                "[%s] curtailed by %.1f%% (regulation %.3f -> %.3f)",
+                self.context.aid,
+                amount * 100,
+                current,
+                new_factor,
+            )
+
+    # ------------------------------------------------------------------
+    # Heat recovery (un-shed)
+    # ------------------------------------------------------------------
+
+    # Fraction of the feasible band below which the agent is considered
+    # comfortably clear and may begin un-shedding.  Matched to
+    # ``_HEAT_CLEAR_FRACTION`` in service/balance.py: an agent only
+    # contributes to the deficit target above this point, so the same
+    # threshold defines "no longer stressed".
+    _HEAT_RECOVERY_CLEAR_FRACTION: float = 0.6
+
+    async def _heat_recovery(self) -> None:
+        if self.sector != Sector.HEAT:
+            return
+        if not self.is_locally_feasible():
+            return
+        if not self.behavior.has_action(self.context.aid, "regulate"):
+            return
+        obs = self.behavior.observe(self.context.aid)
+        if not obs:
+            return
+
+        bounds = SECTOR_CONSTRAINTS.get(self.sector, {})
+        worst_util = 0.0
+        for var, val in obs_constraint_values(obs, self.sector).items():
+            if not math.isfinite(val) or (var == "t_k" and val <= 0.0):
+                return  # solver hasn't populated this junction yet
+            lo, hi = bounds.get(var, (float("-inf"), float("inf")))
+            worst_util = max(worst_util, constraint_utilization(val, lo, hi))
+        if worst_util > self._HEAT_RECOVERY_CLEAR_FRACTION:
+            return
+
+        cap = obs_capacity(obs)
+        if cap <= 0:  # generators are not subject to recovery (DGs ramp via their own role)
+            return
+        current = float(obs.get("regulation", 1.0))
+        if current >= 1.0:
+            return
+
+        # Ramp at the heat-sector convergence rate per recovery period.
+        # 0.15 / s × 1.5×poll(=5 s) ≈ +1.125 per cycle if unbounded; the
+        # min(1.0, ...) clamp caps a single step at full restoration.
+        rate_per_s = SECTOR_TIMESCALE.get(self.sector, {}).get(
+            "convergence_rate", 0.15
+        )
+        period_s = SECTOR_TIMESCALE.get(self.sector, {}).get(
+            "poll_period_s", 5.0
+        ) * 1.5
+        new_factor = min(1.0, current + rate_per_s * period_s * 0.2)
+        if new_factor <= current + 1e-4:
+            return
+
+        from scare.base.util import apply_regulate
+
+        applied = apply_regulate(
+            self.behavior,
+            self.context.aid,
+            new_factor,
+            sector=self.sector.value,
+            reason="heat_recovery",
+            timestamp=self.context.current_timestamp,
+        )
+        if applied:
+            logger.info(
+                "[%s] heat recovery: regulation %.3f -> %.3f (util=%.2f)",
+                self.context.aid,
+                current,
+                new_factor,
+                worst_util,
+            )
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -318,3 +601,38 @@ class GridConstraintMonitor(Role):
     def is_locally_feasible(self) -> bool:
         """True if no local constraint is currently violated."""
         return len(self._violation_emitted) == 0
+
+    def local_sensitivity(self) -> float:
+        """Latest |dV/dP| estimate for this agent's primary constraint
+        variable.  Values are strictly positive (the estimator takes
+        absolute values of each observed pair) and default to a
+        sector-typical prior until enough samples are collected."""
+        return self._sensitivity
+
+    def _update_sensitivity(self, obs: dict) -> None:
+        var = _SECTOR_PRIMARY_VAR.get(self.sector)
+        if var is None or var not in obs:
+            return
+        v = float(obs[var])
+        if not math.isfinite(v):
+            return
+        cap = obs_capacity(obs)
+        sp = obs_setpoint(obs)
+        # Signed injection.  For generators (cap < 0) sp is negative.
+        p = sp if cap != 0.0 else 0.0
+        if self._last_p is not None and self._last_v is not None:
+            dp = p - self._last_p
+            dv = v - self._last_v
+            min_dp = _SENSITIVITY_MIN_DP.get(self.sector, 1e-6)
+            if abs(dp) >= min_dp and math.isfinite(dv):
+                sample = abs(dv / dp)
+                # EMA update.  Clamp absurd values (post-failure
+                # snapshots can show huge jumps that dominate the
+                # estimate otherwise).
+                sample = min(sample, 10.0 * self._sensitivity + 1.0)
+                self._sensitivity = (
+                    (1.0 - _SENSITIVITY_EMA_ALPHA) * self._sensitivity
+                    + _SENSITIVITY_EMA_ALPHA * sample
+                )
+        self._last_p = p
+        self._last_v = v

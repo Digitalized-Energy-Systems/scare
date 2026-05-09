@@ -1,0 +1,244 @@
+{
+  "$comment": [
+    "Full evaluation campaign — every pillar from the dissertation evaluation plan.",
+    "Designed for HPC: each task runs independently under SLURM array; aggregator combines.",
+    "All baseline / variant / ablation experiments use simbench_lv_constrained_45 so the slack",
+    "budget is tight enough that variant outcomes are actually distinguishable.  Cascading,",
+    "scaling, cold-day stress and generator-failure experiments live in their own sections.",
+    "Reconfiguration uses simbench_lv_reconfig (same grid + 5 backup branches per sector)."
+  ],
+  "name": "eval_full",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "timestamp_dir": true,
+
+  "defaults": {"runs_per_grid": 30, "failure_lambda": 0.6, "max_failures": 5},
+
+  "experiments": [
+
+    {
+      "$comment": "Pillar 1 — Functional restoration quality.  Three slack budgets show the curve from easy (80 %) to hard (30 %).",
+      "name": "functional_baseline",
+      "grids": [
+        "simbench_lv_constrained_60",
+        "simbench_lv_constrained_45",
+        "simbench_lv_constrained_30"
+      ],
+      "n_seeds": 30,
+      "variants": ["scare"],
+      "scenarios": [{"kind": "clean", "max_failures": 1}]
+    },
+
+    {
+      "$comment": "Pillar 2 — Optimality gap.  Pairs every scare run with an oracle on the same (grid, seed).",
+      "name": "optimality_gap",
+      "grids": [
+        "simbench_lv_constrained_60",
+        "simbench_lv_constrained_45",
+        "simbench_lv_constrained_30"
+      ],
+      "n_seeds": 30,
+      "variants": ["scare", "oracle"],
+      "scenarios": [{"kind": "clean", "max_failures": 1}]
+    },
+
+    {
+      "$comment": "Strawman comparison — single-level (gossip only) vs full architecture.",
+      "name": "variant_comparison",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 30,
+      "variants": ["scare", "single_level", "oracle"]
+    },
+
+    {
+      "$comment": "Pillar 4 — ablation matrix.  One ablation per architectural component.",
+      "name": "ablation",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        {"enable_holonic": false, "enable_cp_admm": false},
+        {"enable_holonic": false},
+        {"enable_cp_admm": false},
+        {"enable_constraint_aware_gossip": false},
+        {"enable_multihop_constraint": false},
+        {"enable_curtailment_auction": false},
+        {"enable_priority_holon_allocation": false},
+        {"enable_monotonic_floor": false},
+        {"enable_clpu_ramp": false},
+        {"enable_heat_recovery": false},
+        {"enable_distributed_failure_notice": false}
+      ]
+    },
+
+    {
+      "$comment": "Pillar 5a — packet loss robustness.",
+      "name": "robustness_packet_loss",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "sweeps": [
+        {"comms_packet_loss_pct": 0.0},
+        {"comms_packet_loss_pct": 5.0},
+        {"comms_packet_loss_pct": 10.0},
+        {"comms_packet_loss_pct": 20.0},
+        {"comms_packet_loss_pct": 50.0}
+      ]
+    },
+
+    {
+      "$comment": "Pillar 5b — latency jitter.",
+      "name": "robustness_latency",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "sweeps": [
+        {"comms_latency_jitter_ms": 0.0},
+        {"comms_latency_jitter_ms": 50.0},
+        {"comms_latency_jitter_ms": 200.0},
+        {"comms_latency_jitter_ms": 1000.0}
+      ]
+    },
+
+    {
+      "$comment": "Pillar 6 — multi-failure / cascading.",
+      "name": "cascading",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "scenarios": [
+        {"kind": "clean", "max_failures": 1},
+        {"kind": "clean", "max_failures": 3},
+        {"kind": "clean", "max_failures": 5}
+      ]
+    },
+
+    {
+      "$comment": "Cold-day thermal stress.  Heat loads scaled 1.5×, slack supply temperature dropped to 70 °C — narrows the headroom against the 60 °C lower bound so the heat sector actually exercises gossip + curtailment.",
+      "name": "cold_day_stress",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 15,
+      "variants": ["scare", "oracle"],
+      "scenarios": [
+        {"kind": "clean", "max_failures": 1},
+        {"kind": "cold_day", "supply_t_k": 343.15, "heat_load_scale": 1.5, "max_failures": 1}
+      ]
+    },
+
+    {
+      "$comment": "Generator-class failures.  Compares branch-only vs generator-only vs mixed contingency types — generator failures are arguably more realistic for restoration (a CHP trips, not a line) and exercise different sectors.",
+      "name": "generator_failure",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "scenarios": [
+        {"kind": "clean", "failure_type": "branch", "max_failures": 1},
+        {"kind": "clean", "failure_type": "generator", "max_failures": 1},
+        {"kind": "clean", "failure_type": "mixed", "generator_share": 0.5, "max_failures": 2}
+      ]
+    },
+
+    {
+      "$comment": [
+        "Pillar 7 — Scaling.  Three simbench LV variants spanning roughly a decade of node count:",
+        "  small  ≈   36 nodes (1-LV-rural1)",
+        "  medium ≈  137 nodes (1-LV-semiurb4)",
+        "  large  ≈  396 nodes (1-LV-rural3, the established benchmark)",
+        "All run with the same 50 % slack budget so the only varying axis is grid size.",
+        "n_seeds smaller than the baselines because the per-task wallclock on the large grid is the bottleneck."
+      ],
+      "name": "scaling",
+      "grids": [
+        "simbench_lv_small_constrained_45",
+        "simbench_lv_medium_constrained_45",
+        "simbench_lv_constrained_45"
+      ],
+      "n_seeds": 10,
+      "variants": ["scare", "oracle"],
+      "scenarios": [{"kind": "clean", "max_failures": 1}]
+    },
+
+    {
+      "$comment": [
+        "Pillar 8 — Reconfiguration.  Uses simbench_lv_reconfig: the constrained LV grid",
+        "augmented with 5 normally-open backup branches per sector (15 total) placed via",
+        "add_backup_lines so the GridReconfigurator's path search has alternative routes",
+        "to discover when a primary line trips.  Failures bias toward branches because the",
+        "reconfiguration pathway only fires on BranchFailureEvent; generator failures don't",
+        "test reconfiguration."
+      ],
+      "name": "reconfiguration",
+      "grids": ["simbench_lv_reconfig"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "scenarios": [
+        {"kind": "clean", "failure_type": "branch", "max_failures": 1},
+        {"kind": "clean", "failure_type": "branch", "max_failures": 2}
+      ]
+    },
+
+    {
+      "$comment": "Sensitivity sweeps.",
+      "name": "cooldown_sweep",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 5,
+      "variants": ["scare"],
+      "sweeps": [
+        {"cooldown_s": 0.0},
+        {"cooldown_s": 0.05},
+        {"cooldown_s": 0.1},
+        {"cooldown_s": 0.5},
+        {"cooldown_s": 1.0}
+      ]
+    },
+    {
+      "name": "ttl_sweep",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 5,
+      "variants": ["scare"],
+      "sweeps": [
+        {"ttl_hops": 1},
+        {"ttl_hops": 2},
+        {"ttl_hops": 3},
+        {"ttl_hops": 5},
+        {"ttl_hops": 10}
+      ]
+    },
+    {
+      "name": "holon_size_sweep",
+      "grids": ["simbench_lv_constrained_45"],
+      "n_seeds": 5,
+      "variants": ["scare"],
+      "sweeps": [
+        {"holon_max_size": 2},
+        {"holon_max_size": 4},
+        {"holon_max_size": 8},
+        {"holon_max_size": 16}
+      ]
+    },
+
+    {
+      "$comment": [
+        "TODO — agent dropout robustness.  The schedule_agent_dropout helper in",
+        "scare/base/comms.py is a contract stub; needs a mango scheduling hook to fire mid-sim."
+      ],
+      "name": "robustness_dropout_TODO",
+      "grids": [],
+      "n_seeds": 15,
+      "notes": "TODO: implement mid-sim agent unregister via mango scheduling"
+    }
+  ],
+
+  "slurm": {
+    "partition": "rosa.p",
+    "time": "00:45:00",
+    "mem": "4G",
+    "cpus": 1,
+    "max_concurrent": 64,
+    "aggregate": true
+  }
+}

@@ -1,3 +1,7 @@
-from scare.community.role import Community, CommunityParticipant
+from scare.community.role import (
+    Community,
+    CommunityParticipant,
+    PreAssignedCommunityRole,
+)
 
-__all__ = ["Community", "CommunityParticipant"]
+__all__ = ["Community", "CommunityParticipant", "PreAssignedCommunityRole"]

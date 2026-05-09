@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 
 from scare.base.model import NegotiationFinishedEvent, Sector
-from scare.base.util import obs_capacity
+from scare.base.util import apply_regulate, obs_capacity
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -63,5 +63,11 @@ class GenerationController(Role):
         if cap == 0.0:
             return
         factor = max(0.0, min(1.0, abs(event.new_setpoint / cap)))
-        if self.behavior.has_action(self.context.aid, "regulate"):
-            self.behavior.act(self.context.aid, "regulate", factor)
+        apply_regulate(
+            self.behavior,
+            self.context.aid,
+            factor,
+            sector=self.sector.value,
+            reason="stability",
+            timestamp=self.context.current_timestamp,
+        )

@@ -107,7 +107,7 @@ class NegotiationFinishedEvent:
 
 @dataclass(frozen=True)
 class OptimizationFinishedLocalEvent:
-    result: list[float]  # [el_mw, heat_w, gas_kgps]
+    result: list[float]  # [el_mw, heat_mw, gas_kgps]
 
 
 @dataclass
@@ -123,6 +123,33 @@ class LineFailure:
     source_node_id: Any
     target_node_id: Any
     branch_id: tuple
+
+
+@dataclass
+class FailureNotice:
+    """Distributed branch-failure announcement.
+
+    Originated at the two endpoint nodes of a failed branch (by
+    ``ProblemDetector.on_global_event``) and propagated through the
+    physical-grid neighbour graph hop-by-hop.  Each ``ProblemDetector``
+    along the way deduplicates by ``(origin_addr, branch_id)``,
+    decrements ``hops_remaining`` by an edge-type-dependent cost, and
+    forwards to grid neighbours whose connecting branch is either
+    same-sector or a coupling-point bridge.  Replaces the centralised
+    ``BranchFailureEvent → behavior_in`` dispatch that violated the
+    distributed-self-organisation invariant of the architecture.
+
+    ``sector`` carries the failing branch's own sector — agents react
+    only when their sector matches.  Cross-sector reactions are reached
+    through CP-bridge edges *physically*, but the eventual coupling
+    response (e.g. heat junction cooling because power was cut to a
+    CHP) flows through ``ConstraintViolation`` rather than this notice.
+    """
+
+    branch_id: tuple
+    sector: Sector
+    hops_remaining: int
+    origin_addr: Any
 
 
 @dataclass
@@ -146,10 +173,16 @@ class EnergyNegotiationMessage:
     negotiation_target: float
     current_delta: float
     counter: int
-    # Per-agent contribution ledger: agent_key -> (delta, counter, priority).
-    # An aggregate-only digest double-counts in cycles; propagating the
-    # whole ledger and merging by latest-counter-per-agent avoids it.
+    # Per-agent contribution ledger: agent_key -> (delta, counter, priority,
+    # saturated).  An aggregate-only digest double-counts in cycles;
+    # propagating the whole ledger and merging by latest-counter-per-agent
+    # avoids it.  ``saturated`` (P1) flags entries whose delta has hit
+    # dmin/dmax so the equal-share denominator counts only free agents.
     memory: dict = field(default_factory=dict)
+    # P6: scalar dual variable for the primal-dual QP gossip.  Default
+    # 0.0 corresponds to the equal-share / pre-P6 behaviour (no QP
+    # primal update).
+    dual_lambda: float = 0.0
 
 
 @dataclass
@@ -160,12 +193,14 @@ class GridPathMessage:
     path: list[Any]
     asked_agents: list[Any]
     uncertain_connections: list[tuple[Any, Any]]
+    search_id: str = ""
 
 
 @dataclass
 class GridPathResult:
     path: list[Any]
     uncertain_connections: list[tuple[Any, Any]]
+    search_id: str = ""
 
 
 @dataclass
@@ -286,6 +321,29 @@ class CurtailmentRequest:
 
     sector: Sector
     amount: float  # MW / kg/s / W to curtail (positive = reduce)
+
+
+@dataclass
+class CurtailmentNeed:
+    """Auction-phase message: broadcast to neighbours announcing the
+    total curtailment required so they can bid on how much they are
+    willing / able to absorb.  Sender collects bids and then issues
+    per-neighbour :class:`CurtailmentRequest` messages."""
+
+    sector: Sector
+    total_amount: float   # aggregate fractional curtailment needed [0..1]
+    auction_id: str
+
+
+@dataclass
+class CurtailmentBid:
+    """Reply to a :class:`CurtailmentNeed`.  Carries a scalar willingness
+    score — higher = more effective / more able to absorb curtailment —
+    that the auctioneer uses to allocate the total."""
+
+    auction_id: str
+    willingness: float
+    sector: Sector
 
 
 # ---------------------------------------------------------------------------

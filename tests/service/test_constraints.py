@@ -132,6 +132,29 @@ async def test_is_locally_feasible_default():
 
 
 @pytest.mark.asyncio
+async def test_local_sensitivity_ema_update():
+    """Sensitivity estimator should converge via EMA from repeated (P, V) samples."""
+    behavior = MockBehavior()
+    monitor = _make_monitor(behavior, vm_pu=1.0)
+
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    initial = monitor.local_sensitivity()
+
+    async with world:
+        # First sample establishes baseline; subsequent samples move the EMA.
+        for p, v in [(5.0, 1.00), (6.0, 1.02), (7.0, 1.04), (8.0, 1.06)]:
+            behavior.set_obs("agent-0", {"p_mw": p, "vm_pu": v})
+            await step_simulation(world, step_size_s=1.0)
+
+    # Each |ΔV/ΔP| = 0.02 / 1.0 = 0.02; EMA should move toward this.
+    assert monitor.local_sensitivity() != initial
+    assert monitor.local_sensitivity() > 0.0
+
+
+@pytest.mark.asyncio
 async def test_worst_neighbour_utilization_default():
     behavior = MockBehavior()
     monitor = _make_monitor(behavior, vm_pu=1.0)

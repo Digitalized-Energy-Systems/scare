@@ -1,0 +1,31 @@
+{
+  "name": "restoration_baseline",
+  "out_root": "experiment/_runs",
+  "notes": "Baseline restoration evaluation across simbench LV variants with varying coupling density.",
+  "base_seed": 0,
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1500.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "timestamp_dir": true,
+
+  "defaults": {
+    "runs_per_grid": 32,
+    "failure_lambda": 0.6,
+    "max_failures": 5
+  },
+  "grids": [
+    "simbench_lv_low",
+    "simbench_lv",
+    "simbench_lv_high"
+  ],
+  "slurm": {
+    "partition": "rosa.p",
+    "nodelist": "mpcb001,mpcs001",
+    "time": "00:30:00",
+    "mem": "4G",
+    "cpus": 1,
+    "max_concurrent": 32,
+    "aggregate": true
+  }
+}

@@ -1,0 +1,115 @@
+{
+  "$comment": [
+    "Quick-run slice of eval_full — exercises the architectural layers on the",
+    "hard regime.  All loads receive a skewed priority distribution (10 % critical /",
+    "70 % residential / 20 % curtailable) so the priority-weighted served fraction",
+    "is genuinely weighted.  Tight slack budget (constrained_30) + multi-failure",
+    "scenarios + 10 s of simulated time keep PWSF visibly < 1.",
+    "",
+    "Includes two targeted holonic / CP scenarios:",
+    "- cp_flexibility_shift (generator + mixed failures): produces per-seed",
+    "  cross-sector imbalance for the CP-ADMM layer to act on.",
+    "- concentrated_imbalance (failures at a single node): produces a stark",
+    "  per-group deficit while adjacent groups have slack capacity, so the",
+    "  Level-2 holonic ADMM is the only path to recover the lost demand.",
+    "  This is the experiment specifically designed to make the holonic",
+    "  layer's value visible in the metric."
+  ],
+  "name": "eval_quick",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 10.0,
+  "task_timeout_s": 1500.0,
+  "failure_delay_s_max": 1.0,
+  "write_timeseries": true,
+  "timestamp_dir": true,
+
+  "defaults": {"runs_per_grid": 3, "failure_lambda": 3.0, "max_failures": 4},
+
+  "experiments": [
+
+    {
+      "$comment": "Pillar 1+2: priority-diverse functional baseline.",
+      "name": "functional_baseline",
+      "grids": ["simbench_lv_constrained_30"],
+      "n_seeds": 3,
+      "variants": ["scare", "oracle"],
+      "scenarios": [
+        {"kind": "clean", "max_failures": 4, "priority_assignment": "skewed"}
+      ]
+    },
+
+    {
+      "$comment": "Pillar 3: scare vs single_level vs oracle.",
+      "name": "variant_comparison",
+      "grids": ["simbench_lv_constrained_30"],
+      "n_seeds": 3,
+      "variants": ["scare", "single_level", "oracle"],
+      "scenarios": [
+        {"kind": "clean", "max_failures": 4, "priority_assignment": "skewed"}
+      ]
+    },
+
+    {
+      "$comment": "Pillar 4: ablation including priority_holon_allocation, the load-bearing knob for holonic ADMM.",
+      "name": "ablation",
+      "grids": ["simbench_lv_constrained_30"],
+      "n_seeds": 2,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        {"enable_cp_admm": false},
+        {"enable_holonic": false},
+        {"enable_priority_holon_allocation": false},
+        {"enable_qp_gossip": false}
+      ],
+      "scenarios": [
+        {"kind": "clean", "failure_type": "concentrated", "max_failures": 5, "priority_assignment": "skewed"}
+      ]
+    },
+
+    {
+      "$comment": [
+        "CP flexibility shift: generator + mixed failures with diverse priorities.",
+        "Generator failures sometimes hit heat-side (HeatGenerator) and sometimes",
+        "power-side (PowerGenerator/CHP), producing per-seed variability in the",
+        "imbalance-vector signs."
+      ],
+      "name": "cp_flexibility_shift",
+      "grids": ["simbench_lv_constrained_30"],
+      "n_seeds": 3,
+      "variants": ["scare", "single_level", "oracle"],
+      "scenarios": [
+        {"kind": "clean", "failure_type": "mixed", "generator_share": 0.5, "max_failures": 5, "priority_assignment": "skewed"}
+      ]
+    },
+
+    {
+      "$comment": [
+        "Concentrated imbalance — the targeted holonic-layer test.  All failures",
+        "hit branches incident to a single node, creating a local sub-community",
+        "with stark deficit while neighbouring groups retain slack capacity.",
+        "Without Level-2 holonic ADMM, the deficit group can only recover what",
+        "its intra-group gossip finds locally; with holonic ADMM, capacity is",
+        "redirected from neighbouring groups.  This is the experiment most",
+        "likely to surface a measurable scare > single_level advantage on simbench."
+      ],
+      "name": "concentrated_imbalance",
+      "grids": ["simbench_lv_constrained_30"],
+      "n_seeds": 4,
+      "variants": ["scare", "single_level", "oracle"],
+      "scenarios": [
+        {"kind": "clean", "failure_type": "concentrated", "n_failures": 4, "priority_assignment": "skewed"},
+        {"kind": "clean", "failure_type": "concentrated", "n_failures": 6, "priority_assignment": "skewed"}
+      ]
+    }
+  ],
+
+  "slurm": {
+    "partition": "rosa.p",
+    "time": "00:30:00",
+    "mem": "4G",
+    "cpus": 1,
+    "max_concurrent": 16,
+    "aggregate": true
+  }
+}

@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 _ACCESS_KEYS: dict[Sector, str] = {
     Sector.ELECTRICITY: "el_mw",
     Sector.GAS: "gas_kgps",
-    Sector.HEAT: "heat_w",
+    Sector.HEAT: "heat_mw",
 }
 
 # ADMM result index for each sector
@@ -42,6 +42,20 @@ _RESULT_INDEX: dict[Sector, int] = {
     Sector.HEAT: 1,
     Sector.GAS: 2,
 }
+
+# --- CP ↔ sector fixed-point tolerance ---
+# A NegotiationFinishedEvent re-triggers CP ADMM only if the sector's
+# new setpoint differs from the last one observed here by more than
+# this tolerance.  Below the tolerance the loop has reached a
+# fixed-point on the CP side and re-triggering would just ping-pong
+# back to the group and waste messages.  Units match _ACCESS_KEYS
+# (MW for electricity, kg/s for gas, W for heat).
+_CP_SETPOINT_TOLERANCE: dict[Sector, float] = {
+    Sector.ELECTRICITY: 0.01,   # MW
+    Sector.GAS: 1e-4,           # kg/s
+    Sector.HEAT: 1e-4,          # MW (~100 W)
+}
+_CP_DEFAULT_TOLERANCE = 0.01
 
 
 class EnergyConverterRole(Role):
@@ -59,6 +73,17 @@ class EnergyConverterRole(Role):
         self._active: bool = False
         self._flex_answers: list[AvailableFlexAnswer] = []
         self._flex_expected: int = 0
+
+        # Per-sector last-observed group setpoint; used to suppress
+        # re-triggering CP ADMM when the balance negotiation converged
+        # to essentially the same point as before (fixed-point gate).
+        self._last_sector_setpoint: dict[Sector, float] = {}
+
+        # Skip-count throttle: ADMM may decline to run because the
+        # imbalance vector has the same sign across all sectors (no
+        # cross-sector trade improves the objective).  Log every Nth
+        # such skip at INFO so it is visible without flooding.
+        self._same_sign_skip_count: int = 0
 
     def setup(self) -> None:
         def _wrap(coro_fn):
@@ -102,8 +127,27 @@ class EnergyConverterRole(Role):
     async def _handle_negotiation_finished(
         self, message: NegotiationFinishedEvent, meta: dict
     ) -> None:
-        if topology_characteristic(self, tid="cps") == "leader" and not self._active:
-            self.context.schedule_instant_task(self.trigger_cp_negotiation())
+        if topology_characteristic(self, tid="cps") != "leader":
+            return
+        if self._active:
+            return
+        # Fixed-point gate: skip re-trigger if this sector's group
+        # setpoint has not moved enough to change the ADMM answer.
+        sector = message.sector
+        tol = _CP_SETPOINT_TOLERANCE.get(sector, _CP_DEFAULT_TOLERANCE)
+        prev = self._last_sector_setpoint.get(sector)
+        new = message.new_setpoint
+        if prev is not None and abs(new - prev) < tol:
+            logger.debug(
+                "[%s] CP re-trigger suppressed (sector=%s, |Δ|=%.6g < %.6g)",
+                self.context.aid,
+                sector.value,
+                abs(new - prev),
+                tol,
+            )
+            return
+        self._last_sector_setpoint[sector] = new
+        self.context.schedule_instant_task(self.trigger_cp_negotiation())
 
     async def trigger_cp_negotiation(self) -> None:
         if topology_characteristic(self, tid="cps") != "leader":
@@ -172,10 +216,27 @@ class EnergyConverterRole(Role):
         imb_heat = imbalance_by_sector.get(Sector.HEAT, 0.0)
         imb_gas = imbalance_by_sector.get(Sector.GAS, 0.0)
 
-        T = np.array([imb_el, imb_heat / 1e6, kgps_to_mw(imb_gas)])
+        # Imbalances are now reported in their natural sector units —
+        # electricity in MW, heat in MW (was W), gas in kg/s.  ADMM
+        # lives in MW across all dimensions, so only gas needs unit
+        # conversion; the historical /1e6 on heat is no longer correct
+        # since monee switched ``q_w_heat`` → ``q_mw_heat``.
+        T = np.array([imb_el, imb_heat, kgps_to_mw(imb_gas)])
 
         if np.all(T >= 0) or np.all(T <= 0):
-            logger.debug("[%s] ADMM skipped: T=%s (same sign)", self.context.aid, T)
+            self._same_sign_skip_count += 1
+            # First skip per leader and every 10th thereafter at INFO so
+            # the suppressed coordination is visible without log flooding.
+            if (
+                self._same_sign_skip_count == 1
+                or self._same_sign_skip_count % 10 == 0
+            ):
+                logger.info(
+                    "[%s] CP ADMM skipped (same-sign T=%s, n=%d)",
+                    self.context.aid,
+                    T.tolist(),
+                    self._same_sign_skip_count,
+                )
             self._active = False
             return
 
@@ -241,7 +302,14 @@ class EnergyConverterRole(Role):
                 best_weight = weight
                 best_factor = factor
 
-        if best_factor is not None and self.behavior.has_action(
-            self.context.aid, "regulate"
-        ):
-            self.behavior.act(self.context.aid, "regulate", best_factor)
+        if best_factor is not None:
+            from scare.base.util import apply_regulate
+
+            apply_regulate(
+                self.behavior,
+                self.context.aid,
+                best_factor,
+                sector="cp",
+                reason="cp_admm",
+                timestamp=self.context.current_timestamp,
+            )
