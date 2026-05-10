@@ -376,3 +376,20 @@ class HolonicAssignment:
     level: int = 0
     parent_addr: Any = None  # address of the holon leader
     child_community_ids: list[UUID] = field(default_factory=list)
+
+
+@dataclass
+class HebbianFlexBeacon:
+    """B.2: periodic broadcast from a group leader carrying its latest
+    flex-side scalar surrogate $\\delta_g$ (signed imbalance / capacity).
+
+    Receivers update their local Hebbian co-variance estimate
+    $H_{gh}(t)$ from the pair $(\\delta_g, \\delta_h)$.  High-correlation
+    pairs cluster naturally into the same holon.  No global view is
+    required; every leader exchanges only with its same-sector
+    topology neighbours.
+    """
+
+    sector: Sector
+    delta_g: float          # leader's signed surrogate, normalised by capacity
+    timestamp: float        # sender's simulation time at emission

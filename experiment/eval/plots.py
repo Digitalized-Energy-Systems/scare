@@ -4,7 +4,7 @@ Each function takes a slice of the summary DataFrame (or a per-task
 artefact) and writes one figure to disk in two formats:
 
 - ``<name>.html`` — interactive Plotly figure for exploration.
-- ``<name>.png``  — high-DPI static image for inclusion in chapters.
+- ``<name>.pdf``  — vector static image for inclusion in chapters.
 
 Style is consistent across all figures via the ``_apply_theme`` helper:
 serif title, sans-serif body, light gridlines, scientific colour
@@ -12,7 +12,7 @@ palette, no chart junk.  Variants get fixed colours so the eye learns
 them across the report.
 
 Each primitive returns the *base* path stem (``out_path`` without a
-suffix) so the caller can reference both the .html and .png alongside.
+suffix) so the caller can reference both the .html and .pdf alongside.
 """
 
 from __future__ import annotations
@@ -112,8 +112,8 @@ def _apply_theme(fig: go.Figure, *, title: str, height: int = 460) -> go.Figure:
     return fig
 
 
-def _save(fig: go.Figure, out_path: Path, *, png_scale: int = 2) -> Path:
-    """Write both HTML and PNG; return the directory-relative stem path
+def _save(fig: go.Figure, out_path: Path) -> Path:
+    """Write both HTML and PDF; return the directory-relative stem path
     (no suffix)."""
     out_path = Path(out_path).with_suffix("")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,14 +123,14 @@ def _save(fig: go.Figure, out_path: Path, *, png_scale: int = 2) -> Path:
         html_path,
         include_plotlyjs="cdn",
         full_html=True,
-        config={"displayModeBar": True, "responsive": True, "toImageButtonOptions": {"scale": png_scale}},
+        config={"displayModeBar": True, "responsive": True, "toImageButtonOptions": {"format": "pdf"}},
     )
-    png_path = out_path.with_suffix(".png")
+    pdf_path = out_path.with_suffix(".pdf")
     try:
-        fig.write_image(png_path, scale=png_scale)
+        fig.write_image(pdf_path, format="pdf")
     except Exception:
         # Kaleido failure shouldn't kill the whole report — HTML is
-        # the canonical format; PNG is for static inclusion only.
+        # the canonical format; PDF is for static inclusion only.
         pass
     return out_path
 
@@ -695,6 +695,209 @@ def claims_pass_rate(df: pd.DataFrame, out_path: Path) -> Path:
     fig.update_xaxes(title="pass rate", range=[0, 1.05], tickformat=".0%")
     fig.update_yaxes(title="")
     return _save(_apply_theme(fig, title=title, height=max(360, 60 * len(pivot) + 80)), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Diary distribution (Pillars 1, 8)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Restoration vs baseline (raw load + per-tier)
+# ---------------------------------------------------------------------------
+
+
+def restoration_vs_baseline_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Absolute restoration vs no-failure baseline",
+) -> Path:
+    """Per-grid grouped bars: pre-failure served (baseline) vs
+    post-restoration served, in raw MW (unweighted).  Overlay shows
+    PWSF (priority-weighted) so the reader can compare *absolute load
+    actually lost* against the priority-weighted view.
+
+    Reads ``outcomes__restoration__total_served_baseline_mw`` and
+    ``outcomes__restoration__total_served_post_mw``.  Falls back to an
+    empty figure if the baseline columns are missing (campaigns that
+    pre-date the restoration metric).
+    """
+    base_col = "outcomes__restoration__total_served_baseline_mw"
+    post_col = "outcomes__restoration__total_served_post_mw"
+    raw_col  = "outcomes__restoration__raw_restoration_ratio"
+    pwsf_col = "outcomes__restoration__pwsf_restoration_ratio"
+    if df.empty or base_col not in df.columns or post_col not in df.columns:
+        return _save(_empty_fig("no restoration data — re-run campaign", title), out_path)
+
+    sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
+    sub = sub.dropna(subset=[base_col, post_col])
+    if sub.empty:
+        return _save(_empty_fig("no scare baseline rows", title), out_path)
+
+    grouped = sub.groupby("grid").agg(
+        baseline_mw=(base_col, "mean"),
+        post_mw=(post_col, "mean"),
+        raw_ratio=(raw_col, "mean") if raw_col in sub.columns else (post_col, "mean"),
+        pwsf_ratio=(pwsf_col, "mean") if pwsf_col in sub.columns else (post_col, "mean"),
+        n=(base_col, "count"),
+    ).sort_values("baseline_mw", ascending=False)
+    grids = grouped.index.tolist()
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(
+        x=grids,
+        y=grouped["baseline_mw"].values,
+        name="baseline (no failure) MW",
+        marker=dict(color="#7F7F7F", line=dict(width=0)),
+        opacity=0.55,
+        hovertemplate="<b>%{x}</b><br>baseline: %{y:.3f} MW<extra></extra>",
+    ), secondary_y=False)
+    fig.add_trace(go.Bar(
+        x=grids,
+        y=grouped["post_mw"].values,
+        name="post-restoration MW",
+        marker=dict(color=_VARIANT_COLOR["scare"], line=dict(width=0)),
+        hovertemplate="<b>%{x}</b><br>post: %{y:.3f} MW<extra></extra>",
+    ), secondary_y=False)
+    if raw_col in sub.columns:
+        fig.add_trace(go.Scatter(
+            x=grids,
+            y=grouped["raw_ratio"].values,
+            mode="markers",
+            name="raw ratio (post/base)",
+            marker=dict(color="#1A1A1A", size=10, symbol="diamond",
+                        line=dict(color="white", width=1.2)),
+            hovertemplate="<b>%{x}</b><br>raw ratio: %{y:.3f}<extra></extra>",
+        ), secondary_y=True)
+    if pwsf_col in sub.columns:
+        fig.add_trace(go.Scatter(
+            x=grids,
+            y=grouped["pwsf_ratio"].values,
+            mode="markers",
+            name="PWSF ratio (post/base)",
+            marker=dict(color="#D62728", size=10, symbol="triangle-up",
+                        line=dict(color="white", width=1.2)),
+            hovertemplate="<b>%{x}</b><br>PWSF ratio: %{y:.3f}<extra></extra>",
+        ), secondary_y=True)
+    fig.add_hline(y=1.0, line=dict(color="#999999", dash="dash", width=1), secondary_y=True)
+
+    fig.update_layout(barmode="overlay", bargap=0.25)
+    fig.update_yaxes(title="served (MW, unweighted)", secondary_y=False, rangemode="tozero")
+    fig.update_yaxes(title="restoration ratio", secondary_y=True, range=[0, 1.05],
+                     showgrid=False)
+    fig.update_xaxes(title="grid")
+    fig.update_layout(legend=dict(x=0.5, y=-0.22, orientation="h", xanchor="center"))
+    return _save(_apply_theme(fig, title=title, height=500), out_path)
+
+
+def restoration_by_tier_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Per-tier restoration ratio (post / baseline served, MW)",
+) -> Path:
+    """Grouped bars per grid × tier showing how much of each tier's
+    pre-failure served load survived restoration.  Tier 1 = most
+    critical; if it doesn't sit close to 1.0 the protocol is failing
+    on the loads that matter most.
+    """
+    if df.empty or "variant" not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+    sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
+
+    tier_cols: dict[int, str] = {}
+    for col in sub.columns:
+        m = col
+        prefix = "outcomes__restoration__by_tier__"
+        suffix = "__ratio"
+        if m.startswith(prefix) and m.endswith(suffix):
+            try:
+                tier = int(m[len(prefix):-len(suffix)])
+            except ValueError:
+                continue
+            tier_cols[tier] = m
+    if not tier_cols:
+        return _save(_empty_fig("no per-tier restoration data", title), out_path)
+
+    tiers = sorted(tier_cols)
+    grouped = sub.groupby("grid")[[tier_cols[t] for t in tiers]].mean()
+    if grouped.empty:
+        return _save(_empty_fig("empty per-tier table", title), out_path)
+    grids = grouped.index.tolist()
+
+    fig = go.Figure()
+    for tier in tiers:
+        col = tier_cols[tier]
+        # Tier 1 = brightest red (critical); fade towards grey for low priority.
+        intensity = max(0.15, 1.0 - 0.13 * max(0, tier - 1))
+        color = f"rgba(214, 39, 40, {intensity:.2f})" if tier <= 3 else _QUAL_PALETTE[tier % len(_QUAL_PALETTE)]
+        fig.add_trace(go.Bar(
+            name=f"tier {tier}",
+            x=grids,
+            y=grouped[col].values,
+            marker=dict(color=color, line=dict(width=0)),
+            hovertemplate=f"<b>tier {tier}</b><br>grid: %{{x}}<br>ratio: %{{y:.3f}}<extra></extra>",
+        ))
+    fig.add_hline(y=1.0, line=dict(color="#999999", dash="dash", width=1))
+    fig.update_layout(barmode="group", bargap=0.18, bargroupgap=0.05)
+    fig.update_yaxes(title="restoration ratio (post / baseline served)", range=[0, 1.05])
+    fig.update_xaxes(title="grid")
+    return _save(_apply_theme(fig, title=title, height=500), out_path)
+
+
+def absolute_load_lost_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Absolute load lost despite restoration (MW, unweighted)",
+) -> Path:
+    """Per-grid view of ``absolute_load_dropped_mw`` — how much served
+    load was lost relative to the no-failure baseline.  Complements the
+    PWSF view by showing the *unweighted* shortfall, so the reader can
+    tell whether high PWSF is hiding a sizeable absolute loss on
+    low-priority loads.
+    """
+    col = "outcomes__restoration__absolute_load_dropped_mw"
+    base_col = "outcomes__restoration__total_served_baseline_mw"
+    if df.empty or col not in df.columns:
+        return _save(_empty_fig("no restoration data — re-run campaign", title), out_path)
+
+    sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
+    sub = sub.dropna(subset=[col])
+    if sub.empty:
+        return _save(_empty_fig("no scare rows", title), out_path)
+
+    grouped = sub.groupby("grid").agg(
+        dropped_mw=(col, "mean"),
+        baseline_mw=(base_col, "mean") if base_col in sub.columns else (col, "max"),
+        n=(col, "count"),
+    ).sort_values("dropped_mw", ascending=False)
+
+    pct = (grouped["dropped_mw"] / grouped["baseline_mw"]).where(
+        grouped["baseline_mw"] > 0, 0.0
+    )
+
+    fig = go.Figure(go.Bar(
+        x=grouped.index,
+        y=grouped["dropped_mw"].values,
+        marker=dict(color="#D62728", line=dict(width=0)),
+        text=[f"{p*100:.1f}%" for p in pct],
+        textposition="outside",
+        customdata=[
+            f"<b>{g}</b><br>dropped: {d:.3f} MW<br>baseline: {b:.3f} MW<br>"
+            f"share: {p*100:.1f}%<br>n: {int(n)}"
+            for g, d, b, p, n in zip(
+                grouped.index, grouped["dropped_mw"], grouped["baseline_mw"],
+                pct, grouped["n"],
+            )
+        ],
+        hovertemplate="%{customdata}<extra></extra>",
+    ))
+    fig.update_xaxes(title="grid")
+    fig.update_yaxes(title="absolute load dropped vs baseline (MW)", rangemode="tozero")
+    fig.update_layout(showlegend=False)
+    return _save(_apply_theme(fig, title=title, height=460), out_path)
 
 
 # ---------------------------------------------------------------------------

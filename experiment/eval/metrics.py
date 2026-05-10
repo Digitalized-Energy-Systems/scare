@@ -41,6 +41,39 @@ def _tier_weight(tier: int) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _disconnected_node_ids(monee_net: Any) -> set[int]:
+    """Return the set of node IDs that have no path to any grid-forming
+    component (ExtPowerGrid / ExtHydrGrid) through the *currently active*
+    branch topology.  These nodes' loads are physically un-servable
+    regardless of what the LP or the agents claim — they must be counted
+    as zero served in the restoration metric.
+
+    Mirrors monee's solver-side ``find_ignored_nodes`` but operates
+    purely on the user-visible network so we don't depend on whether
+    the solver was invoked with ``exclude_unconnected_nodes=True``.
+
+    The two failure modes we're guarding against:
+
+    1. ``inject_nans`` zeroes ``regulation`` on the LP *copy*; the
+       original (which the metric reads) keeps the constructor default
+       of 1.0.  A disconnected load then reports ``served = cap``.
+    2. The solver was run without ``exclude_unconnected_nodes=True``
+       (currently the case for both oracle and scare's per-step solver),
+       went infeasible, and left every regulation at 1.0.
+
+    Both routes lead to the metric over-counting served load on
+    physically disconnected nodes.  This helper closes both holes.
+    """
+    try:
+        from monee.solver.core import find_ignored_nodes
+    except Exception:  # pragma: no cover - monee always available in this project
+        return set()
+    try:
+        return set(find_ignored_nodes(monee_net))
+    except Exception:
+        return set()
+
+
 def served_breakdown(
     monee_net: Any,
     behavior: Any,
@@ -65,6 +98,10 @@ def served_breakdown(
     ``priority_weighted_*`` divide by total weighted demand so the
     fraction is in [0, 1] and comparable across grids of different
     absolute size.
+
+    Loads on nodes with no active path to a grid-forming source are
+    forced to ``served = 0`` (see :func:`_disconnected_node_ids`) — the
+    LP / agent state can't be trusted to reflect physical disconnect.
     """
     by_tier_sector: dict[str, dict[int, dict[str, float]]] = {}
     by_sector: dict[str, dict[str, float]] = {}
@@ -74,16 +111,25 @@ def served_breakdown(
     pw_demand = 0.0
     pw_served = 0.0
 
+    disconnected = _disconnected_node_ids(monee_net)
+
     for child in monee_net.childs:
         aid = f"child-{child.id}"
         obs = behavior.observe(aid) or {}
         cap = obs_capacity(obs)
-        if cap <= 0:
-            # Generators (cap < 0) and unknown agents don't contribute
-            # to load served.  Restoration metric is load-side only.
+        # Skip generators (cap < 0), zero-capacity placeholders, and
+        # NaN-capacity entries.  monee's ``persist_solution`` propagates
+        # NaN values from ``inject_nans`` back into compound port-childs
+        # (e.g.\ SubHG on a disconnected heat node) — those carry no
+        # consumer demand of their own and would otherwise pollute the
+        # sector totals.
+        if not (cap > 0):
             continue
         n_loads += 1
-        sp = obs_setpoint(obs)
+        if not getattr(child, "active", True) or child.node_id in disconnected:
+            sp = 0.0
+        else:
+            sp = obs_setpoint(obs)
         served = max(0.0, sp)
         demand = cap
 
@@ -144,6 +190,119 @@ def served_breakdown(
         ),
         "n_loads": n_loads,
         "n_loads_served_zero": n_zero,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Restoration breakdown — relative to the pre-failure baseline
+# ---------------------------------------------------------------------------
+
+
+def restoration_breakdown(
+    post: dict[str, Any], baseline: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Compare post-restoration served breakdown against the pre-failure
+    baseline, producing the metrics that show "how much got lost
+    despite restoration".
+
+    ``post`` and ``baseline`` are both ``served_breakdown`` dicts
+    (same shape).  When ``baseline`` is None or has zero demand the
+    derived ratios collapse to ``1.0`` (no failure → no degradation).
+
+    Output:
+
+    ``{
+        "absolute_load_lost_mw":   total_demand_baseline - total_served_post,
+        "absolute_load_dropped_mw": total_served_baseline - total_served_post,
+        "total_demand_mw":         total_demand_baseline,
+        "total_served_baseline_mw": total_served_baseline,
+        "total_served_post_mw":     total_served_post,
+        "raw_restoration_ratio":   total_served_post / total_served_baseline,
+        "pwsf_baseline":           baseline.priority_weighted_fraction,
+        "pwsf_post":               post.priority_weighted_fraction,
+        "pwsf_restoration_ratio":  pwsf_post / pwsf_baseline,
+        "by_tier":   per-tier {demand_baseline_mw, served_baseline_mw,
+                                served_post_mw, ratio (=post/baseline)},
+        "by_sector": per-sector {demand_baseline_mw, served_baseline_mw,
+                                  served_post_mw, ratio},
+    }``
+
+    The ``raw_*`` fields are unweighted MW so the chapter can show
+    "absolute load lost despite restoration" alongside the
+    priority-weighted fraction.  ``by_tier.ratio`` is what surfaces
+    "did tier-1 critical loads actually get fully restored?".
+    """
+    if not baseline:
+        return {"baseline_available": False}
+
+    pw_demand = baseline.get("priority_weighted_demand", 0.0)
+    pw_served_baseline = baseline.get("priority_weighted_served", 0.0)
+    pw_served_post = post.get("priority_weighted_served", 0.0)
+
+    sector_baseline = baseline.get("by_sector", {})
+    sector_post = post.get("by_sector", {})
+    total_demand = sum(s.get("demand", 0.0) for s in sector_baseline.values())
+    total_served_baseline = sum(
+        s.get("served", 0.0) for s in sector_baseline.values()
+    )
+    total_served_post = sum(s.get("served", 0.0) for s in sector_post.values())
+
+    by_tier_b = baseline.get("by_tier", {})
+    by_tier_p = post.get("by_tier", {})
+    by_tier_out: dict[str, dict[str, float]] = {}
+    for tier in set(by_tier_b) | set(by_tier_p):
+        tb = by_tier_b.get(tier, {})
+        tp = by_tier_p.get(tier, {})
+        d_b = float(tb.get("demand", 0.0))
+        s_b = float(tb.get("served", 0.0))
+        s_p = float(tp.get("served", 0.0))
+        ratio = s_p / s_b if s_b > 1e-12 else (1.0 if d_b < 1e-12 else 0.0)
+        by_tier_out[str(tier)] = {
+            "demand_baseline_mw": d_b,
+            "served_baseline_mw": s_b,
+            "served_post_mw":     s_p,
+            "ratio":              max(0.0, min(1.0, ratio)),
+            "weight":             float(tb.get("weight", 0.0)),
+        }
+
+    by_sector_out: dict[str, dict[str, float]] = {}
+    for sec in set(sector_baseline) | set(sector_post):
+        sb = sector_baseline.get(sec, {})
+        sp = sector_post.get(sec, {})
+        d_b = float(sb.get("demand", 0.0))
+        s_b = float(sb.get("served", 0.0))
+        s_p = float(sp.get("served", 0.0))
+        ratio = s_p / s_b if s_b > 1e-12 else 1.0
+        by_sector_out[sec] = {
+            "demand_baseline_mw": d_b,
+            "served_baseline_mw": s_b,
+            "served_post_mw":     s_p,
+            "ratio":              max(0.0, min(1.0, ratio)),
+        }
+
+    return {
+        "baseline_available":          True,
+        "absolute_load_lost_mw":       max(0.0, total_demand - total_served_post),
+        "absolute_load_dropped_mw":    max(0.0, total_served_baseline - total_served_post),
+        "total_demand_mw":             total_demand,
+        "total_served_baseline_mw":    total_served_baseline,
+        "total_served_post_mw":        total_served_post,
+        "raw_restoration_ratio":       (
+            total_served_post / total_served_baseline
+            if total_served_baseline > 1e-12 else 1.0
+        ),
+        "pwsf_baseline":               (
+            pw_served_baseline / pw_demand if pw_demand > 0 else 1.0
+        ),
+        "pwsf_post":                   (
+            pw_served_post / pw_demand if pw_demand > 0 else 1.0
+        ),
+        "pwsf_restoration_ratio":      (
+            pw_served_post / pw_served_baseline
+            if pw_served_baseline > 1e-12 else 1.0
+        ),
+        "by_tier":                     by_tier_out,
+        "by_sector":                   by_sector_out,
     }
 
 

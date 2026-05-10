@@ -128,6 +128,7 @@ class CampaignConfig:
     task_timeout_s: float = 1500.0
     failure_delay_s_max: float = 2.0
     write_timeseries: bool = True
+    write_trajectories: bool = False
     timestamp_dir: bool = True
     notes: str = ""
     defaults: GridDefaults = field(default_factory=GridDefaults)
@@ -189,6 +190,7 @@ class RuntimePlan:
     task_timeout_s: float = 1500.0
     failure_delay_s_max: float = 2.0
     write_timeseries: bool = True
+    write_trajectories: bool = False
 
     @classmethod
     def from_config_json(cls, path: Path) -> "RuntimePlan":
@@ -198,6 +200,7 @@ class RuntimePlan:
             task_timeout_s=float(data.get("task_timeout_s", 1500.0)),
             failure_delay_s_max=float(data.get("failure_delay_s_max", 2.0)),
             write_timeseries=bool(data.get("write_timeseries", True)),
+            write_trajectories=bool(data.get("write_trajectories", False)),
         )
 
 

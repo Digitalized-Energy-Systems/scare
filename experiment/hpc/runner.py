@@ -265,7 +265,13 @@ async def _run_simulation(plan: RuntimePlan, task: TaskSpec, logger: logging.Log
     return world, failures, net
 
 
-def _run_oracle(plan: RuntimePlan, task: TaskSpec, logger: logging.Logger):
+def _run_oracle(
+    plan: RuntimePlan,
+    task: TaskSpec,
+    logger: logging.Logger,
+    *,
+    baseline_served: dict[str, Any] | None = None,
+):
     """Build the network, draw the same failures the scare variant
     would, and solve monee's minimal-load-shedding LP.  Returns
     (net, failures, result_payload) — no world, no agents.
@@ -297,6 +303,7 @@ def _run_oracle(plan: RuntimePlan, task: TaskSpec, logger: logging.Logger):
         task_meta=task.to_dict(),
         wallclock_s=0.0,
         priorities=priorities,
+        baseline_served=baseline_served,
     )
     payload["wallclock_s"] = round(_time.monotonic() - started, 3)
     return net, failures, payload
@@ -417,6 +424,23 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 os.environ.get("HOSTNAME") or os.uname().nodename)
 
     _seed_everything(task.seed)
+    # Toggle per-aid trajectory logging for the whole task run; off by
+    # default because the log can grow large.  Enabled by setting
+    # ``write_trajectories: true`` in the campaign config; consumed by
+    # the C.5 cluster-synchronisation analysis.
+    from scare.base import diagnostics as _diag
+
+    _diag.set_trajectory_logging(getattr(plan, "write_trajectories", False))
+    # Drop any stale exception.json from a prior failed run so the
+    # aggregator's exception counts reflect only the *current* status.
+    # Without this, a re-run that succeeds still shows a count in
+    # ``Exception breakdown`` because the old crash file persists.
+    stale_exc = out_dir / "exception.json"
+    if stale_exc.exists():
+        try:
+            stale_exc.unlink()
+        except OSError:
+            pass
     started = time.monotonic()
     status: dict[str, Any] = {
         "task_id": task.task_id,
@@ -431,10 +455,44 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     }
     exit_code = EXIT_ERROR
 
+    # Pre-failure baseline.  Solve the no-failure LP on a fresh build
+    # of this grid + scenario; result.json's ``outcomes.restoration``
+    # then expresses post-restoration served as a ratio of this
+    # baseline, surfacing absolute load lost despite the restoration
+    # rather than the priority-weighted fraction alone.
+    baseline_served = None
+    try:
+        from experiment.eval.oracle import compute_baseline_served
+        from experiment.restoration import GRIDS
+
+        if task.grid in GRIDS:
+            # We need priorities for the baseline metric to be
+            # comparable; resolve them from a fresh build.
+            base_net = GRIDS[task.grid]()
+            from monee.model.formulation import MISOCP_NETWORK_FORMULATION
+            base_net.apply_formulation(MISOCP_NETWORK_FORMULATION)
+            _apply_scenario(base_net, task, logger)
+            base_priorities = _resolve_priorities(base_net, task, logger)
+            baseline_served = compute_baseline_served(
+                task.grid,
+                scenario=task.scenario or {},
+                priorities=base_priorities,
+            )
+            logger.info(
+                "Pre-failure baseline: served=%.4f / demand=%.4f (PWSF=%.4f)",
+                baseline_served.get("priority_weighted_served", 0.0),
+                baseline_served.get("priority_weighted_demand", 0.0),
+                baseline_served.get("priority_weighted_fraction", 0.0),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Baseline LP failed (continuing without it): %s", exc)
+
     try:
         if task.variant == "oracle":
             world = None
-            net, failures, oracle_metrics = _run_oracle(plan, task, logger)
+            net, failures, oracle_metrics = _run_oracle(
+                plan, task, logger, baseline_served=baseline_served
+            )
             (out_dir / "failures.json").write_text(
                 json.dumps(_serialize_failures(failures), indent=2)
             )
@@ -454,6 +512,7 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 write_messages_csv,
                 write_result_json,
                 write_served_csv,
+                write_trajectories_csv,
             )
             behavior = world.environment.behavior
             priorities = getattr(net, "_scare_priorities", None)
@@ -466,6 +525,7 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 completed=True,
                 extra_metrics={"legacy_metrics": _extract_metrics(world)},
                 priorities=priorities,
+                baseline_served=baseline_served,
             )
             write_result_json(out_dir / "result.json", payload)
             write_served_csv(out_dir / "served.csv", net, behavior, priorities=priorities)
@@ -479,6 +539,11 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                     _write_timeseries(world, out_dir / "timeseries.csv")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to write timeseries.csv: %s", exc)
+            if getattr(plan, "write_trajectories", False):
+                try:
+                    write_trajectories_csv(out_dir / "trajectories.csv")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to write trajectories.csv: %s", exc)
             # Claims validation: consume the artefacts we just wrote and
             # fold pass/fail into result.json so the aggregator can roll
             # them up.

@@ -183,11 +183,18 @@ def _format_md(df: pd.DataFrame) -> str:
             parts.append(_markdown_table(["grid", *metric_cols], rows))
 
     if "exception_type" in df.columns and df["exception_type"].notna().any():
+        # Only count exceptions for tasks whose final status is not ``ok``.
+        # Stale ``exception.json`` files from a failed run that was later
+        # re-run successfully would otherwise inflate the breakdown.
         parts.append("")
         parts.append("## Exception breakdown")
-        counts = df["exception_type"].dropna().value_counts()
-        rows = [[t, int(c)] for t, c in counts.items()]
-        parts.append(_markdown_table(["type", "count"], rows))
+        failed = df[df["status"] != "ok"]
+        counts = failed["exception_type"].dropna().value_counts()
+        if counts.empty:
+            parts.append("_(no failures)_")
+        else:
+            rows = [[t, int(c)] for t, c in counts.items()]
+            parts.append(_markdown_table(["type", "count"], rows))
 
     parts.extend(_format_eval_sections(df))
     return "\n".join(parts) + "\n"
@@ -297,6 +304,43 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
         parts.append(_markdown_table(
             ["scenario", "n", "mean served"], rows
         ))
+
+    # Restoration vs no-failure baseline — surface absolute load lost
+    # alongside the priority-weighted view so the contrast between
+    # "PWSF says 99%" and "10 MW of low-priority load actually
+    # dropped" isn't hidden in CSV columns.
+    base_col = "outcomes__restoration__total_served_baseline_mw"
+    post_col = "outcomes__restoration__total_served_post_mw"
+    drop_col = "outcomes__restoration__absolute_load_dropped_mw"
+    raw_col  = "outcomes__restoration__raw_restoration_ratio"
+    pwsf_col = "outcomes__restoration__pwsf_restoration_ratio"
+    if base_col in ok.columns and post_col in ok.columns:
+        rest = ok[ok["variant"] == "scare"] if "scare" in ok["variant"].unique() else ok
+        rest = rest.dropna(subset=[base_col, post_col])
+        if not rest.empty:
+            parts.append("")
+            parts.append("## Restoration vs no-failure baseline (scare, mean)")
+            rows = []
+            for grid, g in rest.groupby("grid"):
+                base_mw = float(g[base_col].mean())
+                post_mw = float(g[post_col].mean())
+                drop_mw = float(g[drop_col].mean()) if drop_col in g.columns else max(0.0, base_mw - post_mw)
+                raw_r   = float(g[raw_col].mean())  if raw_col  in g.columns else (post_mw / base_mw if base_mw else 1.0)
+                pwsf_r  = float(g[pwsf_col].mean()) if pwsf_col in g.columns else float("nan")
+                pct     = drop_mw / base_mw if base_mw else 0.0
+                rows.append([
+                    grid, len(g),
+                    f"{base_mw:.3f}", f"{post_mw:.3f}",
+                    f"{drop_mw:.3f}", f"{pct*100:.1f}%",
+                    f"{raw_r:.3f}",
+                    f"{pwsf_r:.3f}" if not (pwsf_r != pwsf_r) else "—",
+                ])
+            rows.sort(key=lambda r: -float(r[4]))  # biggest absolute drop first
+            parts.append(_markdown_table(
+                ["grid", "n", "base MW", "post MW", "dropped MW",
+                 "% of base", "raw ratio", "PWSF ratio"],
+                rows,
+            ))
 
     # Diary invariant rate per variant — flag where the protocol drifts.
     inv_col = "diary__invariant_holds"

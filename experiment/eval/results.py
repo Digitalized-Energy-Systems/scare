@@ -46,9 +46,13 @@ def compose_result(
     completed: bool,
     extra_metrics: dict[str, Any] | None = None,
     priorities: dict[str, int] | None = None,
+    baseline_served: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structured result.json payload for a scare-variant run."""
+    from experiment.eval.metrics import restoration_breakdown
+
     served = served_breakdown(monee_net, behavior, priorities=priorities)
+    restoration = restoration_breakdown(served, baseline_served)
     integral = constraint_violation_integral(world)
     t_stable = time_to_stabilise_s(world)
 
@@ -94,6 +98,7 @@ def compose_result(
             "time_to_stabilise_s": t_stable,
             "regulates_total": sum(regulates_by_reason.values()),
             "regulates_by_reason": dict(regulates_by_reason),
+            "restoration": restoration,
         },
         "diary": {**diary_summary, "invariant_holds": diary_invariant},
         "events": event_summary,
@@ -152,6 +157,51 @@ def write_diary_csv(path: Path) -> None:
 def write_events_csv(path: Path) -> None:
     rows = diagnostics.event_log()
     _write_dataclass_csv(path, rows)
+
+
+def write_trajectories_csv(path: Path) -> None:
+    """Pivot the per-aid trajectory log into a wide CSV.
+
+    Output layout:
+
+        time_s, <aid_1>, <aid_2>, ..., <aid_n>
+        t_0,    f_0_1,   f_0_2,   ...,  f_0_n
+        ...
+
+    Forward-fills missing values per aid (regulate is event-driven, so
+    aids report at different timestamps).  The result is consumed by
+    the C.5 cluster-synchronisation analysis in
+    :mod:`experiment.eval.adaptive_network_analysis`.
+    """
+    rows = diagnostics.trajectory_log()
+    if not rows:
+        return
+    aids: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        if r.aid not in seen:
+            seen.add(r.aid)
+            aids.append(r.aid)
+    times = sorted({round(r.t, 6) for r in rows})
+
+    # last-observed factor per aid, replayed at each unique timestamp.
+    pending: dict[str, float] = {}
+    by_t: dict[float, dict[str, float]] = {}
+    for r in rows:
+        t = round(r.t, 6)
+        by_t.setdefault(t, {})[r.aid] = float(r.factor)
+
+    with Path(path).open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time_s", *aids])
+        for t in times:
+            updates = by_t.get(t, {})
+            pending.update(updates)
+            row = [f"{t:.6f}"]
+            for aid in aids:
+                v = pending.get(aid)
+                row.append(f"{v:.6f}" if v is not None else "")
+            w.writerow(row)
 
 
 def write_messages_csv(path: Path, world: Any) -> None:

@@ -130,6 +130,24 @@ class GridConstraintMonitor(Role):
         # avoid flooding.
         self._violation_emitted: set[str] = set()
 
+        # B.1: continuous coupling weights K_ij for the constraint
+        # propagation overlay.  Independent of the balance negotiator's
+        # ledger because the topology and message frequencies differ.
+        # Used to (a) weight the worst-neighbour utilisation by trust,
+        # (b) skip forwarding to neighbours whose K is below the
+        # liveness threshold.
+        from scare.base.trust import TrustLedger, TrustParams
+
+        poll_s = SECTOR_TIMESCALE.get(sector, {}).get("poll_period_s", 1.0)
+        self._trust = TrustLedger(
+            TrustParams(
+                decay_rate_per_s=1.0 / max(poll_s * 8.0, 1.0),
+                recover_rate=0.6,
+                liveness_threshold=0.5,
+                initial=1.0,
+            )
+        )
+
         # --- Local power-flow sensitivity estimate ---
         # EMA of |dV/dP| observed from this agent's own (P, V) history.
         # Used by the curtailment auction so agents near the violated
@@ -309,6 +327,12 @@ class GridConstraintMonitor(Role):
     ) -> None:
         origin_key = (str(message.origin_addr), message.variable)
 
+        # B.1: nudge the K-score of the link the message arrived on.
+        sender = mango_sender_addr(meta)
+        now = self.context.current_timestamp
+        if sender is not None:
+            self._trust.on_message_received(str(sender), now)
+
         # Cache the latest state from this origin
         self._neighbour_state[origin_key] = message
 
@@ -331,10 +355,12 @@ class GridConstraintMonitor(Role):
             hops_remaining=message.hops_remaining - 1,
             origin_addr=message.origin_addr,
         )
-        sender = mango_sender_addr(meta)
         for addr in topology_neighbors(self, tid="groups"):
             # Don't send back to the origin or the immediate sender
             if addr == message.origin_addr or addr == sender:
+                continue
+            # B.1: skip forwarding to neighbours below the liveness gate.
+            if not self._trust.is_live(str(addr), now):
                 continue
             await self.context.send_message(fwd, receiver_addr=addr)
 
@@ -592,11 +618,24 @@ class GridConstraintMonitor(Role):
 
     def worst_neighbour_utilization(self) -> float:
         """Return the worst constraint utilization reported by any
-        neighbour within multi-hop range.  Used by the balance negotiator
-        to apply conservative margins."""
+        neighbour within multi-hop range, weighted by the continuous
+        coupling weight K_ij of the link the report arrived on (B.1).
+
+        A low-trust link contributes a proportionally weaker signal, so
+        the negotiator's pessimism factor degrades smoothly as
+        connectivity becomes unreliable.  The weighted utilisation is
+        ``K_ij * util_neighbour``.
+        """
         if not self._neighbour_state:
             return 0.0
-        return max(s.utilization for s in self._neighbour_state.values())
+        now = self.context.current_timestamp
+        worst = 0.0
+        for (origin_str, _var), msg in self._neighbour_state.items():
+            k = self._trust.score(origin_str, now)
+            weighted = k * msg.utilization
+            if weighted > worst:
+                worst = weighted
+        return worst
 
     def is_locally_feasible(self) -> bool:
         """True if no local constraint is currently violated."""

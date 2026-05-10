@@ -2,10 +2,17 @@
   "$comment": [
     "Full evaluation campaign — every pillar from the dissertation evaluation plan.",
     "Designed for HPC: each task runs independently under SLURM array; aggregator combines.",
-    "All baseline / variant / ablation experiments use simbench_lv_constrained_45 so the slack",
+    "Most baseline / variant / ablation experiments use simbench_lv_constrained_45 so the slack",
     "budget is tight enough that variant outcomes are actually distinguishable.  Cascading,",
     "scaling, cold-day stress and generator-failure experiments live in their own sections.",
-    "Reconfiguration uses simbench_lv_reconfig (same grid + 5 backup branches per sector)."
+    "Reconfiguration uses simbench_lv_reconfig (same grid + 5 backup branches per sector).",
+    "Pillar 9 (cp_flexibility) uses the cp_size_multiplier / replace_primary_generation knobs",
+    "of monee's MES generator to construct grids where coupling-point capacity is load-bearing",
+    "for resilience: simbench_lv_cp_heavy_45 inflates CP rated output 2x (additive); cp_dependent_45",
+    "keeps CP at 1x but absorbs primary-gen output to keep total per-carrier production invariant",
+    "(losing a CP now disables both the unit and the displaced primary gen); cp_heavy_dependent_45",
+    "combines both knobs.  Also exercises the new failure_type=concentrated picker which clusters",
+    "branch failures around a load-rich node to produce per-group capacity asymmetry."
   ],
   "name": "eval_full",
   "out_root": "experiment/_runs/eval",
@@ -15,12 +22,12 @@
   "write_timeseries": true,
   "timestamp_dir": true,
 
-  "defaults": {"runs_per_grid": 30, "failure_lambda": 0.6, "max_failures": 5},
+  "defaults": {"runs_per_grid": 30, "failure_lambda": 1.5, "max_failures": 4},
 
   "experiments": [
 
     {
-      "$comment": "Pillar 1 — Functional restoration quality.  Three slack budgets show the curve from easy (80 %) to hard (30 %).",
+      "$comment": "Pillar 1 — Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
       "name": "functional_baseline",
       "grids": [
         "simbench_lv_constrained_60",
@@ -29,7 +36,7 @@
       ],
       "n_seeds": 30,
       "variants": ["scare"],
-      "scenarios": [{"kind": "clean", "max_failures": 1}]
+      "scenarios": [{"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"}]
     },
 
     {
@@ -42,19 +49,20 @@
       ],
       "n_seeds": 30,
       "variants": ["scare", "oracle"],
-      "scenarios": [{"kind": "clean", "max_failures": 1}]
+      "scenarios": [{"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"}]
     },
 
     {
-      "$comment": "Strawman comparison — single-level (gossip only) vs full architecture.",
+      "$comment": "Pillar 3 — variant comparison: scare vs single-level (gossip only) vs oracle.",
       "name": "variant_comparison",
       "grids": ["simbench_lv_constrained_45"],
       "n_seeds": 30,
-      "variants": ["scare", "single_level", "oracle"]
+      "variants": ["scare", "single_level", "oracle"],
+      "scenarios": [{"kind": "clean", "max_failures": 4, "priority_assignment": "skewed"}]
     },
 
     {
-      "$comment": "Pillar 4 — ablation matrix.  One ablation per architectural component.",
+      "$comment": "Pillar 4 — ablation matrix.  One ablation per architectural component.  Run on concentrated failures so the architecture has work to do.",
       "name": "ablation",
       "grids": ["simbench_lv_constrained_45"],
       "n_seeds": 15,
@@ -64,6 +72,7 @@
         {"enable_holonic": false, "enable_cp_admm": false},
         {"enable_holonic": false},
         {"enable_cp_admm": false},
+        {"enable_qp_gossip": false},
         {"enable_constraint_aware_gossip": false},
         {"enable_multihop_constraint": false},
         {"enable_curtailment_auction": false},
@@ -72,6 +81,9 @@
         {"enable_clpu_ramp": false},
         {"enable_heat_recovery": false},
         {"enable_distributed_failure_notice": false}
+      ],
+      "scenarios": [
+        {"kind": "clean", "failure_type": "concentrated", "n_failures": 5, "priority_assignment": "skewed"}
       ]
     },
 
@@ -87,7 +99,8 @@
         {"comms_packet_loss_pct": 10.0},
         {"comms_packet_loss_pct": 20.0},
         {"comms_packet_loss_pct": 50.0}
-      ]
+      ],
+      "scenarios": [{"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"}]
     },
 
     {
@@ -101,7 +114,8 @@
         {"comms_latency_jitter_ms": 50.0},
         {"comms_latency_jitter_ms": 200.0},
         {"comms_latency_jitter_ms": 1000.0}
-      ]
+      ],
+      "scenarios": [{"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"}]
     },
 
     {
@@ -111,34 +125,34 @@
       "n_seeds": 15,
       "variants": ["scare"],
       "scenarios": [
-        {"kind": "clean", "max_failures": 1},
-        {"kind": "clean", "max_failures": 3},
-        {"kind": "clean", "max_failures": 5}
+        {"kind": "clean", "n_failures": 1, "priority_assignment": "skewed"},
+        {"kind": "clean", "n_failures": 3, "priority_assignment": "skewed"},
+        {"kind": "clean", "n_failures": 5, "priority_assignment": "skewed"}
       ]
     },
 
     {
-      "$comment": "Cold-day thermal stress.  Heat loads scaled 1.5×, slack supply temperature dropped to 70 °C — narrows the headroom against the 60 °C lower bound so the heat sector actually exercises gossip + curtailment.",
+      "$comment": "Cold-day thermal stress — narrows heat sector against its lower bound; CP plants matter when they can convert gas/power to extra heat output.",
       "name": "cold_day_stress",
-      "grids": ["simbench_lv_constrained_45"],
+      "grids": ["simbench_lv_constrained_45", "simbench_lv_cp_heavy_45"],
       "n_seeds": 15,
-      "variants": ["scare", "oracle"],
+      "variants": ["scare", "single_level", "oracle"],
       "scenarios": [
-        {"kind": "clean", "max_failures": 1},
-        {"kind": "cold_day", "supply_t_k": 343.15, "heat_load_scale": 1.5, "max_failures": 1}
+        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"},
+        {"kind": "cold_day", "supply_t_k": 343.15, "heat_load_scale": 1.5, "max_failures": 3, "priority_assignment": "skewed"}
       ]
     },
 
     {
-      "$comment": "Generator-class failures.  Compares branch-only vs generator-only vs mixed contingency types — generator failures are arguably more realistic for restoration (a CHP trips, not a line) and exercise different sectors.",
+      "$comment": "Generator-class failures — the historical CP-flexibility scenario.  Compares branch / generator / mixed contingency populations.",
       "name": "generator_failure",
       "grids": ["simbench_lv_constrained_45"],
       "n_seeds": 15,
-      "variants": ["scare"],
+      "variants": ["scare", "single_level", "oracle"],
       "scenarios": [
-        {"kind": "clean", "failure_type": "branch", "max_failures": 1},
-        {"kind": "clean", "failure_type": "generator", "max_failures": 1},
-        {"kind": "clean", "failure_type": "mixed", "generator_share": 0.5, "max_failures": 2}
+        {"kind": "clean", "failure_type": "branch", "max_failures": 3, "priority_assignment": "skewed"},
+        {"kind": "clean", "failure_type": "generator", "max_failures": 3, "priority_assignment": "skewed"},
+        {"kind": "clean", "failure_type": "mixed", "generator_share": 0.5, "max_failures": 4, "priority_assignment": "skewed"}
       ]
     },
 
@@ -148,8 +162,7 @@
         "  small  ≈   36 nodes (1-LV-rural1)",
         "  medium ≈  137 nodes (1-LV-semiurb4)",
         "  large  ≈  396 nodes (1-LV-rural3, the established benchmark)",
-        "All run with the same 50 % slack budget so the only varying axis is grid size.",
-        "n_seeds smaller than the baselines because the per-task wallclock on the large grid is the bottleneck."
+        "All run with the same 45 % slack budget so the only varying axis is grid size."
       ],
       "name": "scaling",
       "grids": [
@@ -159,25 +172,69 @@
       ],
       "n_seeds": 10,
       "variants": ["scare", "oracle"],
-      "scenarios": [{"kind": "clean", "max_failures": 1}]
+      "scenarios": [{"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"}]
     },
 
     {
       "$comment": [
         "Pillar 8 — Reconfiguration.  Uses simbench_lv_reconfig: the constrained LV grid",
-        "augmented with 5 normally-open backup branches per sector (15 total) placed via",
-        "add_backup_lines so the GridReconfigurator's path search has alternative routes",
-        "to discover when a primary line trips.  Failures bias toward branches because the",
-        "reconfiguration pathway only fires on BranchFailureEvent; generator failures don't",
-        "test reconfiguration."
+        "augmented with 5 normally-open backup branches per sector (15 total).  Failures",
+        "bias toward branches because the reconfiguration pathway only fires on",
+        "BranchFailureEvent; generator failures don't test reconfiguration."
       ],
       "name": "reconfiguration",
       "grids": ["simbench_lv_reconfig"],
       "n_seeds": 15,
       "variants": ["scare"],
       "scenarios": [
-        {"kind": "clean", "failure_type": "branch", "max_failures": 1},
-        {"kind": "clean", "failure_type": "branch", "max_failures": 2}
+        {"kind": "clean", "failure_type": "branch", "max_failures": 2, "priority_assignment": "skewed"},
+        {"kind": "clean", "failure_type": "branch", "max_failures": 4, "priority_assignment": "skewed"}
+      ]
+    },
+
+    {
+      "$comment": [
+        "Pillar 9 — CP flexibility shift.  The headline experiment for the cross-sector ADMM",
+        "layer.  Uses three new grid variants built with monee's cp_size_multiplier and",
+        "replace_primary_generation knobs:",
+        "  cp_heavy_45            : CP rated output 2x, additive (loss of CP recoverable)",
+        "  cp_dependent_45        : CP rated output 1x, replaces primary gen (loss of CP",
+        "                            disables BOTH the unit and the displaced primary gen)",
+        "  cp_heavy_dependent_45  : both knobs combined (maximum cross-carrier dependence)",
+        "On the dependent variants, gossip + islanding alone cannot recover from a CP",
+        "failure because the displaced primary gen is gone — the cross-sector ADMM is",
+        "the only path to compensate.",
+        "Failures: generator-class so CPs themselves are part of the failure population."
+      ],
+      "name": "cp_flexibility",
+      "grids": [
+        "simbench_lv_cp_heavy_45",
+        "simbench_lv_cp_dependent_45",
+        "simbench_lv_cp_heavy_dependent_45"
+      ],
+      "n_seeds": 15,
+      "variants": ["scare", "single_level", "oracle"],
+      "scenarios": [
+        {"kind": "clean", "failure_type": "generator", "max_failures": 3, "priority_assignment": "skewed"},
+        {"kind": "clean", "failure_type": "mixed", "generator_share": 0.6, "max_failures": 4, "priority_assignment": "skewed"}
+      ]
+    },
+
+    {
+      "$comment": [
+        "Concentrated imbalance.  failure_type=concentrated picks a load-rich node and",
+        "BFS-walks outward, producing spatially-clustered failures that target one",
+        "sub-community with stark deficit while neighbours retain slack capacity.",
+        "This is the test designed to surface the holonic ADMM's inter-group",
+        "redistribution; on the cp_heavy_dependent grid the CP-ADMM may also engage."
+      ],
+      "name": "concentrated_imbalance",
+      "grids": ["simbench_lv_constrained_30", "simbench_lv_cp_heavy_dependent_30"],
+      "n_seeds": 15,
+      "variants": ["scare", "single_level", "oracle"],
+      "scenarios": [
+        {"kind": "clean", "failure_type": "concentrated", "n_failures": 4, "priority_assignment": "skewed"},
+        {"kind": "clean", "failure_type": "concentrated", "n_failures": 6, "priority_assignment": "skewed"}
       ]
     },
 
@@ -193,7 +250,8 @@
         {"cooldown_s": 0.1},
         {"cooldown_s": 0.5},
         {"cooldown_s": 1.0}
-      ]
+      ],
+      "scenarios": [{"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"}]
     },
     {
       "name": "ttl_sweep",
@@ -206,7 +264,8 @@
         {"ttl_hops": 3},
         {"ttl_hops": 5},
         {"ttl_hops": 10}
-      ]
+      ],
+      "scenarios": [{"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"}]
     },
     {
       "name": "holon_size_sweep",
@@ -218,7 +277,20 @@
         {"holon_max_size": 4},
         {"holon_max_size": 8},
         {"holon_max_size": 16}
-      ]
+      ],
+      "scenarios": [{"kind": "clean", "max_failures": 3, "priority_assignment": "skewed"}]
+    },
+    {
+      "$comment": "CP-size sweep — measures how PWSF varies with CP rated output on the dependent variant.  Replaces the old todo for sizing studies.",
+      "name": "cp_size_sweep",
+      "grids": [
+        "simbench_lv_cp_dependent_45",
+        "simbench_lv_cp_heavy_45",
+        "simbench_lv_cp_heavy_dependent_45"
+      ],
+      "n_seeds": 5,
+      "variants": ["scare", "oracle"],
+      "scenarios": [{"kind": "clean", "failure_type": "generator", "max_failures": 3, "priority_assignment": "skewed"}]
     },
 
     {

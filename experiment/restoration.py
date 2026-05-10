@@ -38,6 +38,8 @@ def create_large_lv_simbench(
     simbench_code: str = "1-LV-rural3--1-no_sw",
     backup_lines_per_sector: int = 0,
     backup_seed: int | None = None,
+    cp_size_multiplier: float = 1.0,
+    replace_primary_generation: bool = False,
 ):
     """Build a simbench LV multi-energy network.
 
@@ -64,6 +66,20 @@ def create_large_lv_simbench(
         no alternative paths to discover.
     backup_seed:
         RNG seed for backup placement (reproducible test fixtures).
+    cp_size_multiplier:
+        Scales every coupling-point's rated output uniformly (1.0 =
+        monee's per-bus default; 2.0 doubles every CP capacity).
+        Larger CPs amplify the cross-sector substitution potential —
+        the headline knob for "how big do CPs need to be before
+        their contribution rises above noise?".
+    replace_primary_generation:
+        When True (default False), the rated output of every CP is
+        absorbed from the matching primary generation pool, keeping
+        total per-carrier rated production invariant.  This flips the
+        framing from CP-as-redundancy (the additive default) to
+        CP-as-cross-carrier-dependence: losing a CP now disables
+        both the unit and the primary gen it displaced, so cross-
+        sector ADMM coordination becomes load-bearing for resilience.
     """
 
     def create():
@@ -74,7 +90,12 @@ def create_large_lv_simbench(
             coupling_density=density,
             centralized=False,
             couplings=("chp", "p2g", "p2h"),
-            coupling_kwargs={"seed": 1, "use_hg_variants": True},
+            coupling_kwargs={
+                "seed": 1,
+                "use_hg_variants": True,
+                "cp_size_multiplier": cp_size_multiplier,
+                "replace_primary_generation": replace_primary_generation,
+            },
             heat_kwargs={"node_based_heat_loads": True},
         )
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
@@ -193,6 +214,43 @@ GRIDS: dict[str, Callable[[], "object"]] = {
     "simbench_lv_reconfig": create_large_lv_simbench(
         0.5, slack_budget_pct=0.45,
         backup_lines_per_sector=5, backup_seed=0,
+    ),
+
+    # CP-flexibility pillar.  Three variants exercise the new
+    # ``cp_size_multiplier`` and ``replace_primary_generation`` knobs
+    # in monee's MES generator.
+    #
+    # ``cp_heavy_45``         — additive CPs at 2× rated output.  CPs
+    #   stack on top of primary gen, so removing a CP is recoverable
+    #   by the unchanged primary fleet — but the inflated CP capacity
+    #   makes the cross-sector flex shift large enough to be visible
+    #   in the metric when the CP-ADMM layer engages.
+    # ``cp_dependent_45``     — CPs at 1× rated output that *replace*
+    #   primary generation.  Total per-carrier rated production stays
+    #   invariant, but losing a CP now disables both the unit and
+    #   the primary gen it displaced.  This is the regime where the
+    #   CP-ADMM layer's cross-sector substitution becomes load-
+    #   bearing for resilience: gossip + islanding alone cannot
+    #   recover a lost CP because the displaced primary is gone.
+    # ``cp_heavy_dependent_45`` — both knobs maxed.  Maximum cross-
+    #   sector dependence; CPs are big enough that losing one
+    #   produces a deep deficit only solvable by re-routing through
+    #   the surviving CHP / G2P / P2H plants.
+    "simbench_lv_cp_heavy_45": create_large_lv_simbench(
+        0.5, slack_budget_pct=0.45, cp_size_multiplier=2.0,
+        replace_primary_generation=False,
+    ),
+    "simbench_lv_cp_dependent_45": create_large_lv_simbench(
+        0.5, slack_budget_pct=0.45, cp_size_multiplier=1.0,
+        replace_primary_generation=True,
+    ),
+    "simbench_lv_cp_heavy_dependent_45": create_large_lv_simbench(
+        0.5, slack_budget_pct=0.45, cp_size_multiplier=2.0,
+        replace_primary_generation=True,
+    ),
+    "simbench_lv_cp_heavy_dependent_30": create_large_lv_simbench(
+        0.5, slack_budget_pct=0.30, cp_size_multiplier=2.0,
+        replace_primary_generation=True,
     ),
 }
 

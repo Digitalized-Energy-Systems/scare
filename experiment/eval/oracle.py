@@ -19,14 +19,24 @@ logger = logging.getLogger(__name__)
 
 
 def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
-    """Mark every failed branch as out of service before solving.
+    """Apply every failure to the network *exactly* the way the live
+    simulation's ``apply_failures`` does, so the oracle solves the same
+    post-failure topology scare sees.
 
-    monee's branch model exposes ``on_off`` for switchable branches and
-    ``in_service`` for unconditional disconnection.  Try both — falling
-    back to setting the attribute that exists.
+    Branches: set ``branch.active = False`` (and ``on_off = 0`` belt-and-
+    braces — both routes are honoured by the solver's edge-removal pass).
+    Nodes: set ``node.active = False``.
+    Custom (generator/compound deactivation): invoke the closure on the
+    network so ``net.deactivate(component)`` runs.
+
+    The earlier version handled only ``branch_ids``, which silently
+    swallowed every generator-failure scenario — the LP then solved on
+    an unfailed network and returned PWSF=1.0.  See
+    mango_energy_environments.environments.restoration.multi_energy_monee.apply_failures
+    for the canonical reference.
     """
     for failure in failures:
-        for branch_id in getattr(failure, "branch_ids", []):
+        for branch_id in getattr(failure, "branch_ids", []) or []:
             try:
                 branch = monee_net.branch_by_id(branch_id)
             except Exception as exc:  # noqa: BLE001
@@ -35,18 +45,25 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
                     branch_id, exc,
                 )
                 continue
-            model = branch.model
-            if hasattr(model, "on_off"):
-                model.on_off = 0
-            elif hasattr(model, "in_service"):
-                model.in_service = False
-            else:
-                # Last resort: the branch can't be marked off — log and
-                # continue, the LP will still try to find a solution
-                # that respects the rest of the network.
+            branch.active = False
+            if hasattr(branch.model, "on_off"):
+                branch.model.on_off = 0
+        for node_id in getattr(failure, "node_ids", []) or []:
+            try:
+                monee_net.node_by_id(node_id).active = False
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "oracle: branch %s has no on_off/in_service handle",
-                    branch_id,
+                    "oracle: could not find node %s to disable: %s",
+                    node_id, exc,
+                )
+        custom = getattr(failure, "custom", None)
+        if custom is not None:
+            try:
+                custom(monee_net)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "oracle: custom failure %s raised: %s",
+                    getattr(failure, "custom_id", None), exc,
                 )
 
 
@@ -110,8 +127,20 @@ def run_oracle(
     prob = create_min_load_shedding_problem()
     logger.info("oracle: solving min-load-shedding LP on net (%d childs, %d branches)",
                 len(monee_net.childs), len(monee_net.branches))
-    run_energy_flow_optimization(monee_net, prob, solver=solver, solver_name="gurobi")
-    logger.info("oracle: solve done.")
+    # ``exclude_unconnected_nodes=True`` is mandatory: without it monee's
+    # solver assembles equations for the disconnected component too, and the
+    # LP becomes structurally infeasible (mass-balance on a heat node with
+    # no inflow + non-zero load, etc.).  When that happens monee still
+    # returns — it just leaves ``regulation`` at the constructor default of
+    # 1.0, which the metric then reads as "everything served".  See the
+    # IIS analysis: residuals concentrate on ``node_276_eq_*``,
+    # ``node_285_eq_*`` etc. — exactly the disconnected island.
+    result = run_energy_flow_optimization(
+        monee_net, prob, solver=solver, solver_name="gurobi",
+        exclude_unconnected_nodes=True,
+    )
+    lp_success = bool(getattr(result, "success", True))
+    logger.info("oracle: solve done (success=%s).", lp_success)
 
     behavior = _adapter_observe(monee_net)
     served = served_breakdown(monee_net, behavior, priorities=priorities)
@@ -131,7 +160,53 @@ def run_oracle(
         "served": served,
         "constraint_violation_integral": integral,
         "regulations": regulations,
+        "lp_success": lp_success,
     }
+
+
+def compute_baseline_served(
+    grid_name: str,
+    *,
+    scenario: dict[str, Any] | None = None,
+    priorities: dict[str, int] | None = None,
+    solver: Any = None,
+) -> dict[str, Any]:
+    """Solve the no-failure minimum-load-shedding LP on a freshly built
+    grid and return the resulting ``served_breakdown``.
+
+    This is the "pre-failure baseline" used to compute restoration
+    ratios in :func:`experiment.eval.metrics.restoration_breakdown` —
+    the optimum operating point the network can reach with no
+    contingencies, which sets the upper bound for any restoration
+    metric.  Scenarios that mutate the network (e.g.\ ``cold_day``
+    scaling heat loads) are applied here too, so the baseline reflects
+    the same demand profile the post-failure runs see.
+
+    Building the grid fresh is necessary because the LP mutates the
+    network's variable state; we cannot reuse the same instance for
+    both the baseline and the post-failure run without confusing the
+    Pyomo solver.
+    """
+    from experiment.restoration import GRIDS
+    from monee.model.formulation import MISOCP_NETWORK_FORMULATION
+
+    if grid_name not in GRIDS:
+        raise SystemExit(f"Unknown grid {grid_name!r}")
+    fresh = GRIDS[grid_name]()
+    fresh.apply_formulation(MISOCP_NETWORK_FORMULATION)
+    if scenario:
+        kind = scenario.get("kind", "clean")
+        if kind == "cold_day":
+            from experiment.restoration import apply_cold_day
+
+            kwargs = {
+                k: scenario[k]
+                for k in ("supply_t_k", "heat_load_scale")
+                if k in scenario
+            }
+            apply_cold_day(fresh, **kwargs)
+    out = run_oracle(fresh, [], solver=solver, priorities=priorities)
+    return out["served"]
 
 
 def compose_oracle_result(
@@ -142,12 +217,16 @@ def compose_oracle_result(
     wallclock_s: float,
     solver: str | None = None,
     priorities: dict[str, int] | None = None,
+    baseline_served: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a result.json payload identical in shape to the scare
     composer so the aggregator can read both off the same schema."""
+    from experiment.eval.metrics import restoration_breakdown
+
     out = run_oracle(monee_net, failures, solver=solver, priorities=priorities)
     served = out["served"]
     integral = out["constraint_violation_integral"]
+    restoration = restoration_breakdown(served, baseline_served)
 
     return {
         "task": task_meta,
@@ -167,6 +246,8 @@ def compose_oracle_result(
             "time_to_stabilise_s": 0.0,
             "regulates_total": 0,
             "regulates_by_reason": {},
+            "restoration": restoration,
+            "oracle_lp_success": out.get("lp_success", True),
         },
         "diary": {"invariant_holds": True},   # vacuous
         "events": {},

@@ -164,6 +164,32 @@ def _claims(campaign: CampaignData, out_dir: Path) -> list[str]:
     ))]
 
 
+def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Campaign-wide restoration view: pre-failure baseline vs
+    post-restoration absolute MW + per-tier ratio.  Only emits figures
+    when the campaign carried the new ``outcomes.restoration.*`` block
+    (older campaigns silently fall back to an empty placeholder).
+    """
+    df = campaign.summary
+    if df.empty:
+        return []
+    ok = df[df["status"] == "ok"]
+    if ok.empty:
+        return []
+    figs = [
+        str(plots.restoration_vs_baseline_bar(
+            ok, out_dir / "absolute_vs_baseline.png",
+        )),
+        str(plots.absolute_load_lost_bar(
+            ok, out_dir / "absolute_load_lost.png",
+        )),
+        str(plots.restoration_by_tier_bar(
+            ok, out_dir / "by_tier.png",
+        )),
+    ]
+    return figs
+
+
 # ---------------------------------------------------------------------------
 # Markdown stitch
 # ---------------------------------------------------------------------------
@@ -256,6 +282,7 @@ def generate_report(campaign_dir: Path) -> Path:
         ("Robustness", _robustness, "robustness"),
         ("Cascading", _cascading, "cascading"),
         ("Sensitivity sweeps", _sweeps, "sweeps"),
+        ("Restoration vs baseline", _restoration, "restoration"),
         ("Claims (overall)", _claims, "claims"),
     ):
         out_dir = plots_root / sub

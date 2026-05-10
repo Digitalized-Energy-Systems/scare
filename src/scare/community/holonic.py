@@ -32,6 +32,7 @@ from mango.express.topology import topology_characteristic, topology_neighbors
 from scare.base.model import (
     AvailableFlexAnswer,
     CommunityAssignment,
+    HebbianFlexBeacon,
     HolonicAssignment,
     HolonicJoinAnswer,
     HolonicJoinRequest,
@@ -83,6 +84,11 @@ class HolonicCommunityRole(Role):
         max_holon_size: int = DEFAULT_MAX_HOLON_SIZE,
         rebalance_period_s: float = 10.0,
         flex_timeout_s: float = 5.0,
+        enable_hebbian_formation: bool = True,
+        hebbian_beacon_period_s: float = 4.0,
+        hebbian_eta: float = 0.25,
+        hebbian_threshold: float = 0.35,
+        hebbian_warmup_s: float = 12.0,
     ) -> None:
         super().__init__()
         self.sector = sector
@@ -90,6 +96,16 @@ class HolonicCommunityRole(Role):
         self.max_holon_size = max_holon_size
         self.rebalance_period_s = rebalance_period_s
         self.flex_timeout_s = flex_timeout_s
+
+        # B.2: Hebbian-emergent holon formation parameters.
+        # The Hebbian path co-exists with the propose-accept path (above):
+        # propose-accept gives a fast-bootstrap membership; Hebbian
+        # asymptotically refines it based on observed flex co-variance.
+        self.enable_hebbian_formation = enable_hebbian_formation
+        self.hebbian_beacon_period_s = hebbian_beacon_period_s
+        self.hebbian_eta = hebbian_eta              # learning rate
+        self.hebbian_threshold = hebbian_threshold  # H_gh > τ → same cluster
+        self.hebbian_warmup_s = hebbian_warmup_s    # cold-start grace
 
         # holon_id -> {sender_key: (addr, accept_or_None)}.  Storing the
         # address alongside the response so we can build the resolved
@@ -117,6 +133,23 @@ class HolonicCommunityRole(Role):
         self._logged_not_leader: bool = False
         self._logged_no_neighbours: bool = False
 
+        # --- B.2: Hebbian co-variance state ---
+        # Each leader keeps a per-peer running mean of (delta_g · delta_h)
+        # and a sample count.  Once warmed up, holon membership is the
+        # connected component of {peers : H_{gh} > threshold}.
+        # addr_str -> (H_gh, samples)
+        self._hebbian_H: dict[str, tuple[float, int]] = {}
+        # Last own delta_g surrogate broadcast (for diagnostics + own-pair).
+        self._last_own_delta_g: float = 0.0
+        # Most recent flex aggregate per peer; used to gauge own delta_g
+        # by comparison after each rebalance cycle.
+        self._peer_last_delta: dict[str, float] = {}
+        # Wallclock at which the warmup ended (set in ``setup``).
+        self._hebbian_warmup_until: float = 0.0
+        # Snapshot of the last Hebbian-emergent member set, used to
+        # detect drift relative to the propose/accept membership.
+        self._hebbian_members: set[str] = set()
+
     def setup(self) -> None:
         self.context.schedule_periodic_task(
             self._try_form_holon, delay=self.formation_period_s
@@ -124,6 +157,17 @@ class HolonicCommunityRole(Role):
         self.context.schedule_periodic_task(
             self._try_rebalance, delay=self.rebalance_period_s
         )
+        if self.enable_hebbian_formation:
+            self.context.schedule_periodic_task(
+                self._hebbian_beacon, delay=self.hebbian_beacon_period_s
+            )
+            self.context.schedule_periodic_task(
+                self._hebbian_recluster,
+                delay=max(2.0 * self.hebbian_beacon_period_s, self.formation_period_s),
+            )
+            self._hebbian_warmup_until = (
+                self.context.current_timestamp + self.hebbian_warmup_s
+            )
 
         def _wrap(coro_fn):
             def _sync(msg, meta):
@@ -146,6 +190,13 @@ class HolonicCommunityRole(Role):
             lambda msg, meta: isinstance(msg, AvailableFlexAnswer)
             and msg.sector == self.sector,
         )
+        if self.enable_hebbian_formation:
+            self.context.subscribe_message(
+                self,
+                _wrap(self._handle_hebbian_beacon),
+                lambda msg, meta: isinstance(msg, HebbianFlexBeacon)
+                and msg.sector == self.sector,
+            )
 
     # ------------------------------------------------------------------
     # Holon formation
@@ -372,6 +423,12 @@ class HolonicCommunityRole(Role):
     async def _handle_flex_answer(
         self, message: AvailableFlexAnswer, meta: dict
     ) -> None:
+        # B.2: regardless of rebalance state, record the peer's signed
+        # delta surrogate for the Hebbian co-variance matrix.
+        if self.enable_hebbian_formation:
+            sender_key = str(mango_sender_addr(meta))
+            self._peer_last_delta[sender_key] = self._delta_g_from_flex(message)
+
         if not self._rebalance_active:
             return
         # Defensive: ignore answers from non-members.  ``_handle_ask_flex``
@@ -584,3 +641,156 @@ class HolonicCommunityRole(Role):
                 triggers = []
         for addr in triggers:
             await self.context.send_message(StartBalanceNegotiation(), receiver_addr=addr)
+
+    # ------------------------------------------------------------------
+    # B.2: Hebbian-emergent holon formation
+    # ------------------------------------------------------------------
+    #
+    # Each leader broadcasts a periodic ``HebbianFlexBeacon`` carrying a
+    # scalar delta_g surrogate (signed sector imbalance / capacity), and
+    # updates a per-peer Hebbian co-variance estimate from incoming
+    # beacons.  After warmup, holon membership is the connected
+    # component of {peers : H_{gh} > τ}.  This is *additive* to the
+    # propose-accept path: the latter establishes a fast bootstrap
+    # membership, the former asymptotically refines it based on
+    # observed dynamics.
+    #
+    # The update rule is the classical exponentially-weighted Hebbian
+    # rule (Aoki & Aoyagi 2009):
+    #     H_{gh}(t+1) = (1 - eta) * H_{gh}(t) + eta * delta_g * delta_h
+    # The threshold τ is in the same scaled units (signed share of
+    # capacity), so cross-pair comparison is meaningful.
+    # ------------------------------------------------------------------
+
+    def _delta_g_from_flex(self, answer: AvailableFlexAnswer) -> float:
+        """Extract a signed scalar surrogate of the leader's group state.
+
+        Uses balance / max(|flex| + |balance|, ε) so that the value
+        sits in roughly [-1, 1]: positive ⇒ unmet demand, negative ⇒
+        surplus generation.  Group capacity normalises out of the
+        product H = δ_g · δ_h, so two leaders that are both
+        proportionally stressed pair up regardless of their absolute
+        size.
+        """
+        bal = float(answer.balance)
+        flex = float(answer.flex)
+        denom = max(abs(bal) + abs(flex), 1e-9)
+        return bal / denom
+
+    async def _hebbian_beacon(self) -> None:
+        """Periodic broadcast of own δ_g to same-sector neighbours."""
+        if not self.enable_hebbian_formation:
+            return
+        if topology_characteristic(self, tid="groups") != "leader":
+            return
+        # Compute own delta_g from the latest known flex (if any) or
+        # simply 0 during warmup before any rebalance has run.
+        own_key = str(self.context.addr)
+        delta_g = self._peer_last_delta.get(own_key, self._last_own_delta_g)
+        self._last_own_delta_g = delta_g
+
+        try:
+            neighbours = topology_neighbors(self, tid="holons")
+        except Exception:
+            return
+        if not neighbours:
+            return
+        msg = HebbianFlexBeacon(
+            sector=self.sector,
+            delta_g=float(delta_g),
+            timestamp=float(self.context.current_timestamp),
+        )
+        for addr in neighbours:
+            await self.context.send_message(msg, receiver_addr=addr)
+
+    async def _handle_hebbian_beacon(
+        self, message: HebbianFlexBeacon, meta: dict
+    ) -> None:
+        """Update the per-peer Hebbian co-variance estimate."""
+        sender = mango_sender_addr(meta)
+        if sender is None:
+            return
+        sender_key = str(sender)
+        # Pair the sender's delta with our most recent own delta_g so
+        # H_{gh} reflects co-variance, not just the sender's signal.
+        own = self._last_own_delta_g
+        product = float(message.delta_g) * float(own)
+        prev_h, prev_n = self._hebbian_H.get(sender_key, (0.0, 0))
+        new_h = (1.0 - self.hebbian_eta) * prev_h + self.hebbian_eta * product
+        self._hebbian_H[sender_key] = (new_h, prev_n + 1)
+
+    def hebbian_membership_candidates(self) -> set[str]:
+        """Return the set of peer-keys whose H_{gh} exceeds the threshold.
+
+        Public so the diagnostics layer (and the ``C.5`` cluster-sync
+        analysis script) can compare static topology membership against
+        the dynamically-emergent partition.
+        """
+        return {
+            k for k, (h, _n) in self._hebbian_H.items()
+            if h > self.hebbian_threshold
+        }
+
+    def _hebbian_recluster(self) -> None:
+        """Apply the thresholded Hebbian co-variance to refine the
+        leader's holon membership after warmup.
+
+        Only the leader (no parent_addr) reclusters; non-leader peers
+        accept whatever membership their leader announces via the
+        existing propose/accept channel.  Reclustering modifies
+        ``_holon_member_addrs`` / ``_holon_member_keys`` in place so
+        the next ``_try_rebalance`` cycle picks up the refined set.
+        """
+        if not self.enable_hebbian_formation:
+            return
+        if topology_characteristic(self, tid="groups") != "leader":
+            return
+        if self.context.current_timestamp < self._hebbian_warmup_until:
+            return
+        assignment = self.context.get_or_create_model(HolonicAssignment)
+        if assignment.holon_id is None or assignment.parent_addr is not None:
+            return  # not a leader of a formed holon
+
+        candidates = self.hebbian_membership_candidates()
+        if not candidates:
+            return
+
+        # Resolve candidate keys back to addresses via the topology.
+        try:
+            holon_neighbours = topology_neighbors(self, tid="holons")
+        except Exception:
+            return
+        addr_by_key = {str(a): a for a in holon_neighbours}
+
+        new_addrs: list[Any] = []
+        new_keys: set[str] = set()
+        for key in candidates:
+            if key in addr_by_key and len(new_addrs) < self.max_holon_size - 1:
+                new_addrs.append(addr_by_key[key])
+                new_keys.add(key)
+
+        if not new_addrs:
+            return
+
+        prev_keys = self._holon_member_keys
+        if new_keys == prev_keys:
+            return  # no drift
+
+        self._holon_member_addrs = new_addrs
+        self._holon_member_keys = new_keys
+        self._hebbian_members = new_keys
+        logger.info(
+            "[%s] Hebbian re-cluster: holon membership updated to %d peers (sector=%s)",
+            self.context.aid,
+            len(new_keys),
+            self.sector.value,
+        )
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=self.context.current_timestamp,
+            kind="hebbian_recluster",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=f"members={len(new_keys)} drift={len(new_keys ^ prev_keys)}",
+        )

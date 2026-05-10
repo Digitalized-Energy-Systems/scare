@@ -30,6 +30,7 @@ from scare.base.model import (
     Sector,
     StartBalanceNegotiation,
 )
+from scare.base.trust import TrustLedger, hash_weighted_choice
 from scare.base.util import (
     clamp_to_constraints,
     constraint_utilization,
@@ -333,6 +334,24 @@ class EnergyBalanceNegotiator(Role):
         poll = ts.get("poll_period_s", 1.0)
         self._heartbeat_max_age_s: float = poll * _HEARTBEAT_MAX_AGE_MULTIPLE
 
+        # --- B.1: continuous coupling weights K_ij(t) ---
+        # Each known neighbour carries a continuous trust score in [0, 1]
+        # that biases gossip forwarding and tightens the liveness gate.
+        # Refined heartbeat: the binary "have we heard recently?" check
+        # is replaced by K >= liveness_threshold.  Decay rate scales with
+        # the sector poll period so heat (slow polling) doesn't pessimise
+        # K too aggressively.
+        from scare.base.trust import TrustParams
+
+        self._trust = TrustLedger(
+            TrustParams(
+                decay_rate_per_s=1.0 / max(poll * _HEARTBEAT_MAX_AGE_MULTIPLE, 1.0),
+                recover_rate=0.6,
+                liveness_threshold=0.5,
+                initial=1.0,
+            )
+        )
+
         # --- Local proactive constraint utilization ---
         # Populated by the co-located GridConstraintMonitor's
         # ConstraintWarning events.  Keyed by variable name; value is the
@@ -508,7 +527,11 @@ class EnergyBalanceNegotiator(Role):
         addr = mango_sender_addr(meta)
         if addr is None:
             return
-        self._neighbour_last_seen[str(addr)] = self.context.current_timestamp
+        key = str(addr)
+        now = self.context.current_timestamp
+        self._neighbour_last_seen[key] = now
+        # B.1: every received message recovers the K-score multiplicatively.
+        self._trust.on_message_received(key, now)
 
     def _touch_neighbours(self, addrs: list) -> None:
         """Seed the heartbeat clock for neighbours we have just contacted.
@@ -706,20 +729,37 @@ class EnergyBalanceNegotiator(Role):
         )
 
     def _live_neighbours(self) -> list:
-        """Return group neighbours that have been heard from recently.
+        """Return group neighbours whose continuous trust score K_ij is
+        above the liveness threshold (B.1).
 
-        A neighbour is considered live if either (a) we have never
-        attempted contact yet (unknown → included) or (b) the last
-        observed timestamp is within the heartbeat window.
+        Bootstraps unknown neighbours optimistically (initial K = 1.0 in
+        the ``TrustLedger``), so first contact always succeeds; recovery
+        is multiplicative on every received message and decay is linear
+        in the silence interval scaled by the sector poll period.
         """
         all_neighbours = topology_neighbors(self, tid="groups")
         now = self.context.current_timestamp
-        live = []
-        for addr in all_neighbours:
-            last = self._neighbour_last_seen.get(str(addr))
-            if last is None or (now - last) <= self._heartbeat_max_age_s:
-                live.append(addr)
-        return live
+        return [a for a in all_neighbours if self._trust.is_live(str(a), now)]
+
+    def _scored_neighbours(self, neighbours: list) -> list[float]:
+        """Return the K-score for each neighbour in ``neighbours`` order."""
+        now = self.context.current_timestamp
+        return [self._trust.score(str(a), now) for a in neighbours]
+
+    def _next_hop(self, neighbours: list, nid: str, counter: int):
+        """B.1: K-weighted deterministic next-hop selection.
+
+        Generalises ``_deterministic_next`` by picking the index in
+        proportion to the trust score K_ij.  Reduces to the uniform
+        SHA256 modulo when all K's are equal, so behaviour matches the
+        legacy path under healthy conditions.  When some neighbours
+        have low K (recent silence, partial outage), the gossip routes
+        around them automatically.
+        """
+        if not neighbours:
+            return None
+        weights = self._scored_neighbours(neighbours)
+        return hash_weighted_choice(neighbours, weights, f"{nid}:{counter}")
 
     # ------------------------------------------------------------------
     # Trigger phase
@@ -932,9 +972,9 @@ class EnergyBalanceNegotiator(Role):
             # consistently averaged across parallel tokens with
             # different ledger views (Σ a_j differs by orders of
             # magnitude between tokens that have seen different
-            # peers).  Forward to a single deterministic next-hop
-            # instead, just like every subsequent round.
-            next_addr = _deterministic_next(neighbours, nid, 0)
+            # peers).  Forward to a single K-weighted next-hop instead,
+            # just like every subsequent round (B.1).
+            next_addr = self._next_hop(neighbours, nid, 0)
             await self.context.send_message(msg, receiver_addr=next_addr)
         else:
             # Equal-share path is robust to multi-token broadcast at
@@ -1219,7 +1259,7 @@ class EnergyBalanceNegotiator(Role):
         if abs(open_gap) <= self.termination_tolerance or counter >= self.max_hops:
             await self._finish_negotiation()
         elif neighbours:
-            next_addr = _deterministic_next(neighbours, nid, counter)
+            next_addr = self._next_hop(neighbours, nid, counter)
             fwd = EnergyNegotiationMessage(
                 negotiation_id=nid,
                 sector=self.sector,

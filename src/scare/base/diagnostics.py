@@ -33,6 +33,13 @@ _negotiation_log: list["NegotiationRecord"] = []
 # negotiation log: unbounded, cleared on ``arm()``.
 _event_log: list["EventRecord"] = []
 
+# Per-aid trajectory log — every applied regulation factor with timestamp.
+# Powers the C.5 cluster-synchronisation analysis.  Off by default; arm
+# turns it on, ``set_trajectory_logging`` toggles independently because
+# this log can grow large on long runs and is therefore opt-in.
+_trajectory_log: list["TrajectoryRecord"] = []
+_trajectory_armed: bool = False
+
 
 @dataclass(frozen=True)
 class ActionRecord:
@@ -55,6 +62,22 @@ class EventRecord:
     aid: str
     sector: str
     detail: str
+
+
+@dataclass(frozen=True)
+class TrajectoryRecord:
+    """One sample of a device's regulation factor.
+
+    Generated whenever a role calls ``record_regulate`` and trajectory
+    logging is armed.  Aggregated downstream into per-task
+    ``trajectories.csv`` (one column per aid, one row per timestamp,
+    factor in [0, 1] with the last seen value forward-filled).
+    """
+
+    t: float
+    aid: str
+    sector: str
+    factor: float
 
 
 @dataclass(frozen=True)
@@ -91,6 +114,21 @@ def arm() -> None:
     _armed = True
     _negotiation_log.clear()
     _event_log.clear()
+    _trajectory_log.clear()
+
+
+def set_trajectory_logging(enabled: bool) -> None:
+    """Toggle per-aid regulation-factor trajectory logging.
+
+    Default is OFF: the log can grow to thousands of rows per device
+    on long runs, and only the C.5 cluster-synchronisation analysis
+    needs it.  The eval runner enables it via the corresponding plan
+    flag.
+    """
+    global _trajectory_armed
+    _trajectory_armed = bool(enabled)
+    if not _trajectory_armed:
+        _trajectory_log.clear()
 
 
 def record_regulate(
@@ -102,6 +140,10 @@ def record_regulate(
         ActionRecord(t=t, kind="regulate", aid=aid, sector=sector,
                      value=factor, reason=reason)
     )
+    if _trajectory_armed:
+        _trajectory_log.append(
+            TrajectoryRecord(t=t, aid=aid, sector=sector, factor=factor)
+        )
 
 
 def record_switch(*, t: float, aid: str, reason: str) -> None:
@@ -210,6 +252,11 @@ def event_summary() -> dict[str, int]:
     for r in _event_log:
         summary[r.kind] = summary.get(r.kind, 0) + 1
     return summary
+
+
+def trajectory_log() -> list[TrajectoryRecord]:
+    """Snapshot of the per-aid regulation factor trajectory ledger."""
+    return list(_trajectory_log)
 
 
 def _format_record(r: ActionRecord) -> str:
