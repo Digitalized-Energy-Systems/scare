@@ -91,6 +91,10 @@ class EnergyConverterRole(Role):
                 self.context.schedule_instant_task(coro_fn(msg, meta))
             return _sync
 
+        logger.debug(
+            "[%s] EnergyConverterRole setup: sectors=%s",
+            self.context.aid, [s.value for s in self.sectors],
+        )
         self.context.subscribe_message(
             self,
             _wrap(self._handle_ask_energy),
@@ -127,7 +131,12 @@ class EnergyConverterRole(Role):
     async def _handle_negotiation_finished(
         self, message: NegotiationFinishedEvent, meta: dict
     ) -> None:
-        if topology_characteristic(self, tid="cps") != "leader":
+        char = topology_characteristic(self, tid="cps")
+        logger.debug(
+            "[%s] CP received NegotiationFinishedEvent (sector=%s, new_sp=%.4f, my_cps_char=%s)",
+            self.context.aid, message.sector.value, message.new_setpoint, char,
+        )
+        if char != "leader":
             return
         if self._active:
             return
@@ -158,12 +167,19 @@ class EnergyConverterRole(Role):
 
         group_leaders = topology_connectors(self, tid="cps")
         if not group_leaders:
+            logger.info(
+                "[%s] CP trigger skipped: no connected group leaders", self.context.aid,
+            )
             self._active = False
             return
 
         self._flex_answers = []
         self._flex_expected = len(group_leaders)
 
+        logger.info(
+            "[%s] CP triggered: asking %d group leaders for flex",
+            self.context.aid, len(group_leaders),
+        )
         msg = AskForAvailableFlex(include_connectors=False)
         for addr in group_leaders:
             await self.context.send_message(msg, receiver_addr=addr)
@@ -261,8 +277,17 @@ class EnergyConverterRole(Role):
             )
             result = list(self.flex_actor.x)
             logger.info("[%s] ADMM result: %s", self.context.aid, result)
-            self.context.emit_event(OptimizationFinishedLocalEvent(result=result))
+            # ``_apply_result`` must run *before* ``emit_event``: nothing
+            # subscribes to ``OptimizationFinishedLocalEvent``, so the
+            # underlying ``RoleHandler.emit_event`` raises ``KeyError``
+            # on its dict lookup.  Previously that KeyError was caught by
+            # the outer ``except Exception`` and the ADMM result was
+            # discarded — the CP layer was diagnostic-only.
             self._apply_result(result)
+            try:
+                self.context.emit_event(OptimizationFinishedLocalEvent(result=result))
+            except KeyError:
+                pass
             for addr in topology_connectors(self, tid="cps"):
                 await self.context.send_message(StartBalanceNegotiation(), receiver_addr=addr)
         except Exception as exc:

@@ -88,6 +88,21 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
     stderr.setFormatter(logging.Formatter(LOG_FORMAT))
     root.addHandler(stderr)
 
+    # Suppress the verbose solver loggers — pyomo, gurobipy and
+    # mango.simulation emit one DEBUG line per constraint / per branch
+    # which dominates the per-task log (hundreds of MB) once the
+    # solver fires from multiple roles per simulation step.  Keep
+    # WARN+ so genuine solver failures still surface.
+    for noisy in (
+        "pyomo.core",
+        "pyomo.opt",
+        "pyomo.contrib",
+        "gurobipy",
+        "mango.simulation.world",
+        "mango.express",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     counter = _SolverFailureCounter()
     logging.getLogger("monee.solver.pyo").addFilter(counter)
     return handler, counter
@@ -205,7 +220,6 @@ async def _run_simulation(plan: RuntimePlan, task: TaskSpec, logger: logging.Log
     end-of-sim recordings (e.g. served breakdown via the behavior).
     """
     from experiment.restoration import GRIDS
-    from monee.model.formulation import MISOCP_NETWORK_FORMULATION
     from scare.base.config import RestorationConfiguration
     from scare.scenario.restoration import (
         create_restoration_scenario_world,
@@ -217,8 +231,9 @@ async def _run_simulation(plan: RuntimePlan, task: TaskSpec, logger: logging.Log
 
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s", task.grid)
+    # Factory already applies MISOCP + McCormick formulations; re-applying
+    # MISOCP here would overwrite the McCormick partition metadata.
     net = factory()
-    net.apply_formulation(MISOCP_NETWORK_FORMULATION)
     _apply_scenario(net, task, logger)
 
     failures = _resolve_failures(net, plan, task)
@@ -279,7 +294,6 @@ def _run_oracle(
     import time as _time
 
     from experiment.restoration import GRIDS
-    from monee.model.formulation import MISOCP_NETWORK_FORMULATION
 
     from experiment.eval.oracle import compose_oracle_result
 
@@ -287,8 +301,8 @@ def _run_oracle(
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s (oracle)", task.grid)
+    # Factory already applies MISOCP + McCormick.
     net = factory()
-    net.apply_formulation(MISOCP_NETWORK_FORMULATION)
     _apply_scenario(net, task, logger)
     failures = _resolve_failures(net, plan, task)
     logger.info(
@@ -313,17 +327,22 @@ def _resolve_priorities(
     net: Any, task: TaskSpec, logger: logging.Logger
 ) -> dict[str, int] | None:
     """Build the per-load priority dict from the scenario's
-    ``priority_assignment`` knob.  Returns ``None`` when the scenario
-    does not request priority diversity, preserving the legacy
-    ``all-tier-1`` default that earlier campaigns relied on.
+    ``priority_assignment`` knob.
+
+    Default is ``"skewed"`` so the priority machinery (QP weights,
+    tier-aware ADMM, priority-weighted served fraction) is exercised
+    by default.  monee observations don't carry a per-load priority
+    field, so without this default the obs_priority fallback returned
+    tier 1 for every load and the priority-aware behaviour was
+    degenerate (audit P1-7).
 
     Recognised values for ``priority_assignment``:
     ``"uniform"``, ``"skewed"``, ``"by_capacity"``, ``"all_one"``.
+    Set ``"all_one"`` explicitly to recover the legacy degenerate
+    behaviour.
     """
     scenario = task.scenario or {}
-    distribution = scenario.get("priority_assignment")
-    if not distribution:
-        return None
+    distribution = scenario.get("priority_assignment", "skewed")
     from experiment.restoration import assign_load_priorities
 
     priorities = assign_load_priorities(
@@ -351,9 +370,30 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
       scale heat loads up (see ``experiment.restoration.apply_cold_day``).
       Tunables: ``supply_t_k`` (default 343.15 K) and
       ``heat_load_scale`` (default 1.5×).
+    - ``"pv_peak"`` — sunny-midday over-voltage stress: scale up every
+      ``PowerGenerator.p_mw`` and scale down every ``PowerLoad.p_mw``
+      so the feeder runs reverse-power and ``vm_pu`` drifts toward the
+      upper bound.  Targets the VDE-AR-N 4105 operating point.
+      Tunables: ``gen_scale`` (default 3×) and ``load_scale`` (default
+      0.3×).
+    - ``"line_stress"`` — line-thermal stress: scale loads up and
+      reduce PowerLine ``max_i_ka`` so loading_percent rises into
+      overload after a single branch failure.  Exercises the branch-
+      mode constraint monitor, the priority-aware home group
+      assignment, and the 6c path-ranking reconfigurator.
+      Tunables: ``load_scale`` (default 1.8×), ``ampacity_scale``
+      (default 0.5×), ``affect_branch_fraction`` (default 1.0).
 
     Other kinds are silently passed through so future scenario types
     can be wired without changing existing behaviour.
+
+    The scenario may also carry ``slack_budget_pct`` independently of
+    ``kind``: when set, ``experiment.restoration.apply_slack_budget``
+    is called *after* any kind-specific mutation, so the budget
+    reflects the (possibly scaled) post-mutation demand.  The grid
+    factory itself never bakes the slack budget in — the LP needs an
+    unconstrained slack to converge, and the budget is an operator
+    policy that varies by scenario, not a physical grid attribute.
     """
     scenario = task.scenario or {}
     kind = scenario.get("kind", "clean")
@@ -367,6 +407,45 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         }
         apply_cold_day(net, **kwargs)
         logger.info("Applied cold_day scenario: %s", kwargs or "<defaults>")
+    elif kind == "pv_peak":
+        from experiment.restoration import apply_pv_peak
+
+        kwargs = {
+            k: scenario[k]
+            for k in ("gen_scale", "load_scale")
+            if k in scenario
+        }
+        apply_pv_peak(net, **kwargs)
+        logger.info("Applied pv_peak scenario: %s", kwargs or "<defaults>")
+    elif kind == "line_stress":
+        from experiment.restoration import apply_line_stress
+
+        kwargs = {
+            k: scenario[k]
+            for k in ("load_scale", "ampacity_scale", "affect_branch_fraction")
+            if k in scenario
+        }
+        apply_line_stress(net, **kwargs)
+        logger.info("Applied line_stress scenario: %s", kwargs or "<defaults>")
+
+    # Operator slack-budget policy — orthogonal to ``kind`` so any
+    # scenario kind can carry one.  Applied AFTER any kind-specific
+    # mutation so the budget reflects the (possibly scaled) demand
+    # in the post-mutation network.  ``apply_slack_budget`` widens
+    # the LP Var bounds to ``±10·budget`` (keeps the LP feasible)
+    # and stamps the budget as the slack agents' rating that the MAS
+    # then drives toward via ``slack_target_fraction``.  The grid
+    # factory itself never bakes a slack budget in — see the
+    # ``GRIDS`` dict comment for the design rationale.
+    slack_budget_pct = scenario.get("slack_budget_pct")
+    if slack_budget_pct is not None:
+        from experiment.restoration import apply_slack_budget
+
+        apply_slack_budget(net, float(slack_budget_pct))
+        logger.info(
+            "Applied slack_budget_pct=%s (per-scenario operator policy)",
+            slack_budget_pct,
+        )
 
 
 def _config_from_task(task: TaskSpec):
@@ -467,10 +546,9 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
 
         if task.grid in GRIDS:
             # We need priorities for the baseline metric to be
-            # comparable; resolve them from a fresh build.
+            # comparable; resolve them from a fresh build.  Factory
+            # already applies MISOCP + McCormick.
             base_net = GRIDS[task.grid]()
-            from monee.model.formulation import MISOCP_NETWORK_FORMULATION
-            base_net.apply_formulation(MISOCP_NETWORK_FORMULATION)
             _apply_scenario(base_net, task, logger)
             base_priorities = _resolve_priorities(base_net, task, logger)
             baseline_served = compute_baseline_served(

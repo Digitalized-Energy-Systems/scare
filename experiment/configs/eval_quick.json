@@ -1,6 +1,6 @@
 {
   "$comment": [
-    "Quick-run slice of eval_full — exercises the architectural layers on the",
+    "Quick-run slice of eval_full \u2014 exercises the architectural layers on the",
     "hard regime.  All loads receive a skewed priority distribution (10 % critical /",
     "70 % residential / 20 % curtailable) so the priority-weighted served fraction",
     "is genuinely weighted.  Tight slack budget (constrained_30) + multi-failure",
@@ -22,51 +22,88 @@
   "failure_delay_s_max": 1.0,
   "write_timeseries": true,
   "timestamp_dir": true,
-
-  "defaults": {"runs_per_grid": 3, "failure_lambda": 3.0, "max_failures": 4},
-
+  "defaults": {
+    "runs_per_grid": 3,
+    "failure_lambda": 3.0,
+    "max_failures": 4
+  },
   "experiments": [
-
     {
       "$comment": "Pillar 1+2: priority-diverse functional baseline.",
       "name": "functional_baseline",
-      "grids": ["simbench_lv_constrained_30"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 3,
-      "variants": ["scare", "oracle"],
+      "variants": [
+        "scare",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 4, "priority_assignment": "skewed"}
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
       ]
     },
-
     {
       "$comment": "Pillar 3: scare vs single_level vs oracle.",
       "name": "variant_comparison",
-      "grids": ["simbench_lv_constrained_30"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 3,
-      "variants": ["scare", "single_level", "oracle"],
+      "variants": [
+        "scare",
+        "single_level",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 4, "priority_assignment": "skewed"}
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
       ]
     },
-
     {
       "$comment": "Pillar 4: ablation including priority_holon_allocation, the load-bearing knob for holonic ADMM.",
       "name": "ablation",
-      "grids": ["simbench_lv_constrained_30"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_cp_admm": false},
-        {"enable_holonic": false},
-        {"enable_priority_holon_allocation": false},
-        {"enable_qp_gossip": false}
+        {
+          "enable_cp_admm": false
+        },
+        {
+          "enable_holonic": false
+        },
+        {
+          "enable_priority_holon_allocation": false
+        },
+        {
+          "enable_qp_gossip": false
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "concentrated", "max_failures": 5, "priority_assignment": "skewed"}
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "max_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
       ]
     },
-
     {
       "$comment": [
         "CP flexibility shift: generator + mixed failures with diverse priorities.",
@@ -75,17 +112,29 @@
         "imbalance-vector signs."
       ],
       "name": "cp_flexibility_shift",
-      "grids": ["simbench_lv_constrained_30"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 3,
-      "variants": ["scare", "single_level", "oracle"],
+      "variants": [
+        "scare",
+        "single_level",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "mixed", "generator_share": 0.5, "max_failures": 5, "priority_assignment": "skewed"}
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
       ]
     },
-
     {
       "$comment": [
-        "Concentrated imbalance — the targeted holonic-layer test.  All failures",
+        "Concentrated imbalance \u2014 the targeted holonic-layer test.  All failures",
         "hit branches incident to a single node, creating a local sub-community",
         "with stark deficit while neighbouring groups retain slack capacity.",
         "Without Level-2 holonic ADMM, the deficit group can only recover what",
@@ -94,16 +143,33 @@
         "likely to surface a measurable scare > single_level advantage on simbench."
       ],
       "name": "concentrated_imbalance",
-      "grids": ["simbench_lv_constrained_30"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 4,
-      "variants": ["scare", "single_level", "oracle"],
+      "variants": [
+        "scare",
+        "single_level",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "concentrated", "n_failures": 4, "priority_assignment": "skewed"},
-        {"kind": "clean", "failure_type": "concentrated", "n_failures": 6, "priority_assignment": "skewed"}
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        },
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 6,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
       ]
     }
   ],
-
   "slurm": {
     "partition": "rosa.p",
     "time": "00:30:00",

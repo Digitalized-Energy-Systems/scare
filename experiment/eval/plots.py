@@ -54,61 +54,94 @@ _QUAL_PALETTE = [
 ]
 
 _FONT_FAMILY = "Inter, -apple-system, Segoe UI, Roboto, sans-serif"
-_TITLE_FONT_FAMILY = "Inter, -apple-system, Segoe UI, Roboto, sans-serif"
+_TITLE_FONT_FAMILY = "Charter, Georgia, 'Times New Roman', serif"
+
+# Figure dimensions tuned for two-column LaTeX dissertation layout.
+# At \columnwidth ≈ 3.3 in, a 500×340 native PDF scales to ~0.63 in
+# \includegraphics, which keeps the font sizes below at ≥9 pt printed.
+_FIG_WIDTH = 500
+_FIG_HEIGHT = 340
+
+# Font sizing — chosen so labels remain ≥9 pt after column-width scaling.
+_BASE_FONT_SIZE = 14
+_TITLE_FONT_SIZE = 19
+_AXIS_TITLE_FONT_SIZE = 15
+_TICK_FONT_SIZE = 14
+_LEGEND_FONT_SIZE = 13
+_ANNOTATION_FONT_SIZE = 13
+
+_GRID_COLOR = "#ECECEC"
+_AXIS_COLOR = "#1A1A1A"
+_MUTED_COLOR = "#666666"
+
+_AXIS_STYLE = dict(
+    gridcolor=_GRID_COLOR,
+    gridwidth=0.8,
+    zeroline=False,
+    showline=True,
+    linecolor=_AXIS_COLOR,
+    linewidth=1.1,
+    mirror=False,
+    ticks="outside",
+    tickcolor=_AXIS_COLOR,
+    ticklen=4,
+    tickwidth=0.9,
+    tickfont=dict(size=_TICK_FONT_SIZE),
+    title=dict(font=dict(size=_AXIS_TITLE_FONT_SIZE), standoff=8),
+    automargin=True,
+)
 
 _DEFAULT_LAYOUT = dict(
     template="plotly_white",
-    font=dict(family=_FONT_FAMILY, size=13, color="#1A1A1A"),
+    width=_FIG_WIDTH,
+    height=_FIG_HEIGHT,
+    font=dict(family=_FONT_FAMILY, size=_BASE_FONT_SIZE, color=_AXIS_COLOR),
     title=dict(
-        font=dict(family=_TITLE_FONT_FAMILY, size=18, color="#1A1A1A"),
+        font=dict(family=_TITLE_FONT_FAMILY, size=_TITLE_FONT_SIZE, color=_AXIS_COLOR),
         x=0.02,
         xanchor="left",
         y=0.97,
         yanchor="top",
+        pad=dict(t=4, b=4),
     ),
     paper_bgcolor="white",
     plot_bgcolor="white",
-    margin=dict(l=70, r=30, t=70, b=60),
+    margin=dict(l=66, r=20, t=58, b=80),
     legend=dict(
-        bgcolor="rgba(255,255,255,0.95)",
-        bordercolor="#DCDCDC",
-        borderwidth=1,
-        font=dict(size=12),
+        bgcolor="rgba(255,255,255,0)",
+        bordercolor="rgba(0,0,0,0)",
+        borderwidth=0,
+        font=dict(size=_LEGEND_FONT_SIZE),
+        orientation="h",
+        x=0.5,
+        xanchor="center",
+        y=-0.22,
+        yanchor="top",
+        itemsizing="constant",
     ),
-    xaxis=dict(
-        gridcolor="#EAEAEA",
-        gridwidth=1,
-        zeroline=False,
-        showline=True,
-        linecolor="#1A1A1A",
-        linewidth=1,
-        ticks="outside",
-        tickcolor="#1A1A1A",
-        ticklen=4,
-    ),
-    yaxis=dict(
-        gridcolor="#EAEAEA",
-        gridwidth=1,
-        zeroline=False,
-        showline=True,
-        linecolor="#1A1A1A",
-        linewidth=1,
-        ticks="outside",
-        tickcolor="#1A1A1A",
-        ticklen=4,
-    ),
+    xaxis=_AXIS_STYLE,
+    yaxis=_AXIS_STYLE,
     hoverlabel=dict(
         bgcolor="white",
-        bordercolor="#1A1A1A",
+        bordercolor=_AXIS_COLOR,
         font=dict(family=_FONT_FAMILY, size=12),
     ),
 )
 
 
-def _apply_theme(fig: go.Figure, *, title: str, height: int = 460) -> go.Figure:
+def _apply_theme(
+    fig: go.Figure,
+    *,
+    title: str,
+    height: int = _FIG_HEIGHT,
+    width: int = _FIG_WIDTH,
+) -> go.Figure:
     fig.update_layout(_DEFAULT_LAYOUT)
-    fig.update_layout(title=dict(text=title, **_DEFAULT_LAYOUT["title"]),
-                      height=height)
+    fig.update_layout(
+        title=dict(text=title, **_DEFAULT_LAYOUT["title"]),
+        height=height,
+        width=width,
+    )
     return fig
 
 
@@ -160,7 +193,7 @@ def _empty_fig(message: str, title: str) -> go.Figure:
         text=message,
         xref="paper", yref="paper",
         x=0.5, y=0.5, showarrow=False,
-        font=dict(family=_FONT_FAMILY, size=14, color="#888888"),
+        font=dict(family=_FONT_FAMILY, size=_ANNOTATION_FONT_SIZE, color=_MUTED_COLOR),
     )
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
@@ -169,6 +202,32 @@ def _empty_fig(message: str, title: str) -> go.Figure:
 
 def _variant_color(variant: str, fallback: str | None = None) -> str:
     return _VARIANT_COLOR.get(variant, fallback or _QUAL_PALETTE[hash(variant) % len(_QUAL_PALETTE)])
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {alpha:.2f})"
+
+
+# Display-only alias helpers.  The plot pipeline routes every grid /
+# scenario / variant string through these so the canonical long names
+# in summary.csv stay machine-readable while the figures show the
+# short labels defined in ``experiment/configs/display_aliases.json``.
+from experiment.eval.aliases import (  # noqa: E402
+    alias_experiment,
+    alias_grid,
+    alias_scenario,
+    alias_variant,
+)
+
+
+def _grids_display(grids: list[str]) -> list[str]:
+    return [alias_grid(g) for g in grids]
+
+
+def _variants_display(variants: list[str]) -> list[str]:
+    return [alias_variant(v) for v in variants]
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +248,7 @@ def variant_comparison_bar(
     grouped = df.groupby(["grid", "variant"])[metric_col].apply(list)
     grids = sorted({k[0] for k in grouped.index})
     variants = sorted({k[1] for k in grouped.index})
+    grids_lbl = _grids_display(grids)
 
     fig = go.Figure()
     for variant in variants:
@@ -202,21 +262,24 @@ def variant_comparison_bar(
             cis.append(ci)
             ns.append(len(vals))
         hover = [
-            f"<b>{variant}</b><br>grid: {g}<br>mean: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {n}"
+            f"<b>{alias_variant(variant)}</b><br>grid: {g}<br>"
+            f"mean: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {n}"
             for g, m, c, n in zip(grids, means, cis, ns)
         ]
         fig.add_trace(go.Bar(
-            name=variant,
-            x=grids,
+            name=alias_variant(variant),
+            x=grids_lbl,
             y=means,
-            error_y=dict(type="data", array=cis, visible=True, thickness=1.5, color="#1A1A1A"),
-            marker=dict(color=_variant_color(variant), line=dict(width=0)),
+            error_y=dict(type="data", array=cis, visible=True, thickness=1.2, width=4,
+                         color=_MUTED_COLOR),
+            marker=dict(color=_variant_color(variant), line=dict(width=0.5, color="white")),
             hovertemplate="%{customdata}<extra></extra>",
             customdata=hover,
         ))
 
-    fig.update_layout(barmode="group", bargap=0.18, bargroupgap=0.06)
-    fig.update_yaxes(range=[0, 1.05], title="priority-weighted served fraction")
+    fig.update_layout(barmode="group", bargap=0.22, bargroupgap=0.06)
+    fig.update_yaxes(range=[0, 1.05], title="priority-weighted served fraction",
+                     tickformat=".2f")
     fig.update_xaxes(title="grid")
     return _save(_apply_theme(fig, title=title), out_path)
 
@@ -243,8 +306,8 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
     fig.add_trace(go.Scatter(
         x=[0, 1], y=[0, 1],
         mode="lines",
-        line=dict(color="#999999", dash="dash", width=1.2),
-        name="parity (oracle = scare)",
+        line=dict(color="#BBBBBB", dash="dash", width=1),
+        name="parity",
         hoverinfo="skip",
     ))
     grids = sorted(pivot.index.get_level_values("grid").unique())
@@ -254,15 +317,15 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
         fig.add_trace(go.Scatter(
             x=sub["oracle"], y=sub["scare"],
             mode="markers",
-            name=grid,
+            name=alias_grid(grid),
             marker=dict(
-                size=10,
+                size=9,
                 color=_QUAL_PALETTE[i % len(_QUAL_PALETTE)],
-                line=dict(width=1.2, color="white"),
-                opacity=0.85,
+                line=dict(width=1, color="white"),
+                opacity=0.9,
             ),
             customdata=[
-                f"grid: {grid}<br>seed: {s}<br>oracle: {sub.loc[s,'oracle']:.4f}<br>scare: {sub.loc[s,'scare']:.4f}<br>gap: {(sub.loc[s,'oracle']-sub.loc[s,'scare']):.4f}"
+                f"grid: {alias_grid(grid)}<br>seed: {s}<br>oracle: {sub.loc[s,'oracle']:.4f}<br>scare: {sub.loc[s,'scare']:.4f}<br>gap: {(sub.loc[s,'oracle']-sub.loc[s,'scare']):.4f}"
                 for s in seeds
             ],
             hovertemplate="%{customdata}<extra></extra>",
@@ -272,17 +335,20 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
     pivot["gap"] = pivot["oracle"] - pivot["scare"]
     mean_gap = float(pivot["gap"].mean())
     fig.add_annotation(
-        xref="paper", yref="paper", x=0.02, y=0.98,
+        xref="paper", yref="paper", x=0.97, y=0.05,
+        xanchor="right", yanchor="bottom",
         showarrow=False,
-        align="left",
-        bgcolor="rgba(255,255,255,0.9)",
-        bordercolor="#1A1A1A", borderwidth=1, borderpad=6,
-        text=f"<b>mean gap</b>: {mean_gap:.4f}<br><b>n</b>: {len(pivot)}",
-        font=dict(family=_FONT_FAMILY, size=12),
+        align="right",
+        bgcolor="rgba(255,255,255,0.85)",
+        bordercolor="#CCCCCC", borderwidth=0.6, borderpad=5,
+        text=f"<b>mean gap</b> {mean_gap:+.4f}  ·  <b>n</b>={len(pivot)}",
+        font=dict(family=_FONT_FAMILY, size=_ANNOTATION_FONT_SIZE, color=_AXIS_COLOR),
     )
 
-    fig.update_xaxes(title="oracle priority-weighted served", range=[0, 1.05])
-    fig.update_yaxes(title="scare priority-weighted served", range=[0, 1.05])
+    fig.update_xaxes(title="oracle priority-weighted served", range=[0, 1.05],
+                     tickformat=".2f")
+    fig.update_yaxes(title="scare priority-weighted served", range=[0, 1.05],
+                     tickformat=".2f")
     return _save(_apply_theme(fig, title=title), out_path)
 
 
@@ -306,17 +372,20 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
     grids = sorted(pivot.index.get_level_values("grid").unique())
     for i, grid in enumerate(grids):
         gaps = pivot.xs(grid, level="grid")["gap"].values
+        color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
         fig.add_trace(go.Box(
             y=gaps,
-            name=grid,
-            marker=dict(color=_QUAL_PALETTE[i % len(_QUAL_PALETTE)], outliercolor="#D62728"),
+            name=alias_grid(grid),
+            marker=dict(color=color, outliercolor="#D62728", size=4),
+            fillcolor=_hex_to_rgba(color, 0.18),
+            line=dict(width=1.4, color=color),
             boxmean=True,
             boxpoints="outliers",
-            line=dict(width=1.2),
             hovertemplate="grid: %{x}<br>gap: %{y:.4f}<extra></extra>",
         ))
-    fig.add_hline(y=0, line=dict(color="#999999", dash="dash", width=1))
-    fig.update_yaxes(title="relative gap (oracle − scare) / oracle")
+    fig.add_hline(y=0, line=dict(color="#BBBBBB", dash="dash", width=1))
+    fig.update_yaxes(title="relative gap (oracle − scare) / oracle",
+                     tickformat=".2f", zeroline=False)
     fig.update_xaxes(title="grid")
     fig.update_layout(showlegend=False)
     return _save(_apply_theme(fig, title=title), out_path)
@@ -350,23 +419,26 @@ def ablation_impact_bar(df: pd.DataFrame, out_path: Path) -> Path:
         x=grouped["mean"],
         y=grouped.index,
         orientation="h",
-        marker=dict(color=colors, line=dict(width=0)),
-        error_x=dict(type="data", array=grouped["ci"], thickness=1.5, color="#1A1A1A"),
+        marker=dict(color=colors, line=dict(width=0.5, color="white")),
+        error_x=dict(type="data", array=grouped["ci"], thickness=1.2, width=4,
+                     color=_MUTED_COLOR),
         customdata=hover,
         hovertemplate="%{customdata}<extra></extra>",
     ))
     if baseline_mean is not None:
         fig.add_vline(
             x=baseline_mean,
-            line=dict(color="#D62728", dash="dash", width=1.2),
+            line=dict(color="#D62728", dash="dash", width=1.1),
             annotation_text="baseline",
-            annotation_position="top right",
-            annotation_font=dict(color="#D62728", size=12),
+            annotation_position="top",
+            annotation_font=dict(color="#D62728", size=_ANNOTATION_FONT_SIZE),
         )
-    fig.update_xaxes(title="mean priority-weighted served fraction", range=[0, 1.05])
+    fig.update_xaxes(title="mean priority-weighted served fraction", range=[0, 1.05],
+                     tickformat=".2f")
     fig.update_yaxes(title="")
-    fig.update_layout(showlegend=False, height=max(360, 50 * len(grouped) + 80))
-    return _save(_apply_theme(fig, title=title, height=max(360, 50 * len(grouped) + 80)), out_path)
+    height = max(_FIG_HEIGHT, 30 * len(grouped) + 120)
+    fig.update_layout(showlegend=False)
+    return _save(_apply_theme(fig, title=title, height=height), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +479,7 @@ def robustness_curve(
         x=x + x[::-1],
         y=upper + lower[::-1],
         fill="toself",
-        fillcolor="rgba(31, 78, 150, 0.18)",
+        fillcolor=_hex_to_rgba(_VARIANT_COLOR["scare"], 0.16),
         line=dict(color="rgba(0,0,0,0)"),
         hoverinfo="skip",
         showlegend=False,
@@ -415,8 +487,8 @@ def robustness_curve(
     fig.add_trace(go.Scatter(
         x=x, y=y,
         mode="lines+markers",
-        line=dict(color=_VARIANT_COLOR["scare"], width=2.2),
-        marker=dict(size=9, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1.2)),
+        line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
+        marker=dict(size=8, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)),
         customdata=[
             f"x={xv}<br>mean: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {int(n)}"
             for xv, m, c, n in zip(x, grouped["mean"], grouped["ci"], grouped["count"])
@@ -424,7 +496,8 @@ def robustness_curve(
         hovertemplate="%{customdata}<extra></extra>",
         name="scare",
     ))
-    fig.update_yaxes(title="priority-weighted served fraction", range=[0, 1.05])
+    fig.update_yaxes(title="priority-weighted served fraction", range=[0, 1.05],
+                     tickformat=".2f")
     fig.update_xaxes(title=x_label)
     fig.update_layout(showlegend=False)
     return _save(_apply_theme(fig, title=title), out_path)
@@ -470,7 +543,7 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
         x=x + x[::-1],
         y=upper + lower[::-1],
         fill="toself",
-        fillcolor="rgba(31, 78, 150, 0.18)",
+        fillcolor=_hex_to_rgba(_VARIANT_COLOR["scare"], 0.16),
         line=dict(color="rgba(0,0,0,0)"),
         hoverinfo="skip",
         showlegend=False,
@@ -478,8 +551,8 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
     fig.add_trace(go.Scatter(
         x=x, y=y,
         mode="lines+markers",
-        line=dict(color=_VARIANT_COLOR["scare"], width=2.2),
-        marker=dict(size=10, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1.2)),
+        line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
+        marker=dict(size=9, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)),
         customdata=[
             f"failures: {xv}<br>mean served: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {int(n)}"
             for xv, m, c, n in zip(x, grouped["mean"], grouped["ci"], grouped["count"])
@@ -487,7 +560,8 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
         hovertemplate="%{customdata}<extra></extra>",
         name="scare",
     ))
-    fig.update_yaxes(title="priority-weighted served fraction", range=[0, 1.05])
+    fig.update_yaxes(title="priority-weighted served fraction", range=[0, 1.05],
+                     tickformat=".2f")
     fig.update_xaxes(title="number of simultaneous failures", dtick=1)
     fig.update_layout(showlegend=False)
     return _save(_apply_theme(fig, title=title), out_path)
@@ -522,8 +596,8 @@ def sweep_curve_dual(
         x=served.index, y=served.values,
         mode="lines+markers",
         name="served",
-        line=dict(color=_VARIANT_COLOR["scare"], width=2.2),
-        marker=dict(size=9, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1.2)),
+        line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
+        marker=dict(size=8, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)),
         hovertemplate=f"{sweep_param}: %{{x}}<br>served: %{{y:.4f}}<extra></extra>",
     ), secondary_y=False)
 
@@ -533,18 +607,23 @@ def sweep_curve_dual(
             x=wall.index, y=wall.values,
             mode="lines+markers",
             name="wallclock (s)",
-            line=dict(color=_VARIANT_COLOR["single_level"], width=2.2, dash="dot"),
-            marker=dict(size=9, color=_VARIANT_COLOR["single_level"], symbol="square",
-                        line=dict(color="white", width=1.2)),
+            line=dict(color=_VARIANT_COLOR["single_level"], width=2.0, dash="dot"),
+            marker=dict(size=8, color=_VARIANT_COLOR["single_level"], symbol="square",
+                        line=dict(color="white", width=1)),
             hovertemplate=f"{sweep_param}: %{{x}}<br>wallclock: %{{y:.0f}}s<extra></extra>",
         ), secondary_y=True)
-        fig.update_yaxes(title="wallclock (s)", color=_VARIANT_COLOR["single_level"], secondary_y=True,
-                         showgrid=False, gridcolor="#EAEAEA")
+        fig.update_yaxes(
+            title="wallclock (s)", color=_VARIANT_COLOR["single_level"], secondary_y=True,
+            showgrid=False,
+            tickfont=dict(size=_TICK_FONT_SIZE),
+            title_font=dict(size=_AXIS_TITLE_FONT_SIZE),
+        )
 
-    fig.update_yaxes(title="priority-weighted served fraction", range=[0, 1.05],
-                     color=_VARIANT_COLOR["scare"], secondary_y=False)
+    fig.update_yaxes(
+        title="priority-weighted served fraction", range=[0, 1.05],
+        color=_VARIANT_COLOR["scare"], secondary_y=False, tickformat=".2f",
+    )
     fig.update_xaxes(title=x_label)
-    fig.update_layout(legend=dict(x=0.5, y=-0.25, orientation="h", xanchor="center"))
     return _save(_apply_theme(fig, title=title), out_path)
 
 
@@ -571,12 +650,13 @@ def served_by_tier(
             x=pivot.index.astype(str),
             y=pivot[sec].values,
             name=sec,
-            marker=dict(color=_SECTOR_COLOR.get(sec, "#888888"), line=dict(width=0)),
+            marker=dict(color=_SECTOR_COLOR.get(sec, "#888888"),
+                        line=dict(width=0.5, color="white")),
             hovertemplate=f"<b>{sec}</b><br>tier: %{{x}}<br>served: %{{y:.4f}}<extra></extra>",
         ))
-    fig.update_layout(barmode="group", bargap=0.18, bargroupgap=0.08)
+    fig.update_layout(barmode="group", bargap=0.24, bargroupgap=0.06)
     fig.update_xaxes(title="priority tier (1 = most critical)")
-    fig.update_yaxes(title="served fraction", range=[0, 1.05])
+    fig.update_yaxes(title="served fraction", range=[0, 1.05], tickformat=".2f")
     return _save(_apply_theme(fig, title=title), out_path)
 
 
@@ -644,8 +724,7 @@ def restoration_trajectory(
 
     fig.update_xaxes(title="simulation time (s)")
     fig.update_yaxes(title="Σ regulation per sector")
-    fig.update_layout(legend=dict(x=1.02, y=1.0, xanchor="left"))
-    return _save(_apply_theme(fig, title=title), out_path)
+    return _save(_apply_theme(fig, title=title, height=360), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -682,19 +761,20 @@ def claims_pass_rate(df: pd.DataFrame, out_path: Path) -> Path:
         fig.add_trace(go.Bar(
             y=pivot.index,
             x=pivot[variant].values,
-            name=variant,
+            name=alias_variant(variant),
             orientation="h",
-            marker=dict(color=_variant_color(variant), line=dict(width=0)),
+            marker=dict(color=_variant_color(variant), line=dict(width=0.5, color="white")),
             customdata=[
-                f"<b>{c}</b><br>variant: {variant}<br>pass rate: {p:.1%}<br>n: {int(n_pivot.loc[c, variant])}"
+                f"<b>{c}</b><br>variant: {alias_variant(variant)}<br>pass rate: {p:.1%}<br>n: {int(n_pivot.loc[c, variant])}"
                 for c, p in zip(pivot.index, pivot[variant].values)
             ],
             hovertemplate="%{customdata}<extra></extra>",
         ))
-    fig.update_layout(barmode="group", bargap=0.2, bargroupgap=0.06)
+    fig.update_layout(barmode="group", bargap=0.22, bargroupgap=0.06)
     fig.update_xaxes(title="pass rate", range=[0, 1.05], tickformat=".0%")
     fig.update_yaxes(title="")
-    return _save(_apply_theme(fig, title=title, height=max(360, 60 * len(pivot) + 80)), out_path)
+    height = max(_FIG_HEIGHT, 36 * len(pivot) + 130)
+    return _save(_apply_theme(fig, title=title, height=height), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -743,52 +823,57 @@ def restoration_vs_baseline_bar(
         n=(base_col, "count"),
     ).sort_values("baseline_mw", ascending=False)
     grids = grouped.index.tolist()
+    grids_lbl = _grids_display(grids)
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Bar(
-        x=grids,
+        x=grids_lbl,
         y=grouped["baseline_mw"].values,
-        name="baseline (no failure) MW",
-        marker=dict(color="#7F7F7F", line=dict(width=0)),
-        opacity=0.55,
+        name="baseline (no failure)",
+        marker=dict(color="#BFBFBF", line=dict(width=0)),
+        opacity=0.6,
         hovertemplate="<b>%{x}</b><br>baseline: %{y:.3f} MW<extra></extra>",
     ), secondary_y=False)
     fig.add_trace(go.Bar(
-        x=grids,
+        x=grids_lbl,
         y=grouped["post_mw"].values,
-        name="post-restoration MW",
-        marker=dict(color=_VARIANT_COLOR["scare"], line=dict(width=0)),
+        name="post-restoration",
+        marker=dict(color=_VARIANT_COLOR["scare"], line=dict(width=0.5, color="white")),
         hovertemplate="<b>%{x}</b><br>post: %{y:.3f} MW<extra></extra>",
     ), secondary_y=False)
     if raw_col in sub.columns:
         fig.add_trace(go.Scatter(
-            x=grids,
+            x=grids_lbl,
             y=grouped["raw_ratio"].values,
             mode="markers",
-            name="raw ratio (post/base)",
-            marker=dict(color="#1A1A1A", size=10, symbol="diamond",
-                        line=dict(color="white", width=1.2)),
+            name="raw ratio",
+            marker=dict(color=_AXIS_COLOR, size=9, symbol="diamond",
+                        line=dict(color="white", width=1)),
             hovertemplate="<b>%{x}</b><br>raw ratio: %{y:.3f}<extra></extra>",
         ), secondary_y=True)
     if pwsf_col in sub.columns:
         fig.add_trace(go.Scatter(
-            x=grids,
+            x=grids_lbl,
             y=grouped["pwsf_ratio"].values,
             mode="markers",
-            name="PWSF ratio (post/base)",
-            marker=dict(color="#D62728", size=10, symbol="triangle-up",
-                        line=dict(color="white", width=1.2)),
+            name="PWSF ratio",
+            marker=dict(color="#D62728", size=9, symbol="triangle-up",
+                        line=dict(color="white", width=1)),
             hovertemplate="<b>%{x}</b><br>PWSF ratio: %{y:.3f}<extra></extra>",
         ), secondary_y=True)
-    fig.add_hline(y=1.0, line=dict(color="#999999", dash="dash", width=1), secondary_y=True)
+    fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1), secondary_y=True)
 
-    fig.update_layout(barmode="overlay", bargap=0.25)
-    fig.update_yaxes(title="served (MW, unweighted)", secondary_y=False, rangemode="tozero")
-    fig.update_yaxes(title="restoration ratio", secondary_y=True, range=[0, 1.05],
-                     showgrid=False)
+    fig.update_layout(barmode="overlay", bargap=0.28)
+    fig.update_yaxes(title="served (MW, unweighted)", secondary_y=False, rangemode="tozero",
+                     tickformat=".2f")
+    fig.update_yaxes(
+        title="restoration ratio", secondary_y=True, range=[0, 1.05],
+        showgrid=False, tickformat=".2f",
+        tickfont=dict(size=_TICK_FONT_SIZE),
+        title_font=dict(size=_AXIS_TITLE_FONT_SIZE),
+    )
     fig.update_xaxes(title="grid")
-    fig.update_layout(legend=dict(x=0.5, y=-0.22, orientation="h", xanchor="center"))
-    return _save(_apply_theme(fig, title=title, height=500), out_path)
+    return _save(_apply_theme(fig, title=title, height=400), out_path)
 
 
 def restoration_by_tier_bar(
@@ -825,6 +910,7 @@ def restoration_by_tier_bar(
     if grouped.empty:
         return _save(_empty_fig("empty per-tier table", title), out_path)
     grids = grouped.index.tolist()
+    grids_lbl = _grids_display(grids)
 
     fig = go.Figure()
     for tier in tiers:
@@ -834,16 +920,210 @@ def restoration_by_tier_bar(
         color = f"rgba(214, 39, 40, {intensity:.2f})" if tier <= 3 else _QUAL_PALETTE[tier % len(_QUAL_PALETTE)]
         fig.add_trace(go.Bar(
             name=f"tier {tier}",
-            x=grids,
+            x=grids_lbl,
             y=grouped[col].values,
-            marker=dict(color=color, line=dict(width=0)),
+            marker=dict(color=color, line=dict(width=0.5, color="white")),
             hovertemplate=f"<b>tier {tier}</b><br>grid: %{{x}}<br>ratio: %{{y:.3f}}<extra></extra>",
         ))
-    fig.add_hline(y=1.0, line=dict(color="#999999", dash="dash", width=1))
-    fig.update_layout(barmode="group", bargap=0.18, bargroupgap=0.05)
-    fig.update_yaxes(title="restoration ratio (post / baseline served)", range=[0, 1.05])
+    fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
+    fig.update_layout(barmode="group", bargap=0.22, bargroupgap=0.05)
+    fig.update_yaxes(title="restoration ratio (post / baseline served)", range=[0, 1.05],
+                     tickformat=".2f")
     fig.update_xaxes(title="grid")
-    return _save(_apply_theme(fig, title=title, height=500), out_path)
+    return _save(_apply_theme(fig, title=title, height=400), out_path)
+
+
+def restoration_loss_split_by_tier_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Per-tier loss split: physical disconnect vs agent-shed (MW)",
+) -> Path:
+    """Stacked bars per tier showing the *attribution* of each tier's
+    restoration loss:
+
+    - ``disconnect_lost`` (priority-blind): demand whose node had no
+      active path to a grid-forming source.  Physics decides; the
+      agents cannot save it regardless of priority.
+    - ``agent_shed`` (priority-aware): load the QP / ADMM layers chose
+      to drop.  This is the only contribution the priority weighting
+      actually controls.
+
+    The chapter's "tier 1 protected, tier 10 sheds first" claim
+    applies to the *agent_shed* component only.  Plotting both
+    contributions side-by-side makes that clear: if tier 1's bar is
+    dominated by ``disconnect_lost`` it is *not* a failure of the
+    priority machinery, just a failure of the physical topology.
+    """
+    if df.empty or "variant" not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+    sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
+
+    # Discover tiers by inspecting per-tier disconnect / agent columns.
+    disc_pat = "outcomes__restoration__by_tier__"
+    disc_suf = "__disconnect_lost_mw"
+    agt_suf  = "__agent_shed_mw"
+    tiers: list[int] = []
+    for col in sub.columns:
+        if col.startswith(disc_pat) and col.endswith(disc_suf):
+            try:
+                tiers.append(int(col[len(disc_pat):-len(disc_suf)]))
+            except ValueError:
+                continue
+    tiers = sorted(set(tiers))
+    if not tiers:
+        return _save(
+            _empty_fig("no disconnect/agent split data — re-run with metric update",
+                       title), out_path,
+        )
+
+    disc_means: list[float] = []
+    agt_means: list[float] = []
+    for t in tiers:
+        d_col = f"{disc_pat}{t}{disc_suf}"
+        a_col = f"{disc_pat}{t}{agt_suf}"
+        d = sub[d_col].dropna() if d_col in sub.columns else pd.Series(dtype=float)
+        a = sub[a_col].dropna() if a_col in sub.columns else pd.Series(dtype=float)
+        disc_means.append(float(d.mean()) if len(d) else 0.0)
+        agt_means.append(float(a.mean()) if len(a) else 0.0)
+
+    x = [f"tier {t}" for t in tiers]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name="physical disconnect (priority-blind)",
+        x=x,
+        y=disc_means,
+        marker=dict(color="#999999", line=dict(width=0.5, color="white")),
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "disconnect lost (mean per task): %{y:.3f} MW<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Bar(
+        name="agent-shed (priority-aware)",
+        x=x,
+        y=agt_means,
+        marker=dict(color=_VARIANT_COLOR.get("scare", "#1F4E96"),
+                    line=dict(width=0.5, color="white")),
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "agent shed (mean per task): %{y:.3f} MW<extra></extra>"
+        ),
+    ))
+    fig.update_layout(barmode="stack", bargap=0.22)
+    fig.update_yaxes(title="loss per task (MW, mean over scare tasks)",
+                     rangemode="tozero", tickformat=".3f")
+    fig.update_xaxes(title="priority tier (1 = most critical)")
+    return _save(_apply_theme(fig, title=title, height=400), out_path)
+
+
+def agent_only_ratio_by_tier_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Per-tier restoration ratio (agent-shed only — disconnect excluded)",
+) -> Path:
+    """Per-tier waterfall using ``agent_only_ratio`` — the share of
+    demand each tier kept *after removing physically disconnected
+    load* from the denominator.  This isolates the priority signal
+    from the topology noise: if the chapter's claim holds, tier 1
+    should sit near 1.0 across grids and the curve should slope down
+    monotonically to tier 10.
+    """
+    if df.empty or "variant" not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+    sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
+
+    pat = "outcomes__restoration__by_tier__"
+    suf = "__agent_only_ratio"
+    tier_cols: dict[int, str] = {}
+    for col in sub.columns:
+        if col.startswith(pat) and col.endswith(suf):
+            try:
+                tier_cols[int(col[len(pat):-len(suf)])] = col
+            except ValueError:
+                continue
+    if not tier_cols:
+        return _save(
+            _empty_fig("no agent_only_ratio data — re-run with metric update", title),
+            out_path,
+        )
+    tiers = sorted(tier_cols)
+    grouped = sub.groupby("grid")[[tier_cols[t] for t in tiers]].mean()
+    if grouped.empty:
+        return _save(_empty_fig("empty per-tier table", title), out_path)
+    grids = grouped.index.tolist()
+    grids_lbl = _grids_display(grids)
+
+    fig = go.Figure()
+    for tier in tiers:
+        col = tier_cols[tier]
+        intensity = max(0.15, 1.0 - 0.13 * max(0, tier - 1))
+        color = f"rgba(214, 39, 40, {intensity:.2f})" if tier <= 3 else _QUAL_PALETTE[tier % len(_QUAL_PALETTE)]
+        fig.add_trace(go.Bar(
+            name=f"tier {tier}",
+            x=grids_lbl,
+            y=grouped[col].values,
+            marker=dict(color=color, line=dict(width=0.5, color="white")),
+            hovertemplate=f"<b>tier {tier}</b><br>grid: %{{x}}<br>agent-only ratio: %{{y:.3f}}<extra></extra>",
+        ))
+    fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
+    fig.update_layout(barmode="group", bargap=0.22, bargroupgap=0.05)
+    fig.update_yaxes(
+        title="agent-only ratio (post / (baseline − disconnect))",
+        range=[0, 1.05], tickformat=".2f",
+    )
+    fig.update_xaxes(title="grid")
+    return _save(_apply_theme(fig, title=title, height=400), out_path)
+
+
+def restoration_ratio_by_variant_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Raw restoration ratio (post / baseline) by grid × variant",
+) -> Path:
+    """Per-grid grouped bars comparing scare / single_level / oracle on
+    raw_restoration_ratio.  This is the missing direct comparison —
+    ``restoration_vs_baseline_bar`` only plots one variant at a time;
+    ``optimality_gap_scatter`` only shows scare vs oracle.  Here the
+    reader sees how each variant performs against the no-failure
+    baseline across every grid in one figure.
+    """
+    col = "outcomes__restoration__raw_restoration_ratio"
+    if df.empty or col not in df.columns or "variant" not in df.columns:
+        return _save(_empty_fig("no restoration ratio data", title), out_path)
+    sub = df.dropna(subset=[col])
+    if sub.empty:
+        return _save(_empty_fig("no restoration ratio data", title), out_path)
+
+    grouped = sub.groupby(["grid", "variant"])[col].mean().unstack("variant")
+    if grouped.empty:
+        return _save(_empty_fig("empty grouping", title), out_path)
+
+    grids = grouped.index.tolist()
+    grids_lbl = _grids_display(grids)
+    variants = sorted(grouped.columns)
+
+    fig = go.Figure()
+    for variant in variants:
+        ys = grouped[variant].values
+        fig.add_trace(go.Bar(
+            x=grids_lbl,
+            y=ys,
+            name=alias_variant(variant),
+            marker=dict(color=_variant_color(variant), line=dict(width=0.5, color="white")),
+            hovertemplate=(
+                f"<b>{alias_variant(variant)}</b>"
+                "<br>grid: %{x}<br>raw ratio: %{y:.3f}<extra></extra>"
+            ),
+        ))
+    fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
+    fig.update_layout(barmode="group", bargap=0.22, bargroupgap=0.06)
+    fig.update_yaxes(title="raw restoration ratio", range=[0, 1.05], tickformat=".2f")
+    fig.update_xaxes(title="grid")
+    return _save(_apply_theme(fig, title=title, height=400), out_path)
 
 
 def absolute_load_lost_bar(
@@ -879,13 +1159,14 @@ def absolute_load_lost_bar(
     )
 
     fig = go.Figure(go.Bar(
-        x=grouped.index,
+        x=_grids_display(list(grouped.index)),
         y=grouped["dropped_mw"].values,
-        marker=dict(color="#D62728", line=dict(width=0)),
+        marker=dict(color="#D62728", line=dict(width=0.5, color="white")),
         text=[f"{p*100:.1f}%" for p in pct],
         textposition="outside",
+        textfont=dict(size=_ANNOTATION_FONT_SIZE),
         customdata=[
-            f"<b>{g}</b><br>dropped: {d:.3f} MW<br>baseline: {b:.3f} MW<br>"
+            f"<b>{alias_grid(g)}</b><br>dropped: {d:.3f} MW<br>baseline: {b:.3f} MW<br>"
             f"share: {p*100:.1f}%<br>n: {int(n)}"
             for g, d, b, p, n in zip(
                 grouped.index, grouped["dropped_mw"], grouped["baseline_mw"],
@@ -895,9 +1176,10 @@ def absolute_load_lost_bar(
         hovertemplate="%{customdata}<extra></extra>",
     ))
     fig.update_xaxes(title="grid")
-    fig.update_yaxes(title="absolute load dropped vs baseline (MW)", rangemode="tozero")
-    fig.update_layout(showlegend=False)
-    return _save(_apply_theme(fig, title=title, height=460), out_path)
+    fig.update_yaxes(title="absolute load dropped vs baseline (MW)", rangemode="tozero",
+                     tickformat=".2f")
+    fig.update_layout(showlegend=False, bargap=0.28)
+    return _save(_apply_theme(fig, title=title), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -925,15 +1207,16 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
         return _save(_empty_fig("no diary data", title), out_path)
 
     fig = go.Figure()
+    variants_lbl = _variants_display(list(by_variant.index))
     for col, label, color in cols:
         fig.add_trace(go.Bar(
-            x=by_variant.index,
+            x=variants_lbl,
             y=by_variant[col].values,
             name=label,
-            marker=dict(color=color, line=dict(width=0)),
+            marker=dict(color=color, line=dict(width=0.5, color="white")),
             hovertemplate=f"<b>{label}</b><br>variant: %{{x}}<br>count: %{{y}}<extra></extra>",
         ))
-    fig.update_layout(barmode="stack", bargap=0.18)
+    fig.update_layout(barmode="stack", bargap=0.28)
     fig.update_xaxes(title="variant")
     fig.update_yaxes(title="count")
     return _save(_apply_theme(fig, title=title), out_path)

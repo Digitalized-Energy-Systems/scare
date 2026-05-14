@@ -154,10 +154,15 @@ def _format_md(df: pd.DataFrame) -> str:
             mean_duration_s=("duration_s", "mean"),
             mean_solver_failures=("solver_failures", "mean"),
         )
+        try:
+            from experiment.eval.aliases import alias_grid as _alias_grid
+        except Exception:  # pragma: no cover
+            def _alias_grid(g):
+                return g
         rows = []
         for grid, r in agg.iterrows():
             rows.append([
-                grid, int(r["total"]), int(r["ok"]), int(r["error"]),
+                _alias_grid(grid), int(r["total"]), int(r["ok"]), int(r["error"]),
                 int(r["timeout"]), int(r["missing"]),
                 f"{r['mean_duration_s']:.1f}" if pd.notna(r["mean_duration_s"]) else "—",
                 f"{r['mean_solver_failures']:.2f}" if pd.notna(r["mean_solver_failures"]) else "—",
@@ -177,9 +182,14 @@ def _format_md(df: pd.DataFrame) -> str:
             parts.append("_(no successful runs)_")
         else:
             agg = ok_df.groupby("grid")[metric_cols].mean()
+            try:
+                from experiment.eval.aliases import alias_grid as _alias_grid_m
+            except Exception:  # pragma: no cover
+                def _alias_grid_m(g):
+                    return g
             rows = []
             for grid, r in agg.iterrows():
-                rows.append([grid, *[f"{r[c]:.4g}" if pd.notna(r[c]) else "—" for c in metric_cols]])
+                rows.append([_alias_grid_m(grid), *[f"{r[c]:.4g}" if pd.notna(r[c]) else "—" for c in metric_cols]])
             parts.append(_markdown_table(["grid", *metric_cols], rows))
 
     if "exception_type" in df.columns and df["exception_type"].notna().any():
@@ -217,6 +227,11 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
         return parts
 
     # Variant comparison: scare vs single_level vs oracle, per grid.
+    try:
+        from experiment.eval.aliases import alias_grid as _ag, alias_variant as _av
+    except Exception:  # pragma: no cover
+        def _ag(x): return x
+        def _av(x): return x
     parts.append("")
     parts.append("## Variant comparison (priority-weighted served, mean ± 95% CI)")
     rows = []
@@ -225,7 +240,7 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
         if s.empty:
             continue
         mean, ci = _mean_ci95(s)
-        rows.append([grid, variant, len(s), f"{mean:.4f}", f"±{ci:.4f}"])
+        rows.append([_ag(grid), _av(variant), len(s), f"{mean:.4f}", f"±{ci:.4f}"])
     if rows:
         rows.sort(key=lambda r: (r[0], r[1]))
         parts.append(_markdown_table(["grid", "variant", "n", "mean", "95% CI"], rows))
@@ -329,7 +344,7 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
                 pwsf_r  = float(g[pwsf_col].mean()) if pwsf_col in g.columns else float("nan")
                 pct     = drop_mw / base_mw if base_mw else 0.0
                 rows.append([
-                    grid, len(g),
+                    _ag(grid), len(g),
                     f"{base_mw:.3f}", f"{post_mw:.3f}",
                     f"{drop_mw:.3f}", f"{pct*100:.1f}%",
                     f"{raw_r:.3f}",
@@ -353,7 +368,7 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
             if s.empty:
                 continue
             ok_pct = 100.0 * float(s.astype(bool).sum()) / len(s)
-            rows.append([variant, len(s), f"{ok_pct:.1f}%"])
+            rows.append([_av(variant), len(s), f"{ok_pct:.1f}%"])
         parts.append(_markdown_table(
             ["variant", "n", "invariant holds"], rows,
         ))

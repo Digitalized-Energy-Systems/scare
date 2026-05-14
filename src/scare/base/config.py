@@ -71,6 +71,35 @@ class RestorationConfiguration:
     # When False, heat regulations stay where the gossip put them.
     enable_heat_recovery: bool = True
 
+    # Local Q-V droop at every inverter-coupled PowerGenerator (PV).
+    # Follows the VDE-AR-N 4105 Q(U) characteristic: piecewise-linear
+    # with a 0.97–1.03 pu deadband, saturating at ±Q_max at 0.95 / 1.05.
+    # Q_max is bounded by the apparent-power capability circle of the
+    # inverter (S_n = |p_n| / cos φ_min, with cos φ_min = 0.95 for
+    # S_n ≤ 13.8 kVA, else 0.90).  When False, no droop role is
+    # installed and reactive dispatch stays at simbench defaults — used
+    # for the ablation comparison showing the contribution of local
+    # voltage support to overall restoration quality.
+    enable_qv_droop: bool = True
+
+    # Voltage reference for the Q(U) curve (per unit).  Per VDE-AR-N
+    # 4105 the curve is anchored at 1.0 pu; exposed so the sensitivity
+    # sweep can probe the effect of a re-centred droop.
+    qv_droop_voltage_ref_pu: float = 1.0
+
+    # F2: slack-infeed target as a fraction of the registered slack
+    # rating (which itself is ``_bound_external_slack``'s cap when the
+    # grid uses a constrained slack budget).  Each slack agent then
+    # reports ``setpoint = slack_target_fraction · rating`` as its
+    # contribution to the gossip's imbalance computation — driving the
+    # MAS to shed / restore until the residual matches what the slack
+    # is *expected* to provide, instead of treating "slack absorbs
+    # everything" as the equilibrium.  Default 0.0: slack provides
+    # nothing in the imbalance accounting and the MAS does all the
+    # balancing locally.  1.0: slack should provide up to its full
+    # rated infeed; MAS handles anything beyond that.
+    slack_target_fraction: float = 0.0
+
     # P6 primal-dual QP gossip.  When True (default), the receiving
     # agent computes its δ_i in closed form from the gossiped dual
     # variable λ as ``δ_i = clamp(w_i · λ, dmin_i, dmax_i)``, with
@@ -83,6 +112,31 @@ class RestorationConfiguration:
     # differs.  Exposed as an ablation flag so the harness can run
     # head-to-head comparisons between QP and equal-share gossip.
     enable_qp_gossip: bool = True
+
+    # Branch-side line-loading monitor.  When True every PowerLine
+    # branch (switchable or not) gets a GridConstraintMonitor watching
+    # the line's loading_percent.  On overload the monitor sends
+    # StartBalanceNegotiation with a relief-MW override target to the
+    # branch's home group leader (picked at scenario setup time as the
+    # endpoint with the lower priority-weighted demand, so shedding
+    # falls on the less-critical side) and propagates a
+    # ConstraintStateMessage to both endpoint groups so neighbouring
+    # gossip agents throttle their participation.  When False the
+    # branch agents are not registered and line overload is silent.
+    enable_line_loading_constraint: bool = True
+
+    # GridReconfigurator path ranking by line loading.  When True the
+    # reconfigurator carries a running max_loading_percent along each
+    # GridPathMessage, buffers all results within a short window, and
+    # picks the path with the lowest peak loading instead of the
+    # first-arrived (typically shortest).  When False the legacy
+    # first-arrival behaviour is preserved.
+    enable_reconfig_feasibility_ranking: bool = True
+
+    # Window during which the reconfigurator collects candidate paths
+    # before picking the best.  Sized for the electricity poll period;
+    # too short loses alternatives, too long delays restoration.
+    reconfig_path_window_s: float = 1.5
 
     # ----------------------------------------------------------------
     # Sensitivity-sweep tunables

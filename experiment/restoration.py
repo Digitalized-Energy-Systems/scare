@@ -34,7 +34,6 @@ FAILURE_DELAY_S = 2.0
 def create_large_lv_simbench(
     density,
     *,
-    slack_budget_pct: float | None = None,
     simbench_code: str = "1-LV-rural3--1-no_sw",
     backup_lines_per_sector: int = 0,
     backup_seed: int | None = None,
@@ -43,17 +42,20 @@ def create_large_lv_simbench(
 ):
     """Build a simbench LV multi-energy network.
 
+    The grid is constructed with an *unconstrained slack* so the
+    energy-flow LP always converges.  Slack-budget shaping (the
+    operator's import / export target) is a per-scenario policy,
+    applied at ``_apply_scenario`` time via
+    :func:`apply_slack_budget`.  Bake-it-into-the-grid was the
+    pre-refactor approach but it made the LP infeasible whenever a
+    failure shifted the imbalance past the budget — see the slack-
+    handling F1–F3 refactor for the design rationale.
+
     Parameters
     ----------
     density:
         Coupling-point density passed straight to monee's MES generator
         (controls how many CHP / P2G / P2H plants are placed).
-    slack_budget_pct:
-        When set, caps the external power and gas grid injections at
-        this fraction of the network's total nominal load.  Defaults
-        to ``None`` (unbounded slack — original behaviour).  Setting
-        to e.g. 0.5 forces the MAS to actually choose what to serve
-        post-failure rather than letting the slack absorb everything.
     simbench_code:
         simbench network code; the default ``1-LV-rural3--1-no_sw`` is
         the established ~340-load benchmark, but smaller variants
@@ -84,6 +86,10 @@ def create_large_lv_simbench(
 
     def create():
         net = simbench.get_simbench_net(simbench_code)
+        from pandapower import runpp
+        runpp(net)
+        print(net.res_line)
+        print(net.line)
         mn = from_pandapower_net(net)
         mes = generate_supply_return_mes_based_on_power_net(
             mn,
@@ -100,8 +106,13 @@ def create_large_lv_simbench(
         )
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
         mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
-        if slack_budget_pct is not None:
-            _bound_external_slack(mes, slack_budget_pct)
+        # Slack budget is no longer applied at grid-construction time —
+        # it is a per-scenario operator policy, not a physical grid
+        # attribute, and the LP needs an unconstrained slack to
+        # guarantee convergence.  ``apply_slack_budget`` is called by
+        # ``experiment.hpc.runner._apply_scenario`` when the task
+        # specifies ``scenario.slack_budget_pct``.  See the F1–F3
+        # slack-handling refactor for the design rationale.
         if backup_lines_per_sector > 0:
             add_backup_lines(
                 mes,
@@ -112,15 +123,35 @@ def create_large_lv_simbench(
     return create
 
 
-def _bound_external_slack(mes, fraction: float) -> None:
-    """Tighten ``ExtPowerGrid`` and ``ExtHydrGrid`` import bounds so the
-    slack can't absorb every imbalance the MAS introduces.
+_SLACK_LP_HEADROOM_FACTOR: float = 10.0
+
+
+def apply_slack_budget(mes, fraction: float) -> None:
+    """Register the operator's slack budget on the slack agents.
+
+    F3 — the slack budget is now a **soft target the MAS enforces**,
+    not a hard LP bound that can make the energy-flow LP infeasible
+    after a failure shifts the imbalance.  We:
+
+    1. Compute the operator's budget per sector from the sum of
+       nominal load magnitudes (same formula as before).
+    2. Set the slack Var bounds to a generous *physical* envelope
+       ``± _SLACK_LP_HEADROOM_FACTOR · budget`` so the LP can always
+       balance the network (with a high slack draw paying a "natural"
+       price via the load-shedding objective if one is set, or simply
+       being absorbed if no objective constrains it).
+    3. Stash the budget as the underscore-prefixed attribute
+       ``_scare_slack_budget_mw`` / ``_scare_slack_budget_kgs`` on
+       the slack model so F1's scenario-build hook can register that
+       value as the slack agent's "rating" — which F2 then multiplies
+       by ``slack_target_fraction`` to derive the MAS-level target.
 
     Cap is computed per-sector from the sum of nominal load magnitudes
     in that sector.  ``fraction`` is the share of total demand that
-    the external grid is allowed to supply (e.g. 0.5 means at most
-    50 % of nominal demand can come from upstream).  Generators on
-    the network make up the remainder.
+    the operator wants the external grid to supply (e.g. 0.5 means
+    the slack target is 50 % of nominal demand).  Generators on the
+    network make up the remainder, and the MAS drives toward that
+    distribution.
     """
     from monee.model.child import (
         ExtHydrGrid,
@@ -158,100 +189,97 @@ def _bound_external_slack(mes, fraction: float) -> None:
     cap_p_mw = max(1e-3, fraction * total_p_mw)
     cap_gas_mass_kgs = max(1e-4, fraction * total_gas_mass_kgs)
 
+    lp_p_mw = _SLACK_LP_HEADROOM_FACTOR * cap_p_mw
+    lp_gas_mass_kgs = _SLACK_LP_HEADROOM_FACTOR * cap_gas_mass_kgs
+
     for child in mes.childs:
         m = child.model
         if isinstance(m, ExtPowerGrid) and hasattr(m, "p_mw") and hasattr(m.p_mw, "min"):
-            # The Var's ``min`` is set to ``-max_import_mw`` (consumption
-            # convention — so import bound is the magnitude on min).
-            m.p_mw.min = -cap_p_mw
-            m.p_mw.max = cap_p_mw
+            # Wide LP envelope so the energy-flow solve stays feasible
+            # under any failure-induced imbalance; the MAS owns the
+            # soft target.
+            m.p_mw.min = -lp_p_mw
+            m.p_mw.max = lp_p_mw
+            # Soft target the MAS drives toward (F2 reads this).
+            m._scare_slack_budget_mw = cap_p_mw
         elif isinstance(m, ExtHydrGrid) and hasattr(m, "mass_flow") and hasattr(m.mass_flow, "min"):
-            # Distinguish gas vs heat (water) by parent-node grid type.
             try:
                 grid_name = str(getattr(mes.node_by_id(child.node_id).grid, "name", "")).lower()
             except Exception:
                 grid_name = ""
             if "gas" in grid_name:
-                m.mass_flow.min = -cap_gas_mass_kgs
-                m.mass_flow.max = cap_gas_mass_kgs
+                m.mass_flow.min = -lp_gas_mass_kgs
+                m.mass_flow.max = lp_gas_mass_kgs
+                m._scare_slack_budget_kgs = cap_gas_mass_kgs
             # heat-side ExtHydrGrid intentionally left unbounded
 
 
 GRIDS: dict[str, Callable[[], "object"]] = {
-    # Coupling-density variants (unbounded slack — easy regime).
+    # Slack budget is *not* baked into any grid below — it is a per-
+    # scenario knob (``scenario.slack_budget_pct``) so the same base
+    # grid can be exercised under multiple operator policies without
+    # rebuilding monee networks, and so the energy-flow LP always has
+    # a free slack to converge against.
+
+    # Coupling-density variants — only varying axis is the number of
+    # CP plants generated by monee's MES builder.  Mid density (0.5)
+    # is the default used by every pillar that doesn't sweep this
+    # axis explicitly.
     "simbench_lv_low": create_large_lv_simbench(0.1),
-    "simbench_lv": create_large_lv_simbench(0.5),
-    "simbench_lv_high": create_large_lv_simbench(0.9),
-    # Slack-budget variants.  These force the MAS to actually allocate
-    # scarce capacity instead of letting the external grid absorb every
-    # imbalance.  Mid coupling density; the budget is the discriminator.
-    # Headroom (slack + local gen vs nominal load) for this grid:
-    #   _30  → 87 %  (shedding required throughout)
-    #   _45  → 97 %  (knife-edge — light shedding)
-    #   _60  → 107 % (loose — discriminates against a stronger baseline)
-    # Earlier 50/80 variants were dropped because the slack alone exceeded
-    # demand and no shedding was ever required.
-    "simbench_lv_constrained_60": create_large_lv_simbench(0.5, slack_budget_pct=0.6),
-    "simbench_lv_constrained_45": create_large_lv_simbench(0.5, slack_budget_pct=0.45),
-    "simbench_lv_constrained_30": create_large_lv_simbench(0.5, slack_budget_pct=0.3),
+    "simbench_lv": create_large_lv_simbench(0.2),
+    "simbench_lv_high": create_large_lv_simbench(0.3),
+
     # Scaling pillar.  Three simbench LV variants giving roughly a
-    # decade of range in node count: small (~15 buses), medium (~44),
-    # large (~129; the default ``simbench_lv``).  All built with the
-    # same coupling density and the mid 45 % slack budget so the
-    # only varying axis is grid size.
-    "simbench_lv_small_constrained_45": create_large_lv_simbench(
-        0.5, slack_budget_pct=0.45, simbench_code="1-LV-rural1--1-no_sw"
+    # decade of range in node count:
+    #   small  (~15 buses, 1-LV-rural1)
+    #   medium (~44 buses, 1-LV-semiurb4)
+    #   large  (~129 buses, 1-LV-rural3 — the default ``simbench_lv``)
+    # All built at the same coupling density; the per-scenario slack
+    # budget makes the operator-policy axis orthogonal.
+    "simbench_lv_small": create_large_lv_simbench(
+        0.2, simbench_code="1-LV-rural1--1-no_sw"
     ),
-    "simbench_lv_medium_constrained_45": create_large_lv_simbench(
-        0.5, slack_budget_pct=0.45, simbench_code="1-LV-semiurb4--1-no_sw"
+    "simbench_lv_medium": create_large_lv_simbench(
+        0.2, simbench_code="1-LV-semiurb4--1-no_sw"
     ),
-    # ``simbench_lv_constrained_45`` above is the "large" point of
-    # this scaling sweep.
 
-    # Reconfiguration pillar.  Same constrained large LV grid plus
-    # five backup branches per sector so the GridReconfigurator has
-    # alternative paths to discover when a primary line trips.
+    # Reconfiguration pillar.  The default LV grid plus five backup
+    # branches per sector so the GridReconfigurator has alternative
+    # paths to discover when a primary line trips.  Backup placement
+    # is seeded for reproducibility.
     "simbench_lv_reconfig": create_large_lv_simbench(
-        0.5, slack_budget_pct=0.45,
-        backup_lines_per_sector=5, backup_seed=0,
+        0.2, backup_lines_per_sector=5, backup_seed=0,
     ),
 
-    # CP-flexibility pillar.  Three variants exercise the new
+    # CP-flexibility pillar.  Three variants exercise the
     # ``cp_size_multiplier`` and ``replace_primary_generation`` knobs
     # in monee's MES generator.
     #
-    # ``cp_heavy_45``         — additive CPs at 2× rated output.  CPs
+    # ``cp_heavy``         — additive CPs at 2× rated output.  CPs
     #   stack on top of primary gen, so removing a CP is recoverable
     #   by the unchanged primary fleet — but the inflated CP capacity
     #   makes the cross-sector flex shift large enough to be visible
     #   in the metric when the CP-ADMM layer engages.
-    # ``cp_dependent_45``     — CPs at 1× rated output that *replace*
+    # ``cp_dependent``     — CPs at 1× rated output that *replace*
     #   primary generation.  Total per-carrier rated production stays
     #   invariant, but losing a CP now disables both the unit and
     #   the primary gen it displaced.  This is the regime where the
     #   CP-ADMM layer's cross-sector substitution becomes load-
     #   bearing for resilience: gossip + islanding alone cannot
     #   recover a lost CP because the displaced primary is gone.
-    # ``cp_heavy_dependent_45`` — both knobs maxed.  Maximum cross-
+    # ``cp_heavy_dependent`` — both knobs maxed.  Maximum cross-
     #   sector dependence; CPs are big enough that losing one
     #   produces a deep deficit only solvable by re-routing through
     #   the surviving CHP / G2P / P2H plants.
-    "simbench_lv_cp_heavy_45": create_large_lv_simbench(
-        0.5, slack_budget_pct=0.45, cp_size_multiplier=2.0,
-        replace_primary_generation=False,
+    "simbench_lv_cp_heavy": create_large_lv_simbench(
+        0.3, cp_size_multiplier=2.0, replace_primary_generation=False,
     ),
-    "simbench_lv_cp_dependent_45": create_large_lv_simbench(
-        0.5, slack_budget_pct=0.45, cp_size_multiplier=1.0,
-        replace_primary_generation=True,
+    "simbench_lv_cp_dependent": create_large_lv_simbench(
+        0.3, cp_size_multiplier=1.0, replace_primary_generation=True,
     ),
-    "simbench_lv_cp_heavy_dependent_45": create_large_lv_simbench(
-        0.5, slack_budget_pct=0.45, cp_size_multiplier=2.0,
-        replace_primary_generation=True,
-    ),
-    "simbench_lv_cp_heavy_dependent_30": create_large_lv_simbench(
-        0.5, slack_budget_pct=0.30, cp_size_multiplier=2.0,
-        replace_primary_generation=True,
-    ),
+    "simbench_lv_cp_heavy_dependent": create_large_lv_simbench(
+        0.3, cp_size_multiplier=2.0, replace_primary_generation=True,
+    )
 }
 
 
@@ -578,6 +606,152 @@ def apply_cold_day(
                 grid_name = ""
             if "water" in grid_name or "heat" in grid_name:
                 m.t_k = supply_t_k
+
+
+def apply_pv_peak(
+    mes: "object",
+    *,
+    gen_scale: float = 1.5,
+    load_scale: float = 0.4,
+    slack_vm_pu: float = 1.04,
+) -> None:
+    """Mutate ``mes`` in place to simulate a sunny-midday over-voltage
+    stress scenario — the regime VDE-AR-N 4105 was written for.
+
+    The realistic LV over-voltage problem has three contributing
+    factors that this helper reproduces in concert:
+
+    1. **HV/MV transformer tap is high** to support evening peak.  The
+       slack ``ExtPowerGrid.vm_pu`` is set to ``slack_vm_pu`` (default
+       1.04 pu); the LV feeder therefore sits within ~1 % of the upper
+       bound already, before any PV.
+    2. **PV output near nameplate** — every ``PowerGenerator.p_mw``
+       magnitude is multiplied by ``gen_scale`` (default 1.5×).  The
+       moderate multiplier is deliberate: a 3–4× scale-up creates a
+       trivial imbalance that the LP curtails via ``regulation`` and
+       never produces a voltage swing; a 1.5× scale-up still fits
+       within the slack budget so the LP doesn't bail it out, and the
+       *physical* voltage profile ends up dependent on local Q
+       support.
+    3. **Daytime load trough** — ``PowerLoad.p_mw`` is multiplied by
+       ``load_scale`` (default 0.4×) to mirror residential consumption
+       in mid-day.  Reactive load is left at nominal because the
+       standard targets active-power imbalance.
+
+    Idempotent in the sense of "build a fresh net then call once" — do
+    not call this twice on the same net or the scales stack.
+    """
+    from monee.model.child import ExtPowerGrid, PowerGenerator, PowerLoad
+
+    # Track totals so we can size the slack-budget relaxation.
+    total_gen_p = 0.0
+    total_load_p = 0.0
+
+    for child in mes.childs:
+        m = child.model
+        if isinstance(m, PowerGenerator):
+            # PowerGenerator stores p_mw < 0 (load convention).  Scaling
+            # preserves sign; the magnitude grows.
+            m.p_mw = float(m.p_mw) * gen_scale
+            total_gen_p += abs(m.p_mw)
+        elif isinstance(m, PowerLoad):
+            m.p_mw = float(m.p_mw) * load_scale
+            total_load_p += abs(m.p_mw)
+
+    # Relax the slack budget so the LP isn't infeasible.  The
+    # ``constrained_*`` grids cap the slack at a small fraction of
+    # nominal load; under PV peak that cap is far below the reverse
+    # flow and the LP cannot converge.  This scenario is about voltage
+    # behaviour, not slack scarcity — wide the slack so the LP can
+    # always solve, then voltage stress comes from the tap setpoint
+    # and feeder impedance instead of from an artificial slack
+    # constraint.
+    headroom = max(total_gen_p - total_load_p, total_load_p) + 0.5
+    for child in mes.childs:
+        m = child.model
+        if isinstance(m, ExtPowerGrid):
+            # Tap the upstream slack high.  ``vm_pu`` is a plain
+            # scalar on ExtPowerGrid (it pins the slack bus's voltage
+            # magnitude via the overwrite hook); changing it shifts
+            # the entire feeder profile upward.
+            try:
+                m.vm_pu = float(slack_vm_pu)
+            except Exception:
+                pass
+            # Widen the slack p_mw bounds so the LP has room to absorb
+            # the reverse flow.  ``p_mw`` is a Var on ExtPowerGrid;
+            # update its bounds directly.
+            try:
+                if hasattr(m.p_mw, "min"):
+                    m.p_mw.min = -headroom
+                if hasattr(m.p_mw, "max"):
+                    m.p_mw.max = +headroom
+            except Exception:
+                pass
+
+
+def apply_line_stress(
+    mes: "object",
+    *,
+    load_scale: float = 1.8,
+    ampacity_scale: float = 0.5,
+    affect_branch_fraction: float = 1.0,
+) -> None:
+    """Mutate ``mes`` in place to simulate a line-loading stress scenario.
+
+    Designed to exercise the line-loading constraint pipeline added in
+    decision (b) — PowerLine branch agents must observe overload so the
+    monitor fires, the priority-aware home group leader receives a
+    relief-MW ``StartBalanceNegotiation``, and the reconfigurator's
+    6c path-ranking sees meaningful loading variation across candidate
+    paths.
+
+    Three knobs:
+
+    - ``load_scale`` (default 1.8×): multiplier on every
+      ``PowerLoad.p_mw``.  Higher loads push more current through every
+      feeder; combined with reduced ampacity, this guarantees overload
+      on at least one line after any non-trivial branch failure.
+    - ``ampacity_scale`` (default 0.5×): multiplier on every PowerLine
+      ``max_i_ka``.  Halving the ampacity is equivalent to doubling the
+      flow's loading-percent reading at the same currents — the binding
+      constraint shifts from voltage to thermal.
+    - ``affect_branch_fraction`` (default 1.0): fraction of PowerLines
+      to apply ``ampacity_scale`` to, picked deterministically by
+      sorted branch id.  Sweep over this knob to study how concentrated
+      vs distributed ampacity reductions interact with the path-ranking
+      reconfiguration.
+
+    Idempotent in the "build fresh net then call once" sense — calling
+    twice stacks the scales.
+    """
+    from monee.model.child import PowerLoad
+
+    for child in mes.childs:
+        m = child.model
+        if isinstance(m, PowerLoad):
+            m.p_mw = float(m.p_mw) * load_scale
+
+    if ampacity_scale != 1.0 and affect_branch_fraction > 0.0:
+        # Collect PowerLine branches; reduce ampacity on a deterministic
+        # subset.  Pick branches with the largest ``max_i_ka`` first so
+        # the reduction concentrates the constraint on the originally
+        # most permissive lines — those are the ones the reconfigurator
+        # would otherwise prefer and now must avoid.
+        powerlines = [
+            b for b in mes.branches
+            if hasattr(b.model, "max_i_ka")
+            and type(b.model).__name__.lower().startswith("power")
+        ]
+        powerlines.sort(
+            key=lambda b: (-float(getattr(b.model, "max_i_ka", 0.0)), b.id),
+        )
+        n_affect = max(1, int(len(powerlines) * affect_branch_fraction))
+        for branch in powerlines[:n_affect]:
+            try:
+                branch.model.max_i_ka = float(branch.model.max_i_ka) * ampacity_scale
+            except Exception:
+                pass
 
 
 async def run(grid: str, seed: int | None = None, write_html: bool = True) -> None:

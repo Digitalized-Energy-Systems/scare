@@ -188,12 +188,11 @@ def compute_baseline_served(
     Pyomo solver.
     """
     from experiment.restoration import GRIDS
-    from monee.model.formulation import MISOCP_NETWORK_FORMULATION
 
     if grid_name not in GRIDS:
         raise SystemExit(f"Unknown grid {grid_name!r}")
+    # Factory already applies MISOCP + McCormick.
     fresh = GRIDS[grid_name]()
-    fresh.apply_formulation(MISOCP_NETWORK_FORMULATION)
     if scenario:
         kind = scenario.get("kind", "clean")
         if kind == "cold_day":

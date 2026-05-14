@@ -59,7 +59,7 @@ class GenerationController(Role):
         obs = self.behavior.observe(self.context.aid)
         if not obs:
             return
-        cap = obs_capacity(obs)
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         if cap == 0.0:
             return
         factor = max(0.0, min(1.0, abs(event.new_setpoint / cap)))

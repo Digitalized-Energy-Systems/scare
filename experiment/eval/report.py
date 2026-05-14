@@ -180,14 +180,66 @@ def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
         str(plots.restoration_vs_baseline_bar(
             ok, out_dir / "absolute_vs_baseline.png",
         )),
+        str(plots.restoration_ratio_by_variant_bar(
+            ok, out_dir / "ratio_by_variant.png",
+        )),
         str(plots.absolute_load_lost_bar(
             ok, out_dir / "absolute_load_lost.png",
         )),
         str(plots.restoration_by_tier_bar(
             ok, out_dir / "by_tier.png",
         )),
+        # Split per-tier loss into priority-blind (physical disconnect)
+        # vs priority-aware (agent-shed) — the chapter's tier waterfall
+        # claim applies only to the latter.
+        str(plots.restoration_loss_split_by_tier_bar(
+            ok, out_dir / "loss_split_by_tier.png",
+        )),
+        str(plots.agent_only_ratio_by_tier_bar(
+            ok, out_dir / "agent_only_ratio_by_tier.png",
+        )),
     ]
     return figs
+
+
+def _missing_experiment_sections(
+    campaign: CampaignData, plots_root: Path,
+) -> list[tuple[str, list[str]]]:
+    """Per-experiment served-by-variant bars for every experiment that
+    doesn't have a dedicated dispatcher above.  Closes the gap where
+    cp_flexibility / cp_size_sweep / cold_day_stress /
+    concentrated_imbalance / generator_failure / scaling had data in
+    summary.csv but no figure in the report.
+    """
+    df = campaign.summary
+    if df.empty or "experiment" not in df.columns:
+        return []
+    handled = {
+        "functional_baseline", "optimality_gap", "variant_comparison",
+        "ablation", "robustness_packet_loss", "robustness_latency",
+        "cascading", "cooldown_sweep", "ttl_sweep", "holon_size_sweep",
+    }
+    ok = df[df["status"] == "ok"]
+    if ok.empty:
+        return []
+    out: list[tuple[str, list[str]]] = []
+    for exp_name in sorted(ok["experiment"].dropna().unique()):
+        if exp_name in handled or not exp_name:
+            continue
+        sub = ok[ok["experiment"] == exp_name]
+        if sub.empty:
+            continue
+        from experiment.eval.aliases import alias_experiment
+        out_dir = plots_root / exp_name
+        figs = [
+            str(plots.variant_comparison_bar(
+                sub,
+                out_dir / "served_by_variant.png",
+                title=f"PWSF by variant — {alias_experiment(exp_name)}",
+            ))
+        ]
+        out.append((f"{alias_experiment(exp_name)} (auto)", figs))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +262,8 @@ def _table_status(campaign: CampaignData) -> str:
 
 
 def _table_variant_means(campaign: CampaignData) -> str:
+    from experiment.eval.aliases import alias_variant
+
     df = campaign.summary
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns:
@@ -223,7 +277,8 @@ def _table_variant_means(campaign: CampaignData) -> str:
     lines = ["| variant | n | mean served | std |", "|---|---|---|---|"]
     for variant, r in rows.iterrows():
         lines.append(
-            f"| {variant} | {int(r['count'])} | {r['mean']:.4f} | {r['std']:.4f} |"
+            f"| {alias_variant(str(variant))} | {int(r['count'])} | "
+            f"{r['mean']:.4f} | {r['std']:.4f} |"
         )
     return "\n".join(lines)
 
@@ -295,6 +350,17 @@ def generate_report(campaign_dir: Path) -> Path:
             figs = []
         if figs:
             sections.append((label, figs))
+
+    # Auto-dispatched per-experiment sections — closes the gap where
+    # experiments like cp_flexibility / cp_size_sweep / cold_day_stress
+    # /concentrated_imbalance / generator_failure / scaling have data
+    # in summary.csv but no dedicated curve.
+    try:
+        for label, figs in _missing_experiment_sections(campaign, plots_root):
+            if figs:
+                sections.append((label, figs))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Auto-dispatch failed: %s — skipping", exc)
 
     md = _stitch(campaign, sections)
     report_path = campaign_dir / "REPORT.md"

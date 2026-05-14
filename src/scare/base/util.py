@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -31,19 +32,78 @@ def kgps_to_mw(value: float) -> float:
     return value * 3.6 * HHV
 
 
-def obs_capacity(obs: dict) -> float:
+def obs_capacity(
+    obs: dict,
+    *,
+    behavior: Any = None,
+    aid: str | None = None,
+) -> float:
+    """Return the rated capacity for this agent's child.
+
+    For ``PowerLoad`` / ``PowerGenerator`` / ``HeatLoad`` / ``Sink`` /
+    ``Source`` the rated value lives directly in ``obs`` (``p_mw``,
+    ``q_mw_heat``, ``mass_flow``, …) — those keys carry the rated
+    quantity unchanged through the simulation.
+
+    For ``ExtPowerGrid`` / ``ExtHydrGrid`` the corresponding key
+    carries the *current* operating point (the LP picks it every
+    step), not the rating.  When the slack-registry hint resolves we
+    return the registered rating instead — see ``register_slack``.
+    """
+    if behavior is not None and aid is not None:
+        slack = lookup_slack(behavior, aid)
+        if slack is not None:
+            return slack.cap
     for key in _CAPACITY_KEYS:
         if key in obs:
             return float(obs[key])
     return 0.0
 
 
-def obs_setpoint(obs: dict) -> float:
+def obs_setpoint(
+    obs: dict,
+    *,
+    behavior: Any = None,
+    aid: str | None = None,
+) -> float:
+    """Return the current dispatched power (load convention).
+
+    For non-slack children ``setpoint = capacity * regulation``.  For
+    slack children there is no regulation; the dispatched value is the
+    LP-chosen ``p_mw`` / ``mass_flow`` itself, which lives directly in
+    ``obs``.
+    """
+    if behavior is not None and aid is not None:
+        slack = lookup_slack(behavior, aid)
+        if slack is not None:
+            # Slack agents have no regulation knob — the LP picks the
+            # actual operating point and stores it in the obs key
+            # corresponding to the slack's Var.
+            for key in _CAPACITY_KEYS:
+                if key in obs:
+                    return float(obs[key])
+            return 0.0
     return obs_capacity(obs) * float(obs.get("regulation", 1.0))
 
 
-def obs_min_max(obs: dict) -> tuple[float, float]:
-    """Return (delta_min, delta_max) relative to current setpoint."""
+def obs_min_max(
+    obs: dict,
+    *,
+    behavior: Any = None,
+    aid: str | None = None,
+) -> tuple[float, float]:
+    """Return (delta_min, delta_max) relative to current setpoint.
+
+    For slack children the δ-range is the *full Var bound range minus
+    the current value*, capturing the slack's headroom in both
+    directions (import and export).  For all other children δ stays in
+    ``[-sp, cap-sp]`` / ``[cap-sp, -sp]`` as before.
+    """
+    if behavior is not None and aid is not None:
+        slack = lookup_slack(behavior, aid)
+        if slack is not None:
+            sp = obs_setpoint(obs, behavior=behavior, aid=aid)
+            return (slack.dmin_abs - sp, slack.dmax_abs - sp)
     cap = obs_capacity(obs)
     sp = obs_setpoint(obs)
     if cap < 0:
@@ -86,6 +146,76 @@ def register_sector(behavior: Any, aid: str, sector: Sector | None) -> None:
 
 def lookup_sector(behavior: Any, aid: str) -> Sector | None:
     return _sector_store(behavior).get(aid)
+
+
+# ---------------------------------------------------------------------------
+# Slack-agent metadata (F1)
+# ---------------------------------------------------------------------------
+#
+# ExtPowerGrid / ExtHydrGrid children carry their rated import/export
+# capacity in the Var bounds on ``p_mw`` / ``mass_flow``.  Those bounds
+# are not part of the runtime observation dict (only the *current value*
+# is), so without an out-of-band registry the gossip negotiator would
+# read a slack agent's "capacity" as whatever the LP picked this step
+# (and treat it as a load when the slack is importing).  The registry
+# below carries the *rated* capacity + bounded ``δ`` range so that
+# ``obs_capacity`` / ``obs_min_max`` / ``obs_priority`` can return the
+# physically meaningful values for slack children.
+
+@dataclass(frozen=True)
+class _SlackMeta:
+    """Cached slack rating + δ-range information for one ExtPowerGrid /
+    ExtHydrGrid child.  ``cap`` follows monee's load convention:
+    negative for sources (generator-class), positive for sinks; the
+    slack is always a source from the local network's perspective, so
+    ``cap < 0`` (generator-priority).  ``dmin_abs`` / ``dmax_abs`` are
+    the absolute bounds on the slack Var; deltas relative to the
+    current setpoint are derived in ``obs_min_max``.
+    """
+    cap: float          # generator-convention rated output, < 0
+    dmin_abs: float     # min absolute p_mw the Var can take
+    dmax_abs: float     # max absolute p_mw the Var can take
+
+
+def _slack_store(behavior: Any) -> dict[str, "_SlackMeta"]:
+    store = getattr(behavior, "_scare_slacks", None)
+    if store is None:
+        store = {}
+        behavior._scare_slacks = store
+    return store
+
+
+def register_slack(
+    behavior: Any,
+    aid: str,
+    *,
+    rating_mw: float,
+    p_min: float | None = None,
+    p_max: float | None = None,
+) -> None:
+    """Register a slack-class agent's rating.
+
+    ``rating_mw`` is the absolute magnitude (positive) of the rated
+    transformer / pipeline capacity.  ``p_min`` / ``p_max`` are the
+    actual ``p_mw`` Var bounds (load convention: negative = export,
+    positive = import).  If both are None, the slack is assumed
+    bidirectional at ``rating_mw``: ``[-rating_mw, +rating_mw]``.
+    """
+    if rating_mw <= 0.0:
+        return
+    if p_min is None:
+        p_min = -float(rating_mw)
+    if p_max is None:
+        p_max = +float(rating_mw)
+    _slack_store(behavior)[aid] = _SlackMeta(
+        cap=-float(rating_mw),  # generator-class sign convention
+        dmin_abs=float(p_min),
+        dmax_abs=float(p_max),
+    )
+
+
+def lookup_slack(behavior: Any, aid: str) -> "_SlackMeta | None":
+    return _slack_store(behavior).get(aid)
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +594,15 @@ def create_g2p_admm_flex_actor(g2p_obs: dict, priority: int):
     return create_admm_flex_actor_one_to_many(cap, eta, np.full(3, float(priority)))
 
 
+def create_p2h_admm_flex_actor(p2h_obs: dict, priority: int):
+    """P2H: consumes electricity, produces heat (high-grade or low-grade)."""
+    from distributed_resource_optimization import create_admm_flex_actor_one_to_many
+
+    cap = float(p2h_obs.get("el_mw", obs_capacity(p2h_obs)))
+    eta = efficiency_vector(-1.0, p2h_obs.get("eta_heat", 0.9), 0.0)
+    return create_admm_flex_actor_one_to_many(cap, eta, np.full(3, float(priority)))
+
+
 def sector_color(sector: Sector) -> str:
     return {Sector.GAS: "green", Sector.HEAT: "red", Sector.ELECTRICITY: "orange"}[
         sector
@@ -480,6 +619,7 @@ def sector_color(sector: Sector) -> str:
 _CONSTRAINT_OBS_KEYS: dict[Sector, dict[str, str]] = {
     Sector.ELECTRICITY: {
         "vm_pu": "vm_pu",              # from Bus model
+        "loading_percent": "loading_percent",  # from PowerLine model
     },
     Sector.GAS: {
         "pressure_pu": "pressure_pu",  # from Junction model
@@ -491,12 +631,43 @@ _CONSTRAINT_OBS_KEYS: dict[Sector, dict[str, str]] = {
 
 
 def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
-    """Extract grid-constraint measurements from an observation dict."""
+    """Extract grid-constraint measurements from an observation dict.
+
+    For ``loading_percent`` the underlying monee model exposes two
+    variants: ``GenericPowerBranch`` reports it as a *fraction*
+    (``i_from_ka / max_i_ka`` ∈ [0, 1]) while the
+    ``IntermediateEq`` form in ``monee.model.core`` reports it as an
+    actual percent (× 100).  ``SECTOR_CONSTRAINTS`` uses the percent
+    convention, so we auto-scale the fraction form by 100×.  The
+    discriminator is the magnitude: a value ≤ 5 cannot meaningfully
+    represent a real loading-percent (even a 500 % overload would be
+    catastrophic), so any value at that scale must be the fraction
+    form and is multiplied up.
+
+    The branch model exposes ``loading_from_percent`` /
+    ``loading_to_percent`` as raw Vars but ``loading_percent`` is only
+    a Python property — so it is *not* in ``model.values``.  Fall back
+    to the max of the per-side Vars when the bare key is missing.
+    """
     keys = _CONSTRAINT_OBS_KEYS.get(sector, {})
     result: dict[str, float] = {}
     for var, obs_key in keys.items():
+        raw: float | None = None
         if obs_key in obs:
-            result[var] = float(obs[obs_key])
+            raw = float(obs[obs_key])
+        elif var == "loading_percent":
+            lf = obs.get("loading_from_percent")
+            lt = obs.get("loading_to_percent")
+            if lf is not None or lt is not None:
+                raw = max(
+                    abs(float(lf)) if lf is not None else 0.0,
+                    abs(float(lt)) if lt is not None else 0.0,
+                )
+        if raw is None:
+            continue
+        if var == "loading_percent" and abs(raw) <= 5.0:
+            raw = raw * 100.0
+        result[var] = raw
     return result
 
 
@@ -515,19 +686,32 @@ def constraint_utilization(
     return min(1.0, abs(value - mid) / (span / 2.0))
 
 
-def obs_priority(obs: dict) -> int:
+def obs_priority(
+    obs: dict,
+    *,
+    behavior: Any = None,
+    aid: str | None = None,
+) -> int:
     """Read an explicit priority value from an observation dict.
 
-    Falls back to inferring priority from the capacity sign: monee
-    encodes generators with negative capacity and loads with positive
-    capacity (chapter §3.1).  Generators get priority 0, loads default
-    to priority tier 1 (highest urgency).
+    monee observations do not carry a ``priority`` key, so this
+    accessor is only meaningful when callers pre-populate priorities
+    via :func:`experiment.restoration.assign_load_priorities` and
+    pass them explicitly to the metric / role layer (see
+    ``EnergyBalanceNegotiator._build_priorities``).  The fallback
+    below returns tier 0 for generators (negative capacity) and tier 1
+    for loads — a uniform-priority degenerate baseline.  Callers that
+    require tier diversity should set ``priority_assignment`` in the
+    scenario or feed an explicit priority dict.
 
-    NB: an earlier version used the ``dmin < 0`` heuristic which
-    incorrectly flagged loads as generators — a load at full
-    regulation has ``dmin = -sp < 0`` because its setpoint is positive
-    and ``dmin`` is the *decrease* margin.
+    Slack agents are always classified as tier 0 (generator-class)
+    regardless of the LP's current sign — the sign flips depending on
+    import / export direction, but the role of the slack is always to
+    supply / absorb at the network boundary, never to be shed.
     """
+    if behavior is not None and aid is not None:
+        if lookup_slack(behavior, aid) is not None:
+            return 0
     if "priority" in obs:
         return int(obs["priority"])
     cap = obs_capacity(obs)

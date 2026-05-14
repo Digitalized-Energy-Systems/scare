@@ -32,6 +32,16 @@ class SystemStrategy(Enum):
 SECTOR_CONSTRAINTS: dict[Sector, dict[str, tuple[float, float]]] = {
     Sector.ELECTRICITY: {
         "vm_pu": (0.95, 1.05),           # voltage magnitude [p.u.]
+        # Line / transformer thermal loading.  loading_percent is a
+        # one-sided quantity (0 = idle, 100 = at limit), but the
+        # existing ``constraint_utilization`` formula is symmetric
+        # around the midpoint.  Setting the lower bound to -100
+        # places the midpoint at 0 and keeps the utility formula
+        # unchanged; values < 0 cannot occur physically, so the
+        # lower half is just unused.  Surfaced as an observation
+        # on PowerLine branch agents — see
+        # ``GridConstraintMonitor`` branch mode.
+        "loading_percent": (-100.0, 100.0),
     },
     Sector.GAS: {
         "pressure_pu": (0.90, 1.10),     # junction pressure [p.u.]
@@ -194,6 +204,11 @@ class GridPathMessage:
     asked_agents: list[Any]
     uncertain_connections: list[tuple[Any, Any]]
     search_id: str = ""
+    # Running maximum of ``loading_percent`` along the path so far,
+    # populated by each forwarding agent from its co-located branch
+    # observation.  Carried in the message so the originator can rank
+    # competing paths by peak thermal stress (6c).  Zero on init.
+    max_loading_percent: float = 0.0
 
 
 @dataclass
@@ -201,6 +216,10 @@ class GridPathResult:
     path: list[Any]
     uncertain_connections: list[tuple[Any, Any]]
     search_id: str = ""
+    # Peak line loading along the path that produced this result.
+    # The reconfigurator collects all results within a short window
+    # and picks the one with the lowest peak (6c).
+    max_loading_percent: float = 0.0
 
 
 @dataclass
@@ -226,7 +245,14 @@ class AvailableFlexAnswer:
 
 @dataclass
 class StartBalanceNegotiation:
-    pass
+    # When set, the receiving group leader skips the local
+    # ask-energy → response-energy round and uses this value directly
+    # as the gossip target (= negative of the net setpoint the group is
+    # expected to absorb).  Populated by the holonic ADMM coordinator so
+    # the per-actor allocation from Layer 2 actually drives the per-group
+    # gossip target instead of being discarded.  None preserves the
+    # original behaviour: member leader recomputes its own target.
+    override_target: float | None = None
 
 
 @dataclass

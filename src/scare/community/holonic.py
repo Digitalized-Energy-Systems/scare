@@ -11,11 +11,12 @@ Implements the "two-layer local-information architecture" and
             inter-group resource sharing.
 
 This module adds a *super-community* (holon) layer on top of the
-existing ``CHSRole`` group formation.  After base groups have formed,
-group leaders negotiate with neighbouring group leaders to merge into
-holons.  The holon leader runs a DRO-based ADMM optimisation to
-distribute surplus / deficit across member groups, then instructs each
-group to rebalance internally.
+base group formation (``PreAssignedCommunityRole``).  After base
+groups have formed, group leaders negotiate with neighbouring group
+leaders to merge into holons.  The holon leader runs a DRO-based ADMM
+optimisation to distribute surplus / deficit across member groups,
+then instructs each group to rebalance internally using the
+per-actor allocation as the gossip target.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from scare.base.model import (
     HolonicAssignment,
     HolonicJoinAnswer,
     HolonicJoinRequest,
+    NegotiationFinishedEvent,
     Sector,
     StartBalanceNegotiation,
 )
@@ -61,8 +63,9 @@ class HolonicCommunityRole(Role):
     """Manages holonic (super-community) formation and inter-group
     coordination using DRO-based ADMM optimisation.
 
-    After base groups have been established (via ``CHSRole``), group
-    leaders periodically attempt to merge with neighbouring leaders into
+    After base groups have been established (via
+    ``PreAssignedCommunityRole``), group leaders periodically attempt
+    to merge with neighbouring leaders into
     a *holon*.  The holon leader:
 
     1. Collects ``AvailableFlexAnswer`` from member group leaders.
@@ -80,9 +83,10 @@ class HolonicCommunityRole(Role):
         self,
         sector: Sector,
         *,
-        formation_period_s: float = 8.0,
+        formation_period_s: float = 4.0,
         max_holon_size: int = DEFAULT_MAX_HOLON_SIZE,
-        rebalance_period_s: float = 10.0,
+        rebalance_period_s: float = 60.0,
+        rebalance_min_gap_s: float = 2.0,
         flex_timeout_s: float = 5.0,
         enable_hebbian_formation: bool = True,
         hebbian_beacon_period_s: float = 4.0,
@@ -94,7 +98,30 @@ class HolonicCommunityRole(Role):
         self.sector = sector
         self.formation_period_s = formation_period_s
         self.max_holon_size = max_holon_size
+        # ``rebalance_period_s`` is the *slow* background heartbeat — only
+        # there to catch drift from timeseries inputs (load profiles,
+        # supply temperatures) that change without firing any
+        # NegotiationFinishedEvent.  Was 2 s while we were validating
+        # the reactive path; now relaxed to 60 s because:
+        #
+        # * For the smoke / discrete-failure scenarios there is no
+        #   driving input drift between failures, so the periodic
+        #   contributes only "ADMM skipped: balanced" overhead.
+        # * For long timeseries runs the slow heartbeat still picks up
+        #   accumulated demand shifts that the reactive path (which
+        #   fires only on Layer-1 NegotiationFinishedEvent / holon
+        #   formation) would otherwise miss.
+        #
+        # ``rebalance_min_gap_s`` is the *fast* feedback-loop fuse —
+        # holon ADMM sends ``StartBalanceNegotiation(override_target=…)``
+        # to each member, which produces gossip → finished events →
+        # would re-fire this role's ``_on_member_finished``.  Without
+        # the gap the loop runs flat out.  2 s is enough to let one
+        # full round of member gossip resolve before another ADMM
+        # cycle can start, and decoupled from the slow heartbeat so
+        # reactive triggers respond promptly to real events.
         self.rebalance_period_s = rebalance_period_s
+        self.rebalance_min_gap_s = rebalance_min_gap_s
         self.flex_timeout_s = flex_timeout_s
 
         # B.2: Hebbian-emergent holon formation parameters.
@@ -112,10 +139,19 @@ class HolonicCommunityRole(Role):
         # member list for flex collection without re-resolving from a
         # topology lookup.
         self._pending_proposals: dict[UUID, dict[str, tuple[Any, bool | None]]] = {}
-        # Collected flex answers from member groups for inter-holon ADMM
+        # Collected flex answers from member groups for inter-holon ADMM.
+        # ``_flex_answer_senders`` stores the sender address per answer so
+        # the holon leader can route the ADMM per-actor allocation back to
+        # each member as an override balance target.
         self._flex_answers: list[AvailableFlexAnswer] = []
+        self._flex_answer_senders: list[Any] = []
         self._flex_expected: int = 0
         self._rebalance_active: bool = False
+        # Throttle for reactive ``_on_member_finished`` triggers so the
+        # holon→member→finished→holon feedback loop is bounded.  Last
+        # rebalance start time; new reactive triggers below this gap
+        # are dropped.
+        self._last_rebalance_t: float = float("-inf")
 
         # Resolved holon membership on the leader side.  Populated when
         # ``_handle_join_answer`` confirms acceptances; consulted by
@@ -188,6 +224,18 @@ class HolonicCommunityRole(Role):
             self,
             _wrap(self._handle_flex_answer),
             lambda msg, meta: isinstance(msg, AvailableFlexAnswer)
+            and msg.sector == self.sector,
+        )
+        # Reactive Layer-2 trigger: when a member group finishes its
+        # balance gossip (NegotiationFinishedEvent broadcast), kick
+        # off an inter-group rebalance.  This is the natural moment
+        # to redistribute: each member has just resolved its
+        # intra-group imbalance, leaving a residual that ADMM can
+        # spread across the holon.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._on_member_finished),
+            lambda msg, meta: isinstance(msg, NegotiationFinishedEvent)
             and msg.sector == self.sector,
         )
         if self.enable_hebbian_formation:
@@ -323,14 +371,34 @@ class HolonicCommunityRole(Role):
             sector=self.sector.value,
             detail=f"members={len(accepted_addrs) + 1}",
         )
+        # Reactive Layer-2 trigger: rebalance immediately after the
+        # holon has finished forming.  The periodic ``_try_rebalance``
+        # loop alone would otherwise wait up to ``rebalance_period_s``
+        # before firing, and at typical ``simulation_duration_s`` only
+        # a few cycles fit anyway.  Starting eagerly here ensures the
+        # ADMM gets at least one shot while the post-failure deficit
+        # is still present.
+        self.context.schedule_instant_task(self._try_rebalance())
 
     # ------------------------------------------------------------------
     # Inter-group coordination via DRO ADMM
     # ------------------------------------------------------------------
 
     async def _try_rebalance(self) -> None:
-        """Holon leader periodically collects flex from member groups
-        and runs ADMM to optimally redistribute resources."""
+        """Holon leader collects flex from member groups and runs ADMM
+        to redistribute resources.  Fired periodically (slow heartbeat
+        for input drift) AND reactively (on holon formation, on member
+        ``NegotiationFinishedEvent``).  See class docstring on
+        ``rebalance_period_s`` vs ``rebalance_min_gap_s``.
+        """
+        # Fast-loop fuse: at most one rebalance start every
+        # ``rebalance_min_gap_s`` (decoupled from the slow heartbeat).
+        # Prevents the holon→member→finished→holon feedback loop where
+        # each ADMM round triggers per-member balance which fires
+        # ``NegotiationFinishedEvent``, re-arming the reactive path.
+        now = self.context.current_timestamp
+        if (now - self._last_rebalance_t) < self.rebalance_min_gap_s:
+            return
         assignment = self.context.get_or_create_model(HolonicAssignment)
         if assignment.holon_id is None:
             if not self._logged_no_holon:
@@ -377,14 +445,16 @@ class HolonicCommunityRole(Role):
             return
 
         self._rebalance_active = True
+        self._last_rebalance_t = self.context.current_timestamp
         self._flex_answers = []
+        self._flex_answer_senders = []
         # The leader contributes its own group's flex too — without that
         # ADMM would be a single-actor problem and bail out early.
         self._flex_expected = len(members) + 1
 
         from scare.base.model import AskForAvailableFlex
 
-        logger.info(
+        logger.debug(
             "[%s] holon rebalance: asking %d members (+self) for flex",
             self.context.aid,
             len(members),
@@ -420,6 +490,29 @@ class HolonicCommunityRole(Role):
         else:
             self._rebalance_active = False
 
+    async def _on_member_finished(
+        self, message: NegotiationFinishedEvent, meta: dict
+    ) -> None:
+        """A member group finished its balance gossip — try an
+        inter-group rebalance now to spread the post-gossip residual.
+
+        Throttled by ``rebalance_min_gap_s`` (the fast feedback-loop
+        fuse) — not by the slow periodic heartbeat — so reactive
+        triggers respond promptly to genuine events while still
+        breaking the holon→member→finished→holon feedback loop.
+        ``_try_rebalance`` also self-gates on holon membership /
+        leader status / not-currently-rebalancing.
+        """
+        assignment = self.context.get_or_create_model(HolonicAssignment)
+        if assignment.holon_id is None or assignment.parent_addr is not None:
+            return
+        if self._rebalance_active:
+            return
+        now = self.context.current_timestamp
+        if now - self._last_rebalance_t < self.rebalance_min_gap_s:
+            return
+        self.context.schedule_instant_task(self._try_rebalance())
+
     async def _handle_flex_answer(
         self, message: AvailableFlexAnswer, meta: dict
     ) -> None:
@@ -441,7 +534,9 @@ class HolonicCommunityRole(Role):
                 and sender_key not in self._holon_member_keys
             ):
                 return
+        sender = mango_sender_addr(meta)
         self._flex_answers.append(message)
+        self._flex_answer_senders.append(sender)
 
         if len(self._flex_answers) >= self._flex_expected:
             await self._run_inter_group_admm()
@@ -481,7 +576,9 @@ class HolonicCommunityRole(Role):
         if not self._rebalance_active:
             return
         answers = self._flex_answers[:]
+        senders = self._flex_answer_senders[:]
         self._flex_answers = []
+        self._flex_answer_senders = []
         self._flex_expected = 0
         self._rebalance_active = False  # release lock early to prevent timeout re-entry
 
@@ -546,13 +643,23 @@ class HolonicCommunityRole(Role):
         # --- Priority-weighted S computation ---
         # Compute waterfall shares: how much each group *should* receive
         # if resources were allocated strictly by priority ordering.
-        total_generation = sum(
-            max(0.0, -a.balance) for a in answers
-        )
+        #
+        # The waterfall budget is the total amount of resources that the
+        # holon can redistribute: excess generation (groups with negative
+        # balance, i.e. surplus) plus flex headroom across all groups.
+        # The earlier formulation used excess generation alone, which is
+        # zero in a pure-deficit holon (every group positive imbalance)
+        # — exactly the regime where priority discrimination matters
+        # most.  Including flex headroom keeps the budget positive and
+        # the relative per-tier shares meaningful even when no group has
+        # surplus to donate.
+        total_surplus = sum(max(0.0, -a.balance) for a in answers)
+        total_flex = sum(max(0.0, a.flex) for a in answers)
+        total_available = total_surplus + total_flex
         priority_shares = compute_priority_weighted_shares(
             [a.demand_by_priority for a in answers],
             [a.served_by_priority for a in answers],
-            total_generation,
+            total_available,
         )
 
         for idx, answer in enumerate(answers):
@@ -629,9 +736,22 @@ class HolonicCommunityRole(Role):
             # Fallback: still trigger intra-group gossip so member groups
             # can rebalance locally even without inter-group redistribution.
 
-        # Trigger intra-group rebalancing in all member groups (both on
-        # success and on failure — groups should always get a chance to
-        # re-negotiate after a holon-level event).
+        # Trigger intra-group rebalancing in all member groups, routing
+        # the ADMM per-actor allocation as the override target so the
+        # gossip target reflects the cross-sector optimisation instead
+        # of being recomputed locally (which would discard the ADMM
+        # result entirely).  Each ``actors[idx].x`` is a vector across
+        # ``all_sectors``; we pick the entry matching the member's own
+        # sector and pass it as the *target* for that member's gossip
+        # (negation: target = -allocation, since the member must absorb
+        # ``allocation`` worth of imbalance from the holon's pool).
+        #
+        # Members whose addresses we couldn't map to an ADMM actor fall
+        # back to the historical empty-trigger path (recompute locally).
+        sender_to_actor: dict[str, tuple[Any, AvailableFlexAnswer]] = {}
+        for sender, answer, actor in zip(senders, answers, actors):
+            sender_to_actor[str(sender)] = (actor, answer)
+
         if self._holon_member_addrs:
             triggers = list(self._holon_member_addrs)
         else:
@@ -640,7 +760,24 @@ class HolonicCommunityRole(Role):
             except Exception:
                 triggers = []
         for addr in triggers:
-            await self.context.send_message(StartBalanceNegotiation(), receiver_addr=addr)
+            entry = sender_to_actor.get(str(addr))
+            override: float | None = None
+            if entry is not None:
+                actor_obj, answer = entry
+                # ADMM solved successfully → actor_obj.x is populated.
+                # Index by the member's natural sector.
+                try:
+                    x_vec = list(actor_obj.x)
+                    if answer.sector.value in sector_idx:
+                        override = -float(x_vec[sector_idx[answer.sector.value]])
+                    elif x_vec:
+                        override = -float(x_vec[0])
+                except Exception:  # pragma: no cover - defensive
+                    override = None
+            await self.context.send_message(
+                StartBalanceNegotiation(override_target=override),
+                receiver_addr=addr,
+            )
 
     # ------------------------------------------------------------------
     # B.2: Hebbian-emergent holon formation

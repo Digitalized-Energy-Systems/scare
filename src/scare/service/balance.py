@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -34,6 +35,7 @@ from scare.base.trust import TrustLedger, hash_weighted_choice
 from scare.base.util import (
     clamp_to_constraints,
     constraint_utilization,
+    lookup_slack,
     obs_capacity,
     obs_min_max,
     obs_priority,
@@ -811,7 +813,7 @@ class EnergyBalanceNegotiator(Role):
 
     async def _handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
         obs = self.behavior.observe(self.context.aid) or {}
-        cap = obs_capacity(obs)
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         sp = self._reported_setpoint(obs)
         reply = ResponseEnergyMessage(
             negotiation_id=message.negotiation_id,
@@ -828,8 +830,30 @@ class EnergyBalanceNegotiator(Role):
         agent's local thermal deficit so a stressed group surfaces a
         non-zero negative target — the gossip then sheds load via the
         existing reverse-priority rules in ``_compute_actual_priority``.
+
+        F2 — Slack target:  if this agent is registered as a slack
+        (``register_slack``), report the *target infeed* rather than
+        the LP's current operating point.  The target is
+        ``slack_target_fraction · rating`` in load convention (positive
+        when the operator wants the slack to import).  This shifts the
+        gossip's imbalance accounting from "everything balances to
+        zero" (which the LP achieves trivially) to "the rest of the
+        group should balance such that the slack only draws its
+        target" — which is the real operator objective.
         """
-        sp = obs_setpoint(obs)
+        slack = lookup_slack(self.behavior, self.context.aid)
+        if slack is not None:
+            cfg = getattr(self.behavior, "_scare_config", None)
+            fraction = float(
+                getattr(cfg, "slack_target_fraction", 0.0) if cfg is not None else 0.0
+            )
+            # ``slack.cap`` is generator-convention (negative); the
+            # *import* target is the positive of that magnitude.  In
+            # load convention an importing slack has positive p_mw.
+            rating = abs(slack.cap)
+            sp = fraction * rating
+            return sp
+        sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
         if self.sector == Sector.HEAT:
             sp += _heat_thermal_deficit_mw(obs)
         return sp
@@ -888,7 +912,30 @@ class EnergyBalanceNegotiator(Role):
         self_key = str(self.context.addr)
 
         obs = self.behavior.observe(self.context.aid) or {}
-        starting_sp = obs_setpoint(obs)
+        starting_sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
+
+        # Seed ``λ`` conservatively.  The original audit (P1-1) noted
+        # the first hop produces ``δ = clamp(a_i · 0, …) = 0`` — a
+        # wasted primal step.  A naive fix ``λ₀ = target / a_self``
+        # over-shoots wildly: with ``target ≈ -0.05`` and ``a_self = 2``
+        # (low-priority originator), ``λ₀ = -0.025``; the first
+        # recipient with ``a_r = 1024`` (tier 10) computes
+        # ``δ = -25.6``, clamps at the negative-shed bound, and *every*
+        # subsequent agent then also saturates because λ-decay is
+        # slow.  That destroys the priority waterfall — tier 1 ends up
+        # fully shed alongside tier 10.  Scale by a conservative
+        # ``Σ a_j`` proxy (group size × the *maximum* possible weight
+        # so the seed is upper-bounded even when ``a_self`` is the
+        # minimum weight):
+        P = _PRIORITY_TIERS
+        # Maximum possible priority weight across both regimes
+        # (matches ``_qp_priority_weight`` upper bound).
+        a_max = 2.0 ** (P + 1)
+        # Heuristic group size for seeding (real Σ a_j is unknown at
+        # send time; corrected by the dual update on every hop).
+        n_seed = max(8, len(neighbours) + 1)
+        sigma_a_est = max(a_max * n_seed, 1.0)
+        lambda_seed = target / sigma_a_est
 
         self._gossip = _GossipState(
             negotiation_id=nid,
@@ -898,6 +945,7 @@ class EnergyBalanceNegotiator(Role):
             starting_setpoint=starting_sp,
             memory={self_key: (0.0, 0, self.priority, False)},
             is_originator=True,
+            dual_lambda=lambda_seed,
         )
 
         if not neighbours:
@@ -1058,7 +1106,9 @@ class EnergyBalanceNegotiator(Role):
                 target=message.negotiation_target,
                 counter=counter,
                 current_delta=0.0,
-                starting_setpoint=obs_setpoint(obs),
+                starting_setpoint=obs_setpoint(
+                    obs, behavior=self.behavior, aid=self.context.aid
+                ),
                 memory=dict(message.memory),
                 dual_lambda=getattr(message, "dual_lambda", 0.0),
             )
@@ -1094,8 +1144,8 @@ class EnergyBalanceNegotiator(Role):
 
         target = self._gossip.target
         obs = self.behavior.observe(self.context.aid) or {}
-        cap = obs_capacity(obs)
-        dmin, dmax = obs_min_max(obs)
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
+        dmin, dmax = obs_min_max(obs, behavior=self.behavior, aid=self.context.aid)
 
         prev_own = self._gossip.memory.get(self_key, (0.0, 0, self.priority, False))[0]
         total_delta = sum(v[0] for v in self._gossip.memory.values())
@@ -1349,13 +1399,27 @@ class EnergyBalanceNegotiator(Role):
         # emit its own local event.  Pruned neighbours are skipped —
         # sending to an unreachable peer just wastes a scheduled message
         # that will stall the simulation-termination tracker.
-        finished_msg = NegotiationFinishedEvent(new_setpoint=0, sector=self.sector)
+        # ``new_setpoint`` carries the leader's converged setpoint so the
+        # CP fixed-point gate (cp.py:_handle_negotiation_finished) can
+        # detect setpoint movement.  Earlier versions hard-coded zero;
+        # the gate then compared |0 − 0| < tol on every subsequent
+        # broadcast and suppressed every CP re-trigger past the first.
+        # Neighbours re-derive their own setpoint locally via
+        # ``starting_sp + current_delta`` (see _handle_negotiation_finished_msg)
+        # so they are unaffected by what value travels in this field.
+        finished_msg = NegotiationFinishedEvent(new_setpoint=new_sp, sector=self.sector)
         for addr in neighbours:
             await self.context.send_message(finished_msg, receiver_addr=addr)
 
         # Leader also notifies CP connectors
         if topology_characteristic(self, tid="groups") == "leader":
-            for addr in topology_connectors(self, tid="groups"):
+            cp_connectors = list(topology_connectors(self, tid="groups"))
+            if cp_connectors:
+                logger.info(
+                    "[%s] gossip finished: notifying %d CP connectors (new_sp=%.4f)",
+                    self.context.aid, len(cp_connectors), new_sp,
+                )
+            for addr in cp_connectors:
                 await self.context.send_message(finished_msg, receiver_addr=addr)
 
         self._gossip = None
@@ -1431,8 +1495,8 @@ class EnergyBalanceNegotiator(Role):
             sector = obs_sector(obs, behavior=self.behavior, aid=aid)
             if sector is None:
                 continue
-            cap = obs_capacity(obs)
-            sp = obs_setpoint(obs)
+            cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
+            sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
             available = cap - sp  # headroom
             # Per-sector breakdown for multi-dimensional ADMM
             sec_key = sector.value
@@ -1440,7 +1504,7 @@ class EnergyBalanceNegotiator(Role):
             balance_by_sector[sec_key] = balance_by_sector.get(sec_key, 0.0) + sp
             # Priority-tier demand aggregation (loads only: cap > 0)
             if cap > 0:
-                prio = obs_priority(obs)
+                prio = obs_priority(obs, behavior=self.behavior, aid=aid)
                 demand_by_priority[prio] = demand_by_priority.get(prio, 0.0) + abs(cap)
                 served_by_priority[prio] = served_by_priority.get(prio, 0.0) + abs(sp)
             if sector != self.sector:
@@ -1465,8 +1529,21 @@ class EnergyBalanceNegotiator(Role):
     async def _handle_start_balance(
         self, message: StartBalanceNegotiation, meta: dict
     ) -> None:
-        if topology_characteristic(self, tid="groups") == "leader":
-            self.context.schedule_instant_task(self.trigger_balance_negotiation())
+        if topology_characteristic(self, tid="groups") != "leader":
+            return
+        override = getattr(message, "override_target", None)
+        if override is not None and math.isfinite(override):
+            # Holonic ADMM (Layer 2) computed this leader's share of the
+            # holon-wide imbalance.  Skip the local ask-energy round and
+            # use the ADMM result directly as the gossip target so the
+            # cross-sector optimisation actually drives the per-group
+            # contribution instead of being discarded.
+            if self._active:
+                return
+            self._active = True
+            self.context.schedule_instant_task(self._start_gossip(float(override)))
+            return
+        self.context.schedule_instant_task(self.trigger_balance_negotiation())
 
     async def _handle_failure_notice(
         self, message: FailureNotice, meta: dict
@@ -1500,7 +1577,7 @@ class EnergyBalanceNegotiator(Role):
 
     def _apply_setpoint(self, new_setpoint: float) -> None:
         obs = self.behavior.observe(self.context.aid) or {}
-        cap = obs_capacity(obs)
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         if cap == 0.0:
             return
 
@@ -1580,10 +1657,10 @@ class EnergyBalanceNegotiator(Role):
         if deficit <= 0:
             return
         obs = self.behavior.observe(self.context.aid) or {}
-        cap = obs_capacity(obs)
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         if cap >= 0:
             return  # not a generator (generators have negative capacity)
-        sp = obs_setpoint(obs)
+        sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
         headroom = abs(cap) - abs(sp)
         if headroom < 1e-6:
             return

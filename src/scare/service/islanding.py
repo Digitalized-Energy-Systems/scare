@@ -88,10 +88,10 @@ class IslandingFallbackRole(Role):
             obs = self.behavior.observe(aid) or {}
             if obs_sector(obs, behavior=self.behavior, aid=aid) != self.sector:
                 continue
-            if obs_priority(obs) != 0:
+            if obs_priority(obs, behavior=self.behavior, aid=aid) != 0:
                 continue  # not a generator
-            cap = obs_capacity(obs)
-            sp = obs_setpoint(obs)
+            cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
+            sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
             headroom = abs(cap) - abs(sp)
             if headroom > 1e-6:
                 generators.append((aid, abs(cap), headroom))
@@ -113,7 +113,7 @@ class IslandingFallbackRole(Role):
             # Distribute deficit proportional to each generator's headroom
             share = min(headroom, deficit * (headroom / total_headroom))
             obs = self.behavior.observe(aid) or {}
-            current_sp = abs(obs_setpoint(obs))
+            current_sp = abs(obs_setpoint(obs, behavior=self.behavior, aid=aid))
             new_factor = min(1.0, (current_sp + share) / cap) if cap > 0 else 0.0
 
             from scare.base.util import apply_regulate

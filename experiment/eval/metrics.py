@@ -112,8 +112,24 @@ def served_breakdown(
     pw_served = 0.0
 
     disconnected = _disconnected_node_ids(monee_net)
+    # Filter to actual *consumer* load childs.  In monee's hydraulic /
+    # multi-energy models, ``Sink`` represents the return-side of a heat
+    # exchanger and ``ExtHydrGrid`` / ``ExtPowerGrid`` are slack injectors —
+    # none of them are customer demand, yet all three carry mass-flow /
+    # p_mw fields that ``obs_capacity`` would otherwise pick up post-LP.
+    # Without this filter, scare's metric inflates ``served`` past
+    # baseline (validation run: post=6.21 MW vs baseline=5.20 MW on
+    # cp_heavy_dependent_45; the 1 MW excess was 170 Sinks + 2 ExtHydrGrids).
+    _LOAD_CLASSES: tuple[type, ...] | None = None
+    try:
+        from monee.model.child import HeatLoad, PowerLoad
+        _LOAD_CLASSES = (HeatLoad, PowerLoad)
+    except Exception:  # pragma: no cover
+        _LOAD_CLASSES = None
 
     for child in monee_net.childs:
+        if _LOAD_CLASSES is not None and not isinstance(child.model, _LOAD_CLASSES):
+            continue
         aid = f"child-{child.id}"
         obs = behavior.observe(aid) or {}
         cap = obs_capacity(obs)
@@ -126,12 +142,35 @@ def served_breakdown(
         if not (cap > 0):
             continue
         n_loads += 1
-        if not getattr(child, "active", True) or child.node_id in disconnected:
+        # ``is_disconnected`` distinguishes the *physical* loss path
+        # (priority-blind by definition: no path to a grid-forming
+        # source) from the *agent-driven* path (where the QP / ADMM
+        # priority weighting actually decides who sheds).  The
+        # restoration_breakdown downstream uses this to split per-tier
+        # losses into the two contributions.
+        is_disconnected = (
+            not getattr(child, "active", True)
+            or child.node_id in disconnected
+        )
+        if is_disconnected:
             sp = 0.0
         else:
             sp = obs_setpoint(obs)
-        served = max(0.0, sp)
+        # Clamp to [0, cap] — a load physically can't consume more than its
+        # rated demand, and the MAS variants are free to set regulation > 1.0
+        # (bound is [0, 2]).  Without clamping, agents over-serving one load
+        # mask genuine zero-served loads in the totals: post-restoration
+        # ``served`` can exceed pre-failure baseline even when 30+ loads sit
+        # disconnected.  Confirmed in the validation run on cp_heavy_45 with
+        # generator failures (scare reports 6.05 MW served vs 5.20 MW baseline
+        # while 30 loads are at zero).
+        served = max(0.0, min(cap, sp))
         demand = cap
+        # Demand on physically disconnected nodes — the priority-blind
+        # share of the per-tier loss.  Baseline runs (no failures) have
+        # this at zero on every tier; the restoration_breakdown uses
+        # the difference to attribute losses.
+        demand_disc = demand if is_disconnected else 0.0
 
         node = monee_net.node_by_id(child.node_id)
         sec = sector_from_grid(node.grid)
@@ -144,20 +183,26 @@ def served_breakdown(
         w = _tier_weight(tier)
 
         sec_key = sec.value
-        by_sector.setdefault(sec_key, {"demand": 0.0, "served": 0.0})
+        by_sector.setdefault(sec_key, {"demand": 0.0, "served": 0.0, "demand_disconnected": 0.0})
         by_sector[sec_key]["demand"] += demand
         by_sector[sec_key]["served"] += served
+        by_sector[sec_key]["demand_disconnected"] += demand_disc
 
-        by_tier.setdefault(tier, {"demand": 0.0, "served": 0.0, "weight": w})
+        by_tier.setdefault(
+            tier,
+            {"demand": 0.0, "served": 0.0, "weight": w, "demand_disconnected": 0.0},
+        )
         by_tier[tier]["demand"] += demand
         by_tier[tier]["served"] += served
+        by_tier[tier]["demand_disconnected"] += demand_disc
 
         by_tier_sector.setdefault(sec_key, {})
         by_tier_sector[sec_key].setdefault(
-            tier, {"demand": 0.0, "served": 0.0}
+            tier, {"demand": 0.0, "served": 0.0, "demand_disconnected": 0.0}
         )
         by_tier_sector[sec_key][tier]["demand"] += demand
         by_tier_sector[sec_key][tier]["served"] += served
+        by_tier_sector[sec_key][tier]["demand_disconnected"] += demand_disc
 
         pw_demand += w * demand
         pw_served += w * served
@@ -256,13 +301,33 @@ def restoration_breakdown(
         d_b = float(tb.get("demand", 0.0))
         s_b = float(tb.get("served", 0.0))
         s_p = float(tp.get("served", 0.0))
+        # ``demand_disconnected`` is the priority-blind share of the
+        # per-tier loss: load that physically lost its path to a
+        # grid-forming source and is therefore irrecoverable regardless
+        # of what the agents decide.  The rest of the per-tier loss is
+        # the *agent-shed* portion — load the QP / ADMM chose to drop.
+        # Splitting the two makes the chapter's priority-waterfall
+        # claim verifiable: priority should drive ``agent_shed``, not
+        # ``disconnect_lost``.  See P0/P1 audit + restoration
+        # validation pass for context.
+        disc_p = float(tp.get("demand_disconnected", 0.0))
+        total_loss = max(0.0, s_b - s_p)
+        disconnect_lost = max(0.0, min(disc_p, total_loss))
+        agent_shed = max(0.0, total_loss - disconnect_lost)
         ratio = s_p / s_b if s_b > 1e-12 else (1.0 if d_b < 1e-12 else 0.0)
+        # Agent-only ratio: how would tier i look if disconnection
+        # hadn't happened?  Used by the priority-awareness plot.
+        s_b_recoverable = max(1e-12, s_b - disconnect_lost)
+        agent_ratio = (s_b - total_loss + disconnect_lost) / s_b_recoverable
         by_tier_out[str(tier)] = {
-            "demand_baseline_mw": d_b,
-            "served_baseline_mw": s_b,
-            "served_post_mw":     s_p,
-            "ratio":              max(0.0, min(1.0, ratio)),
-            "weight":             float(tb.get("weight", 0.0)),
+            "demand_baseline_mw":   d_b,
+            "served_baseline_mw":   s_b,
+            "served_post_mw":       s_p,
+            "ratio":                max(0.0, min(1.0, ratio)),
+            "disconnect_lost_mw":   disconnect_lost,
+            "agent_shed_mw":        agent_shed,
+            "agent_only_ratio":     max(0.0, min(1.0, agent_ratio)),
+            "weight":               float(tb.get("weight", 0.0)),
         }
 
     by_sector_out: dict[str, dict[str, float]] = {}
@@ -273,17 +338,35 @@ def restoration_breakdown(
         s_b = float(sb.get("served", 0.0))
         s_p = float(sp.get("served", 0.0))
         ratio = s_p / s_b if s_b > 1e-12 else 1.0
+        disc_p = float(sp.get("demand_disconnected", 0.0))
+        total_loss = max(0.0, s_b - s_p)
+        disconnect_lost = max(0.0, min(disc_p, total_loss))
+        agent_shed = max(0.0, total_loss - disconnect_lost)
         by_sector_out[sec] = {
-            "demand_baseline_mw": d_b,
-            "served_baseline_mw": s_b,
-            "served_post_mw":     s_p,
-            "ratio":              max(0.0, min(1.0, ratio)),
+            "demand_baseline_mw":   d_b,
+            "served_baseline_mw":   s_b,
+            "served_post_mw":       s_p,
+            "ratio":                max(0.0, min(1.0, ratio)),
+            "disconnect_lost_mw":   disconnect_lost,
+            "agent_shed_mw":        agent_shed,
         }
+
+    # Campaign-level disconnect vs agent split — sum the per-sector
+    # contributions so the aggregator + restoration plot can quote the
+    # priority-blind share at a glance.
+    total_disconnect_lost = sum(
+        s.get("disconnect_lost_mw", 0.0) for s in by_sector_out.values()
+    )
+    total_agent_shed = sum(
+        s.get("agent_shed_mw", 0.0) for s in by_sector_out.values()
+    )
 
     return {
         "baseline_available":          True,
         "absolute_load_lost_mw":       max(0.0, total_demand - total_served_post),
         "absolute_load_dropped_mw":    max(0.0, total_served_baseline - total_served_post),
+        "disconnect_lost_mw":          total_disconnect_lost,
+        "agent_shed_mw":               total_agent_shed,
         "total_demand_mw":             total_demand,
         "total_served_baseline_mw":    total_served_baseline,
         "total_served_post_mw":        total_served_post,

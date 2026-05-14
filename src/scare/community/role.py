@@ -22,12 +22,10 @@ class PreAssignedCommunityRole(Role):
     """Writes a pre-computed ``CommunityAssignment`` into the agent's
     context at startup.
 
-    Used when groups are formed offline (e.g., via label-propagation in
-    the scenario builder) instead of through the runtime CHS gossip
-    protocol — it primes the same ``CommunityAssignment`` model that
-    ``CHSRole`` would otherwise populate, so downstream roles like
-    :class:`HolonicCommunityRole` can find a non-empty community at
-    setup time.
+    Groups are formed offline (label-propagation in the scenario
+    builder) and primed into the ``CommunityAssignment`` model at
+    setup so downstream roles like :class:`HolonicCommunityRole` can
+    find a non-empty community immediately.
     """
 
     def __init__(self, community_id: UUID) -> None:
