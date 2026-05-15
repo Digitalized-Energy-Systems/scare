@@ -682,8 +682,8 @@
   ],
   "slurm": {
     "partition": "rosa.p",
-    "time": "00:45:00",
-    "mem": "4G",
+    "time": "02:00:00",
+    "mem": "8G",
     "cpus": 1,
     "max_concurrent": 64,
     "aggregate": true

@@ -39,7 +39,10 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     out["diary_invariant"] = _check_diary_invariant(task_dir / "diary.csv")
-    out["priority_invariant"] = _check_priority_invariant(task_dir / "served.csv")
+    out["priority_invariant"] = _check_priority_invariant(
+        task_dir / "served_by_load.csv",
+        legacy_served_csv=task_dir / "served.csv",
+    )
     out["monotonic_progress"] = _check_monotonic_progress(
         task_dir / "timeseries.csv", task_dir / "events.csv"
     )
@@ -75,16 +78,104 @@ def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _check_priority_invariant(served_path: Path) -> dict[str, Any]:
-    """At end-of-sim, when total demand exceeds capacity, the served
-    fraction should be non-increasing in priority tier (per sector):
-    tier 1 ≥ tier 2 ≥ … ≥ tier P.
+def _check_priority_invariant(
+    by_load_path: Path,
+    *,
+    legacy_served_csv: Path | None = None,
+) -> dict[str, Any]:
+    """At end-of-sim, when total demand exceeds capacity *within a
+    connected component*, the served fraction must be non-increasing in
+    priority tier (per (sector, component)): tier 1 ≥ tier 2 ≥ … ≥ tier
+    P.
 
-    The check is per-sector; we report the worst inversion across all
-    sectors.  Vacuous (passes) when no sector has multiple tiers.
+    Why per-component: heat and gas cannot be transported through a
+    broken pipe, and electricity cannot cross a disconnected feeder
+    without active reconfiguration.  A load on a healthy island will be
+    served 100 % regardless of priority, and that's a spatial accident
+    of where the failure landed — not a SCARE priority violation.  By
+    grouping on the active-branch-subgraph component (recorded in
+    ``served_by_load.csv``'s ``component`` column), the check evaluates
+    only the priority decisions SCARE could plausibly have made.
+
+    Components with no deficit (every tier at 1.0 within the per-tier
+    capacity-weighted tolerance) are skipped — they carry no priority
+    decision to evaluate.
+
+    Falls back to the legacy per-sector check on ``served.csv`` if the
+    per-load file is absent (older campaign artefacts).
     """
-    if not served_path.exists():
-        return {"passed": True, "detail": "no served.csv"}
+    if not by_load_path.exists():
+        if legacy_served_csv is not None and legacy_served_csv.exists():
+            return _check_priority_invariant_legacy(legacy_served_csv)
+        return {"passed": True, "detail": "no served_by_load.csv"}
+    rows = _read_csv(by_load_path)
+    if not rows:
+        return {"passed": True, "detail": "empty served_by_load.csv"}
+
+    # Aggregate per (sector, component, tier): demand and served.
+    agg: dict[tuple[str, str], dict[int, dict[str, float]]] = {}
+    for r in rows:
+        try:
+            sec = r["sector"]
+            comp = r.get("component", "-1")
+            tier = int(r["tier"])
+            demand = float(r["demand"])
+            served = float(r["served"])
+        except (KeyError, ValueError):
+            continue
+        key = (sec, comp)
+        by_tier = agg.setdefault(key, {})
+        entry = by_tier.setdefault(tier, {"demand": 0.0, "served": 0.0})
+        entry["demand"] += demand
+        entry["served"] += served
+
+    inversions: list[dict[str, Any]] = []
+    skipped_no_deficit = 0
+    skipped_singleton = 0
+    checked = 0
+    for (sec, comp), by_tier in agg.items():
+        tiers = sorted(by_tier.items())  # [(tier, {demand, served})]
+        if len(tiers) < 2:
+            skipped_singleton += 1
+            continue
+        total_demand = sum(e["demand"] for _, e in tiers)
+        total_served = sum(e["served"] for _, e in tiers)
+        if total_demand <= 0 or total_served >= total_demand - 1e-6:
+            skipped_no_deficit += 1
+            continue
+        checked += 1
+        # Compute per-tier fraction, then check non-increasing ordering.
+        fracs = []
+        for tier, e in tiers:
+            f = e["served"] / e["demand"] if e["demand"] > 0 else 1.0
+            fracs.append((tier, f))
+        for i in range(1, len(fracs)):
+            t_prev, f_prev = fracs[i - 1]
+            t_cur, f_cur = fracs[i]
+            if f_cur > f_prev + 1e-3:
+                inversions.append({
+                    "sector": sec,
+                    "component": comp,
+                    "tier_prev": t_prev,
+                    "frac_prev": f_prev,
+                    "tier_cur": t_cur,
+                    "frac_cur": f_cur,
+                })
+    return {
+        "passed": not inversions,
+        "detail": {
+            "inversions": inversions[:5],
+            "n_inversions": len(inversions),
+            "n_components_checked": checked,
+            "n_components_skipped_no_deficit": skipped_no_deficit,
+            "n_components_skipped_singleton_tier": skipped_singleton,
+        },
+    }
+
+
+def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
+    """Original per-sector check on ``served.csv`` — retained as a
+    fallback for runs predating the per-load artefact."""
     rows = _read_csv(served_path)
     by_sector: dict[str, list[tuple[int, float]]] = {}
     for r in rows:
@@ -95,16 +186,12 @@ def _check_priority_invariant(served_path: Path) -> dict[str, Any]:
         except (KeyError, ValueError):
             continue
         by_sector.setdefault(sec, []).append((tier, frac))
-
     inversions: list[dict[str, Any]] = []
     for sec, entries in by_sector.items():
         entries.sort(key=lambda e: e[0])
         for i in range(1, len(entries)):
             t_prev, f_prev = entries[i - 1]
             t_cur, f_cur = entries[i]
-            # Non-increasing: f_prev ≥ f_cur.  Allow a small tolerance
-            # (1e-3) so floating-point round-trips through CSV don't
-            # produce spurious inversions.
             if f_cur > f_prev + 1e-3:
                 inversions.append({
                     "sector": sec,
@@ -116,8 +203,9 @@ def _check_priority_invariant(served_path: Path) -> dict[str, Any]:
     return {
         "passed": not inversions,
         "detail": {
-            "inversions": inversions[:5],   # cap so the json stays small
+            "inversions": inversions[:5],
             "n_inversions": len(inversions),
+            "legacy_per_sector": True,
         },
     }
 
@@ -166,7 +254,7 @@ def _check_monotonic_progress(
             continue
         max_y = max(abs(y) for y in ys) or 1.0
         worst = 0.0
-        windows = violations_by_sec.get(sec, [])
+        windows = violations_by_sec.get(sec, []) + violations_by_sec.get("*", [])
         for i in range(1, len(ys)):
             in_violation = any(lo <= t[i] <= hi for lo, hi in windows)
             if in_violation:
@@ -226,18 +314,37 @@ def _load_timeseries(path: Path) -> dict[str, tuple[list[float], list[float]]]:
     return out
 
 
+_DISRUPTION_KINDS = frozenset({
+    "constraint_violation",
+    "line_failure",
+    "node_failure",
+    "branch_failure",
+})
+
+
 def _violation_windows(events_path: Path) -> dict[str, list[tuple[float, float]]]:
-    """Treat every ``constraint_violation`` row as opening a window from
-    its timestamp until the next event of any kind (or the end of the
-    series).  Coarse but the events.csv doesn't currently mark
-    violation-clear, so this gives an upper bound.
+    """Open a disruption window around every event that physically or
+    operationally invalidates the monotonic-progress invariant.  Two
+    classes feed the window set:
+
+      * ``constraint_violation`` — a bound was breached; restoration
+        agents are mid-correction.
+      * ``line_failure`` / ``node_failure`` / ``branch_failure`` — a
+        physical disconnection; the resulting balance drop is the
+        immediate consequence of lost capacity, not an agent regression.
+
+    Each window runs from the event timestamp until the next event of
+    any kind (or end-of-series).  Failure events carry no sector tag, so
+    they open a window for *every* sector under key ``"*"`` — the caller
+    treats matches under that key as applying universally.
     """
     rows = _read_csv(events_path)
     if not rows:
         return {}
     by_sec: dict[str, list[tuple[float, float]]] = {}
     for i, r in enumerate(rows):
-        if r.get("kind") != "constraint_violation":
+        kind = r.get("kind")
+        if kind not in _DISRUPTION_KINDS:
             continue
         try:
             t0 = float(r["t"])
@@ -251,6 +358,10 @@ def _violation_windows(events_path: Path) -> dict[str, list[tuple[float, float]]
                 break
             except (KeyError, ValueError):
                 continue
-        sec = r.get("sector", "")
+        sec = r.get("sector") or ""
+        # Failure events come without a sector tag; bucket them as
+        # universal disruption windows so all three sectors honour them.
+        if kind != "constraint_violation" and not sec:
+            sec = "*"
         by_sec.setdefault(sec, []).append((t0, t1))
     return by_sec

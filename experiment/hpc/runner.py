@@ -52,18 +52,30 @@ LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
 
 class _SolverFailureCounter(logging.Filter):
-    """Counts ``Pyomo solve failed`` warnings on monee.solver.pyo so we
-    can report solver health per task without grepping logs."""
+    """Counts solver-status escalations on monee.solver.pyo so we can
+    report solver health per task without grepping logs.
+
+    Tracks both real infeasibilities (ERROR with ``infeasible``) and
+    non-ok warnings (Gurobi stopping at gap/time limit etc).  ``count``
+    is the union for backwards-compatible reporting; the split is
+    available via ``infeasible_count`` and ``warning_count``.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.count = 0
+        self.infeasible_count = 0
+        self.warning_count = 0
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
-        if (
-            record.levelno >= logging.WARNING
-            and "Pyomo solve failed" in record.getMessage()
-        ):
+        if record.levelno < logging.WARNING:
+            return True
+        msg = record.getMessage()
+        if "infeasible (status=" in msg:
+            self.infeasible_count += 1
+            self.count += 1
+        elif "returned non-ok status" in msg:
+            self.warning_count += 1
             self.count += 1
         return True
 
@@ -589,10 +601,21 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 write_events_csv,
                 write_messages_csv,
                 write_result_json,
+                write_served_by_load_csv,
                 write_served_csv,
                 write_trajectories_csv,
             )
             behavior = world.environment.behavior
+            # End-of-sim measurement boundary: force a fresh energy flow
+            # so observers report post-agent-action state instead of the
+            # cooldown-cached previous solve.  Without this the served
+            # breakdown reflects an older regulation value and the
+            # priority-invariant claim hallucinates intra-component
+            # inversions.
+            try:
+                behavior.flush_energy_flow()
+            except AttributeError:
+                logger.debug("Behavior has no flush_energy_flow() — skipping")
             priorities = getattr(net, "_scare_priorities", None)
             payload = compose_result(
                 world=world,
@@ -607,6 +630,9 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
             )
             write_result_json(out_dir / "result.json", payload)
             write_served_csv(out_dir / "served.csv", net, behavior, priorities=priorities)
+            write_served_by_load_csv(
+                out_dir / "served_by_load.csv", net, behavior, priorities=priorities,
+            )
             write_diary_csv(out_dir / "diary.csv")
             write_events_csv(out_dir / "events.csv")
             cfg = _config_from_task(task)
@@ -659,6 +685,8 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     finally:
         status["duration_s"] = round(time.monotonic() - started, 3)
         status["solver_failures"] = solver_counter.count
+        status["solver_infeasibilities"] = solver_counter.infeasible_count
+        status["solver_warnings"] = solver_counter.warning_count
         (out_dir / "status.json").write_text(json.dumps(status, indent=2, sort_keys=True))
         try:
             _dump_diagnostics(out_dir / "diagnostics.txt")

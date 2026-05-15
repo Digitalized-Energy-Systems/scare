@@ -205,7 +205,11 @@ def _inverter_s_nom_mva(child: Any) -> float | None:
     # First pass with the small-inverter cos φ.
     from scare.service.voltage_droop import (
         COS_PHI_LARGE as _LARGE_INV_COS_PHI,
+    )
+    from scare.service.voltage_droop import (
         COS_PHI_SMALL as _SMALL_INV_COS_PHI,
+    )
+    from scare.service.voltage_droop import (
         COS_PHI_THRESHOLD_MVA as _SMALL_INV_THRESHOLD,
     )
 

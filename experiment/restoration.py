@@ -105,14 +105,10 @@ def create_large_lv_simbench(
             heat_kwargs={"node_based_heat_loads": True},
         )
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
-        mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
-        # Slack budget is no longer applied at grid-construction time —
-        # it is a per-scenario operator policy, not a physical grid
-        # attribute, and the LP needs an unconstrained slack to
-        # guarantee convergence.  ``apply_slack_budget`` is called by
-        # ``experiment.hpc.runner._apply_scenario`` when the task
-        # specifies ``scenario.slack_budget_pct``.  See the F1–F3
-        # slack-handling refactor for the design rationale.
+        # McCormick is maybe not necessery here as only energy flow is needed
+        # McCormick can on failures, lead to infeasibles due to envelope bounds
+        # mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
+
         if backup_lines_per_sector > 0:
             add_backup_lines(
                 mes,

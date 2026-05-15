@@ -74,6 +74,112 @@ def _disconnected_node_ids(monee_net: Any) -> set[int]:
         return set()
 
 
+def _active_node_components(monee_net: Any) -> dict[Any, int]:
+    """Return a mapping ``node_id -> component_index`` over the
+    *active*-branch subgraph.  Failed branches (``branch.active is
+    False``) and the failed branches' contribution to graph connectivity
+    are removed; the result captures the post-failure islands that the
+    priority-invariant check needs in order to compare tiers fairly
+    within each connected partition.
+
+    Disconnected single nodes get their own component.  Component
+    indices are arbitrary but stable within a single call (assigned in
+    discovery order via union-find).
+    """
+    try:
+        import networkx as nx
+    except Exception:  # pragma: no cover - networkx is a hard dep
+        return {}
+    graph = nx.Graph()
+    for node in monee_net.nodes:
+        graph.add_node(node.id)
+    for branch in monee_net.branches:
+        if not _branch_is_active(branch):
+            continue
+        a, b = branch.id[0], branch.id[1]
+        graph.add_edge(a, b)
+    out: dict[Any, int] = {}
+    for idx, comp in enumerate(nx.connected_components(graph)):
+        for node_id in comp:
+            out[node_id] = idx
+    return out
+
+
+def _branch_is_active(branch: Any) -> bool:
+    """``branch.model.active`` when present, falling back to
+    ``branch.active``.  Mirrors :meth:`Network._set_active` so we read
+    the same flag the simulator writes to."""
+    model = getattr(branch, "model", None)
+    if model is not None and "active" in getattr(model, "vars", {}):
+        return bool(model.active)
+    return bool(getattr(branch, "active", True))
+
+
+def served_by_load(
+    monee_net: Any,
+    behavior: Any,
+    priorities: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Per-load served / demand / fraction with node + component tag.
+
+    Returns a list of dicts ready for CSV-writing or per-component
+    aggregation.  Shape:
+
+    ``[{aid, sector, tier, node_id, component, demand, served, fraction,
+        disconnected}, ...]``
+
+    Loads on physically disconnected nodes get ``served = 0``,
+    matching :func:`served_breakdown`'s contract.  ``component`` is the
+    active-subgraph component index from :func:`_active_node_components`
+    so the priority-invariant claim can group by it.
+    """
+    disconnected = _disconnected_node_ids(monee_net)
+    components = _active_node_components(monee_net)
+
+    _LOAD_CLASSES: tuple[type, ...] | None = None
+    try:
+        from monee.model.child import HeatLoad, PowerLoad
+        _LOAD_CLASSES = (HeatLoad, PowerLoad)
+    except Exception:  # pragma: no cover
+        _LOAD_CLASSES = None
+
+    rows: list[dict[str, Any]] = []
+    for child in monee_net.childs:
+        if _LOAD_CLASSES is not None and not isinstance(child.model, _LOAD_CLASSES):
+            continue
+        aid = f"child-{child.id}"
+        obs = behavior.observe(aid) or {}
+        cap = obs_capacity(obs)
+        if not (cap > 0):
+            continue
+        is_disconnected = (
+            not getattr(child, "active", True)
+            or child.node_id in disconnected
+        )
+        sp = 0.0 if is_disconnected else obs_setpoint(obs)
+        served = max(0.0, min(cap, sp))
+        node = monee_net.node_by_id(child.node_id)
+        sec = sector_from_grid(node.grid)
+        if sec is None:
+            continue
+        if priorities is not None and aid in priorities:
+            tier = int(priorities[aid])
+        else:
+            tier = obs_priority(obs)
+        rows.append({
+            "aid": aid,
+            "sector": sec.value,
+            "tier": tier,
+            "node_id": child.node_id,
+            "component": components.get(child.node_id, -1),
+            "demand": cap,
+            "served": served,
+            "fraction": served / cap if cap > 0 else 0.0,
+            "disconnected": int(is_disconnected),
+        })
+    return rows
+
+
 def served_breakdown(
     monee_net: Any,
     behavior: Any,

@@ -158,7 +158,10 @@ class ReactivePowerDroopRole(Role):
     async def _step(self) -> None:
         if not self.behavior.has_action(self.context.aid, "set_q"):
             return
-        obs = self.behavior.observe(self.context.aid) or {}
+        try:
+            obs = self.behavior.observe(self.context.aid) or {}
+        except AttributeError:
+            return
         v = obs.get("vm_pu")
         if v is None:
             return

@@ -27,6 +27,7 @@ from scare.base import diagnostics
 from experiment.eval.metrics import (
     constraint_violation_integral,
     served_breakdown,
+    served_by_load,
     time_to_stabilise_s,
 )
 
@@ -147,6 +148,35 @@ def write_served_csv(
                     f"{entry['served']:.6f}",
                     f"{entry['fraction']:.6f}",
                 ])
+
+
+def write_served_by_load_csv(
+    path: Path,
+    monee_net: Any,
+    behavior: Any,
+    priorities: dict[str, int] | None = None,
+) -> None:
+    """Per-load detail with sector, tier, node_id, component, demand,
+    served, fraction, disconnected.  The ``component`` column carries
+    the active-branch-subgraph connected-component index so the
+    priority-invariant claim check can compare tiers within each
+    post-failure island fairly (cross-island deficits are spatial
+    accidents and shouldn't count as priority inversions).
+    """
+    rows = served_by_load(monee_net, behavior, priorities=priorities)
+    cols = (
+        "aid", "sector", "tier", "node_id", "component",
+        "demand", "served", "fraction", "disconnected",
+    )
+    with Path(path).open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([
+                r["aid"], r["sector"], r["tier"], r["node_id"], r["component"],
+                f"{r['demand']:.6f}", f"{r['served']:.6f}", f"{r['fraction']:.6f}",
+                r["disconnected"],
+            ])
 
 
 def write_diary_csv(path: Path) -> None:

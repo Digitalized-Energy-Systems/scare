@@ -148,6 +148,9 @@
         },
         {
           "enable_distributed_failure_notice": false
+        },
+        {
+          "enable_qv_droop": false
         }
       ],
       "scenarios": [
@@ -157,6 +160,29 @@
           "n_failures": 5,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "name": "voltage_stress",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_qv_droop": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
         }
       ]
     },
