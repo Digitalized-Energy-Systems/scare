@@ -25,5 +25,9 @@ if [ ! -x "$PYTHON_BIN" ]; then
     exit 1
 fi
 
+module load hpc-env/13.1
+module load Miniforge3/26.1.0-0
+conda activate cmres_env
+
 cd "$REPO_ROOT"
 exec "$PYTHON_BIN" -m experiment.hpc.submit "$@"
