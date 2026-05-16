@@ -322,6 +322,9 @@ _DISRUPTION_KINDS = frozenset({
 })
 
 
+_DISRUPTION_GRACE_S = 2.0
+
+
 def _violation_windows(events_path: Path) -> dict[str, list[tuple[float, float]]]:
     """Open a disruption window around every event that physically or
     operationally invalidates the monotonic-progress invariant.  Two
@@ -333,16 +336,23 @@ def _violation_windows(events_path: Path) -> dict[str, list[tuple[float, float]]
         physical disconnection; the resulting balance drop is the
         immediate consequence of lost capacity, not an agent regression.
 
-    Each window runs from the event timestamp until the next event of
-    any kind (or end-of-series).  Failure events carry no sector tag, so
-    they open a window for *every* sector under key ``"*"`` — the caller
-    treats matches under that key as applying universally.
+    Each window runs from the event timestamp for ``_DISRUPTION_GRACE_S``
+    seconds.  Earlier versions closed the window at the next event of
+    any kind, but dense holon_formed / negotiation events at the same
+    timestamp collapsed the window to zero, leaving the real failure
+    transient counted as an agent regression.  A fixed grace period is
+    coarse but robust — agents reliably finish responding to a single
+    failure within a couple of seconds on the LV grids we run.
+
+    Failure events carry no sector tag, so they open a window for
+    *every* sector under key ``"*"`` — the caller treats matches under
+    that key as applying universally.
     """
     rows = _read_csv(events_path)
     if not rows:
         return {}
     by_sec: dict[str, list[tuple[float, float]]] = {}
-    for i, r in enumerate(rows):
+    for r in rows:
         kind = r.get("kind")
         if kind not in _DISRUPTION_KINDS:
             continue
@@ -350,14 +360,7 @@ def _violation_windows(events_path: Path) -> dict[str, list[tuple[float, float]]
             t0 = float(r["t"])
         except (KeyError, ValueError):
             continue
-        # Window ends at the next row's timestamp, or open-ended.
-        t1 = float("inf")
-        for r2 in rows[i + 1:]:
-            try:
-                t1 = float(r2["t"])
-                break
-            except (KeyError, ValueError):
-                continue
+        t1 = t0 + _DISRUPTION_GRACE_S
         sec = r.get("sector") or ""
         # Failure events come without a sector tag; bucket them as
         # universal disruption windows so all three sectors honour them.

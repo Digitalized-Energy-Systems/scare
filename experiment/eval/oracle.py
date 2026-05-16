@@ -204,6 +204,29 @@ def compute_baseline_served(
                 if k in scenario
             }
             apply_cold_day(fresh, **kwargs)
+        elif kind == "pv_peak":
+            from experiment.restoration import apply_pv_peak
+
+            kwargs = {
+                k: scenario[k]
+                for k in ("gen_scale", "load_scale")
+                if k in scenario
+            }
+            apply_pv_peak(fresh, **kwargs)
+        elif kind == "line_stress":
+            from experiment.restoration import apply_line_stress
+
+            kwargs = {
+                k: scenario[k]
+                for k in ("load_scale", "ampacity_scale", "affect_branch_fraction")
+                if k in scenario
+            }
+            apply_line_stress(fresh, **kwargs)
+        slack_budget_pct = scenario.get("slack_budget_pct")
+        if slack_budget_pct is not None:
+            from experiment.restoration import apply_slack_budget
+
+            apply_slack_budget(fresh, float(slack_budget_pct))
     out = run_oracle(fresh, [], solver=solver, priorities=priorities)
     return out["served"]
 
