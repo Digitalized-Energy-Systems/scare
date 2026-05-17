@@ -1,0 +1,34 @@
+{
+  "$comment": [
+    "Layer-3 isolation on a CP-bearing grid (simbench_lv_cp_heavy, density=0.3, 2x CP size).",
+    "Two cells: (L1+L3) and (Full). The simbench_lv_small grid used by layer_validation.json",
+    "has too few coupling plants for the CP-ADMM layer to actually fire."
+  ],
+  "name": "layer_validation_cp",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 5.0,
+  "task_timeout_s": 1500.0,
+  "failure_delay_s_max": 1.0,
+  "write_timeseries": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 1,
+    "failure_lambda": 0.6,
+    "max_failures": 2
+  },
+  "experiments": [
+    {
+      "name": "cp_layer_isolation",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {"enable_holonic": false},
+        {}
+      ],
+      "scenarios": [
+        {"kind": "clean", "slack_budget_pct": 0.45}
+      ]
+    }
+  ]
+}

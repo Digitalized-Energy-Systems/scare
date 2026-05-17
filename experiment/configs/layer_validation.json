@@ -1,0 +1,39 @@
+{
+  "$comment": [
+    "Layer-isolation validation: one task per layer-stack cell.",
+    "L1 only           — QP gossip, no holon, no CP",
+    "L1+L2             — QP gossip + holon ADMM, no CP",
+    "L1+L3             — QP gossip + CP ADMM, no holon",
+    "Full              — all three layers (tests inter-layer communication)",
+    "Smallest grid + 3s sim so the full grid of four cells runs in a few minutes."
+  ],
+  "name": "layer_validation",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 3.0,
+  "task_timeout_s": 900.0,
+  "failure_delay_s_max": 1.0,
+  "write_timeseries": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 1,
+    "failure_lambda": 0.6,
+    "max_failures": 2
+  },
+  "experiments": [
+    {
+      "name": "layer_isolation",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {"enable_holonic": false, "enable_cp_admm": false},
+        {"enable_cp_admm": false},
+        {"enable_holonic": false},
+        {}
+      ],
+      "scenarios": [
+        {"kind": "clean", "slack_budget_pct": 0.45}
+      ]
+    }
+  ]
+}
