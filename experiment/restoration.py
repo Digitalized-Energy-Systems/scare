@@ -86,10 +86,6 @@ def create_large_lv_simbench(
 
     def create():
         net = simbench.get_simbench_net(simbench_code)
-        from pandapower import runpp
-        runpp(net)
-        print(net.res_line)
-        print(net.line)
         mn = from_pandapower_net(net)
         mes = generate_supply_return_mes_based_on_power_net(
             mn,
@@ -120,6 +116,108 @@ def create_large_lv_simbench(
 
 
 _SLACK_LP_HEADROOM_FACTOR: float = 10.0
+
+
+def apply_microgrid_islanding(
+    mes: "object",
+    *,
+    carriers: "frozenset[str] | set[str] | tuple[str, ...] | list[str]" = ("electricity", "water", "gas"),
+    promote_all_generators: bool = False,
+    grid_former_aids: "tuple[str, ...] | list[str] | set[str]" = (),
+) -> dict[str, int]:
+    """Enable monee's islanding extension on *mes* and (optionally) convert
+    selected generator-class children into their ``GridForming*`` types
+    so that the extension has grid-formers to anchor sub-islands on.
+
+    Args:
+        carriers:
+            Iterable of carrier names that get islanding turned on
+            (``"electricity"``, ``"water"``, ``"gas"``).  monee accepts
+            ``True`` per-carrier for the default ``IslandingMode``; this
+            helper only forwards True/None and does not customise modes.
+        promote_all_generators:
+            When True, every eligible generator-class child
+            (PowerGenerator, gas/water Source) is replaced with the
+            corresponding ``GridFormingGenerator`` / ``GridFormingSource``
+            so that any sub-island containing one can be solved as its
+            own island.  When False, only children whose aid matches
+            ``grid_former_aids`` are promoted.
+        grid_former_aids:
+            Per-child opt-in.  Aid strings of the form ``"child-{id}"``;
+            ignored when ``promote_all_generators`` is True.
+
+    Returns:
+        Dict of ``{carrier: n_promoted}`` reporting how many children
+        were converted in each sector — useful for sanity-checking the
+        scenario.
+
+    Side effects:
+        Calls :func:`monee.enable_islanding` on *mes*; the resulting
+        ``NetworkIslandingConfig`` is attached to the network and used
+        automatically by every subsequent solve (Pyomo / Gekko both
+        respect it).
+
+    Notes:
+        Promotion uses approximate ratings derived from the original
+        child's setpoint magnitude.  This is fine for *eligibility*
+        (the LP needs a leading reference per island, not a precise
+        capacity), and the chapter's CP-coordination claim can build
+        on top with the per-aid ``grid_former_aids`` knob.
+    """
+    from monee import enable_islanding
+    from monee.model.child import PowerGenerator, Source
+    from monee.model.extension import GridFormingGenerator, GridFormingSource
+
+    carrier_set = frozenset(carriers)
+    if not carrier_set:
+        return {"electricity": 0, "water": 0, "gas": 0}
+
+    promote_aids = set(grid_former_aids) if grid_former_aids else set()
+    counters = {"electricity": 0, "water": 0, "gas": 0}
+
+    for child in mes.childs:
+        aid = f"child-{child.id}"
+        if not (promote_all_generators or aid in promote_aids):
+            continue
+        try:
+            node = mes.node_by_id(child.node_id)
+        except Exception:
+            continue
+        grid_name = str(getattr(node.grid, "name", "") or "").lower()
+        m = child.model
+
+        if isinstance(m, PowerGenerator) and "power" in grid_name and "electricity" in carrier_set:
+            p_max = max(1e-6, abs(float(getattr(m, "p_mw", 0.0) or 0.0)))
+            q_max = max(1e-6, abs(float(getattr(m, "q_mvar", 0.0) or 0.0)) + 0.1 * p_max)
+            child.model = GridFormingGenerator(
+                p_mw_max=p_max, q_mvar_max=q_max, vm_pu=1.0,
+            )
+            counters["electricity"] += 1
+        elif isinstance(m, Source):
+            # Sources live on both gas and water nodes; route by the
+            # parent node's grid so the right carrier counter advances
+            # and the right islanding mode anchors the conversion.
+            mass_max = max(1e-6, abs(float(getattr(m, "mass_flow", 0.0) or 0.0)))
+            if "gas" in grid_name and "gas" in carrier_set:
+                child.model = GridFormingSource(
+                    pressure_pu=1.0, mass_flow_max=mass_max,
+                )
+                counters["gas"] += 1
+            elif "water" in grid_name and "water" in carrier_set:
+                child.model = GridFormingSource(
+                    pressure_pu=1.0, t_k=356.0, mass_flow_max=mass_max,
+                )
+                counters["water"] += 1
+
+    # Switch on monee's islanding extension.  None per-carrier means
+    # "leave that carrier disabled" (legacy behaviour for that sector).
+    enable_islanding(
+        mes,
+        electricity=True if "electricity" in carrier_set else None,
+        gas=True if "gas" in carrier_set else None,
+        water=True if "water" in carrier_set else None,
+    )
+    return counters
 
 
 def apply_slack_budget(mes, fraction: float) -> None:

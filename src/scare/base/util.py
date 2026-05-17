@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 from typing import Any
@@ -202,6 +203,17 @@ def register_slack(
     bidirectional at ``rating_mw``: ``[-rating_mw, +rating_mw]``.
     """
     if rating_mw <= 0.0:
+        # Silent no-op here would leave the slack child unregistered,
+        # which downstream ``obs_capacity`` / ``obs_priority`` falls
+        # back on the LP's current operating value — i.e. the slack
+        # gets reclassified as a load.  Surface the bad input instead.
+        import logging
+        logging.getLogger(__name__).warning(
+            "register_slack(%s, rating_mw=%s): non-positive rating; "
+            "slack will fall back to LP-value capacity, which is "
+            "rarely what callers want.",
+            aid, rating_mw,
+        )
         return
     if p_min is None:
         p_min = -float(rating_mw)
@@ -785,6 +797,19 @@ def aggregate_priority_weight(
     return weight
 
 
+# Deadband threshold for ``clamp_to_constraints``: utilization must
+# exceed this fraction of the feasible range before clamping kicks in.
+# A 5%-bounded voltage envelope (±5% around 1.0 pu) means utilization
+# values up to ~0.5 are everyday-normal operating drift, not a sign of
+# stress.  The original linear-from-zero formula shed loads to 50 % of
+# rated demand at vm_pu=1.025 pu (perfectly normal) — that's the source
+# of the priority-inversion observed on simbench_lv (tier-1 critical
+# load served at 65 % while tier-6 loads at 100 %, because tier-1
+# happened to sit in a slightly higher-voltage neighbourhood).  The
+# deadband restores the intent of "near-violation, throttle".
+_CLAMP_UTILIZATION_DEADBAND: float = 0.85
+
+
 def clamp_to_constraints(
     setpoint: float,
     obs: dict,
@@ -792,16 +817,22 @@ def clamp_to_constraints(
 ) -> float:
     """Clamp a proposed setpoint so it stays within local constraint bounds.
 
-    This implements the "Conservative feasibility margins" MUST-requirement
-    from improvements.txt §5.
+    Conservative-feasibility helper (improvements.txt §5): when a local
+    grid measurement is approaching a hard bound, reduce the proposed
+    setpoint to avoid actuating a violation.
 
-    The clamping factor is derived from the constraint utilization:
-    ``allowed_fraction = 1 - utilization``.  When a constraint variable is
-    at the centre of its feasible range (utilization = 0), the full
-    capacity is available.  As the variable approaches a bound
-    (utilization → 1), the allowed fraction shrinks linearly to zero.
-    This gives a smooth, monotonically decreasing response that
-    degrades gracefully rather than switching between discrete steps.
+    Activates only past the ``_CLAMP_UTILIZATION_DEADBAND`` — utilization
+    levels below that represent normal operating drift inside the
+    designed ±5 % LV envelope, not stress.  Above the deadband, the
+    allowed fraction ramps linearly to zero:
+
+        allowed = (1 - util) / (1 - DEADBAND)   for util ∈ [DEADBAND, 1]
+        allowed = 1.0                            for util < DEADBAND
+
+    Without the deadband, normal LV voltage variation (vm_pu=1.02-1.03)
+    cuts every load to 50-70 % of cap — completely overriding the
+    priority-aware gossip waterfall.  Confirmed root cause of the
+    priority-invariant failure on task-0 simbench_lv.
     """
     from scare.base.model import SECTOR_CONSTRAINTS
 
@@ -810,14 +841,22 @@ def clamp_to_constraints(
     if cap == 0.0:
         return setpoint
 
+    deadband = _CLAMP_UTILIZATION_DEADBAND
+    width = max(1e-9, 1.0 - deadband)
+
     # Determine the tightest constraint across all local variables.
     tightest_fraction = 1.0
     for var, (lo, hi) in bounds.items():
         if var not in obs:
             continue
         val = float(obs[var])
+        if not math.isfinite(val):
+            continue
         util = constraint_utilization(val, lo, hi)
-        allowed = max(0.0, 1.0 - util)
+        if util <= deadband:
+            allowed = 1.0
+        else:
+            allowed = max(0.0, (1.0 - util) / width)
         tightest_fraction = min(tightest_fraction, allowed)
 
     if tightest_fraction < 1.0:

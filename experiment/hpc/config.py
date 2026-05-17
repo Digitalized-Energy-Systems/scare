@@ -191,16 +191,23 @@ class RuntimePlan:
     failure_delay_s_max: float = 2.0
     write_timeseries: bool = True
     write_trajectories: bool = False
+    # Claims that flip task status to ``claims_failed`` when they don't
+    # pass.  Default set covers the two chapter-claim invariants we
+    # cannot silently violate without invalidating the headline numbers.
+    fatal_claims: tuple[str, ...] = ("priority_invariant", "monotonic_progress")
 
     @classmethod
     def from_config_json(cls, path: Path) -> "RuntimePlan":
         data = json.loads(Path(path).read_text())
+        fatal = data.get("fatal_claims")
         return cls(
             simulation_duration_s=float(data.get("simulation_duration_s", 30.0)),
             task_timeout_s=float(data.get("task_timeout_s", 1500.0)),
             failure_delay_s_max=float(data.get("failure_delay_s_max", 2.0)),
             write_timeseries=bool(data.get("write_timeseries", True)),
             write_trajectories=bool(data.get("write_trajectories", False)),
+            fatal_claims=tuple(fatal) if fatal is not None
+                         else ("priority_invariant", "monotonic_progress"),
         )
 
 

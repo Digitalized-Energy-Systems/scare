@@ -11,6 +11,7 @@ serialised straight into ``result.json`` and aggregated downstream.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -22,6 +23,8 @@ from scare.base.util import (
     obs_setpoint,
     sector_from_grid,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Priority-tier weight schedule.  Mirrors the chapter's ``w(π) = 2^(P − π)``
@@ -419,6 +422,16 @@ def restoration_breakdown(
         disc_p = float(tp.get("demand_disconnected", 0.0))
         total_loss = max(0.0, s_b - s_p)
         disconnect_lost = max(0.0, min(disc_p, total_loss))
+        # ``disconnect_lost > total_loss`` would imply we lost more to
+        # physical disconnect than the total drop — arithmetically
+        # impossible.  Log + clamp so the inversion is visible instead
+        # of silently masked by the outer min(1, …).
+        if disc_p > total_loss + 1e-12:
+            logger.warning(
+                "Tier %s: demand_disconnected=%.4g > total_loss=%.4g; "
+                "clamping disconnect_lost to total_loss.",
+                tier, disc_p, total_loss,
+            )
         agent_shed = max(0.0, total_loss - disconnect_lost)
         ratio = s_p / s_b if s_b > 1e-12 else (1.0 if d_b < 1e-12 else 0.0)
         # Agent-only ratio: how would tier i look if disconnection

@@ -25,10 +25,10 @@ classifiers = [
 ]
 keywords = ["multi-agent", "energy systems", "resilience", "restoration", "ADMM"]
 dependencies = [
-    "mango-agents @ file:///home/rschrage/git/mango",
-    "mango-energy-environments @ file:///home/rschrage/git/mango-energy-environments",
-    "distributed-resource-optimization @ file:///home/rschrage/git/mango-optimization",
-    "monee @ file:///home/rschrage/git/monee",
+    "mango-agents @ file:///home/rico/git/mango",
+    "mango-energy-environments @ file:///home/rico/git/mango-energy-environments",
+    "distributed-resource-optimization @ file:///home/rico/git/distributed-resource-optimization",
+    "monee @ file:///home/rico/git/monee",
     "plotly>=5.0",
     "networkx>=3.0",
     "numpy>=1.24",
@@ -46,7 +46,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/OFFIS-DAI/CARE"
+Repository = "https://github.com/Digitalized-Energy-Systems/scare"
 
 [tool.setuptools.packages.find]
 where = ["src"]

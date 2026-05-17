@@ -138,6 +138,19 @@ class RestorationConfiguration:
     # too short loses alternatives, too long delays restoration.
     reconfig_path_window_s: float = 1.5
 
+    # Holon ADMM iteration cap.  50 was chosen historically so concurrent
+    # holon ADMMs across sectors don't block discrete-time progress, but
+    # smoke runs show non-convergence at this cap on simbench_lv (residuals
+    # 1e-3 to 2e-2).  Exposed so the campaign can trade convergence quality
+    # against wallclock cost.
+    holon_admm_max_iters: int = 50
+
+    # ADMM absolute residual tolerance — convergence quality the holon
+    # coordinator stops at when |r| < this.  The package default 1e-4 is
+    # tight; relaxing to 1e-3 lets typical scenarios converge inside the
+    # 50-iter cap without changing the qualitative behaviour.
+    holon_admm_abs_tol: float = 1e-3
+
     # ----------------------------------------------------------------
     # Sensitivity-sweep tunables
     # ----------------------------------------------------------------
@@ -189,6 +202,48 @@ class RestorationConfiguration:
     # Off by default — high volume; turned on for the comm-cost
     # campaign only.
     record_messages: bool = False
+
+    # ----------------------------------------------------------------
+    # Islanding / microgrid configuration (opt-in)
+    # ----------------------------------------------------------------
+    #
+    # When set, monee's ``enable_islanding`` is applied at grid-build
+    # time so that any ``GridFormingMixin`` child can lead an island
+    # for its carrier when the main grid-former is unreachable.  The
+    # default is ``None`` — only ``ExtPowerGrid`` / ``ExtHydrGrid``
+    # form a grid, which mirrors realistic LV networks where black-
+    # start hardware is rare.  The microgrid scenarios opt in by
+    # passing the per-carrier dict here.
+    #
+    # Schema is a per-carrier mapping ``{"electricity": True,
+    # "water": True, "gas": True}`` (None or missing carrier means
+    # "leave that carrier unchanged").  Values can also be a custom
+    # ``IslandingMode`` instance for fine-tuning.
+    #
+    # ``frozenset`` of carriers is used at the dataclass-level so the
+    # frozen-dataclass invariant is preserved; a richer mapping can
+    # be plumbed via a separate hashable wrapper if/when scenarios
+    # need it.
+    microgrid_islanding_carriers: frozenset[str] = field(default_factory=frozenset)
+
+    # When True, the grid factory tries to convert eligible
+    # PowerGenerator / HeatGenerator / Source children into the
+    # corresponding ``GridForming*`` types so that monee's islanding
+    # extension actually has grid-formers to anchor sub-islands on.
+    # Off by default; setting True alongside ``microgrid_islanding_
+    # carriers`` is the "what-if every unit could black-start" upper-
+    # bound scenario.  Use ``microgrid_grid_former_aids`` instead to
+    # mark specific units only.
+    microgrid_promote_all_generators: bool = False
+
+    # Aids (or node-ids) of children to promote to grid-formers for
+    # their sector.  Empty means "no specific units"; if combined
+    # with ``microgrid_promote_all_generators=True``, that flag wins.
+    # When neither is set but ``microgrid_islanding_carriers`` is non-
+    # empty, the LP can still benefit (e.g.\ adjacent sub-islands
+    # connected through the surviving Ext*Grid) but distant sub-
+    # islands stay ignored exactly as before.
+    microgrid_grid_former_aids: tuple[str, ...] = field(default_factory=tuple)
 
 
 def default_config() -> RestorationConfiguration:

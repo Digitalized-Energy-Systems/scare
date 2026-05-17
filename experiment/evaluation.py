@@ -44,8 +44,12 @@ async def evaluate_net(
         baseline_net = solve_load_shedding_optimization(monee_net)
         baseline_perf = calc_general_resilience_performance(baseline_net)
     except Exception as exc:
-        logger.warning("Baseline optimisation failed: %s", exc)
-        baseline_perf = 0.0
+        # Don't swallow into 0.0 — the downstream performance ratio
+        # ``(baseline_perf + ε) / (mas_perf + ε)`` would mask the
+        # failure as "MAS infinitely worse than baseline".  Surface the
+        # error so the caller can decide whether to skip the scenario.
+        logger.error("Baseline optimisation failed: %s", exc)
+        raise
 
     world = create_restoration_scenario_world(
         monee_net,

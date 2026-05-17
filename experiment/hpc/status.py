@@ -48,7 +48,7 @@ def report(campaign_dir: Path, show_failed: int) -> None:
     print(_format_table(
         ["status", "count", "%"],
         [[s, str(overall.get(s, 0)), pct(overall.get(s, 0))]
-         for s in ("ok", "error", "timeout", "missing")],
+         for s in ("ok", "claims_failed", "error", "timeout", "killed", "missing")],
     ))
 
     by_grid: dict[str, Counter] = defaultdict(Counter)
@@ -63,14 +63,20 @@ def report(campaign_dir: Path, show_failed: int) -> None:
         rows.append([
             g, str(total),
             str(counts.get("ok", 0)),
+            str(counts.get("claims_failed", 0)),
             str(counts.get("error", 0)),
             str(counts.get("timeout", 0)),
+            str(counts.get("killed", 0)),
             str(counts.get("missing", 0)),
         ])
-    print(_format_table(["grid", "total", "ok", "error", "timeout", "missing"], rows))
+    print(_format_table(
+        ["grid", "total", "ok", "claims_failed", "error",
+         "timeout", "killed", "missing"], rows,
+    ))
 
     if show_failed > 0:
-        failed = [t for t in tasks if statuses[t.task_id] in ("error", "timeout")]
+        failed = [t for t in tasks
+                  if statuses[t.task_id] in ("error", "timeout", "killed")]
         if failed:
             print()
             print(f"Last {min(show_failed, len(failed))} failed task(s):")

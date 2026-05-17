@@ -200,6 +200,21 @@ class _GossipState:
     counter: int
     current_delta: float
     starting_setpoint: float
+    # Feasible-δ box, anchored to the *starting* setpoint of the
+    # negotiation.  Recomputing dmin/dmax from ``obs_min_max`` on every
+    # primal step creates a chicken-and-egg loop: when the agent's own
+    # regulate from the previous step flips the LP's reported sp from
+    # cap → 0, the box flips from [−cap, 0] → [0, cap]; the next primal
+    # step then computes ``δ ≈ 0`` (clamped to the new dmax-from-above
+    # side), apply_setpoint(starting + 0) = starting → factor=1.0; sp
+    # flips back to cap, box flips back, δ=−cap → factor=0.  Result is
+    # a 40 ms-period oscillation between full-shed and full-load, with
+    # net gossip progress = 0.  Confirmed root cause of child-194's
+    # bang-bang behaviour on gas in task-0 simbench_lv.  Anchoring to
+    # the starting state turns δ into a true cumulative change and
+    # keeps the per-step box constant across the negotiation.
+    dmin_starting: float = 0.0
+    dmax_starting: float = 0.0
     # Shared ledger of per-agent contributions, merged across received
     # messages by taking the entry with the highest counter per agent.
     # This replaces the aggregate digest that double-counted in cycles.
@@ -362,6 +377,24 @@ class EnergyBalanceNegotiator(Role):
         self._proactive_util: dict[str, float] = {}
 
     def setup(self) -> None:
+        # Register this aid as "gossip-capable" so other group members
+        # can route ``EnergyNegotiationMessage`` only to peers that will
+        # actually process it.  The registry lives on the shared
+        # ``behavior`` (sector → set of aids) and is consulted by
+        # ``_gossip_neighbours``.  PowerLine branch agents are joined
+        # to the same electricity groups for flex-query and line-
+        # overload-relief routing, but they do not have an
+        # EnergyBalanceNegotiator — without this filter the gossip
+        # token's deterministic next-hop frequently forwarded to a
+        # branch monitor that silently dropped the message, killing
+        # the gossip after one or two hops (see scenario-trace audit:
+        # ~60 % of failed gossips were token deaths at branches).
+        store = getattr(self.behavior, "_scare_gossip_capable", None)
+        if store is None:
+            store = {}
+            self.behavior._scare_gossip_capable = store
+        store.setdefault(self.sector, set()).add(self.context.aid)
+
         # Mango's handle_message dispatches synchronously, so async handlers
         # must be wrapped to schedule themselves via the agent scheduler.
         # This ensures the simulation's termination detection can track them.
@@ -738,10 +771,34 @@ class EnergyBalanceNegotiator(Role):
         the ``TrustLedger``), so first contact always succeeds; recovery
         is multiplicative on every received message and decay is linear
         in the silence interval scaled by the sector poll period.
+
+        Includes *every* live group neighbour — used for the flex-query
+        round (``AskEnergyMessage``) which branch agents reply to via
+        their stub.  For gossip token routing, use ``_gossip_neighbours``
+        instead so the token only travels among peers that subscribe to
+        ``EnergyNegotiationMessage``.
         """
         all_neighbours = topology_neighbors(self, tid="groups")
         now = self.context.current_timestamp
         return [a for a in all_neighbours if self._trust.is_live(str(a), now)]
+
+    def _gossip_neighbours(self) -> list:
+        """Live group neighbours that have an ``EnergyBalanceNegotiator``
+        of the same sector — i.e. agents that will actually process an
+        ``EnergyNegotiationMessage``.
+
+        PowerLine branch agents (line-loading-relief feature) are joined
+        to the electricity groups topology for the flex-query and
+        overload-relief routing they participate in, but they have a
+        ``GridConstraintMonitor`` in branch mode only — no
+        ``EnergyBalanceNegotiator``, so the gossip protocol dies on a
+        first-hop forward to them.  Filtering on registered gossip-
+        capable aids (see ``setup()``) keeps them in the community for
+        flex purposes while excluding them from token routing.
+        """
+        store = getattr(self.behavior, "_scare_gossip_capable", {})
+        capable = store.get(self.sector, set())
+        return [a for a in self._live_neighbours() if a.aid in capable]
 
     def _scored_neighbours(self, neighbours: list) -> list[float]:
         """Return the K-score for each neighbour in ``neighbours`` order."""
@@ -906,36 +963,62 @@ class EnergyBalanceNegotiator(Role):
         # actively present.
         self._constraint_violation_active = False
 
-        neighbours = self._live_neighbours()
+        # Gossip-only neighbour list: excludes group members without an
+        # EnergyBalanceNegotiator (e.g. PowerLine branch monitors added
+        # to electricity groups for the overload-relief feature).
+        # Including them as gossip targets kills the token on first
+        # forward — they have no handler for EnergyNegotiationMessage.
+        neighbours = self._gossip_neighbours()
         self._touch_neighbours(neighbours)
         nid = str(uuid4())
         self_key = str(self.context.addr)
 
         obs = self.behavior.observe(self.context.aid) or {}
         starting_sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
+        # Anchor the QP δ-box to the starting state for the whole
+        # negotiation — see _GossipState comment.  Recomputing this
+        # box per step from live obs caused a self-driven oscillation
+        # where the box's sign flipped each round the agent regulated
+        # itself.
+        dmin_start, dmax_start = obs_min_max(
+            obs, behavior=self.behavior, aid=self.context.aid
+        )
 
-        # Seed ``λ`` conservatively.  The original audit (P1-1) noted
-        # the first hop produces ``δ = clamp(a_i · 0, …) = 0`` — a
-        # wasted primal step.  A naive fix ``λ₀ = target / a_self``
-        # over-shoots wildly: with ``target ≈ -0.05`` and ``a_self = 2``
-        # (low-priority originator), ``λ₀ = -0.025``; the first
-        # recipient with ``a_r = 1024`` (tier 10) computes
-        # ``δ = -25.6``, clamps at the negative-shed bound, and *every*
-        # subsequent agent then also saturates because λ-decay is
-        # slow.  That destroys the priority waterfall — tier 1 ends up
-        # fully shed alongside tier 10.  Scale by a conservative
-        # ``Σ a_j`` proxy (group size × the *maximum* possible weight
-        # so the seed is upper-bounded even when ``a_self`` is the
-        # minimum weight):
+        # Seed ``λ`` so the originator's own first primal step makes
+        # meaningful progress while the dual update has room to fix
+        # under/over-shoots on subsequent hops.
+        #
+        # History:
+        #   * λ₀ = 0 wastes the first hop (δ = clamp(0, …) = 0).
+        #   * λ₀ = target / a_self over-shoots: a low-priority
+        #     originator (a_self=2) hands a huge λ to a high-priority
+        #     recipient (a_r=1024), saturating everyone.
+        #   * λ₀ = target / (a_max · n_seed) under-shoots so badly that
+        #     high-priority originators (target≈1e-3 MW, a_self=1024)
+        #     produced δ ≈ 1e-4 — far below the threshold, so the
+        #     gossip ran for the full 100 hops without ever closing
+        #     the residual and got classified as ``abandoned``.  This
+        #     was the source of the 87 % abandonment rate observed on
+        #     simbench_lv.
+        #
+        # New rule: aim the originator's own first-step δ at
+        # ``target / n_seed`` (its fair share), which yields
+        # ``λ₀ = target / (n_seed · a_self)``.  The box clamp on each
+        # recipient bounds over-shoot regardless of how aggressive
+        # ``a_self`` is, and the dual update on the originator-step's
+        # error term self-corrects within a couple of hops.
         P = _PRIORITY_TIERS
-        # Maximum possible priority weight across both regimes
-        # (matches ``_qp_priority_weight`` upper bound).
-        a_max = 2.0 ** (P + 1)
-        # Heuristic group size for seeding (real Σ a_j is unknown at
-        # send time; corrected by the dual update on every hop).
-        n_seed = max(8, len(neighbours) + 1)
-        sigma_a_est = max(a_max * n_seed, 1.0)
-        lambda_seed = target / sigma_a_est
+        target_sign = 1 if target > 0 else (-1 if target < 0 else 0)
+        a_self = max(self._qp_priority_weight(target_sign), 1.0)
+        n_seed = max(2, len(neighbours) + 1)
+        lambda_seed = target / (n_seed * a_self)
+        # Defensive cap against pathological tier combinations: clamp
+        # |λ₀| to ``|target|`` so even a tier-1 originator with
+        # a_self = 2^P cannot inject an unbounded step.
+        if lambda_seed > abs(target):
+            lambda_seed = abs(target)
+        elif lambda_seed < -abs(target):
+            lambda_seed = -abs(target)
 
         self._gossip = _GossipState(
             negotiation_id=nid,
@@ -943,6 +1026,8 @@ class EnergyBalanceNegotiator(Role):
             counter=0,
             current_delta=0.0,
             starting_setpoint=starting_sp,
+            dmin_starting=dmin_start,
+            dmax_starting=dmax_start,
             memory={self_key: (0.0, 0, self.priority, False)},
             is_originator=True,
             dual_lambda=lambda_seed,
@@ -1101,6 +1186,9 @@ class EnergyBalanceNegotiator(Role):
                     group_size=len(self._gossip.memory),
                 )
             obs = self.behavior.observe(self.context.aid) or {}
+            init_dmin, init_dmax = obs_min_max(
+                obs, behavior=self.behavior, aid=self.context.aid
+            )
             self._gossip = _GossipState(
                 negotiation_id=nid,
                 target=message.negotiation_target,
@@ -1109,6 +1197,8 @@ class EnergyBalanceNegotiator(Role):
                 starting_setpoint=obs_setpoint(
                     obs, behavior=self.behavior, aid=self.context.aid
                 ),
+                dmin_starting=init_dmin,
+                dmax_starting=init_dmax,
                 memory=dict(message.memory),
                 dual_lambda=getattr(message, "dual_lambda", 0.0),
             )
@@ -1145,7 +1235,13 @@ class EnergyBalanceNegotiator(Role):
         target = self._gossip.target
         obs = self.behavior.observe(self.context.aid) or {}
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
-        dmin, dmax = obs_min_max(obs, behavior=self.behavior, aid=self.context.aid)
+        # Use the gossip-anchored δ-box (captured at the start of the
+        # negotiation), not a fresh per-step ``obs_min_max``.  The latter
+        # tracks the LP's current sp, which flips after the agent's own
+        # previous regulate — re-reading it caused the self-driven
+        # bang-bang oscillation on child-194 (gas, simbench_lv).
+        dmin = self._gossip.dmin_starting
+        dmax = self._gossip.dmax_starting
 
         prev_own = self._gossip.memory.get(self_key, (0.0, 0, self.priority, False))[0]
         total_delta = sum(v[0] for v in self._gossip.memory.values())
@@ -1300,7 +1396,13 @@ class EnergyBalanceNegotiator(Role):
         # than spinning to k_max.
         stalled = self._update_gap_window_and_check_stall(open_gap, target)
 
-        neighbours = self._live_neighbours()
+        # Next-hop selection over gossip-capable peers only.  A token
+        # forwarded to a member without an EnergyBalanceNegotiator
+        # (e.g. a PowerLine branch monitor in an electricity group) is
+        # silently dropped by mango — the token vanishes, the gossip
+        # times out.  Audit on simbench_lv showed ~60 % of failed
+        # gossips were token deaths at branch hops.
+        neighbours = self._gossip_neighbours()
 
         if stalled:
             await self._finish_negotiation_stalled()
@@ -1393,7 +1495,11 @@ class EnergyBalanceNegotiator(Role):
             NegotiationFinishedEvent(new_setpoint=new_sp, sector=self.sector)
         )
 
-        neighbours = self._live_neighbours()
+        # Broadcast to gossip-capable peers only — branch monitors have
+        # no NegotiationFinishedEvent handler so sending to them just
+        # wastes a scheduled message that the simulation-termination
+        # tracker has to wait on.
+        neighbours = self._gossip_neighbours()
 
         # Broadcast convergence to all live group neighbours so each can
         # emit its own local event.  Pruned neighbours are skipped —
@@ -1411,6 +1517,29 @@ class EnergyBalanceNegotiator(Role):
         for addr in neighbours:
             await self.context.send_message(finished_msg, receiver_addr=addr)
 
+        # Layer-2 reactive trigger: also notify holon peers.  Only group
+        # leaders are injected into the ``holons`` topology, so this
+        # broadcast naturally targets the right audience — the holon
+        # leader (and its same-sector siblings) sees that this group
+        # has finished its intra-group balance pass and can schedule a
+        # holon-level ADMM round to redistribute any residual.  Without
+        # this notification, ``HolonicCommunityRole._on_member_finished``
+        # never fires reactively (it only listens for send_message
+        # arrivals, and the groups-topology broadcast above never
+        # reaches another group's leader).  The priority-aware payload
+        # the holon needs is re-fetched fresh inside ``_try_rebalance``
+        # via ``AskForAvailableFlex`` so each member's post-gossip
+        # ``demand_by_priority`` / ``served_by_priority`` drives the
+        # cross-group ADMM's S-pull (see holonic._try_rebalance, where
+        # priority_shares becomes the negative cost steering allocation
+        # toward groups with high-priority unserved demand).
+        try:
+            holon_peers = topology_neighbors(self, tid="holons")
+        except KeyError:
+            holon_peers = []
+        for addr in holon_peers:
+            await self.context.send_message(finished_msg, receiver_addr=addr)
+
         # Leader also notifies CP connectors
         if topology_characteristic(self, tid="groups") == "leader":
             cp_connectors = list(topology_connectors(self, tid="groups"))
@@ -1426,26 +1555,45 @@ class EnergyBalanceNegotiator(Role):
         self._active = False
 
     def flush_pending(self) -> None:
-        """Record any still-active gossip as ``abandoned`` in the diary.
+        """Record any still-active gossip as ``abandoned`` (or ``stalled``
+        when meaningful progress was made) in the diary.
 
         Called from the scenario-level world teardown so a negotiation
         that was in flight when the simulation ended doesn't disappear
         silently from the per-event accounting.  After this call the
         ledger satisfies ``started == finished + timed_out + cancelled
-        + abandoned`` for every nid.
+        + abandoned + stalled`` for every nid.
+
+        Distinguishing ``stalled`` (progress made but cut short by
+        sim-end) from ``abandoned`` (no movement) is important: the
+        previous behaviour lumped both under ``abandoned``, producing
+        the 87 %-abandonment headline on 5 s smoke runs even though
+        most of those gossips were actively closing the residual when
+        the clock ran out.
         """
         if self._gossip is None:
             return
         if self._gossip.is_originator:
             total_delta = sum(v[0] for v in self._gossip.memory.values())
+            target = self._gossip.target
+            residual = target - total_delta
+            # Progress threshold: closed ≥ 30 % of the target's magnitude.
+            # ``stalled`` is a soft terminal that still counts toward the
+            # diary invariant but signals "in-flight at sim-end" rather
+            # than "never started moving".
+            if abs(target) > 1e-12:
+                progress = (abs(target) - abs(residual)) / abs(target)
+            else:
+                progress = 1.0
+            event = "stalled" if progress >= 0.3 else "abandoned"
             record_negotiation(
                 t=self.context.current_timestamp,
                 aid=self.context.aid,
                 sector=self.sector.value,
                 nid=self._gossip.negotiation_id,
-                event="abandoned",
-                target=self._gossip.target,
-                residual=self._gossip.target - total_delta,
+                event=event,
+                target=target,
+                residual=residual,
                 group_size=len(self._gossip.memory),
             )
         self._gossip = None
@@ -1488,6 +1636,7 @@ class EnergyBalanceNegotiator(Role):
         total_shedded = 0.0
         flex_by_sector: dict[str, float] = {}
         balance_by_sector: dict[str, float] = {}
+        unmet_by_sector: dict[str, float] = {}
         demand_by_priority: dict[int, float] = {}
         served_by_priority: dict[int, float] = {}
         for aid in member_aids:
@@ -1507,6 +1656,16 @@ class EnergyBalanceNegotiator(Role):
                 prio = obs_priority(obs, behavior=self.behavior, aid=aid)
                 demand_by_priority[prio] = demand_by_priority.get(prio, 0.0) + abs(cap)
                 served_by_priority[prio] = served_by_priority.get(prio, 0.0) + abs(sp)
+                # Unmet demand: rated cap minus actual sp.  Captures the
+                # silent disconnect-loss case where monee's ``find_ignored_
+                # nodes`` sets regulation=0 on a load that has no path to a
+                # grid-former.  Without this the CP layer cannot see the
+                # cross-sector deficit and skips ADMM with same-sign T.
+                unmet = abs(cap) - abs(sp)
+                if unmet > 1e-12:
+                    unmet_by_sector[sec_key] = (
+                        unmet_by_sector.get(sec_key, 0.0) + unmet
+                    )
             if sector != self.sector:
                 continue
             total_flex += available
@@ -1523,6 +1682,7 @@ class EnergyBalanceNegotiator(Role):
             balance_by_sector=balance_by_sector,
             demand_by_priority=demand_by_priority,
             served_by_priority=served_by_priority,
+            unmet_by_sector=unmet_by_sector,
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 

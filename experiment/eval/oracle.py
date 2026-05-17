@@ -164,6 +164,30 @@ def run_oracle(
     }
 
 
+_BASELINE_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _baseline_cache_key(
+    grid_name: str,
+    scenario: dict[str, Any] | None,
+    priorities: dict[str, int] | None,
+) -> str:
+    """Stable, hashable key for the baseline-LP cache.
+
+    Same grid + scenario + priorities → identical LP → identical result;
+    every task in a campaign rebuilds and re-solves redundantly without
+    this cache.  JSON with sorted keys keeps the key stable across
+    re-orderings of equivalent dicts.
+    """
+    import json
+    payload = {
+        "grid": grid_name,
+        "scenario": scenario or {},
+        "priorities": priorities or {},
+    }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
 def compute_baseline_served(
     grid_name: str,
     *,
@@ -186,7 +210,18 @@ def compute_baseline_served(
     network's variable state; we cannot reuse the same instance for
     both the baseline and the post-failure run without confusing the
     Pyomo solver.
+
+    Result cached in-process by (grid, scenario, priorities): every
+    task in a campaign with identical inputs reuses the prior LP
+    solve, saving the rebuild + solve wallclock.  Cache hits return
+    a deep copy so callers can mutate freely.
     """
+    cache_key = _baseline_cache_key(grid_name, scenario, priorities)
+    cached = _BASELINE_CACHE.get(cache_key)
+    if cached is not None:
+        import copy
+        return copy.deepcopy(cached)
+
     from experiment.restoration import GRIDS
 
     if grid_name not in GRIDS:
@@ -222,13 +257,36 @@ def compute_baseline_served(
                 if k in scenario
             }
             apply_line_stress(fresh, **kwargs)
+        elif kind == "microgrid":
+            # Baseline LP must use the same islanding configuration as
+            # the simulation-time LP, otherwise the no-failure baseline
+            # would be computed without islanding and overstate the
+            # post-failure restoration loss.  Mirrors the runner's
+            # ``_apply_scenario`` microgrid branch.
+            from experiment.restoration import apply_microgrid_islanding
+
+            carriers = scenario.get(
+                "carriers", ("electricity", "water", "gas")
+            )
+            promote_all = bool(scenario.get("promote_all_generators", True))
+            former_aids = tuple(scenario.get("grid_former_aids", ()))
+            apply_microgrid_islanding(
+                fresh,
+                carriers=carriers,
+                promote_all_generators=promote_all,
+                grid_former_aids=former_aids,
+            )
         slack_budget_pct = scenario.get("slack_budget_pct")
         if slack_budget_pct is not None:
             from experiment.restoration import apply_slack_budget
 
             apply_slack_budget(fresh, float(slack_budget_pct))
     out = run_oracle(fresh, [], solver=solver, priorities=priorities)
-    return out["served"]
+    served = out["served"]
+    # Stash in cache for sibling tasks with identical inputs.
+    import copy
+    _BASELINE_CACHE[cache_key] = copy.deepcopy(served)
+    return served
 
 
 def compose_oracle_result(

@@ -189,6 +189,18 @@ class ReactivePowerDroopRole(Role):
         regulation = max(0.0, min(2.0, regulation))
         p_dispatched = p_mag * regulation
         s_sq = self.s_nom_mva * self.s_nom_mva
+        # ``p_dispatched > s_nom_mva`` means the active power exceeds the
+        # inverter's apparent-power rating — the capability circle
+        # collapses to 0 reactive power.  Should never happen on a
+        # well-sized inverter; if it does, surface it so the operator
+        # can investigate the rating mismatch instead of silently
+        # disabling Q support on the affected inverter.
+        if p_dispatched > self.s_nom_mva + 1e-9:
+            logger.warning(
+                "[%s] qv_droop: p_dispatched=%.4g > s_nom=%.4g (over-rated "
+                "real power); Q capability collapses to 0 this tick.",
+                self.context.aid, p_dispatched, self.s_nom_mva,
+            )
         circle_q = max(0.0, math.sqrt(max(0.0, s_sq - p_dispatched * p_dispatched)))
         # Apply the displacement-factor envelope (VDE-AR-N 4105 §5.7.2).
         # |tan(φ_min)| = √(1 − cos²) / cos.

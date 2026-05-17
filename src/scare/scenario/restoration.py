@@ -70,7 +70,11 @@ _SECTOR_GRID_MATCH: dict[Sector, str] = {
     Sector.HEAT: "water",
 }
 
-_CP_BRANCH_TYPES = ("powertogasmodel", "gastopower", "chpmodel", "heatexchangermodel")
+# NB: ``model.is_cp()`` is the only authoritative check.  Earlier
+# revisions kept a substring-matcher fallback against names like
+# ``"powertogasmodel"`` — but monee's actual class names lack the
+# ``"model"`` suffix (``PowerToGas`` / ``Chp`` / ``GasToPower``), so
+# that branch never matched and was inert defensive code.  Removed.
 
 
 def _branch_sector_str(branch: Any, monee_net: Any) -> str:
@@ -107,9 +111,7 @@ def _model_type_name(branch) -> str:
 
 
 def _is_cp_branch(branch) -> bool:
-    return branch.model.is_cp() or any(
-        t in _model_type_name(branch) for t in _CP_BRANCH_TYPES
-    )
+    return branch.model.is_cp()
 
 
 def _maybe_register_slack(behavior: Any, aid: str, child: Any) -> None:
@@ -859,7 +861,12 @@ def _build_topologies(
             mark_as_connector(leader, connector_type=sector.value)
             if config.enable_holonic:
                 leader.add_role(
-                    HolonicCommunityRole(sector, max_holon_size=config.holon_max_size)
+                    HolonicCommunityRole(
+                        sector,
+                        max_holon_size=config.holon_max_size,
+                        admm_max_iters=config.holon_admm_max_iters,
+                        admm_abs_tol=config.holon_admm_abs_tol,
+                    )
                 )
             leader.add_role(IslandingFallbackRole(behavior, sector))
 

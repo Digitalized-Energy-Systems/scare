@@ -26,7 +26,9 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import random
+import signal
 import sys
 import time
 import traceback
@@ -59,7 +61,19 @@ class _SolverFailureCounter(logging.Filter):
     non-ok warnings (Gurobi stopping at gap/time limit etc).  ``count``
     is the union for backwards-compatible reporting; the split is
     available via ``infeasible_count`` and ``warning_count``.
+
+    Also catches Gurobi / Pyomo exception strings that escape the
+    monee.solver.pyo logger (license errors, host-id mismatches, env
+    initialization failures) so the aggregator can distinguish solver
+    environment issues from algorithm bugs.
     """
+
+    _SOLVER_ERROR_MARKERS: tuple[str, ...] = (
+        "GurobiError",
+        "HostID mismatch",
+        "License",  # Gurobi LicenseError
+        "Pyomo solve infeasible",
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -75,6 +89,12 @@ class _SolverFailureCounter(logging.Filter):
             self.infeasible_count += 1
             self.count += 1
         elif "returned non-ok status" in msg:
+            self.warning_count += 1
+            self.count += 1
+        elif any(marker in msg for marker in self._SOLVER_ERROR_MARKERS):
+            # Gurobi env / license / host-id errors do not go through the
+            # monee.solver.pyo "infeasible" pathway, but they are solver
+            # failures from the campaign's POV.
             self.warning_count += 1
             self.count += 1
         return True
@@ -409,6 +429,17 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
     """
     scenario = task.scenario or {}
     kind = scenario.get("kind", "clean")
+    _KNOWN_KINDS = {"clean", "cold_day", "pv_peak", "line_stress", "microgrid"}
+    if kind not in _KNOWN_KINDS:
+        # Silently passing unknown kinds through used to be the rule —
+        # but a typo (``cold day`` vs ``cold_day``) then produced a
+        # clean run with no warning.  Surface it so the campaign author
+        # can correct the config.
+        logger.warning(
+            "Unknown scenario kind %r (known: %s) — falling through to "
+            "no-mutation behaviour.  Check the campaign config for typos.",
+            kind, sorted(_KNOWN_KINDS),
+        )
     if kind == "cold_day":
         from experiment.restoration import apply_cold_day
 
@@ -439,6 +470,31 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         }
         apply_line_stress(net, **kwargs)
         logger.info("Applied line_stress scenario: %s", kwargs or "<defaults>")
+    elif kind == "microgrid":
+        # Microgrid / islanding scenario.  Opt in to monee's islanding
+        # extension AND promote eligible generator-class children to
+        # ``GridForming*`` so the LP has reference units to anchor sub-
+        # islands on when the main slack is unreachable.  Without
+        # promotion, ``enable_islanding`` is a no-op on stock simbench
+        # nets (no native GridFormingMixin children); promotion is
+        # the practical way to make the extension exercise something.
+        from experiment.restoration import apply_microgrid_islanding
+
+        carriers = scenario.get(
+            "carriers", ("electricity", "water", "gas")
+        )
+        promote_all = bool(scenario.get("promote_all_generators", True))
+        former_aids = tuple(scenario.get("grid_former_aids", ()))
+        counts = apply_microgrid_islanding(
+            net,
+            carriers=carriers,
+            promote_all_generators=promote_all,
+            grid_former_aids=former_aids,
+        )
+        logger.info(
+            "Applied microgrid scenario: carriers=%s promote_all=%s promoted=%s",
+            list(carriers), promote_all, counts,
+        )
 
     # Operator slack-budget policy — orthogonal to ``kind`` so any
     # scenario kind can carry one.  Applied AFTER any kind-specific
@@ -512,7 +568,7 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     logger.info("Slurm: job=%s array_task=%s host=%s",
                 os.environ.get("SLURM_JOB_ID"),
                 os.environ.get("SLURM_ARRAY_TASK_ID"),
-                os.environ.get("HOSTNAME") or os.uname().nodename)
+                os.environ.get("HOSTNAME") or platform.node())
 
     _seed_everything(task.seed)
     # Toggle per-aid trajectory logging for the whole task run; off by
@@ -545,6 +601,21 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
     }
     exit_code = EXIT_ERROR
+    claims: dict[str, Any] | None = None
+
+    # SIGTERM handler — converts the signal into a Python exception so the
+    # ``finally`` block below runs and writes ``status.json``.  Without
+    # this, ``timeout`` (SIGTERM) + grace + SIGKILL leaves no trace of the
+    # task, and the aggregator silently drops it.  SIGKILL is uncatchable
+    # by design but we honour the SIGTERM grace window.
+    _prev_term = signal.getsignal(signal.SIGTERM)
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt("SIGTERM received — emergency shutdown")
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        # Not main thread or otherwise restricted — best-effort only.
+        _prev_term = None
 
     # Pre-failure baseline.  Solve the no-failure LP on a fresh build
     # of this grid + scenario; result.json's ``outcomes.restoration``
@@ -659,8 +730,30 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 write_result_json(out_dir / "result.json", payload)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Claims validation failed: %s", exc)
-        status["status"] = "ok"
-        exit_code = EXIT_OK
+        # ``ok`` means the task didn't crash.  If any *fatal* claim
+        # failed (priority_invariant + monotonic_progress by default),
+        # escalate to ``claims_failed`` so the aggregator stops treating
+        # silent priority inversions as successful runs.  Callers can
+        # override the fatal set per-campaign via plan.fatal_claims.
+        fatal_claims = tuple(
+            getattr(plan, "fatal_claims",
+                    ("priority_invariant", "monotonic_progress"))
+        )
+        if claims:
+            failing = [
+                name for name in fatal_claims
+                if name in claims and not claims[name].get("passed", True)
+            ]
+        else:
+            failing = []
+        if failing:
+            logger.warning("Fatal claims failed: %s", failing)
+            status["status"] = "claims_failed"
+            status["failing_claims"] = failing
+            exit_code = EXIT_OK
+        else:
+            status["status"] = "ok"
+            exit_code = EXIT_OK
 
     except asyncio.TimeoutError:
         logger.error("Task timed out after %.0f s", plan.task_timeout_s)
@@ -668,6 +761,17 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         (out_dir / "exception.json").write_text(json.dumps({
             "type": "TimeoutError",
             "message": f"Exceeded plan.task_timeout_s={plan.task_timeout_s}",
+        }, indent=2))
+        exit_code = EXIT_TIMEOUT
+
+    except KeyboardInterrupt as exc:
+        # SIGTERM (or Ctrl-C) — record an explicit ``killed`` status so the
+        # aggregator can distinguish wallclock kill from ordinary error.
+        logger.error("Task killed: %s", exc)
+        status["status"] = "killed"
+        (out_dir / "exception.json").write_text(json.dumps({
+            "type": "KeyboardInterrupt",
+            "message": str(exc),
         }, indent=2))
         exit_code = EXIT_TIMEOUT
 
@@ -697,6 +801,11 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                     status["solver_failures"], exit_code)
         logging.getLogger().removeHandler(handler)
         handler.close()
+        if _prev_term is not None:
+            try:
+                signal.signal(signal.SIGTERM, _prev_term)
+            except (ValueError, OSError):
+                pass
 
     return exit_code
 

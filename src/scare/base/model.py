@@ -241,6 +241,14 @@ class AvailableFlexAnswer:
     # Keys are priority tiers (int, 1=highest); values are MW (or equivalent).
     demand_by_priority: dict[int, float] = field(default_factory=dict)
     served_by_priority: dict[int, float] = field(default_factory=dict)
+    # Unmet load per sector — captures load that the LP could not
+    # deliver (regulation forced to 0 by monee's disconnect handling,
+    # or otherwise shed).  Separate from ``balance_by_sector`` because
+    # ``balance`` reports actually-flowing setpoints (which collapse to
+    # zero on a disconnect, hiding the deficit).  The CP ADMM uses
+    # this so cross-sector help can be triggered when one sector has
+    # surplus and another has invisible-because-disconnected demand.
+    unmet_by_sector: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

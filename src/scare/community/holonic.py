@@ -93,11 +93,17 @@ class HolonicCommunityRole(Role):
         hebbian_eta: float = 0.25,
         hebbian_threshold: float = 0.35,
         hebbian_warmup_s: float = 12.0,
+        admm_max_iters: int = 50,
+        admm_abs_tol: float = 1e-3,
     ) -> None:
         super().__init__()
         self.sector = sector
         self.formation_period_s = formation_period_s
         self.max_holon_size = max_holon_size
+        # ADMM convergence knobs (configurable via RestorationConfiguration
+        # so campaigns can trade quality against wallclock cost).
+        self.admm_max_iters = admm_max_iters
+        self.admm_abs_tol = admm_abs_tol
         # ``rebalance_period_s`` is the *slow* background heartbeat — only
         # there to catch drift from timeseries inputs (load profiles,
         # supply temperatures) that change without firing any
@@ -232,11 +238,23 @@ class HolonicCommunityRole(Role):
         # to redistribute: each member has just resolved its
         # intra-group imbalance, leaving a residual that ADMM can
         # spread across the holon.
+        #
+        # Two subscriptions are needed.  ``subscribe_message`` catches
+        # broadcasts from *other* group leaders arriving over the
+        # holons topology (see balance.py ``_finish_negotiation``).
+        # ``subscribe_event`` catches the local-emit case where this
+        # agent's own ``EnergyBalanceNegotiator`` just finished its
+        # gossip (the same-agent emit_event/send_message buses are
+        # disjoint, so the message subscription alone misses the case
+        # where the holon leader IS the gossip originator).
         self.context.subscribe_message(
             self,
             _wrap(self._on_member_finished),
             lambda msg, meta: isinstance(msg, NegotiationFinishedEvent)
             and msg.sector == self.sector,
+        )
+        self.context.subscribe_event(
+            self, NegotiationFinishedEvent, self._on_member_finished_local
         )
         if self.enable_hebbian_formation:
             self.context.subscribe_message(
@@ -490,18 +508,14 @@ class HolonicCommunityRole(Role):
         else:
             self._rebalance_active = False
 
-    async def _on_member_finished(
-        self, message: NegotiationFinishedEvent, meta: dict
-    ) -> None:
-        """A member group finished its balance gossip — try an
-        inter-group rebalance now to spread the post-gossip residual.
-
-        Throttled by ``rebalance_min_gap_s`` (the fast feedback-loop
-        fuse) — not by the slow periodic heartbeat — so reactive
-        triggers respond promptly to genuine events while still
-        breaking the holon→member→finished→holon feedback loop.
-        ``_try_rebalance`` also self-gates on holon membership /
-        leader status / not-currently-rebalancing.
+    def _maybe_schedule_rebalance(self) -> None:
+        """Shared throttle + gate logic for both the message- and
+        event-driven reactive paths.  Returns silently if any gate
+        rejects (not in a holon, not the holon leader, rebalance
+        already running, or within the ``rebalance_min_gap_s`` fuse
+        window).  ``_try_rebalance`` itself does its own holon-
+        membership and leader checks too, so this method is a fast
+        pre-filter that avoids scheduling a no-op task.
         """
         assignment = self.context.get_or_create_model(HolonicAssignment)
         if assignment.holon_id is None or assignment.parent_addr is not None:
@@ -512,6 +526,41 @@ class HolonicCommunityRole(Role):
         if now - self._last_rebalance_t < self.rebalance_min_gap_s:
             return
         self.context.schedule_instant_task(self._try_rebalance())
+
+    async def _on_member_finished(
+        self, message: NegotiationFinishedEvent, meta: dict
+    ) -> None:
+        """A holon-peer's group finished its balance gossip — try an
+        inter-group rebalance now to spread the post-gossip residual.
+
+        This is the *message* path: the finishing group's leader
+        broadcasts ``NegotiationFinishedEvent`` over the ``holons``
+        topology (see balance.py ``_finish_negotiation``), reaching
+        every same-sector holon peer.  The peer's holon leader (i.e.
+        ``parent_addr is None``) then schedules ADMM.
+
+        Throttled by ``rebalance_min_gap_s`` (the fast feedback-loop
+        fuse) — not by the slow periodic heartbeat — so reactive
+        triggers respond promptly to genuine events while still
+        breaking the holon→member→finished→holon feedback loop.
+        """
+        self._maybe_schedule_rebalance()
+
+    def _on_member_finished_local(
+        self, event: NegotiationFinishedEvent, _src: Any
+    ) -> None:
+        """The *local* path: when the holon leader is also the gossip
+        originator (very common — the lex-smallest leader in the chunk
+        is often the one that ends up running gossip), the leader's
+        own ``EnergyBalanceNegotiator`` emits ``NegotiationFinishedEvent``
+        via ``context.emit_event``.  Local emits travel on a different
+        bus than ``send_message``, so the message-path subscription
+        misses this case.  Subscribing via ``subscribe_event`` here
+        covers it.  Same throttle as ``_on_member_finished``.
+        """
+        if event.sector != self.sector:
+            return
+        self._maybe_schedule_rebalance()
 
     async def _handle_flex_answer(
         self, message: AvailableFlexAnswer, meta: dict
@@ -698,11 +747,14 @@ class HolonicCommunityRole(Role):
             actors.append(ADMMFlexActor(lb=lb, u=ub, C=C, d=d, S=S))
 
         coordinator = create_sharing_target_distance_admm_coordinator()
-        # Tight iter cap so concurrent holon ADMMs across sectors don't
-        # block discrete-time progress: 1000 is the package default and
-        # is wall-time prohibitive when several leaders rebalance per
-        # simulation step.
-        coordinator.max_iters = 50
+        # Iter cap and tolerance configured via RestorationConfiguration
+        # (plumbed through the role constructor in
+        # scenario/restoration.py).  Defaults: 50 iters @ abs_tol=1e-3 —
+        # relaxed from the package default 1000 / 1e-4 so concurrent
+        # holon ADMMs across sectors don't block discrete-time progress
+        # but loose enough that simbench_lv smoke runs converge.
+        coordinator.max_iters = int(self.admm_max_iters)
+        coordinator.abs_tol = float(self.admm_abs_tol)
         start_msg = create_admm_start(create_admm_sharing_data(total_T.tolist()))
 
         from scare.base.diagnostics import record_event

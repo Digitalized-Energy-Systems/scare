@@ -49,6 +49,17 @@ logger = logging.getLogger(__name__)
 # How many hops constraint state information propagates.
 _DEFAULT_MAX_HOPS = 3
 
+# Minimum change in the monitored value (post-normalisation, in
+# constraint-utilization units) that triggers a fresh broadcast.  Below
+# this, the value is considered stable and the previous broadcast still
+# represents network state.  Cuts redundant per-tick floods.
+_FORWARD_VALUE_TOL: float = 0.02
+
+# Minimum sim-time between re-broadcasts of an unchanged value.  Keeps
+# liveness ticks flowing through the trust ledger while preventing the
+# per-cycle flood that ``_forwarded.clear()`` used to enable.
+_FORWARD_FRESHNESS_S: float = 5.0
+
 # EMA smoothing factor for the local sensitivity estimate (dV / dP).
 # 0 = never update, 1 = replace with latest sample.  A low value keeps
 # noisy single samples from swinging the estimate, but high enough that
@@ -133,12 +144,27 @@ class GridConstraintMonitor(Role):
         # (origin_addr_str, variable) -> ConstraintStateMessage
         self._neighbour_state: dict[tuple[str, str], ConstraintStateMessage] = {}
 
-        # Deduplication: track which (origin, variable, hops_remaining)
-        # we have already forwarded to prevent loops in meshed topologies.
-        # Keyed by (origin_addr_str, variable); value is the lowest
-        # hops_remaining we have seen — we only forward if the incoming
-        # hops_remaining is higher (i.e. fresher / closer to origin).
-        self._forwarded: dict[tuple[str, str], int] = {}
+        # Deduplication: track which (origin, variable) we have already
+        # forwarded with the (best_hops_remaining, t_received, value)
+        # triple.  Two suppress rules combine to bound message volume
+        # without losing freshness:
+        #   1. We only forward an incoming copy if its ``hops_remaining``
+        #      strictly improves on what we last forwarded.
+        #   2. We only re-broadcast our own state if the value moved by
+        #      more than ``_FORWARD_VALUE_TOL`` *or* the freshness window
+        #      ``_FORWARD_FRESHNESS_S`` has elapsed.
+        # Earlier revisions cleared this dict every monitor cycle, which
+        # made each cycle re-flood the entire group with identical
+        # information — task 0 produced 119 480 ``ConstraintStateMessage``
+        # in 5 s on simbench_lv (≈ 24 k/s).  Per-cycle clearing is
+        # explicitly removed; freshness is governed by the rules above.
+        self._forwarded: dict[
+            tuple[str, str], tuple[int, float, float]
+        ] = {}
+        # When this agent last broadcast its OWN state, indexed by
+        # variable.  Used by ``_propagate_state`` to decide whether the
+        # local poll has produced a new-enough datum to flood again.
+        self._last_local_propagate: dict[str, tuple[float, float]] = {}
 
         # Track whether we already emitted a violation this cycle to
         # avoid flooding.
@@ -270,9 +296,10 @@ class GridConstraintMonitor(Role):
         bounds = SECTOR_CONSTRAINTS.get(self.sector, {})
         values = obs_constraint_values(obs, self.sector)
 
-        # Reset deduplication table each monitoring cycle so fresh
-        # information can propagate.
-        self._forwarded.clear()
+        # Deduplication state is now persistent across cycles — see
+        # ``_propagate_state`` / ``_handle_constraint_state`` for the
+        # value-delta + freshness-window suppression rules that replace
+        # the per-cycle ``clear()``.
 
         # Update local sensitivity estimate from own (P, V) history.
         self._update_sensitivity(obs)
@@ -389,6 +416,21 @@ class GridConstraintMonitor(Role):
     async def _propagate_state(
         self, variable: str, value: float, utilization: float
     ) -> None:
+        # Suppress re-broadcasts of an unchanged value unless the
+        # freshness window has elapsed (keeps trust-ledger liveness alive)
+        # OR the utilization moved by more than ``_FORWARD_VALUE_TOL``.
+        # Without this, every monitor cycle re-broadcasts the same value
+        # to every neighbour, swamping the network — task-0 baseline had
+        # 119 480 ConstraintStateMessages in 5 s on this path alone.
+        now = self.context.current_timestamp
+        prev = self._last_local_propagate.get(variable)
+        if prev is not None:
+            prev_t, prev_util = prev
+            stale = (now - prev_t) >= _FORWARD_FRESHNESS_S
+            changed = abs(utilization - prev_util) >= _FORWARD_VALUE_TOL
+            if not (stale or changed):
+                return
+
         origin = self.context.addr
         msg = ConstraintStateMessage(
             sector=self.sector,
@@ -399,7 +441,8 @@ class GridConstraintMonitor(Role):
             origin_addr=origin,
         )
         origin_key = (str(origin), variable)
-        self._forwarded[origin_key] = self.max_hops
+        self._forwarded[origin_key] = (self.max_hops, now, utilization)
+        self._last_local_propagate[variable] = (now, utilization)
 
         for addr in topology_neighbors(self, tid="groups"):
             await self.context.send_message(msg, receiver_addr=addr)
@@ -419,12 +462,23 @@ class GridConstraintMonitor(Role):
         self._neighbour_state[origin_key] = message
 
         # --- Deduplication ---
-        # Only forward if we haven't already forwarded a fresher copy
-        # (higher hops_remaining) from the same origin for this variable.
-        prev_hops = self._forwarded.get(origin_key)
-        if prev_hops is not None and message.hops_remaining <= prev_hops:
-            return  # already forwarded a fresher or equal copy
-        self._forwarded[origin_key] = message.hops_remaining
+        # Forward only if the incoming copy improves on what we've
+        # already forwarded for this (origin, variable): either
+        # ``hops_remaining`` is strictly larger (fresher / closer to
+        # origin), or the freshness window has elapsed, or the value
+        # moved by more than the tolerance.  Updated lazily; never
+        # cleared (the per-cycle clear caused the message flood).
+        prev = self._forwarded.get(origin_key)
+        if prev is not None:
+            prev_hops, prev_t, prev_util = prev
+            improves_hops = message.hops_remaining > prev_hops
+            stale = (now - prev_t) >= _FORWARD_FRESHNESS_S
+            changed = abs(message.utilization - prev_util) >= _FORWARD_VALUE_TOL
+            if not (improves_hops or stale or changed):
+                return
+        self._forwarded[origin_key] = (
+            message.hops_remaining, now, message.utilization,
+        )
 
         if message.hops_remaining <= 1:
             return  # TTL exhausted
@@ -695,7 +749,14 @@ class GridConstraintMonitor(Role):
             return
         if not self.behavior.has_action(self.context.aid, "regulate"):
             return
-        obs = self.behavior.observe(self.context.aid)
+        # ``observe`` raises ``AttributeError`` when the simulation hasn't
+        # run a solve yet (``_net_results`` is None on the very first
+        # scheduled tick).  Match the defensive pattern in ``_monitor``
+        # so the periodic task doesn't log 200+ tracebacks per run.
+        try:
+            obs = self.behavior.observe(self.context.aid)
+        except (AttributeError, KeyError):
+            return
         if not obs:
             return
 

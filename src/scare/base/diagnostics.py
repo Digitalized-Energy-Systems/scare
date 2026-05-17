@@ -18,7 +18,13 @@ from typing import Any, Deque
 
 logger = logging.getLogger(__name__)
 
-_MAX_ACTIONS = 64
+# Keep enough history to capture every regulate action across a typical
+# smoke run: 5 s sim × ~200 agents × a few regulate calls each easily
+# pushes past 64 (the original cap, which silently truncated child-1's
+# regulate trace during the priority-inversion investigation).  10k is
+# still well below 1 MB of memory and lets diagnostics.txt remain a
+# faithful audit log of every actuation.
+_MAX_ACTIONS = 10000
 _armed: bool = False
 _log: Deque["ActionRecord"] = deque(maxlen=_MAX_ACTIONS)
 

@@ -213,7 +213,7 @@ def read_manifest(campaign_dir: Path) -> list[TaskSpec]:
 
 
 def task_status(campaign_dir: Path, task: TaskSpec) -> str:
-    """Return ``ok|error|timeout|missing`` for a task on disk."""
+    """Return ``ok|claims_failed|error|timeout|killed|missing`` for a task on disk."""
     f = task_dir(campaign_dir, task.task_id) / "status.json"
     if not f.exists():
         return "missing"
@@ -237,18 +237,23 @@ def filter_task_ids(
     if mode == "all":
         return [t.task_id for t in tasks]
 
+    # ``claims_failed`` and ``ok`` both completed the simulation; only
+    # ``claims_failed`` carries a chapter-claim violation flag.  Treat
+    # both as "done" for re-run filtering so a claim regression doesn't
+    # cause a wholesale recompute.
+    completed = ("ok", "claims_failed")
     out: list[int] = []
     for t in tasks:
         s = task_status(campaign_dir, t)
         if mode == "missing" and s == "missing":
             out.append(t.task_id)
-        elif mode == "failed" and s == "error":
+        elif mode == "failed" and s in ("error", "killed"):
             out.append(t.task_id)
         elif mode == "timeout" and s == "timeout":
             out.append(t.task_id)
-        elif mode == "ok" and s == "ok":
+        elif mode == "ok" and s in completed:
             out.append(t.task_id)
-        elif mode == "incomplete" and s != "ok":
+        elif mode == "incomplete" and s not in completed:
             out.append(t.task_id)
     return out
 

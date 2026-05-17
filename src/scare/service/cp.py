@@ -112,13 +112,21 @@ class EnergyConverterRole(Role):
         )
 
     async def _handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
-        obs = self.behavior.observe(self.context.aid) or {}
+        try:
+            obs = self.behavior.observe(self.context.aid) or {}
+        except (AttributeError, KeyError):
+            obs = {}
         key = _ACCESS_KEYS.get(message.sector)
         if key and key in obs:
-            value = float(obs[key]) * float(obs.get("regulation", 1.0))
+            raw = obs[key]
+            reg = obs.get("regulation", 1.0)
+            try:
+                value = float(raw) * float(reg)
+            except (TypeError, ValueError):
+                value = 0.0
         else:
             value = obs_setpoint(obs)
-        if math.isnan(value):
+        if not math.isfinite(value):
             value = 0.0
         # CP agents report available=0: they have no spare flex of their own
         reply = ResponseEnergyMessage(
@@ -210,17 +218,33 @@ class EnergyConverterRole(Role):
         self._flex_answers = []
         self._flex_expected = 0
 
+        # Per-sector aggregation.  Two channels:
+        # * ``balance_by_sector`` — net signed setpoint (generation + load
+        #   in load-convention).  Reflects what's actually flowing.
+        # * ``unmet_by_sector`` — load that the LP could not deliver
+        #   (regulation forced to 0 by monee's disconnect handling).
+        #   Without this, a sector that loses all its loads to physical
+        #   disconnect reports ``balance = 0`` and the CP layer treats it
+        #   as balanced — exactly when CP help is most needed.  Adding
+        #   ``unmet`` shifts the imbalance toward the deficit side so
+        #   ``T`` carries a real positive entry for the disconnected
+        #   sector and ADMM can find a cross-sector shift instead of
+        #   skipping with ``same-sign T``.
         imbalance_by_sector: dict[Sector, float] = {}
-        # Aggregate priority urgency per sector from all responding groups.
+        unmet_by_sector_total: dict[Sector, float] = {}
         sector_priority_weight: dict[Sector, float] = {}
         for answer in answers:
-            # Use balance (net setpoint = generation + load) as the sector
-            # imbalance.  Negative balance = excess generation, positive =
-            # unmet demand.  The CP should shift its operating point to
-            # compensate for the imbalance, not the total capacity.
             imbalance_by_sector[answer.sector] = (
                 imbalance_by_sector.get(answer.sector, 0.0) + answer.balance
             )
+            for sec_str, val in (getattr(answer, "unmet_by_sector", {}) or {}).items():
+                try:
+                    sec_enum = Sector(sec_str)
+                except ValueError:
+                    continue
+                unmet_by_sector_total[sec_enum] = (
+                    unmet_by_sector_total.get(sec_enum, 0.0) + float(val)
+                )
             w = aggregate_priority_weight(
                 answer.demand_by_priority, answer.served_by_priority
             )
@@ -228,9 +252,21 @@ class EnergyConverterRole(Role):
                 sector_priority_weight.get(answer.sector, 0.0) + w
             )
 
-        imb_el = imbalance_by_sector.get(Sector.ELECTRICITY, 0.0)
-        imb_heat = imbalance_by_sector.get(Sector.HEAT, 0.0)
-        imb_gas = imbalance_by_sector.get(Sector.GAS, 0.0)
+        # Combine balance + unmet into the T vector.  Unmet is unsigned
+        # (always positive deficit) so it shifts T toward positive in
+        # sectors with disconnected loads.
+        imb_el = (
+            imbalance_by_sector.get(Sector.ELECTRICITY, 0.0)
+            + unmet_by_sector_total.get(Sector.ELECTRICITY, 0.0)
+        )
+        imb_heat = (
+            imbalance_by_sector.get(Sector.HEAT, 0.0)
+            + unmet_by_sector_total.get(Sector.HEAT, 0.0)
+        )
+        imb_gas = (
+            imbalance_by_sector.get(Sector.GAS, 0.0)
+            + unmet_by_sector_total.get(Sector.GAS, 0.0)
+        )
 
         # Imbalances are now reported in their natural sector units —
         # electricity in MW, heat in MW (was W), gas in kg/s.  ADMM

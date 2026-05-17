@@ -130,12 +130,14 @@ def _format_md(df: pd.DataFrame) -> str:
     n = len(df)
     parts.append(f"- Tasks: **{n}**")
     if n:
-        for s in ("ok", "error", "timeout", "missing"):
+        for s in ("ok", "claims_failed", "error", "timeout", "killed", "missing"):
             c = int((df["status"] == s).sum())
             parts.append(f"  - {s}: {c} ({100.0 * c / n:.1f}%)")
         if "duration_s" in df.columns and df["duration_s"].notna().any():
-            parts.append(f"- Mean duration: {df['duration_s'].mean():.1f}s "
-                         f"(p95 {df['duration_s'].quantile(0.95):.1f}s)")
+            dur = df["duration_s"].dropna()
+            if not dur.empty:
+                parts.append(f"- Mean duration: {dur.mean():.1f}s "
+                             f"(p95 {dur.quantile(0.95):.1f}s)")
         if "solver_failures" in df.columns:
             parts.append(f"- Total solver-failure warnings: "
                          f"{int(df['solver_failures'].fillna(0).sum())}")
@@ -148,8 +150,10 @@ def _format_md(df: pd.DataFrame) -> str:
         agg = df.groupby("grid").agg(
             total=("task_id", "count"),
             ok=("status", lambda s: int((s == "ok").sum())),
+            claims_failed=("status", lambda s: int((s == "claims_failed").sum())),
             error=("status", lambda s: int((s == "error").sum())),
             timeout=("status", lambda s: int((s == "timeout").sum())),
+            killed=("status", lambda s: int((s == "killed").sum())),
             missing=("status", lambda s: int((s == "missing").sum())),
             mean_duration_s=("duration_s", "mean"),
             mean_solver_failures=("solver_failures", "mean"),
@@ -162,14 +166,15 @@ def _format_md(df: pd.DataFrame) -> str:
         rows = []
         for grid, r in agg.iterrows():
             rows.append([
-                _alias_grid(grid), int(r["total"]), int(r["ok"]), int(r["error"]),
-                int(r["timeout"]), int(r["missing"]),
+                _alias_grid(grid), int(r["total"]), int(r["ok"]),
+                int(r["claims_failed"]), int(r["error"]),
+                int(r["timeout"]), int(r["killed"]), int(r["missing"]),
                 f"{r['mean_duration_s']:.1f}" if pd.notna(r["mean_duration_s"]) else "—",
                 f"{r['mean_solver_failures']:.2f}" if pd.notna(r["mean_solver_failures"]) else "—",
             ])
         parts.append(_markdown_table(
-            ["grid", "total", "ok", "error", "timeout", "missing",
-             "mean dur (s)", "mean solver fails"],
+            ["grid", "total", "ok", "claims_failed", "error", "timeout",
+             "killed", "missing", "mean dur (s)", "mean solver fails"],
             rows,
         ))
 
@@ -177,7 +182,10 @@ def _format_md(df: pd.DataFrame) -> str:
     if metric_cols:
         parts.append("")
         parts.append("## Per-grid metrics (mean over OK runs)")
-        ok_df = df[df["status"] == "ok"]
+        # Include ``claims_failed`` here: the simulation ran to completion
+        # and the metrics are real — claims failure flags a chapter-level
+        # invariant violation, not a missing measurement.
+        ok_df = df[df["status"].isin(("ok", "claims_failed"))]
         if ok_df.empty:
             parts.append("_(no successful runs)_")
         else:
@@ -222,7 +230,10 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
     parts: list[str] = []
     if df.empty or "variant" not in df.columns:
         return parts
-    ok = df[df["status"] == "ok"]
+    # Include ``claims_failed`` runs: the headline ``priority_weighted_fraction``
+    # is computed from a completed simulation; the claim flagged a
+    # priority inversion but the served value itself is valid.
+    ok = df[df["status"].isin(("ok", "claims_failed"))]
     if ok.empty or _PRIMARY_OUTCOME not in ok.columns:
         return parts
 
@@ -407,9 +418,9 @@ def write_summary(campaign_dir: Path) -> tuple[Path, Path]:
     n = len(df)
     by_status = df["status"].value_counts().to_dict() if n else {}
     logger.info("Aggregated %d task(s) → %s", n, csv_path)
-    for s in ("ok", "error", "timeout", "missing"):
+    for s in ("ok", "claims_failed", "error", "timeout", "killed", "missing"):
         if s in by_status:
-            logger.info("  %-10s %d", s, by_status[s])
+            logger.info("  %-14s %d", s, by_status[s])
     if "solver_failures" in df.columns and df["solver_failures"].notna().any():
         logger.info("  total solver-failure warnings: %d",
                     int(df["solver_failures"].fillna(0).sum()))
