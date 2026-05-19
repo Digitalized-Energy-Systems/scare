@@ -47,6 +47,10 @@ from scare.base.util import (
     sector_from_grid,
 )
 from scare.community.holonic import HolonicCommunityRole
+from scare.community.repartition import (
+    DynamicRepartitionRole,
+    RepartitionHandlerRole,
+)
 from scare.community.role import PreAssignedCommunityRole
 from scare.detection.role import ProblemDetector
 from scare.service.balance import EnergyBalanceNegotiator, create_energy_balance_role
@@ -404,6 +408,19 @@ def _populate_world(
             if lookup_slack(behavior, aid) is not None:
                 explicit_priority = 0
 
+        # Register the resolved priority on ``behavior`` so anyone
+        # that aggregates across the group (e.g.
+        # ``EnergyBalanceNegotiator._handle_ask_flex`` building
+        # ``demand_by_sector_priority`` for the tier-stratified holon
+        # ADMM) gets the correct per-aid tier instead of falling
+        # back to ``obs_priority``'s tier-1-for-all-loads default.
+        # Skip slacks since they're already classified via the slack
+        # registry.
+        if explicit_priority is not None:
+            from scare.base.util import register_priority
+
+            register_priority(behavior, aid, int(explicit_priority))
+
         roles = []
         if sector is not None:
             roles.append(
@@ -432,6 +449,13 @@ def _populate_world(
                     enable_heat_recovery=config.enable_heat_recovery,
                 )
             )
+
+        # Every community-member child also receives a passive
+        # handler that updates its CommunityAssignment when a
+        # leader-driven re-partition lands.  Tiny role — single
+        # message subscription, no periodic tasks.
+        if sector is not None:
+            roles.append(RepartitionHandlerRole())
 
         # Local Q-V droop at every inverter-coupled PowerGenerator.
         # Follows VDE-AR-N 4105 §5.7.2; lives entirely at the device and
@@ -759,12 +783,21 @@ def _build_topologies(
     # member agents — same-node agents are mutual NORMAL neighbours after
     # injection, so the existing gossip protocol works unchanged.
     group_leaders_by_sector: dict[Sector, list] = {}
+    # Per-leader member list captured at community-formation time so the
+    # ``DynamicRepartitionRole`` has the static member set to compare
+    # against post-failure reachability.  ``topology_neighbors`` works
+    # at runtime but doesn't give the role construction-time access.
+    leader_to_members: dict[Any, list[Any]] = {}
     branch_to_leader: dict[str, Any] = {}
     with create_topology(tid="groups") as groups_topo:
         for sector in _SECTORS:
-            radius = _LABEL_PROPAGATION_RADIUS.get(sector, 2)
+            radius = config.community_label_propagation_radius or _LABEL_PROPAGATION_RADIUS.get(sector, 2)
             communities = communities_from_topology(
-                sector_grid_topos[sector], max_radius=radius
+                sector_grid_topos[sector],
+                max_radius=radius,
+                method=config.community_partition_method,
+                modularity_iterations=config.community_modularity_iterations,
+                modularity_resolution=config.community_modularity_resolution,
             )
             for members in communities:
                 if not members:
@@ -797,6 +830,7 @@ def _build_topologies(
                             powerline_home_node.pop(b_aid, None)
                 node_id = groups_topo.add_node(*members)
                 leader = members[0]
+                leader_to_members[leader] = list(members)
                 groups_topo.set_characteristic(node_id, leader, "leader")
                 community_id = uuid4()
                 for member in members:
@@ -806,10 +840,43 @@ def _build_topologies(
                     if member.aid in branch_to_leader and branch_to_leader[member.aid] is None:
                         branch_to_leader[member.aid] = leader
                 group_leaders_by_sector.setdefault(sector, []).append(leader)
+            sizes = sorted(len(c) for c in communities) if communities else []
+            try:
+                from scare.base.community import (
+                    label_propagation_partition,
+                    modularity_of_partition,
+                    modularity_partition,
+                )
+                # Recompute the per-node label dict for the diagnostic.
+                # The communities_from_topology call lost it, so we
+                # invoke the same partitioner once more on the sector
+                # graph.  Cheap.
+                if config.community_partition_method == "modularity":
+                    lbl = modularity_partition(
+                        sector_grid_topos[sector].graph,
+                        max_iterations=config.community_modularity_iterations,
+                        resolution=config.community_modularity_resolution,
+                    )
+                else:
+                    lbl = label_propagation_partition(
+                        sector_grid_topos[sector].graph, max_radius=radius
+                    )
+                q_score = modularity_of_partition(
+                    sector_grid_topos[sector].graph, lbl,
+                    resolution=config.community_modularity_resolution,
+                )
+            except Exception:
+                q_score = float("nan")
             logger.info(
-                "Sector %s: label propagation produced %d communities",
+                "Sector %s [%s] partition: n_comm=%d sizes(min/median/max)=%s/%s/%s "
+                "modularity_Q=%.4f",
                 sector.value,
+                config.community_partition_method,
                 len(communities),
+                sizes[0] if sizes else 0,
+                sizes[len(sizes) // 2] if sizes else 0,
+                sizes[-1] if sizes else 0,
+                q_score,
             )
 
     # Patch every branch monitor's home_leader_addr now that the
@@ -852,6 +919,27 @@ def _build_topologies(
             include_childs=False,
         )
 
+    # Build per-leader maps for the dynamic re-partition role.  Each
+    # leader needs: its own parent node_id, the per-member parent
+    # node_id, the per-member current agent address, and the
+    # per-sector branch adjacency.  All cheap to recompute here
+    # rather than thread through from ``_populate_world``.
+    aid_to_node_id: dict[str, Any] = {
+        f"child-{c.id}": c.node_id for c in monee_net.childs
+    }
+    aid_to_addr: dict[str, Any] = {
+        aid: agent.addr for aid, agent in world._agents.items()
+    }
+    sector_branches_by_sector: dict[Sector, dict[tuple, tuple[Any, Any]]] = {
+        s: {} for s in _SECTORS
+    }
+    sector_value_to_enum = {s.value: s for s in _SECTORS}
+    for branch in monee_net.branches:
+        sec = _branch_sector_str(branch, monee_net)
+        if sec in sector_value_to_enum:
+            a, b = branch.id[0], branch.id[1]
+            sector_branches_by_sector[sector_value_to_enum[sec]][branch.id] = (a, b)
+
     # Attach Level-2 / fallback roles to each group leader and mark them
     # as cross-topology connectors for the cps↔groups link.  ``IslandingFallbackRole``
     # always installs (it's the safety net); ``HolonicCommunityRole`` is
@@ -866,9 +954,49 @@ def _build_topologies(
                         max_holon_size=config.holon_max_size,
                         admm_max_iters=config.holon_admm_max_iters,
                         admm_abs_tol=config.holon_admm_abs_tol,
+                        enable_hebbian_formation=config.enable_hebbian_formation,
+                        hebbian_warmup_s=config.hebbian_warmup_s,
+                        hebbian_threshold=config.hebbian_threshold,
+                        enable_tier_stratified_admm=config.enable_tier_stratified_holon_admm,
+                        priority_tiers=config.priority_tiers,
+                        admm_mode=config.holon_admm_mode,
                     )
                 )
             leader.add_role(IslandingFallbackRole(behavior, sector))
+
+            # Failure-driven dynamic re-partition.  Each leader gets
+            # the slice of the per-sector branch table covering its
+            # own sector and the parent-node mapping for every member
+            # of its (initial) community.  Triggered globally by
+            # BranchFailureEvent (wired below in
+            # ``_add_system_behaviors``).
+            members = leader_to_members.get(leader, [leader])
+            member_node_ids = {m.aid: aid_to_node_id[m.aid] for m in members
+                               if m.aid in aid_to_node_id}
+            member_addrs = {m.aid: aid_to_addr.get(m.aid, m.addr)
+                            for m in members}
+            my_node_id = aid_to_node_id.get(leader.aid)
+            if my_node_id is not None:
+                leader.add_role(
+                    DynamicRepartitionRole(
+                        behavior,
+                        sector,
+                        my_node_id,
+                        member_node_ids,
+                        member_addrs,
+                        sector_branches_by_sector.get(sector, {}),
+                    )
+                )
+
+            # Periodic SectorImbalanceUpdate publisher so L3 (CP ADMM)
+            # can trigger from a local-imbalance predicate without
+            # waiting for an L1 NegotiationFinishedEvent that may never
+            # arrive (see scare.base.channel docstring for the
+            # specific pathology this fixes).
+            if config.enable_cp_admm:
+                from scare.base.channel import SectorImbalanceBeacon
+
+                leader.add_role(SectorImbalanceBeacon(behavior, sector))
 
     # Holons topology: partition same-sector group leaders into chunks
     # of ``HolonicCommunityRole.max_holon_size`` and add edges only
@@ -984,6 +1112,26 @@ def _add_system_behaviors(
 
     def _trigger_cp(role: EnergyConverterRole, event: Any) -> None:
         role.context.schedule_instant_task(role.trigger_cp_negotiation())
+
+    def _trigger_repartition(
+        role: DynamicRepartitionRole, event: Any
+    ) -> None:
+        branch_id = getattr(event, "branch_id", None)
+        if branch_id is None:
+            return
+        # event.branch_id is a tuple; normalize for set hashing.
+        role.on_branch_failure(tuple(branch_id))
+
+    # Every failure feeds the leader's per-sector reachability view,
+    # regardless of whether the distributed FailureNotice propagation
+    # is enabled (the path is independent — repartition needs the
+    # branch_id, not the propagated FailureNotice message).
+    behavior_in(
+        world,
+        _trigger_repartition,
+        on_global_event=BranchFailureEvent,
+        role_types=DynamicRepartitionRole,
+    )
 
     if strategy in (SystemStrategy.GROUP_TO_CP, SystemStrategy.SIMULTANEOUSLY):
         # ``CustomFailureEvent`` always keeps the centralised path —

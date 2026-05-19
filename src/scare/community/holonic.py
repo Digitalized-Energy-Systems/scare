@@ -28,8 +28,18 @@ from uuid import UUID, uuid4
 import numpy as np
 from mango import Role
 from mango import sender_addr as mango_sender_addr
-from mango.express.topology import topology_characteristic, topology_neighbors
+from mango.express.topology import (
+    topology_characteristic,
+    topology_connectors,
+    topology_neighbors,
+)
 
+from scare.base.channel import (
+    CPSetpoint,
+    HolonAllocation,
+    MonotonicVersion,
+    SeenVersions,
+)
 from scare.base.model import (
     AvailableFlexAnswer,
     CommunityAssignment,
@@ -95,6 +105,9 @@ class HolonicCommunityRole(Role):
         hebbian_warmup_s: float = 12.0,
         admm_max_iters: int = 50,
         admm_abs_tol: float = 1e-3,
+        enable_tier_stratified_admm: bool = True,
+        priority_tiers: int = 10,
+        admm_mode: str = "demand",
     ) -> None:
         super().__init__()
         self.sector = sector
@@ -104,6 +117,15 @@ class HolonicCommunityRole(Role):
         # so campaigns can trade quality against wallclock cost).
         self.admm_max_iters = admm_max_iters
         self.admm_abs_tol = admm_abs_tol
+        # Tier-stratified ADMM (Package C) — see _run_tier_stratified_admm.
+        self.enable_tier_stratified_admm = enable_tier_stratified_admm
+        self.priority_tiers = priority_tiers
+        # Holon ADMM mode: "demand" (Package C) or "supply" (Route A).
+        if admm_mode not in {"demand", "supply"}:
+            raise ValueError(
+                f"holon admm_mode must be 'demand' or 'supply', got {admm_mode!r}"
+            )
+        self.admm_mode = admm_mode
         # ``rebalance_period_s`` is the *slow* background heartbeat — only
         # there to catch drift from timeseries inputs (load profiles,
         # supply temperatures) that change without firing any
@@ -192,6 +214,16 @@ class HolonicCommunityRole(Role):
         # detect drift relative to the propose/accept membership.
         self._hebbian_members: set[str] = set()
 
+        # --- Channel-pattern state (L2 <-> L3 direct link) ---
+        # ``_version`` advances on every ``HolonAllocation`` we publish;
+        # ``_seen_cps`` tracks the latest ``CPSetpoint`` version we have
+        # consumed per publisher so the predicate doesn't re-fire on
+        # stale data.
+        self._version = MonotonicVersion()
+        self._seen_cps = SeenVersions()
+        self._cp_setpoint_state: dict[tuple[str, str], float] = {}
+        self._last_cp_predicate_fire_t: float = -1e9
+
     def setup(self) -> None:
         self.context.schedule_periodic_task(
             self._try_form_holon, delay=self.formation_period_s
@@ -263,6 +295,16 @@ class HolonicCommunityRole(Role):
                 lambda msg, meta: isinstance(msg, HebbianFlexBeacon)
                 and msg.sector == self.sector,
             )
+        # Direct L3 -> L2 trigger (channel/decision pattern).  When a CP
+        # plant commits a cross-sector setpoint, the affected holons
+        # should re-evaluate without waiting for the L1 gossip chain to
+        # propagate the shift.  Predicate inside the handler decides
+        # whether the change is large enough to merit a rebalance.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_cp_setpoint),
+            lambda msg, meta: isinstance(msg, CPSetpoint),
+        )
 
     # ------------------------------------------------------------------
     # Holon formation
@@ -508,6 +550,62 @@ class HolonicCommunityRole(Role):
         else:
             self._rebalance_active = False
 
+    # Predicate dead-band on the magnitude of cross-sector flow shift
+    # in a single CP commit before the holon bothers to rebalance.
+    # Smaller than the holon's intrinsic ``admm_abs_tol`` so we don't
+    # mask real opportunities, larger than CP regulation noise.
+    _CP_PREDICATE_DEAD_BAND_MW: float = 1e-3
+    _CP_PREDICATE_MIN_GAP_S: float = 1.0
+
+    async def _handle_cp_setpoint(
+        self, message: CPSetpoint, meta: dict
+    ) -> None:
+        """Direct L3 -> L2 trigger via the channel/decision pattern.
+
+        Updates the per-publisher CP-setpoint memory, version-tracks
+        to skip stale repeats, and (if the predicate accepts) calls
+        ``_maybe_schedule_rebalance`` to re-run holon ADMM with the
+        new cross-sector reality baked into the next round's flex
+        collection.
+        """
+        # Only the holon leader bothers; other members would just
+        # double-trigger.
+        assignment = self.context.get_or_create_model(HolonicAssignment)
+        if assignment.holon_id is None or assignment.parent_addr is not None:
+            return
+        # Echo guard: a CP commit caused by our own most-recent
+        # HolonAllocation isn't fresh news.
+        if (
+            message.caused_by.get(str(self.context.aid), -1)
+            == self._version.current
+            and self._version.current > 0
+        ):
+            return
+        if not self._seen_cps.is_fresh(message.publisher, message.version):
+            return
+
+        # Track the CP's per-sector flow for our sector specifically.
+        flow = float(message.sector_flows_mw.get(self.sector.value, 0.0))
+        key = (message.publisher, self.sector.value)
+        prev_flow = self._cp_setpoint_state.get(key, 0.0)
+        self._cp_setpoint_state[key] = flow
+        self._seen_cps.mark(message.publisher, message.version)
+
+        delta = abs(flow - prev_flow)
+        if delta < self._CP_PREDICATE_DEAD_BAND_MW:
+            return
+
+        now = float(self.context.current_timestamp)
+        if now - self._last_cp_predicate_fire_t < self._CP_PREDICATE_MIN_GAP_S:
+            return
+        self._last_cp_predicate_fire_t = now
+
+        logger.info(
+            "[%s] holon predicate fired: sector=%s cp=%s Δflow=%.4f (cause)",
+            self.context.aid, self.sector.value, message.publisher, delta,
+        )
+        self._maybe_schedule_rebalance()
+
     def _maybe_schedule_rebalance(self) -> None:
         """Shared throttle + gate logic for both the message- and
         event-driven reactive paths.  Returns silently if any gate
@@ -591,6 +689,84 @@ class HolonicCommunityRole(Role):
             await self._run_inter_group_admm()
 
     async def _run_inter_group_admm(self) -> None:
+        """Dispatch to either the legacy per-sector ADMM or the
+        tier-stratified per-(sector, priority) ADMM (Package C) based
+        on the ``enable_tier_stratified_admm`` flag.
+
+        The tier-stratified path replaces the single scalar override
+        per (member, sector) — which loses the holon's priority
+        intent in the L2→L1 handoff — with a 2-D allocation
+        ``targets[sector][tier]`` that the L1 honour path dispatches
+        directly to per-tier sub-populations of each group.
+
+        When the flag is set but the gathered answers show *no
+        meaningful per-tier deficit* (e.g. a holon of fully-served
+        communities with non-zero flow but no unmet demand), fall
+        back to the legacy path.  Without that fallback the
+        tier-stratified path would skip on "balanced" and the
+        holon would miss the flow-redistribution that the legacy
+        provided — observed empirically as a regression on
+        label-propagation partitions where the legacy fired ~32
+        rounds but the strict tier-stratified fired only 1.
+        """
+        if not self.enable_tier_stratified_admm:
+            await self._run_legacy_per_sector_admm()
+            return
+        if self.admm_mode == "supply":
+            # Route A: supply-priority ADMM.  Fires whenever the
+            # holon has any supply at all to allocate; the priority
+            # weighting takes over once supply < demand.
+            if self._supply_priority_has_anything_to_do():
+                await self._run_supply_priority_admm()
+                return
+            await self._run_legacy_per_sector_admm()
+            return
+        # Default demand-side path (Package C).
+        if self._tier_stratified_has_meaningful_deficit():
+            await self._run_tier_stratified_admm()
+            return
+        await self._run_legacy_per_sector_admm()
+
+    def _supply_priority_has_anything_to_do(self) -> bool:
+        """Cheap check: do queued answers contain *any* per-tier demand
+        AND *any* supply?  Route A's value is in allocating supply
+        across priorities; with one side empty there's nothing to do.
+        """
+        any_demand = any(
+            a.demand_by_sector_priority for a in self._flex_answers
+        )
+        any_supply = any(
+            float(s) > 1e-9
+            for a in self._flex_answers
+            for s in (a.supply_by_sector or {}).values()
+        )
+        return any_demand and any_supply
+
+    def _tier_stratified_has_meaningful_deficit(
+        self, *, threshold_mw: float = 1e-3
+    ) -> bool:
+        """Cheap check: do the queued flex answers carry any
+        per-(sector, tier) deficit above the noise floor?
+
+        Returns True if at least one (sector, tier) cell has
+        |demand − served| > threshold AND tier ≥ 1 (i.e. not a
+        generator / slack pseudo-tier).  False otherwise — caller
+        should delegate to the legacy flow-redistribution path.
+        """
+        for answer in self._flex_answers:
+            dem_map = answer.demand_by_sector_priority or {}
+            ser_map = answer.served_by_sector_priority or {}
+            for sec, tier_to_dem in dem_map.items():
+                sec_ser = ser_map.get(sec, {})
+                for tier, dem in tier_to_dem.items():
+                    if tier < 1:
+                        continue
+                    ser = float(sec_ser.get(tier, 0.0))
+                    if abs(float(dem) - ser) > threshold_mw:
+                        return True
+        return False
+
+    async def _run_legacy_per_sector_admm(self) -> None:
         """Run ADMM sharing optimisation across member groups.
 
         Each group's flex is modelled as a multi-dimensional ADMM actor
@@ -811,6 +987,13 @@ class HolonicCommunityRole(Role):
                 triggers = topology_neighbors(self, tid="holons")
             except Exception:
                 triggers = []
+        # Collect per-member overrides into the targets dict the
+        # ``HolonAllocation`` Decision will carry, *and* push the
+        # legacy ``StartBalanceNegotiation`` to keep L1's existing
+        # override path working.  Two-line cost; one cleanly typed
+        # decision on the new channel, one legacy message — both go
+        # to the same members.
+        allocation_targets: dict[str, float] = {}
         for addr in triggers:
             entry = sender_to_actor.get(str(addr))
             override: float | None = None
@@ -826,8 +1009,681 @@ class HolonicCommunityRole(Role):
                         override = -float(x_vec[0])
                 except Exception:  # pragma: no cover - defensive
                     override = None
+            if override is not None:
+                allocation_targets[str(addr)] = override
             await self.context.send_message(
                 StartBalanceNegotiation(override_target=override),
+                receiver_addr=addr,
+            )
+
+        # Publish HolonAllocation to CP connectors so L3 (CP ADMM)
+        # can react to the cross-sector setpoint shift directly,
+        # without the three-hop (L2 -> L1 -> gossip-finished -> L3)
+        # detour.  Reuses the same ``tid="groups"`` cross-topology
+        # link the SectorImbalanceBeacon publishes on.
+        if allocation_targets:
+            try:
+                cp_connectors = list(topology_connectors(self, tid="groups"))
+            except Exception:
+                cp_connectors = []
+            if cp_connectors:
+                assignment = self.context.get_or_create_model(HolonicAssignment)
+                holon_id = str(assignment.holon_id) if assignment.holon_id else ""
+                decision = HolonAllocation(
+                    publisher=str(self.context.aid),
+                    version=self._version.next(),
+                    caused_by={},
+                    timestamp_s=float(self.context.current_timestamp),
+                    sector=self.sector,
+                    targets_mw=allocation_targets,
+                    holon_id=holon_id,
+                    residual=0.0,
+                )
+                logger.debug(
+                    "[%s] holon publish: sector=%s n_targets=%d v=%d to %d cps",
+                    self.context.aid, self.sector.value,
+                    len(allocation_targets), decision.version, len(cp_connectors),
+                )
+                for addr in cp_connectors:
+                    await self.context.send_message(decision, receiver_addr=addr)
+
+    async def _run_tier_stratified_admm(self) -> None:
+        """Package C — priority-aware holon ADMM.
+
+        Builds a 2-D allocation problem ``T[sector][tier]`` and runs
+        the standard ADMM sharing coordinator on a flattened
+        ``(n_sectors · n_tiers)``-dimensional vector.  Each member
+        actor contributes per-(sector, tier) bounds reflecting its
+        local unserved demand / served headroom in that cell.  The
+        coordinator's per-dimension ``priorities`` argument weights
+        the L1 distance-to-target term: high-priority tiers get
+        proportionally more pull toward their target deficit, so the
+        solve naturally prioritises tier-1/2 deficits over tier-8/9
+        deficits even when both are positive.
+
+        The result ``actor.x[i]`` is a 2-D allocation that the L1
+        honour path dispatches per-tier instead of per-group-sector,
+        preserving the priority decision through the L2 → L1 handoff.
+        """
+        from distributed_resource_optimization import (
+            create_admm_sharing_data,
+            create_admm_start,
+            create_sharing_target_distance_admm_coordinator,
+            start_coordinated_optimization,
+        )
+        from distributed_resource_optimization.algorithm.admm.flex_actor import (
+            ADMMFlexActor,
+        )
+
+        if not self._rebalance_active:
+            return
+        answers = self._flex_answers[:]
+        senders = self._flex_answer_senders[:]
+        self._flex_answers = []
+        self._flex_answer_senders = []
+        self._flex_expected = 0
+        self._rebalance_active = False
+
+        if len(answers) < 2:
+            return
+
+        # Diagnostic — dump the per-answer demand/served per (sector,
+        # tier) so post-run analysis can see what data the ADMM is
+        # actually working with.  Only fires when the method is
+        # invoked (i.e. when the upstream deficit-check passed), so
+        # it doesn't bloat balanced/healthy runs.
+        for i, a in enumerate(answers):
+            logger.info(
+                "[%s] tier-strat answer[%d] demand_by_sec_prio=%s served=%s",
+                self.context.aid, i,
+                {s: dict(t) for s, t in (a.demand_by_sector_priority or {}).items()},
+                {s: dict(t) for s, t in (a.served_by_sector_priority or {}).items()},
+            )
+
+        # Discover the (sector, tier) cells that have any demand
+        # across the holon.  Empty cells are skipped — adding them to
+        # the ADMM would just inflate the dimension without
+        # contributing to the solve.
+        sectors: list[str] = sorted({
+            s for a in answers
+            for s in (a.demand_by_sector_priority or a.balance_by_sector or {})
+        })
+        # Fall back: if no per-sector data, the per-tier ADMM has no
+        # 2-D structure to exploit — re-route to the legacy path.
+        if not sectors:
+            await self._run_legacy_per_sector_admm()
+            return
+
+        # Find tiers actually present in any group's demand.  Including
+        # tier 0 (slack / generator-class) is harmless — slacks
+        # contribute zero demand so their cells stay zero.
+        tiers_present: set[int] = set()
+        for a in answers:
+            for sec_tier_map in (a.demand_by_sector_priority or {}).values():
+                tiers_present.update(sec_tier_map.keys())
+        tiers = sorted(tiers_present)
+        if not tiers:
+            # No per-tier info — degenerate to legacy path.
+            await self._run_legacy_per_sector_admm()
+            return
+
+        n_sec = len(sectors)
+        n_tier = len(tiers)
+        n_dims = n_sec * n_tier
+        sec_idx = {s: i for i, s in enumerate(sectors)}
+        tier_idx = {t: j for j, t in enumerate(tiers)}
+
+        def _flat_idx(s: str, t: int) -> int:
+            return sec_idx[s] * n_tier + tier_idx[t]
+
+        # Build T per cell: signed deficit = served - demand (positive
+        # = group's tier is under-served, in load convention so the
+        # ADMM "pull" sign matches ``balance`` from the legacy path).
+        total_T = np.zeros(n_dims)
+        group_bounds: list[tuple[np.ndarray, np.ndarray]] = []
+        for answer in answers:
+            lb = np.zeros(n_dims)
+            ub = np.full(n_dims, 1e-6)
+            demand_map = answer.demand_by_sector_priority or {}
+            served_map = answer.served_by_sector_priority or {}
+            for sec in sectors:
+                dem_t = demand_map.get(sec, {})
+                ser_t = served_map.get(sec, {})
+                for tier in tiers:
+                    idx = _flat_idx(sec, tier)
+                    dem = float(dem_t.get(tier, 0.0))
+                    ser = float(ser_t.get(tier, 0.0))
+                    deficit = dem - ser
+                    # Sign convention matches legacy: served setpoint
+                    # accumulates as ``balance``, so positive
+                    # contribution = unmet demand the holon should
+                    # pull this group up to absorb.
+                    total_T[idx] += deficit
+                    # Bounds: the group can absorb at most its unmet
+                    # demand (ub > 0) or give back at most its served
+                    # amount (lb < 0 if other groups need to take
+                    # over).  Numerical floor 1e-6 prevents zero-width
+                    # box that the QP solver dislikes.
+                    lb[idx] = -max(ser, 0.0)
+                    ub[idx] = max(dem - ser, 1e-6)
+            group_bounds.append((lb, ub))
+
+        if not np.all(np.isfinite(total_T)):
+            logger.warning(
+                "[%s] tier-stratified holon ADMM skipped: non-finite T",
+                self.context.aid,
+            )
+            return
+        if np.all(np.abs(total_T) < 1e-6):
+            logger.info(
+                "[%s] tier-stratified holon ADMM skipped: balanced "
+                "(sectors=%s tiers=%s)",
+                self.context.aid, sectors, tiers,
+            )
+            return
+
+        # Per-dimension priority weight passed to the coordinator.
+        # Larger weight = stronger pull toward target for that
+        # dimension.  ``2^(P - tier + 1)`` mirrors the L1 QP gossip
+        # weight (``_qp_priority_weight``) so the L2 decision and
+        # any residual L1 decision agree on tier ordering.
+        P = self.priority_tiers
+        priorities = np.zeros(n_dims)
+        for sec in sectors:
+            for tier in tiers:
+                weight = 2.0 ** max(0, P - tier + 1)
+                priorities[_flat_idx(sec, tier)] = weight
+
+        # Per-actor S coefficient.  Encourages each group to absorb
+        # the share of T proportional to its own *deficit* share in
+        # each cell (not its demand share — a group with demand but
+        # no unmet demand has nothing to absorb).  Negative pull =
+        # "I want this assignment."  Scaling by per-cell priority
+        # weight then biases high-priority deficits to attract
+        # stronger absorption pull than low-priority ones.
+        actors: list[ADMMFlexActor] = []
+        total_deficit_per_cell = np.zeros(n_dims)
+        for answer in answers:
+            demand_map = answer.demand_by_sector_priority or {}
+            served_map = answer.served_by_sector_priority or {}
+            for sec, tier_map in demand_map.items():
+                if sec not in sec_idx:
+                    continue
+                for tier, dem in tier_map.items():
+                    if tier in tier_idx:
+                        ser = float(served_map.get(sec, {}).get(tier, 0.0))
+                        deficit = max(0.0, float(dem) - ser)
+                        total_deficit_per_cell[_flat_idx(sec, tier)] += deficit
+        for idx_a, answer in enumerate(answers):
+            lb, ub = group_bounds[idx_a]
+            S = np.zeros(n_dims)
+            demand_map = answer.demand_by_sector_priority or {}
+            served_map = answer.served_by_sector_priority or {}
+            for sec, tier_map in demand_map.items():
+                if sec not in sec_idx:
+                    continue
+                for tier, dem in tier_map.items():
+                    if tier not in tier_idx:
+                        continue
+                    idx = _flat_idx(sec, tier)
+                    ser = float(served_map.get(sec, {}).get(tier, 0.0))
+                    my_deficit = max(0.0, float(dem) - ser)
+                    pie = total_deficit_per_cell[idx]
+                    if pie > 1e-9 and my_deficit > 1e-9:
+                        share = my_deficit / pie
+                        # Scale by priority weight so high-priority
+                        # cells dominate the local cost balance.
+                        S[idx] = -share * priorities[idx]
+            lb = np.nan_to_num(lb, nan=0.0, posinf=0.0, neginf=0.0)
+            ub = np.nan_to_num(ub, nan=1e-6, posinf=1e6, neginf=1e-6)
+            S = np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Per-actor coupling constraint (Option 2): cap the
+            # group's TOTAL absorption across all (sector, tier) cells
+            # at its physical flex headroom.  Without this, the per-
+            # cell bounds make the problem trivially feasible
+            # (Σ_g ub_g[cell] = T[cell]) and the priority weights in
+            # the coordinator's L1 distance penalty never actually
+            # arbitrate.  Adding the coupling creates scarcity
+            # whenever ``Σ_cell deficit_g > flex_g`` (the group has
+            # more local deficit than headroom to absorb) — in that
+            # regime the ADMM has to choose, and the priority
+            # weighting decides which tiers get covered first.
+            #
+            # ``flex_g`` is the same quantity ``_handle_ask_flex``
+            # already reports as ``answer.flex`` (sum of cap - sp for
+            # same-sector loads).  For pure-load groups where cap ≈
+            # demand, this equals the sum-of-deficits, so the
+            # constraint binds tightly and priority arbitrates only
+            # marginally; for groups with physical / disconnect-
+            # induced cap reduction it binds more sharply.
+            budget_g = float(answer.flex)
+            if budget_g <= 0.0:
+                # No headroom at all → this actor must not absorb in
+                # any cell.  Tighten the cap to zero so ADMM doesn't
+                # produce a positive allocation that the L1 dispatch
+                # then can't deliver.
+                C = np.ones((1, n_dims))
+                d = np.array([0.0])
+            else:
+                C = np.ones((1, n_dims))
+                d = np.array([budget_g])
+            actors.append(ADMMFlexActor(lb=lb, u=ub, C=C, d=d, S=S))
+
+        coordinator = create_sharing_target_distance_admm_coordinator()
+        coordinator.max_iters = int(self.admm_max_iters)
+        coordinator.abs_tol = float(self.admm_abs_tol)
+        start_msg = create_admm_start(
+            create_admm_sharing_data(
+                total_T.tolist(), priorities=priorities.tolist()
+            )
+        )
+
+        from scare.base.diagnostics import record_event
+
+        try:
+            await start_coordinated_optimization(actors, coordinator, start_msg)
+        except Exception as exc:
+            logger.error(
+                "[%s] tier-stratified holon ADMM failed: %s",
+                self.context.aid, exc,
+            )
+            record_event(
+                t=self.context.current_timestamp,
+                kind="holon_admm_failed",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=f"tier_stratified: {exc}",
+            )
+            return
+
+        results = [a.x.tolist() for a in actors]
+        # Detailed diagnostic block: log T, priorities, and per-actor x
+        # per (sector, tier) cell.  Aggregated allocation per tier
+        # across actors lets post-run analysis verify that
+        # high-priority tiers attract proportionally larger
+        # absorption (the priority-awareness claim).
+        per_cell_summary: list[dict[str, float | str | int]] = []
+        sum_x_per_cell = np.sum(results, axis=0) if results else np.zeros(n_dims)
+        for sec in sectors:
+            for tier in tiers:
+                idx = _flat_idx(sec, tier)
+                per_cell_summary.append({
+                    "sector": sec,
+                    "tier": tier,
+                    "T": round(float(total_T[idx]), 6),
+                    "priority_weight": float(priorities[idx]),
+                    "sum_x": round(float(sum_x_per_cell[idx]), 6),
+                })
+        logger.info(
+            "[%s] tier-stratified holon ADMM result: sectors=%s tiers=%s "
+            "T=%s sum_x=%s",
+            self.context.aid, sectors, tiers, total_T.tolist(),
+            sum_x_per_cell.tolist(),
+        )
+        record_event(
+            t=self.context.current_timestamp,
+            kind="holon_admm_result",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=(
+                f"tier_stratified sectors={sectors} tiers={tiers} "
+                f"per_cell={per_cell_summary}"
+            ),
+        )
+        # New diagnostic event specifically for priority-awareness
+        # verification: aggregate absorption per tier, weighted by
+        # priority, lets the post-run analysis check that the
+        # allocation respects the priority ordering.
+        record_event(
+            t=self.context.current_timestamp,
+            kind="holon_priority_allocation",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=str({
+                f"{sec}:tier{tier}": {
+                    "T": round(float(total_T[_flat_idx(sec, tier)]), 6),
+                    "weight": float(priorities[_flat_idx(sec, tier)]),
+                    "sum_x": round(float(sum_x_per_cell[_flat_idx(sec, tier)]), 6),
+                }
+                for sec in sectors for tier in tiers
+            }),
+        )
+
+        # Build the per-member 2-D allocation map and send it back
+        # via the new ``StartBalanceNegotiation.override_targets_by_sector_priority``
+        # field.  Each member's map is keyed by sector → tier →
+        # target_mw, derived from their flat ADMM ``x`` vector.
+        sender_to_x: dict[str, list[float]] = {}
+        for sender, x_vec in zip(senders, results):
+            sender_to_x[str(sender)] = x_vec
+
+        if self._holon_member_addrs:
+            triggers = list(self._holon_member_addrs)
+        else:
+            try:
+                triggers = topology_neighbors(self, tid="holons")
+            except Exception:
+                triggers = []
+
+        allocation_targets_scalar: dict[str, float] = {}
+        for addr in triggers:
+            x_vec = sender_to_x.get(str(addr))
+            override_legacy: float | None = None
+            override_strat: dict[str, dict[int, float]] | None = None
+            if x_vec is not None:
+                # Build the per-(sector, tier) override map.
+                # ``T`` in this ADMM is the *deficit* (= demand −
+                # served, positive when load is unserved) and ``x``
+                # is each actor's share of closing that deficit
+                # (positive ⇒ "I should serve more").  The L1
+                # dispatch (``_dispatch_per_tier_targets``) reads
+                # the override as the desired *change in served
+                # setpoint*: positive ⇒ raise served (restore),
+                # negative ⇒ lower served (shed).  Sign convention
+                # therefore matches ``x`` directly — no negation,
+                # unlike the legacy per-sector path which uses the
+                # gossip's negated target convention.
+                strat: dict[str, dict[int, float]] = {}
+                for sec in sectors:
+                    per_tier: dict[int, float] = {}
+                    for tier in tiers:
+                        v = float(x_vec[_flat_idx(sec, tier)])
+                        per_tier[tier] = v
+                    if per_tier:
+                        strat[sec] = per_tier
+                if strat:
+                    override_strat = strat
+                # Also compute the per-sector scalar (sum across
+                # tiers) as a backwards-compatible scalar override —
+                # so any L1 path that hasn't been migrated to the
+                # tier-aware dispatch still receives a usable target.
+                # The scalar takes the *negated* sum to match the
+                # legacy gossip-target convention (target<0 ⇒
+                # absorb in QP gossip's framing).
+                if strat:
+                    own_sec = self.sector.value
+                    if own_sec in strat:
+                        override_legacy = -sum(strat[own_sec].values())
+                    else:
+                        first_sec = next(iter(strat))
+                        override_legacy = -sum(strat[first_sec].values())
+            if override_legacy is not None:
+                allocation_targets_scalar[str(addr)] = override_legacy
+            await self.context.send_message(
+                StartBalanceNegotiation(
+                    override_target=override_legacy,
+                    override_targets_by_sector_priority=override_strat,
+                ),
+                receiver_addr=addr,
+            )
+
+        # Publish HolonAllocation to CP connectors (unchanged from
+        # legacy: the CP layer treats the holon's intent as a
+        # per-member scalar, which the scalar override above provides).
+        if allocation_targets_scalar:
+            try:
+                cp_connectors = list(topology_connectors(self, tid="groups"))
+            except Exception:
+                cp_connectors = []
+            if cp_connectors:
+                assignment = self.context.get_or_create_model(HolonicAssignment)
+                holon_id = str(assignment.holon_id) if assignment.holon_id else ""
+                decision = HolonAllocation(
+                    publisher=str(self.context.aid),
+                    version=self._version.next(),
+                    caused_by={},
+                    timestamp_s=float(self.context.current_timestamp),
+                    sector=self.sector,
+                    targets_mw=allocation_targets_scalar,
+                    holon_id=holon_id,
+                    residual=0.0,
+                )
+                for addr in cp_connectors:
+                    await self.context.send_message(decision, receiver_addr=addr)
+
+    async def _run_supply_priority_admm(self) -> None:
+        """Route A — supply-priority ADMM.
+
+        Differs from the demand-side path in two key ways:
+
+        1. ``T`` is the *total demand* per (sector, tier) cell across
+           the whole holon — i.e. the ideal-served target — not the
+           per-cell deficit.  The ADMM tries to match this target,
+           with the L1 distance penalty weighted by tier priority.
+        2. Each actor's per-cell ``ub`` and per-actor coupling
+           ``Σ x ≤ supply_g`` reflect that actor's *generator
+           capacity*, not its local demand.  This lets a group with
+           supply but no local tier-X demand contribute to the
+           holon-wide tier-X service (the LP downstream routes the
+           freed power via the grid).
+
+        Output: per-(sector, tier) service fractions sent to each
+        leader.  Each leader applies the fraction uniformly to its
+        local loads at that priority tier, so a high-priority tier
+        served at 100 % and a low-priority tier served at 0 %
+        produces a consistent shed-the-low-tier / serve-the-high-
+        tier pattern across the holon, regardless of which group
+        physically holds the supply.
+        """
+        from distributed_resource_optimization import (
+            create_admm_sharing_data,
+            create_admm_start,
+            create_sharing_target_distance_admm_coordinator,
+            start_coordinated_optimization,
+        )
+        from distributed_resource_optimization.algorithm.admm.flex_actor import (
+            ADMMFlexActor,
+        )
+
+        if not self._rebalance_active:
+            return
+        answers = self._flex_answers[:]
+        senders = self._flex_answer_senders[:]
+        self._flex_answers = []
+        self._flex_answer_senders = []
+        self._flex_expected = 0
+        self._rebalance_active = False
+
+        if len(answers) < 2:
+            return
+
+        # Discover (sector, tier) cells with demand anywhere in the
+        # holon.  Sectors with supply but no demand are still useful
+        # — supply at sector X bypasses the ADMM (sector X has no
+        # cells), but the leader's reply will already account for it.
+        sectors: list[str] = sorted({
+            s for a in answers
+            for s in (a.demand_by_sector_priority or {})
+        })
+        if not sectors:
+            await self._run_legacy_per_sector_admm()
+            return
+
+        tiers_present: set[int] = set()
+        for a in answers:
+            for sec_tier_map in (a.demand_by_sector_priority or {}).values():
+                tiers_present.update(sec_tier_map.keys())
+        tiers = sorted(t for t in tiers_present if t >= 1)
+        if not tiers:
+            await self._run_legacy_per_sector_admm()
+            return
+
+        n_sec = len(sectors)
+        n_tier = len(tiers)
+        n_dims = n_sec * n_tier
+        sec_idx = {s: i for i, s in enumerate(sectors)}
+        tier_idx = {t: j for j, t in enumerate(tiers)}
+
+        def _flat_idx(s: str, t: int) -> int:
+            return sec_idx[s] * n_tier + tier_idx[t]
+
+        # T = total demand per (sector, tier) across the holon.  This
+        # is the "ideal served" target the coordinator pulls every
+        # actor's allocation toward.  Per-tier total demand at the
+        # holon level lets the priority weighting compare apples to
+        # apples — tier-2 demand vs tier-8 demand vs supply-budget.
+        total_T = np.zeros(n_dims)
+        # Per-cell total demand (= T) is also the natural per-cell
+        # upper bound on what makes sense to allocate.  Setting
+        # actor ub larger than total demand wastes solver effort.
+        total_demand_per_cell = np.zeros(n_dims)
+        for a in answers:
+            dem_map = a.demand_by_sector_priority or {}
+            for sec, tier_to_dem in dem_map.items():
+                if sec not in sec_idx:
+                    continue
+                for tier, dem in tier_to_dem.items():
+                    if tier in tier_idx:
+                        total_T[_flat_idx(sec, tier)] += float(dem)
+                        total_demand_per_cell[_flat_idx(sec, tier)] += float(dem)
+
+        if np.all(np.abs(total_T) < 1e-6):
+            await self._run_legacy_per_sector_admm()
+            return
+
+        # Priority weights: 2^(P − tier + 1), mirroring _qp_priority_weight.
+        P = self.priority_tiers
+        priorities = np.zeros(n_dims)
+        for tier in tiers:
+            weight = 2.0 ** max(0, P - tier + 1)
+            for sec in sectors:
+                priorities[_flat_idx(sec, tier)] = weight
+
+        # Per-actor problem.  Each actor can contribute up to its
+        # per-sector supply to any tier within that sector.  Across
+        # tiers, total supply commitment is bounded by the coupling.
+        actors: list[ADMMFlexActor] = []
+        actor_supply_total: list[float] = []
+        for answer in answers:
+            supply_map = answer.supply_by_sector or {}
+            # Per-cell upper bound: cap at min(total demand at this
+            # cell, this actor's supply in that sector).  Smaller of
+            # the two — supply is fungible across tiers within a
+            # sector, but no single cell can absorb more than its
+            # global demand.
+            lb = np.zeros(n_dims)
+            ub = np.full(n_dims, 1e-6)
+            for sec in sectors:
+                supply_s = float(supply_map.get(sec, 0.0))
+                for tier in tiers:
+                    j = _flat_idx(sec, tier)
+                    ub[j] = max(min(supply_s, total_demand_per_cell[j]), 1e-6)
+            # Per-actor coupling: sum of supply commitments ≤ total
+            # supply (across sectors and tiers).  This is the
+            # binding constraint that creates scarcity when supply
+            # < demand.
+            total_supply = sum(float(v) for v in supply_map.values())
+            actor_supply_total.append(total_supply)
+            C = np.ones((1, n_dims))
+            d = np.array([max(total_supply, 0.0)])
+
+            # S coefficient: bias each actor toward contributing to
+            # high-priority cells.  Same direction as the
+            # coordinator's L1 penalty so they reinforce each other.
+            # Magnitude scaled by share of holon supply so actors
+            # with bigger supply pools have a stronger preference
+            # signal.
+            holon_supply_total = sum(
+                sum((a.supply_by_sector or {}).values()) for a in answers
+            ) or 1.0
+            share = total_supply / holon_supply_total
+            S = -share * priorities
+
+            lb = np.nan_to_num(lb, nan=0.0, posinf=0.0, neginf=0.0)
+            ub = np.nan_to_num(ub, nan=1e-6, posinf=1e6, neginf=1e-6)
+            S = np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
+            actors.append(ADMMFlexActor(lb=lb, u=ub, C=C, d=d, S=S))
+
+        coordinator = create_sharing_target_distance_admm_coordinator()
+        coordinator.max_iters = int(self.admm_max_iters)
+        coordinator.abs_tol = float(self.admm_abs_tol)
+        start_msg = create_admm_start(
+            create_admm_sharing_data(
+                total_T.tolist(), priorities=priorities.tolist()
+            )
+        )
+
+        from scare.base.diagnostics import record_event
+
+        try:
+            await start_coordinated_optimization(actors, coordinator, start_msg)
+        except Exception as exc:
+            logger.error(
+                "[%s] supply-priority holon ADMM failed: %s",
+                self.context.aid, exc,
+            )
+            record_event(
+                t=self.context.current_timestamp,
+                kind="holon_admm_failed",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=f"supply_priority: {exc}",
+            )
+            return
+
+        results = [a.x.tolist() for a in actors]
+        sum_x_per_cell = np.sum(results, axis=0) if results else np.zeros(n_dims)
+
+        # Service fraction per cell: how much of the holon-wide
+        # demand at this (sector, tier) the ADMM allocated supply
+        # for.  Each member leader applies this fraction uniformly
+        # to its local loads at that (sec, tier).
+        service_fraction: dict[str, dict[int, float]] = {}
+        for sec in sectors:
+            service_fraction.setdefault(sec, {})
+            for tier in tiers:
+                j = _flat_idx(sec, tier)
+                T_cell = float(total_T[j])
+                committed = float(sum_x_per_cell[j])
+                frac = 1.0 if T_cell <= 1e-9 else min(1.0, max(0.0, committed / T_cell))
+                service_fraction[sec][tier] = frac
+
+        logger.info(
+            "[%s] supply-priority holon ADMM result: sectors=%s tiers=%s "
+            "T=%s sum_x=%s holon_supply=%.4f",
+            self.context.aid, sectors, tiers, total_T.tolist(),
+            sum_x_per_cell.tolist(),
+            sum(actor_supply_total),
+        )
+        record_event(
+            t=self.context.current_timestamp,
+            kind="holon_admm_result",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=f"supply_priority sectors={sectors} tiers={tiers} fractions={service_fraction}",
+        )
+        record_event(
+            t=self.context.current_timestamp,
+            kind="holon_priority_allocation",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=str({
+                f"{sec}:tier{tier}": {
+                    "T": round(float(total_T[_flat_idx(sec, tier)]), 6),
+                    "weight": float(priorities[_flat_idx(sec, tier)]),
+                    "sum_x": round(float(sum_x_per_cell[_flat_idx(sec, tier)]), 6),
+                    "service_frac": round(service_fraction[sec][tier], 4),
+                }
+                for sec in sectors for tier in tiers
+            }),
+        )
+
+        # Send the SAME service fraction map to every member leader
+        # — the fractions are holon-global, so each leader applies
+        # them locally.  This is the L1 honour path for Route A.
+        if self._holon_member_addrs:
+            triggers = list(self._holon_member_addrs)
+        else:
+            try:
+                triggers = topology_neighbors(self, tid="holons")
+            except Exception:
+                triggers = []
+        for addr in triggers:
+            await self.context.send_message(
+                StartBalanceNegotiation(
+                    service_fraction_by_sector_priority=service_fraction,
+                ),
                 receiver_addr=addr,
             )
 
@@ -867,13 +1723,39 @@ class HolonicCommunityRole(Role):
         return bal / denom
 
     async def _hebbian_beacon(self) -> None:
-        """Periodic broadcast of own δ_g to same-sector neighbours."""
+        """Periodic broadcast of own δ_g to same-sector neighbours.
+
+        The leader ALSO asks itself for fresh flex on each tick.
+        ``_peer_last_delta[own_key]`` is only populated by
+        ``_handle_flex_answer``, which fires on incoming
+        ``AvailableFlexAnswer`` messages.  Non-holon-leader leaders
+        never trigger a rebalance round (no ``_try_rebalance`` call),
+        so without an explicit self-ask their own δ_g stays at 0
+        forever — making every pairwise product δ_g · δ_h zero and
+        H_{gh} unable to cross any threshold.  Pre-2026-05 this
+        latent bug rendered the Hebbian co-variance estimate
+        identically zero for every peer; the recluster's
+        ``no_candidates`` early-return was the symptom.
+        """
         if not self.enable_hebbian_formation:
             return
         if topology_characteristic(self, tid="groups") != "leader":
             return
+        from scare.base.model import AskForAvailableFlex
+
+        # Self-ask so this tick (or the next, if the reply lands after
+        # the send below) sees a non-zero own δ_g in
+        # ``_peer_last_delta``.  The handler is already subscribed
+        # because the leader handles its own AskForAvailableFlex
+        # exactly like a member's.
+        await self.context.send_message(
+            AskForAvailableFlex(include_connectors=False),
+            receiver_addr=self.context.addr,
+        )
+
         # Compute own delta_g from the latest known flex (if any) or
-        # simply 0 during warmup before any rebalance has run.
+        # simply 0 during warmup before the first self-ask reply
+        # arrives.
         own_key = str(self.context.addr)
         delta_g = self._peer_last_delta.get(own_key, self._last_own_delta_g)
         self._last_own_delta_g = delta_g
@@ -909,7 +1791,21 @@ class HolonicCommunityRole(Role):
         self._hebbian_H[sender_key] = (new_h, prev_n + 1)
 
     def hebbian_membership_candidates(self) -> set[str]:
-        """Return the set of peer-keys whose H_{gh} exceeds the threshold.
+        """Return the set of peer-keys whose H_{gh} crosses the threshold
+        in the *anti-correlation* direction.
+
+        ADMM benefits when paired groups have *complementary* stress —
+        one's surplus matches the other's deficit, and the sharing
+        solve has real residual to push around.  Pairing groups whose
+        δ moves *together* (high positive H) just stacks similar
+        deficits on top of each other and gives ADMM nothing to do.
+        So the rule is "admit a peer when ``H_{gh} < -threshold``" —
+        same magnitude criterion as the classical Hebbian threshold,
+        but mirrored: we want consistent anti-coupling.
+
+        The threshold value retains the same meaning (a magnitude on
+        the running EWMA of δ_g · δ_h), so existing tunings of
+        ``hebbian_threshold`` carry over with their semantic intact.
 
         Public so the diagnostics layer (and the ``C.5`` cluster-sync
         analysis script) can compare static topology membership against
@@ -917,10 +1813,10 @@ class HolonicCommunityRole(Role):
         """
         return {
             k for k, (h, _n) in self._hebbian_H.items()
-            if h > self.hebbian_threshold
+            if -h > self.hebbian_threshold
         }
 
-    def _hebbian_recluster(self) -> None:
+    async def _hebbian_recluster(self) -> None:
         """Apply the thresholded Hebbian co-variance to refine the
         leader's holon membership after warmup.
 
@@ -929,12 +1825,29 @@ class HolonicCommunityRole(Role):
         existing propose/accept channel.  Reclustering modifies
         ``_holon_member_addrs`` / ``_holon_member_keys`` in place so
         the next ``_try_rebalance`` cycle picks up the refined set.
+
+        ``async`` even though the body has no awaits — mango's
+        ``PeriodicScheduledTask.run`` does ``await self._coroutine_func()``
+        which requires the callable to return an awaitable; a sync
+        function returns None and the periodic loop dies on the first
+        invocation with ``TypeError: object NoneType can't be used in
+        'await' expression``.  Pre-2026-05 this was an undiagnosed
+        latent bug — Hebbian reclustering never actually fired.
         """
+        from scare.base.diagnostics import record_event
+
         if not self.enable_hebbian_formation:
             return
         if topology_characteristic(self, tid="groups") != "leader":
             return
         if self.context.current_timestamp < self._hebbian_warmup_until:
+            record_event(
+                t=self.context.current_timestamp,
+                kind="hebbian_recluster_attempted",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail="warmup",
+            )
             return
         assignment = self.context.get_or_create_model(HolonicAssignment)
         if assignment.holon_id is None or assignment.parent_addr is not None:
@@ -942,6 +1855,13 @@ class HolonicCommunityRole(Role):
 
         candidates = self.hebbian_membership_candidates()
         if not candidates:
+            record_event(
+                t=self.context.current_timestamp,
+                kind="hebbian_recluster_attempted",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail="no_candidates",
+            )
             return
 
         # Resolve candidate keys back to addresses via the topology.
@@ -963,6 +1883,13 @@ class HolonicCommunityRole(Role):
 
         prev_keys = self._holon_member_keys
         if new_keys == prev_keys:
+            record_event(
+                t=self.context.current_timestamp,
+                kind="hebbian_recluster_attempted",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail="no_drift",
+            )
             return  # no drift
 
         self._holon_member_addrs = new_addrs
@@ -974,7 +1901,6 @@ class HolonicCommunityRole(Role):
             len(new_keys),
             self.sector.value,
         )
-        from scare.base.diagnostics import record_event
 
         record_event(
             t=self.context.current_timestamp,

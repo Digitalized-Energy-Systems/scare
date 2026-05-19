@@ -230,6 +230,35 @@ def lookup_slack(behavior: Any, aid: str) -> "_SlackMeta | None":
     return _slack_store(behavior).get(aid)
 
 
+def _priority_store(behavior: Any) -> dict[str, int]:
+    store = getattr(behavior, "_scare_priorities", None)
+    if store is None:
+        store = {}
+        behavior._scare_priorities = store
+    return store
+
+
+def register_priority(behavior: Any, aid: str, tier: int) -> None:
+    """Record an agent's priority tier on the behavior so callers
+    that don't own the role (e.g. ``EnergyBalanceNegotiator._handle_ask_flex``
+    aggregating across all group members) can look it up.
+
+    Without this registry, ``obs_priority(obs)`` falls back to tier 0
+    for generators and tier 1 for loads — uniform priorities — and
+    every per-tier feature (QP gossip weighting, tier-stratified
+    holon ADMM, ``compute_priority_weighted_shares``) degenerates to
+    a single-tier baseline.
+
+    Stored values are integers ≥ 0; tier 0 is reserved for
+    generator-class agents and slacks.
+    """
+    _priority_store(behavior)[aid] = int(tier)
+
+
+def lookup_priority(behavior: Any, aid: str) -> int | None:
+    return _priority_store(behavior).get(aid)
+
+
 # ---------------------------------------------------------------------------
 # Regulate-action de-duplication
 # ---------------------------------------------------------------------------
@@ -724,6 +753,9 @@ def obs_priority(
     if behavior is not None and aid is not None:
         if lookup_slack(behavior, aid) is not None:
             return 0
+        registered = lookup_priority(behavior, aid)
+        if registered is not None:
+            return registered
     if "priority" in obs:
         return int(obs["priority"])
     cap = obs_capacity(obs)

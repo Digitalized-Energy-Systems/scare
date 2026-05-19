@@ -11,6 +11,13 @@ from mango.express.topology import (
     topology_connectors,
 )
 
+from scare.base.channel import (
+    CPSetpoint,
+    HolonAllocation,
+    MonotonicVersion,
+    SectorImbalanceUpdate,
+    SeenVersions,
+)
 from scare.base.model import (
     AskEnergyMessage,
     AskForAvailableFlex,
@@ -57,6 +64,14 @@ _CP_SETPOINT_TOLERANCE: dict[Sector, float] = {
 }
 _CP_DEFAULT_TOLERANCE = 0.01
 
+# --- Predicate-driven trigger (channel/decision path) ---
+# Below ``_PREDICATE_DEAD_BAND`` the cross-sector imbalance is treated
+# as noise and the predicate stays False.  ``_PREDICATE_MIN_GAP_S``
+# enforces a cooldown between predicate-driven fires so the role
+# cannot self-thrash if two beacons publish in rapid succession.
+_PREDICATE_DEAD_BAND_MW: float = 1e-4
+_PREDICATE_MIN_GAP_S: float = 1.0
+
 
 class EnergyConverterRole(Role):
     def __init__(
@@ -85,6 +100,27 @@ class EnergyConverterRole(Role):
         # such skip at INFO so it is visible without flooding.
         self._same_sign_skip_count: int = 0
 
+        # --- Predicate path state ---
+        # Per-publisher version memory for SectorImbalanceUpdate so we
+        # don't re-evaluate the predicate against stale beacon decisions.
+        self._seen_beacons = SeenVersions()
+        # Latest signed imbalance per (publisher, sector).  Aggregated
+        # by sector in ``_predicate_inputs`` when the predicate runs.
+        self._beacon_imbalance: dict[tuple[str, Sector], float] = {}
+        self._last_predicate_fire_t: float = -1e9
+
+        # --- L2 -> L3 channel state ---
+        # Same shape as the beacon path but for ``HolonAllocation``: a
+        # holon committed a cross-sector setpoint shift; we may want
+        # to fire CP ADMM directly without waiting for the downstream
+        # gossip to materialise.
+        self._seen_holon_alloc = SeenVersions()
+        self._holon_alloc_signal: dict[tuple[str, Sector], float] = {}
+        self._last_holon_predicate_fire_t: float = -1e9
+
+        # --- L3 publishing identity ---
+        self._cp_version = MonotonicVersion()
+
     def setup(self) -> None:
         def _wrap(coro_fn):
             def _sync(msg, meta):
@@ -109,6 +145,23 @@ class EnergyConverterRole(Role):
             self,
             _wrap(self._handle_flex_answer),
             lambda msg, meta: isinstance(msg, AvailableFlexAnswer),
+        )
+        # Predicate path: receive sector-imbalance beacons from group
+        # leaders.  This runs *alongside* the legacy NegotiationFinishedEvent
+        # path — both can trigger ADMM independently, and the existing
+        # ``self._active`` guard prevents concurrent runs.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_sector_imbalance),
+            lambda msg, meta: isinstance(msg, SectorImbalanceUpdate),
+        )
+        # Direct L2 -> L3 trigger.  When a holon commits a per-member
+        # allocation that creates cross-sector flow, the CP can decide
+        # to engage before the L1 gossip resolves the new targets.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_holon_allocation),
+            lambda msg, meta: isinstance(msg, HolonAllocation),
         )
 
     async def _handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
@@ -135,6 +188,156 @@ class EnergyConverterRole(Role):
             available=0.0,
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
+
+    async def _handle_sector_imbalance(
+        self, message: SectorImbalanceUpdate, meta: dict
+    ) -> None:
+        """Predicate-driven trigger path (channel/decision design).
+
+        Updates the per-publisher imbalance memory, then evaluates the
+        trigger predicate over the aggregated sector vector.  Fires
+        ``trigger_cp_negotiation`` independently of whether L1 gossip
+        has finished — the missing path that left L3 silent on
+        ``simbench_lv_cp_heavy`` with the holon layer disabled.
+        """
+        # Only the CP leader runs ADMM.  Non-leaders silently drop
+        # beacons; they exist for symmetry with the legacy path.
+        char = topology_characteristic(self, tid="cps")
+        logger.debug(
+            "[%s] CP received beacon: sector=%s imb=%.5f v=%d from %s char=%s",
+            self.context.aid, message.sector.value, message.local_imbalance_mw,
+            message.version, message.publisher, char,
+        )
+        if char != "leader":
+            return
+        # Echo / staleness guard.  ``caused_by[my_aid] == latest`` means
+        # the beacon is reporting on state we just published; skip it.
+        my_latest = self._seen_beacons.latest(self.context.aid)
+        if message.caused_by.get(self.context.aid, -1) == my_latest and my_latest >= 0:
+            return
+        if not self._seen_beacons.is_fresh(message.publisher, message.version):
+            return
+
+        self._beacon_imbalance[(message.publisher, message.sector)] = (
+            float(message.local_imbalance_mw)
+        )
+        self._seen_beacons.mark(message.publisher, message.version)
+
+        if self._active:
+            return
+
+        T = self._predicate_inputs()
+        if not self._predicate_should_run(T):
+            return
+
+        now = float(self.context.current_timestamp)
+        if now - self._last_predicate_fire_t < _PREDICATE_MIN_GAP_S:
+            return
+        self._last_predicate_fire_t = now
+
+        logger.info(
+            "[%s] CP predicate fired: T=%s (publisher=%s v=%d)",
+            self.context.aid,
+            {s.value: round(v, 4) for s, v in T.items()},
+            message.publisher,
+            message.version,
+        )
+        self.context.schedule_instant_task(self.trigger_cp_negotiation())
+
+    def _predicate_inputs(self) -> dict[Sector, float]:
+        """Aggregate the latest per-publisher imbalances by sector.
+
+        A publisher only contributes its most-recent value per sector
+        (the dict is keyed by ``(publisher, sector)``).  Sums across
+        publishers give the sector-level signal the predicate compares
+        across sectors.
+        """
+        by_sector: dict[Sector, float] = {}
+        for (_, sec), v in self._beacon_imbalance.items():
+            if sec in self.sectors:
+                by_sector[sec] = by_sector.get(sec, 0.0) + v
+        return by_sector
+
+    def _predicate_should_run(self, T: dict[Sector, float]) -> bool:
+        """Predicate is a *wake-up hint*, not an ADMM-feasibility test.
+
+        The historical same-sign-skip lives inside ``_run_admm`` (which
+        runs its own ``AskForAvailableFlex`` round after we trigger),
+        so the predicate doesn't need to duplicate it.  Beacons only
+        cover sectors whose group leaders had a CP connector
+        registered (and mango's per-agent single-conn_type rule means
+        multi-sector CPs only show up to one sector's leaders), which
+        would otherwise make the cross-sector check unreachable.
+
+        The predicate just asks: did any subscribed sector report
+        stress beyond the dead-band?  If yes, wake the CP up; its
+        collection round will gather the real cross-sector picture.
+        """
+        if not T:
+            return False
+        return any(abs(v) >= _PREDICATE_DEAD_BAND_MW for v in T.values())
+
+    async def _handle_holon_allocation(
+        self, message: HolonAllocation, meta: dict
+    ) -> None:
+        """Direct L2 -> L3 trigger via the channel/decision pattern.
+
+        A holon just published its per-member ADMM allocation.  The
+        magnitudes of those targets, signed in load convention, are a
+        leading indicator that the affected groups are about to shift
+        their sector balance — CP can engage now rather than waiting
+        for the gossip chain to resolve the new targets and broadcast
+        ``NegotiationFinishedEvent``.
+
+        Aggregation reuses the same dictionary the beacon path fills,
+        keyed by ``(publisher, sector)``, so the predicate sees a
+        unified view across both channels.
+        """
+        char = topology_characteristic(self, tid="cps")
+        logger.debug(
+            "[%s] CP received holon-allocation: sector=%s n_targets=%d v=%d from %s char=%s",
+            self.context.aid, message.sector.value,
+            len(message.targets_mw), message.version, message.publisher, char,
+        )
+        if char != "leader":
+            return
+        # Echo guard: a holon allocation triggered by our own CP
+        # setpoint isn't fresh news to us.
+        if (
+            message.caused_by.get(self.context.aid, -1) == self._cp_version.current
+            and self._cp_version.current > 0
+        ):
+            return
+        if not self._seen_holon_alloc.is_fresh(message.publisher, message.version):
+            return
+
+        # Use the aggregate target magnitude as the per-(publisher, sector)
+        # signal.  Sum of |targets_mw| captures the holon's intent to
+        # rebalance regardless of how the shed is distributed across
+        # members; sign isn't meaningful here because L2's per-member
+        # allocations can cancel out within a sector.
+        signal = sum(abs(v) for v in message.targets_mw.values())
+        key = (message.publisher, message.sector)
+        self._holon_alloc_signal[key] = signal
+        self._seen_holon_alloc.mark(message.publisher, message.version)
+
+        if self._active:
+            return
+        if signal < _PREDICATE_DEAD_BAND_MW:
+            return
+
+        now = float(self.context.current_timestamp)
+        if now - self._last_holon_predicate_fire_t < _PREDICATE_MIN_GAP_S:
+            return
+        self._last_holon_predicate_fire_t = now
+
+        logger.info(
+            "[%s] CP holon-allocation predicate fired: sector=%s "
+            "sum_abs_targets=%.4f (publisher=%s v=%d)",
+            self.context.aid, message.sector.value, signal,
+            message.publisher, message.version,
+        )
+        self.context.schedule_instant_task(self.trigger_cp_negotiation())
 
     async def _handle_negotiation_finished(
         self, message: NegotiationFinishedEvent, meta: dict
@@ -319,13 +522,42 @@ class EnergyConverterRole(Role):
             # on its dict lookup.  Previously that KeyError was caught by
             # the outer ``except Exception`` and the ADMM result was
             # discarded — the CP layer was diagnostic-only.
-            self._apply_result(result)
+            applied_factor = self._apply_result(result)
             try:
                 self.context.emit_event(OptimizationFinishedLocalEvent(result=result))
             except KeyError:
                 pass
-            for addr in topology_connectors(self, tid="cps"):
-                await self.context.send_message(StartBalanceNegotiation(), receiver_addr=addr)
+            group_leaders = topology_connectors(self, tid="cps")
+            # Publish CPSetpoint Decision (channel/decision pattern)
+            # alongside the legacy StartBalanceNegotiation so subscribed
+            # holons can re-evaluate directly.  Result layout matches
+            # _RESULT_INDEX: [0=EL_MW, 1=HEAT_MW, 2=GAS_MW].
+            sector_flows: dict[str, float] = {}
+            for sector, idx in _RESULT_INDEX.items():
+                if idx < len(result):
+                    sector_flows[sector.value] = float(result[idx])
+            cp_decision = CPSetpoint(
+                publisher=str(self.context.aid),
+                version=self._cp_version.next(),
+                caused_by={},
+                timestamp_s=float(self.context.current_timestamp),
+                cp_id=str(self.context.aid),
+                sector_flows_mw=sector_flows,
+                regulation_factor=float(applied_factor or 1.0),
+            )
+            logger.debug(
+                "[%s] CP publish: sector_flows=%s reg=%.3f v=%d to %d holons",
+                self.context.aid,
+                {s: round(v, 3) for s, v in sector_flows.items()},
+                cp_decision.regulation_factor,
+                cp_decision.version,
+                len(group_leaders),
+            )
+            for addr in group_leaders:
+                await self.context.send_message(
+                    StartBalanceNegotiation(), receiver_addr=addr
+                )
+                await self.context.send_message(cp_decision, receiver_addr=addr)
         except Exception as exc:
             logger.error("[%s] ADMM failed: %s", self.context.aid, exc)
             # Fallback: trigger intra-group gossip so groups can still
@@ -337,7 +569,7 @@ class EnergyConverterRole(Role):
 
         self._active = False
 
-    def _apply_result(self, result: list[float]) -> None:
+    def _apply_result(self, result: list[float]) -> float | None:
         obs = self.behavior.observe(self.context.aid) or {}
         # result layout: [0=EL, 1=HEAT, 2=GAS]
         # A CP has a single regulation knob.  Compute a factor per sector
@@ -374,3 +606,4 @@ class EnergyConverterRole(Role):
                 reason="cp_admm",
                 timestamp=self.context.current_timestamp,
             )
+        return best_factor

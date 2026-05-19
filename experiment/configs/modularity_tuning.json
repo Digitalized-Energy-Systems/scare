@@ -1,0 +1,70 @@
+{
+  "$comment": [
+    "Modularity-partition tuning sweep on the same stressed scenario:",
+    "  baseline       : label_propagation + holon_max_size=4 (current default)",
+    "  mod_gamma1_h3  : modularity γ=1.0 + holon_max_size=3  (smaller holons match smaller communities)",
+    "  mod_gamma1_h6  : modularity γ=1.0 + holon_max_size=6  (larger holons pool more flex)",
+    "  mod_gamma05_h4 : modularity γ=0.5 + holon_max_size=4  (coarsen partition, keep holons)",
+    "  mod_gamma05_h3 : modularity γ=0.5 + holon_max_size=3  (both knobs together)",
+    "Same scenario as modularity_eval.json (line_stress + multi-failure on cp_heavy)."
+  ],
+  "name": "modularity_tuning",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 1,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "name": "tuning",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {
+          "community_partition_method": "label_propagation",
+          "holon_max_size": 4,
+          "hebbian_warmup_s": 4.0
+        },
+        {
+          "community_partition_method": "modularity",
+          "community_modularity_resolution": 1.0,
+          "holon_max_size": 3,
+          "hebbian_warmup_s": 4.0
+        },
+        {
+          "community_partition_method": "modularity",
+          "community_modularity_resolution": 1.0,
+          "holon_max_size": 6,
+          "hebbian_warmup_s": 4.0
+        },
+        {
+          "community_partition_method": "modularity",
+          "community_modularity_resolution": 0.5,
+          "holon_max_size": 4,
+          "hebbian_warmup_s": 4.0
+        },
+        {
+          "community_partition_method": "modularity",
+          "community_modularity_resolution": 0.5,
+          "holon_max_size": 3,
+          "hebbian_warmup_s": 4.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "slack_budget_pct": 0.45
+        }
+      ]
+    }
+  ]
+}

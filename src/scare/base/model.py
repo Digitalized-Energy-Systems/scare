@@ -102,6 +102,40 @@ class EnergyData:
 class CommunityAssignment:
     community_id: UUID | None = None
     neighbors: list[Any] = field(default_factory=list)
+    # Leader of the current community.  ``None`` ⇒ leader resolved
+    # statically from the ``groups`` topology characteristic.  Set
+    # explicitly by ``DynamicRepartitionRole`` after a failure-driven
+    # re-election so downstream code can pick the right leader when
+    # the orphaned sub-community has chosen a different one than the
+    # static partition assigned.
+    leader_addr: Any | None = None
+
+
+@dataclass
+class RepartitionAssignment:
+    """Sent from the original group leader to each orphaned member
+    after a failure-driven re-partition.  Carries the orphan's new
+    community membership (a fresh ``community_id`` shared by all
+    orphans), the elected new leader, and the full list of fellow
+    orphan addresses (so the receiving agent can update its own
+    ``CommunityAssignment.neighbors``).
+    """
+
+    community_id: UUID
+    new_leader_addr: Any
+    orphan_addrs: list[Any] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CommunityReassignedEvent:
+    """Local event emitted by the orphan after its CommunityAssignment
+    has been updated post-repartition.  Downstream roles that cache
+    community-derived state (e.g. cached leader address) should
+    subscribe and refresh.
+    """
+
+    new_leader_addr: Any
+    n_neighbors: int
 
 
 @dataclass
@@ -241,6 +275,20 @@ class AvailableFlexAnswer:
     # Keys are priority tiers (int, 1=highest); values are MW (or equivalent).
     demand_by_priority: dict[int, float] = field(default_factory=dict)
     served_by_priority: dict[int, float] = field(default_factory=dict)
+    # Per-(sector, tier) breakdown — populated alongside the tier-only
+    # aggregates so the holon ADMM can build a tier-stratified target
+    # vector instead of collapsing demand to a single per-sector scalar.
+    # ``demand_by_sector_priority["electricity"][2] = 5.0`` means: "this
+    # group has 5 MW of nominal tier-2 demand in the electricity sector".
+    # Empty for messages from heat sectors that have no per-tier info.
+    demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    # Total *supply* (generator-class) capacity per sector.  Used by the
+    # Route-A "supply-priority" holon ADMM mode to model the holon's
+    # scarce supply pool and let priority weighting arbitrate which
+    # tiers' demands get served.  Sum of |cap| across generators /
+    # slack-class children in the group, per sector.
+    supply_by_sector: dict[str, float] = field(default_factory=dict)
     # Unmet load per sector — captures load that the LP could not
     # deliver (regulation forced to 0 by monee's disconnect handling,
     # or otherwise shed).  Separate from ``balance_by_sector`` because
@@ -261,6 +309,27 @@ class StartBalanceNegotiation:
     # gossip target instead of being discarded.  None preserves the
     # original behaviour: member leader recomputes its own target.
     override_target: float | None = None
+    # Per-(sector, tier) override produced by the tier-stratified holon
+    # ADMM (Package C, ``enable_tier_stratified_holon_admm``).  When
+    # set, the receiving leader bypasses the scalar gossip target and
+    # dispatches each agent directly with the slice of its tier's
+    # allocation, preserving the holon's global priority decision
+    # through the L2 → L1 handoff (the scalar ``override_target`` does
+    # not).  Schema: ``{sector_value: {tier: target_mw}}`` where the
+    # tier-2 entry in electricity is the new desired setpoint sum for
+    # all tier-2 electricity loads in this group.  ``None`` keeps the
+    # legacy scalar-only behaviour.
+    override_targets_by_sector_priority: dict[str, dict[int, float]] | None = None
+    # Route-A supply-priority allocation: per-(sector, tier) service
+    # fraction the holon has decided for the system.  Each local load
+    # at (sec, tier) gets ``factor = service_fraction[sec][tier]``
+    # applied via ``apply_regulate``.  Distinct from
+    # ``override_targets_by_sector_priority`` (which carries absolute
+    # MW deltas under the demand-side formulation): the supply-side
+    # formulation gives a fractional service decision that's
+    # independent of the local demand magnitude, so the holon's
+    # priority allocation reaches each load uniformly within its tier.
+    service_fraction_by_sector_priority: dict[str, dict[int, float]] | None = None
 
 
 @dataclass

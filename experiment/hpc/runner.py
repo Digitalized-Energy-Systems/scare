@@ -54,40 +54,70 @@ LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
 
 class _SolverFailureCounter(logging.Filter):
-    """Counts solver-status escalations on monee.solver.pyo so we can
-    report solver health per task without grepping logs.
+    """Counts solver-status escalations across the Pyomo/monee stack so
+    we can report solver health per task without grepping logs.
 
-    Tracks both real infeasibilities (ERROR with ``infeasible``) and
-    non-ok warnings (Gurobi stopping at gap/time limit etc).  ``count``
-    is the union for backwards-compatible reporting; the split is
-    available via ``infeasible_count`` and ``warning_count``.
+    Two paths produce a "model was infeasible" signal:
 
-    Also catches Gurobi / Pyomo exception strings that escape the
-    monee.solver.pyo logger (license errors, host-id mismatches, env
-    initialization failures) so the aggregator can distinguish solver
-    environment issues from algorithm bugs.
+    1. ``monee.solver.pyo._classify_solve_result`` logs ERROR with
+       ``"Pyomo solve infeasible (status=warning, termination=...)"``.
+    2. Pyomo itself logs WARNING on ``pyomo.core`` of the shape
+       ``"Loading a SolverResults object with a warning status …
+       termination condition: infeasible"`` whenever ``load_solutions=
+       True`` accepts a non-OK result.
+
+    The two paths fire as a pair on every infeasible solve.  The
+    counter dedupes by collapsing matches that arrive within
+    ``_DEDUPE_WINDOW_S`` of each other (the pair is always ~tens of
+    ms apart; back-to-back distinct solves are spaced by at least the
+    environment ``energy_flow_cooldown_s`` plus the Gurobi solve time,
+    typically ≥ 100 ms).  Listening on both loggers means we still
+    catch the infeasibility when, for whatever reason, only one of
+    the two emit (observed in ``eval_smoke_20260518`` where the monee
+    ERROR was silent while the pyomo.core WARNING fired).
+
+    Also catches Gurobi / Pyomo exception strings (license errors,
+    host-id mismatches, env initialization failures) so the aggregator
+    can distinguish solver environment issues from algorithm bugs.
     """
 
     _SOLVER_ERROR_MARKERS: tuple[str, ...] = (
         "GurobiError",
         "HostID mismatch",
         "License",  # Gurobi LicenseError
-        "Pyomo solve infeasible",
     )
+    _DEDUPE_WINDOW_S: float = 1.0
 
     def __init__(self) -> None:
         super().__init__()
         self.count = 0
         self.infeasible_count = 0
         self.warning_count = 0
+        self._last_infeasible_t: float = float("-inf")
+
+    def _is_infeasible_msg(self, msg: str) -> bool:
+        # monee.solver.pyo ERROR path (paired classify_solve_result).
+        if "infeasible (status=" in msg or "Pyomo solve infeasible" in msg:
+            return True
+        # pyomo.core load_solutions WARNING path; the multi-line message
+        # carries both substrings on the same record (Pyomo formats them
+        # via ``\n  - termination condition: …``).
+        if (
+            "Loading a SolverResults object" in msg
+            and "termination condition: infeasible" in msg
+        ):
+            return True
+        return False
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         if record.levelno < logging.WARNING:
             return True
         msg = record.getMessage()
-        if "infeasible (status=" in msg:
-            self.infeasible_count += 1
-            self.count += 1
+        if self._is_infeasible_msg(msg):
+            if record.created - self._last_infeasible_t >= self._DEDUPE_WINDOW_S:
+                self.infeasible_count += 1
+                self.count += 1
+            self._last_infeasible_t = record.created
         elif "returned non-ok status" in msg:
             self.warning_count += 1
             self.count += 1
@@ -136,7 +166,12 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     counter = _SolverFailureCounter()
-    logging.getLogger("monee.solver.pyo").addFilter(counter)
+    # Listen on both emitters of the infeasibility signal — monee's
+    # classify_solve_result ERROR and pyomo.core's load_solutions
+    # WARNING.  The counter dedupes the pair internally so a single
+    # infeasible solve is counted once.
+    for logger_name in ("monee.solver.pyo", "pyomo.core"):
+        logging.getLogger(logger_name).addFilter(counter)
     return handler, counter
 
 

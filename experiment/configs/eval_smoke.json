@@ -192,6 +192,83 @@
           "slack_budget_pct": 0.45
         }
       ]
+    },
+    {
+      "$comment": "New code paths from the 2026-05 work — one task each to keep the smoke fast",
+      "name": "holon_admm_mode",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {
+          "holon_admm_mode": "demand",
+          "enable_tier_stratified_holon_admm": true
+        },
+        {
+          "holon_admm_mode": "supply",
+          "enable_tier_stratified_holon_admm": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "slack_budget_pct": 0.45,
+          "priority_assignment": "uniform"
+        }
+      ]
+    },
+    {
+      "name": "partition_method",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {
+          "community_partition_method": "label_propagation"
+        },
+        {
+          "community_partition_method": "modularity"
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "name": "hebbian_reclustering",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {
+          "enable_hebbian_formation": true,
+          "hebbian_warmup_s": 2.0
+        },
+        {
+          "enable_hebbian_formation": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "slack_budget_pct": 0.45
+        }
+      ]
     }
   ],
   "slurm": {

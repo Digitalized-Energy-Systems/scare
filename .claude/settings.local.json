@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show *)",
+      "Bash(timeout 60 python -c \"from experiment.hpc.config import CampaignConfig; cfg = CampaignConfig.from_json\\('experiment/configs/eval_smoke.json'\\); print\\('tasks would be planned for:', cfg.name\\); print\\('experiments:', [e.name for e in cfg.experiments]\\)\")",
+      "Bash(timeout 60 python -m experiment.hpc.plan experiment/configs/eval_smoke.json)",
+      "Bash(timeout 600 python -m experiment.hpc.runner --campaign-dir experiment/_runs/eval/eval_smoke_20260516-141901 --task-id 0)",
+      "Bash(timeout 60 python -m experiment.hpc.runner --campaign-dir experiment/_runs/eval/eval_smoke_20260516-141901 --task-id 0 --dry-run)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(k\\) for k in d.keys\\(\\)]\")",
+      "Bash(python -c ' *)",
+      "Bash(awk '$2 ~ /16:19:36/' experiment/_runs/eval/eval_smoke_20260516-141901/tasks/000000/run.log)"
+    ]
+  }
+}

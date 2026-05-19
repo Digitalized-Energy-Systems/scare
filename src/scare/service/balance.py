@@ -1639,6 +1639,9 @@ class EnergyBalanceNegotiator(Role):
         unmet_by_sector: dict[str, float] = {}
         demand_by_priority: dict[int, float] = {}
         served_by_priority: dict[int, float] = {}
+        demand_by_sector_priority: dict[str, dict[int, float]] = {}
+        served_by_sector_priority: dict[str, dict[int, float]] = {}
+        supply_by_sector: dict[str, float] = {}
         for aid in member_aids:
             obs = self.behavior.observe(aid) or {}
             sector = obs_sector(obs, behavior=self.behavior, aid=aid)
@@ -1651,11 +1654,30 @@ class EnergyBalanceNegotiator(Role):
             sec_key = sector.value
             flex_by_sector[sec_key] = flex_by_sector.get(sec_key, 0.0) + available
             balance_by_sector[sec_key] = balance_by_sector.get(sec_key, 0.0) + sp
+            # Route-A supply-priority: accumulate generator-class
+            # rated supply per sector.  Convention: cap < 0 for
+            # generators (load-sign convention), so |cap| is the
+            # rated output magnitude.  Slack agents register via
+            # ``register_slack`` with their rated capacity surfaced
+            # by ``obs_capacity`` — they too count as supply.
+            if cap < 0:
+                supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + abs(cap)
             # Priority-tier demand aggregation (loads only: cap > 0)
             if cap > 0:
                 prio = obs_priority(obs, behavior=self.behavior, aid=aid)
                 demand_by_priority[prio] = demand_by_priority.get(prio, 0.0) + abs(cap)
                 served_by_priority[prio] = served_by_priority.get(prio, 0.0) + abs(sp)
+                # Per-(sector, tier) split for the tier-stratified holon
+                # ADMM.  Same data, just keyed by sector first so the
+                # holon can build a 2D target vector.
+                demand_by_sector_priority.setdefault(sec_key, {})
+                demand_by_sector_priority[sec_key][prio] = (
+                    demand_by_sector_priority[sec_key].get(prio, 0.0) + abs(cap)
+                )
+                served_by_sector_priority.setdefault(sec_key, {})
+                served_by_sector_priority[sec_key][prio] = (
+                    served_by_sector_priority[sec_key].get(prio, 0.0) + abs(sp)
+                )
                 # Unmet demand: rated cap minus actual sp.  Captures the
                 # silent disconnect-loss case where monee's ``find_ignored_
                 # nodes`` sets regulation=0 on a load that has no path to a
@@ -1683,6 +1705,9 @@ class EnergyBalanceNegotiator(Role):
             demand_by_priority=demand_by_priority,
             served_by_priority=served_by_priority,
             unmet_by_sector=unmet_by_sector,
+            demand_by_sector_priority=demand_by_sector_priority,
+            served_by_sector_priority=served_by_sector_priority,
+            supply_by_sector=supply_by_sector,
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
@@ -1690,6 +1715,34 @@ class EnergyBalanceNegotiator(Role):
         self, message: StartBalanceNegotiation, meta: dict
     ) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
+            return
+        # Route A (supply-priority) takes highest precedence: the
+        # holon-global service fractions are applied directly per
+        # local-load-tier.
+        service_frac = getattr(
+            message, "service_fraction_by_sector_priority", None
+        )
+        if service_frac:
+            if self._active:
+                return
+            self._active = True
+            self.context.schedule_instant_task(
+                self._dispatch_service_fractions(service_frac)
+            )
+            return
+        # Package C tier-stratified override takes precedence over the
+        # scalar override.  The per-(sector, tier) map preserves the
+        # holon's priority decision; the scalar collapses it.
+        per_tier = getattr(
+            message, "override_targets_by_sector_priority", None
+        )
+        if per_tier:
+            if self._active:
+                return
+            self._active = True
+            self.context.schedule_instant_task(
+                self._dispatch_per_tier_targets(per_tier)
+            )
             return
         override = getattr(message, "override_target", None)
         if override is not None and math.isfinite(override):
@@ -1704,6 +1757,166 @@ class EnergyBalanceNegotiator(Role):
             self.context.schedule_instant_task(self._start_gossip(float(override)))
             return
         self.context.schedule_instant_task(self.trigger_balance_negotiation())
+
+    async def _dispatch_service_fractions(
+        self, service_fraction: dict[str, dict[int, float]]
+    ) -> None:
+        """Apply a Route-A supply-priority allocation to local agents.
+
+        ``service_fraction[sector][tier] ∈ [0, 1]`` is the *fraction
+        of demand* the holon has decided to serve at (sector, tier),
+        decided globally across the holon based on supply scarcity
+        and priority weighting.  Each local load at (sec, tier)
+        receives the same fraction as its regulation factor — so a
+        tier-2 cell served at 1.0 globally produces factor=1.0 on
+        every tier-2 load in this group, while a tier-8 cell at 0.0
+        sheds every tier-8 load.
+
+        Generators are not touched here — they're already at their
+        rated output; the LP solver downstream routes the freed
+        supply via the grid to satisfy the served demand.
+        """
+        try:
+            from scare.base.util import apply_regulate, obs_priority
+
+            members = [self.context.aid]
+            for neigh in self._live_neighbours():
+                members.append(neigh.aid)
+
+            applied = 0
+            shed_count = 0
+            for aid in members:
+                obs = self.behavior.observe(aid) or {}
+                cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
+                if cap <= 0:  # generator-class — leave alone
+                    continue
+                sec = obs_sector(obs, behavior=self.behavior, aid=aid)
+                if sec is None:
+                    continue
+                prio = obs_priority(obs, behavior=self.behavior, aid=aid)
+                frac = service_fraction.get(sec.value, {}).get(prio)
+                if frac is None:
+                    # No allocation for this (sec, tier) — preserve
+                    # current state.  Could happen if this tier had
+                    # zero demand at holon collection time but a
+                    # load drifted into the tier since.
+                    continue
+                factor = max(0.0, min(1.0, float(frac)))
+                if factor < 1.0:
+                    shed_count += 1
+                apply_regulate(
+                    self.behavior,
+                    aid,
+                    factor,
+                    sector=sec.value,
+                    reason="holon_supply_priority",
+                    timestamp=self.context.current_timestamp,
+                )
+                applied += 1
+
+            if applied:
+                logger.info(
+                    "[%s] supply-frac dispatched: %d regulations, %d sheds, fracs=%s",
+                    self.context.aid, applied, shed_count,
+                    {sec: {t: round(v, 3) for t, v in tm.items()}
+                     for sec, tm in service_fraction.items()},
+                )
+        finally:
+            self._active = False
+
+    async def _dispatch_per_tier_targets(
+        self, per_tier: dict[str, dict[int, float]]
+    ) -> None:
+        """Apply a tier-stratified holon allocation to local agents.
+
+        ``per_tier[sector][tier]`` is the holon-decided change in
+        served setpoint for the (sector, tier) sub-population of
+        *this leader's group*.  Each agent in the group with the
+        matching sector + tier gets a regulation update proportional
+        to its share of the tier's total capacity.
+
+        This is the L1 honour path for Package C.  Bypasses the
+        gossip QP — the holon already solved the priority allocation
+        globally, and re-running the QP locally would let the local
+        ``_qp_priority_weight`` overrule the holon decision, which is
+        exactly the bug that motivated Package C.  CLPU ramp and
+        monotonic floor still apply: ``apply_regulate`` consults the
+        sector config and clamps regulation increases accordingly.
+        """
+        try:
+            from scare.base.util import apply_regulate, obs_priority
+
+            members = [self.context.aid]
+            for neigh in self._live_neighbours():
+                members.append(neigh.aid)
+
+            # Group members by (sector, tier) so we can split each
+            # tier's target proportionally across its members.
+            per_cell_aids: dict[tuple[str, int], list[str]] = {}
+            for aid in members:
+                obs = self.behavior.observe(aid) or {}
+                cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
+                if cap <= 0:
+                    continue  # generators / slacks contribute via setpoint, not tier
+                prio = obs_priority(obs, behavior=self.behavior, aid=aid)
+                sec = obs_sector(obs, behavior=self.behavior, aid=aid)
+                if sec is None:
+                    continue
+                per_cell_aids.setdefault((sec.value, prio), []).append(aid)
+
+            applied = 0
+            for sec, tier_map in per_tier.items():
+                for tier, tgt in tier_map.items():
+                    aids = per_cell_aids.get((sec, tier), [])
+                    if not aids:
+                        continue
+                    # ``tgt`` is the change in served setpoint the holon
+                    # has allocated to this (sector, tier) cell.  In
+                    # gossip's sign convention this is negative when
+                    # we have to import (i.e. raise served sp).  Total
+                    # absorbed = -tgt; split across members by capacity.
+                    caps = []
+                    for aid in aids:
+                        obs = self.behavior.observe(aid) or {}
+                        caps.append(
+                            abs(obs_capacity(obs, behavior=self.behavior, aid=aid))
+                        )
+                    total_cap = sum(caps) or 1.0
+                    # Compute each agent's new factor.  Sign of tgt:
+                    # negative = absorb (raise factor toward 1), positive
+                    # = shed (lower factor).  The holon ADMM produced
+                    # tgt as -allocation (see _run_tier_stratified_admm
+                    # override construction); so positive tgt means
+                    # "this cell should serve more".
+                    for aid, cap in zip(aids, caps):
+                        share = cap / total_cap
+                        delta_sp = tgt * share  # change in served setpoint
+                        obs = self.behavior.observe(aid) or {}
+                        sp_curr = obs_setpoint(
+                            obs, behavior=self.behavior, aid=aid
+                        )
+                        new_sp = sp_curr + delta_sp
+                        if cap == 0.0:
+                            continue
+                        factor = max(0.0, min(1.0, new_sp / cap))
+                        apply_regulate(
+                            self.behavior,
+                            aid,
+                            factor,
+                            sector=sec,
+                            reason="holon_tier_alloc",
+                            timestamp=self.context.current_timestamp,
+                        )
+                        applied += 1
+
+            if applied:
+                logger.info(
+                    "[%s] tier-alloc dispatched: %d regulations across %d cells",
+                    self.context.aid, applied,
+                    sum(1 for tm in per_tier.values() for _ in tm),
+                )
+        finally:
+            self._active = False
 
     async def _handle_failure_notice(
         self, message: FailureNotice, meta: dict

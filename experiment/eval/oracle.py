@@ -67,6 +67,57 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
                 )
 
 
+def _weight_for_load_factory(
+    monee_net: Any,
+    priorities: dict[str, int] | None,
+    *,
+    base_demand_weight: float,
+    n_tiers: int = 10,
+) -> Any | None:
+    """Build a ``weight_for_load`` closure for monee's
+    ``create_min_load_shedding_problem``.
+
+    Returns a callable ``model -> float | None`` where ``float`` is the
+    per-load weight ``base_demand_weight × 2^(P − tier + 1)`` and
+    ``None`` defers to monee's default ``demand_weight``.  The
+    exponential schedule matches L1's QP weighting and the tier-
+    stratified holon ADMM so the three layers agree on priority
+    ordering.
+
+    Returns ``None`` if no priorities are supplied — caller passes
+    that through to ``weight_for_load=None`` so monee uses its
+    legacy flat-weight behaviour (no priority discrimination).
+
+    The closure resolves models by ``id(model)``, populated once
+    from the network's child list.  Generators / slack / unmapped
+    models return ``None`` so monee uses the default for them.
+    """
+    if not priorities:
+        return None
+    model_to_tier: dict[int, int] = {}
+    for child in monee_net.childs:
+        aid = f"child-{child.id}"
+        tier = priorities.get(aid)
+        if tier is None or int(tier) <= 0:
+            continue
+        model_to_tier[id(child.model)] = int(tier)
+
+    if not model_to_tier:
+        return None
+
+    def _w(model: Any) -> float | None:
+        tier = model_to_tier.get(id(model))
+        if tier is None:
+            return None  # let monee use its default
+        # Schedule mirrors balance.py:_qp_priority_weight (restoration):
+        # tier-1 -> 2^P, tier-P -> 2.  Anchored at the demand-weight base
+        # so the auto-floor logic continues to see something close to the
+        # legacy magnitude as the minimum.
+        return float(base_demand_weight) * (2.0 ** max(0, n_tiers - tier + 1))
+
+    return _w
+
+
 def _adapter_observe(monee_net: Any) -> Any:
     """Return a behavior-like object whose ``observe(aid)`` reads the
     model state directly (so ``served_breakdown`` works unchanged
@@ -106,7 +157,10 @@ def run_oracle(
     # NB: ``create_min_load_shedding_problem`` is exposed only via
     # the submodule ``monee.problem`` — top-level ``monee`` re-imports
     # it but it gets filtered out of the public namespace.
-    from monee.problem import create_min_load_shedding_problem
+    from monee.problem import (
+        WEIGHT_DEMAND,
+        create_min_load_shedding_problem,
+    )
 
     from experiment.eval.metrics import served_breakdown
 
@@ -124,7 +178,23 @@ def run_oracle(
 
         solver = PyomoSolver()
 
-    prob = create_min_load_shedding_problem()
+    # When ``priorities`` is supplied, attach a per-load weight
+    # closure so the LP objective discriminates between tiers.
+    # Without it the oracle minimises *total* unserved MW with
+    # every load equal — defining a "priority-blind upper bound"
+    # that compares unfairly against the priority-aware MAS.
+    weight_for_load = _weight_for_load_factory(
+        monee_net, priorities, base_demand_weight=WEIGHT_DEMAND,
+    )
+    prob = create_min_load_shedding_problem(
+        weight_for_load=weight_for_load,
+    )
+    if weight_for_load is not None:
+        logger.info(
+            "oracle: priority-aware mode — %d loads have per-tier weights",
+            len({c.id for c in monee_net.childs
+                 if priorities.get(f'child-{c.id}', 0) > 0}),
+        )
     logger.info("oracle: solving min-load-shedding LP on net (%d childs, %d branches)",
                 len(monee_net.childs), len(monee_net.branches))
     # ``exclude_unconnected_nodes=True`` is mandatory: without it monee's

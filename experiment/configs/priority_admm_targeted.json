@@ -1,0 +1,62 @@
+{
+  "$comment": [
+    "Targeted scenario to genuinely exercise the tier-stratified ADMM.",
+    "Knobs chosen to maximise the chance of multi-tier deficit *within a",
+    "single holon* (i.e. across its 4 member groups), which is when",
+    "the priority-aware weighting actually distinguishes the allocation:",
+    "  - simbench_lv_cp_heavy: 342 loads, large enough that holons of",
+    "    4 groups span hundreds of children across many tiers",
+    "  - priority_assignment=uniform: each tier 1..10 gets roughly equal",
+    "    counts (~34 loads each) so community partitions are unlikely to",
+    "    end up with single-tier modal populations",
+    "  - line_stress with load_scale=2.2 and ampacity_scale=0.35: hard",
+    "    enough that the LP shed *will* hit multiple tiers per community",
+    "  - failure_lambda=4.0, max_failures=8: high failure density so",
+    "    many holons see real deficit",
+    "  - 60 s sim: enough rounds for the holon ADMM to fire on multiple",
+    "    different deficit patterns",
+    "  - Both label_prop (tier off) and modularity (tier on) for the",
+    "    side-by-side comparison."
+  ],
+  "name": "priority_admm_targeted",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 60.0,
+  "task_timeout_s": 2700.0,
+  "failure_delay_s_max": 3.0,
+  "write_timeseries": false,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 1,
+    "failure_lambda": 4.0,
+    "max_failures": 8
+  },
+  "experiments": [
+    {
+      "name": "targeted",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {
+          "community_partition_method": "modularity",
+          "enable_tier_stratified_holon_admm": true,
+          "hebbian_warmup_s": 4.0
+        },
+        {
+          "community_partition_method": "modularity",
+          "enable_tier_stratified_holon_admm": false,
+          "hebbian_warmup_s": 4.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 2.2,
+          "ampacity_scale": 0.35,
+          "slack_budget_pct": 0.45,
+          "priority_assignment": "uniform"
+        }
+      ]
+    }
+  ]
+}

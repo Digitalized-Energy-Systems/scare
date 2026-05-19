@@ -151,6 +151,98 @@ class RestorationConfiguration:
     # 50-iter cap without changing the qualitative behaviour.
     holon_admm_abs_tol: float = 1e-3
 
+    # Tier-stratified holon ADMM (Package C).  When True, the holon's
+    # ADMM target vector is built per-(sector, priority_tier) instead
+    # of per-sector only, and the L1 honour path dispatches per-tier
+    # targets directly to member agents — preserving the holon's
+    # global priority decision through the L2 → L1 handoff.  Legacy
+    # path (False) uses one scalar target per (member, sector) and
+    # L1 re-derives priority locally, which can invert priority on
+    # finely-partitioned grids (see priority_invariant claim in
+    # eval/claims.py).
+    enable_tier_stratified_holon_admm: bool = True
+
+    # Number of priority tiers the tier-stratified ADMM allocates over.
+    # Mirrors ``base.util.obs_priority``'s tier range (1..10 by
+    # default).  Larger means more ADMM dimensions per actor — solver
+    # cost grows linearly.
+    priority_tiers: int = 10
+
+    # Holon ADMM mode (Package C variants).  Only consulted when
+    # ``enable_tier_stratified_holon_admm`` is True.
+    #
+    # - ``"supply"`` (default, Route A): supply-side formulation.
+    #   ``T`` = total demand at each (sec, tier), each actor's
+    #   contribution represents supply commitment.  Coupling
+    #   ``Σ x_g ≤ supply_g`` binds whenever holon-wide supply <
+    #   holon-wide demand.  Priority weights then decide which
+    #   tiers get the scarce supply.  Enables cross-community
+    #   generation routing (e.g. shed A's tier-8 load to free
+    #   supply for B's tier-2 load).  L1 dispatch interprets the
+    #   result as per-tier service fractions and applies them
+    #   uniformly to local loads at that tier.  This is the
+    #   formulation that actually arbitrates priority across
+    #   communities in end-to-end runs; ``demand`` is preserved as
+    #   an ablation but does not exercise priority weighting in
+    #   practice (see eval/claims.py:priority_invariant).
+    # - ``"demand"`` (legacy, ablation only): Package C demand-side
+    #   formulation.  ``T`` = per-cell deficit, each actor absorbs
+    #   its share of the per-cell deficit (`ub = local_deficit`).
+    #   Priority weights arbitrate only when the per-actor coupling
+    #   (``Σ x_g ≤ flex_g``) binds, which is rare in pure-load
+    #   groups where flex == deficit.  Solves the "where to spend
+    #   limited flex" problem.
+    holon_admm_mode: str = "supply"
+
+    # Hebbian-emergent holon membership refinement (Aoki & Aoyagi 2009).
+    # Leaders broadcast their normalised sector imbalance δ_g as
+    # HebbianFlexBeacon, accumulate a per-peer co-variance estimate
+    # H_{gh} = (1-η)·H + η·δ_g·δ_h, and after ``hebbian_warmup_s``
+    # rebuild holon membership from peers with H_{gh} > threshold.  This
+    # replaces / refines the static lex-chunked partition from
+    # _build_topologies, so groups whose stress dynamics correlate end
+    # up cooperating regardless of aid ordering.  Disable for the
+    # static-partition ablation.
+    enable_hebbian_formation: bool = True
+
+    # Sim-seconds before the recluster begins (during which the co-
+    # variance estimate accumulates).  Default 12 s matches the
+    # original holonic.py constructor default; campaigns with shorter
+    # simulations should drop this (e.g. 4 s) so reclustering has time
+    # to fire within the run window.
+    hebbian_warmup_s: float = 12.0
+
+    # Co-variance threshold above which a peer is admitted to the
+    # dynamically-emergent holon.  Higher = stricter (fewer peers
+    # admitted, smaller holons).
+    hebbian_threshold: float = 0.35
+
+    # Level-1 (sub-community) partition method.
+    #
+    # - ``"label_propagation"`` (default, preserves legacy behaviour):
+    #   radius-bounded min-label propagation — communities are
+    #   ≤``community_label_propagation_radius``-hop balls centred on
+    #   the lex-smallest reachable seed.
+    # - ``"modularity"``: distributed-Louvain Phase 1 — communities
+    #   form to maximise local modularity gain, respecting the graph's
+    #   natural cluster structure.  Sizes vary; not bounded by radius.
+    community_partition_method: str = "label_propagation"
+
+    # Radius bound for ``label_propagation`` method (ignored by
+    # modularity).  Mirrors the per-sector ``_LABEL_PROPAGATION_RADIUS``
+    # default of 2 historically wired in scenario/restoration.py.
+    community_label_propagation_radius: int = 2
+
+    # Resolution γ for ``modularity`` method (ignored by label
+    # propagation).  γ > 1 ⇒ finer partition (more, smaller
+    # communities); γ < 1 ⇒ coarser.  Default 1.0 = standard
+    # modularity.
+    community_modularity_resolution: float = 1.0
+
+    # Iteration cap for the modularity phase-1 sweep.  Convergence
+    # typically in 3-5 rounds; 10 is a safe cap.
+    community_modularity_iterations: int = 10
+
     # ----------------------------------------------------------------
     # Sensitivity-sweep tunables
     # ----------------------------------------------------------------
