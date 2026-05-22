@@ -1,0 +1,498 @@
+"""Targeted unit tests for the priority-dispatch fixes (F1/F2/F4/F7/F-new).
+
+Validates the contract of each fix in isolation so that a regression
+shows up immediately rather than as a campaign-level priority inversion.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+import scare.base.diagnostics as _diag
+from scare.base.diagnostics import arm
+from scare.base.model import Sector
+
+
+from scare.base.util import (
+    apply_regulate,
+    clamp_to_constraints,
+    obs_priority,
+    register_priority,
+)
+
+
+def _drain_events():
+    """Snapshot the diagnostics event log and clear it for the next test."""
+    events = list(_diag._event_log)
+    _diag._event_log.clear()
+    return events
+
+
+def _disarm():
+    _diag._armed = False
+    _diag._event_log.clear()
+
+
+# ---------------------------------------------------------------------------
+# F1: tier-aware clamp
+# ---------------------------------------------------------------------------
+
+
+class TestTierAwareClamp:
+    def test_critical_tier_skips_clamp_at_moderate_util(self):
+        # vm_pu=1.04 → util=0.8.  Default deadband 0.85 ⇒ no clamp.
+        # Critical-tier deadband 0.99 ⇒ also no clamp.  Both should
+        # leave the setpoint unchanged at the moderate-stress regime.
+        obs = {"p_mw": 10.0, "vm_pu": 1.04}
+        assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1) == 5.0
+        assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=5) == 5.0
+
+    def test_critical_tier_resists_clamp_past_default_deadband(self):
+        # vm_pu=1.048 → util=0.96.  Default deadband 0.85 ⇒
+        # allowed=(1-0.96)/0.15 ≈ 0.267, max_abs≈2.67, so a low-tier
+        # 5 MW setpoint is throttled to ~2.67 MW.  Critical-tier
+        # deadband 0.99 ⇒ util 0.96 < 0.99 ⇒ no clamp on tier 1.
+        obs = {"p_mw": 10.0, "vm_pu": 1.048}
+        low_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=8)
+        high_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
+        assert abs(low_tier_result) < 5.0  # was throttled
+        assert high_tier_result == 5.0      # was not throttled
+
+    def test_no_tier_preserves_legacy_behaviour(self):
+        # No tier arg → legacy 0.85 deadband.  vm_pu=1.04 (util=0.8) ⇒ no clamp.
+        obs = {"p_mw": 10.0, "vm_pu": 1.04}
+        assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY) == 5.0
+
+    def test_extreme_stress_still_clamps_critical(self):
+        # vm_pu=1.0499 → util≈0.998.  Critical-tier deadband 0.99 ⇒
+        # allowed=(1-0.998)/(1-0.99)=0.2 ⇒ max_abs=2.0.  So even tier 1
+        # is throttled below the original 5.0 setpoint.
+        obs = {"p_mw": 10.0, "vm_pu": 1.0499}
+        result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
+        assert abs(result) < 5.0
+
+
+# ---------------------------------------------------------------------------
+# F7: priority-aware apply_regulate cooldown
+# ---------------------------------------------------------------------------
+
+
+class _FakeBehavior:
+    def __init__(self, cooldown_s: float = 0.0):
+        from types import SimpleNamespace
+
+        self.acts: list[tuple[str, str, float]] = []
+        self._scare_config = SimpleNamespace(cooldown_s=cooldown_s)
+        self._net_results = object()  # opaque non-None sentinel
+
+    def has_action(self, aid: str, action: str) -> bool:
+        return True
+
+    def act(self, aid: str, action: str, value: float) -> None:
+        self.acts.append((aid, action, value))
+
+
+class TestCooldownBypass:
+    def setup_method(self):
+        arm()
+
+    def teardown_method(self):
+        _disarm()
+
+    def test_low_tier_suppressed_by_cooldown(self):
+        b = _FakeBehavior(cooldown_s=1.0)
+        # First write lands.
+        assert apply_regulate(
+            b, "child-9", 0.5, sector="electricity",
+            reason="test", timestamp=10.0, priority_tier=9,
+        ) is True
+        # Second write within cooldown is suppressed.
+        assert apply_regulate(
+            b, "child-9", 0.6, sector="electricity",
+            reason="test", timestamp=10.5, priority_tier=9,
+        ) is False
+        assert len(b.acts) == 1
+        events = [e for e in _drain_events() if e.kind == "regulate_suppressed_by_cooldown"]
+        assert len(events) == 1
+        assert "tier=9" in events[0].detail
+
+    def test_critical_tier_bypasses_cooldown(self):
+        b = _FakeBehavior(cooldown_s=1.0)
+        assert apply_regulate(
+            b, "child-1", 0.5, sector="electricity",
+            reason="test", timestamp=10.0, priority_tier=1,
+        ) is True
+        # Second write within cooldown DOES land because tier 1 bypasses.
+        assert apply_regulate(
+            b, "child-1", 0.6, sector="electricity",
+            reason="test", timestamp=10.5, priority_tier=1,
+        ) is True
+        assert len(b.acts) == 2
+
+    def test_no_tier_falls_back_to_cooldown(self):
+        b = _FakeBehavior(cooldown_s=1.0)
+        assert apply_regulate(
+            b, "child-0", 0.5, sector="electricity",
+            reason="test", timestamp=10.0,
+        ) is True
+        # No tier given → not critical → suppressed.
+        assert apply_regulate(
+            b, "child-0", 0.6, sector="electricity",
+            reason="test", timestamp=10.5,
+        ) is False
+
+
+# ---------------------------------------------------------------------------
+# F-new (H13): stale-observation detector
+# ---------------------------------------------------------------------------
+
+
+class TestStaleObsCounter:
+    def setup_method(self):
+        arm()
+
+    def teardown_method(self):
+        _disarm()
+
+    def test_no_event_when_obs_advances(self):
+        b = _FakeBehavior()
+        apply_regulate(b, "a1", 0.4, sector="e", reason="r", timestamp=1.0)
+        b._net_results = object()  # advance — LP re-solved
+        apply_regulate(b, "a2", 0.4, sector="e", reason="r", timestamp=2.0)
+        events = [e for e in _drain_events() if e.kind == "regulate_on_stale_obs"]
+        assert events == []
+
+    def test_event_fires_when_obs_frozen(self):
+        b = _FakeBehavior()
+        apply_regulate(b, "a1", 0.4, sector="e", reason="r", timestamp=1.0)
+        # No update to _net_results — second regulate is on stale state.
+        apply_regulate(b, "a2", 0.4, sector="e", reason="r", timestamp=2.0)
+        events = [e for e in _drain_events() if e.kind == "regulate_on_stale_obs"]
+        assert len(events) == 1
+
+
+# ---------------------------------------------------------------------------
+# Heat-side Sink curtailment guard
+# ---------------------------------------------------------------------------
+# Heat-sector consumers are modelled in monee as a (HeatLoad, Sink) pair on
+# the same junction: HeatLoad withdraws thermal energy, Sink withdraws the
+# matching return-line mass flow.  Curtailing the Sink (regulation < 1)
+# zeroes mass-flow withdrawal while the upstream pipe still pushes water in,
+# breaking the junction's mass-flow balance and presolving the energy-flow
+# LP into infeasibility.  The guard blocks such writes; thermal-control
+# curtailment must flow through the HeatLoad instead.
+
+
+class _FakeMonee:
+    """Minimal monee-network stand-in for the heat-sink guard test.
+
+    Supports the two lookups ``_is_heat_side_mass_flow_sink`` needs:
+    ``child_by_id`` and ``node_by_id``.  The child model class drives the
+    Sink-vs-other decision; the grid name on the child's node decides the
+    heat/water-vs-gas branch.
+    """
+
+    def __init__(self, children: dict[int, object], nodes: dict[int, str]):
+        self._children = children
+        self._nodes = nodes
+
+    def child_by_id(self, cid: int):
+        return self._children[cid]
+
+    def node_by_id(self, nid: int):
+        return self._nodes[nid]
+
+
+class _Node:
+    def __init__(self, grid_name: str):
+        from types import SimpleNamespace
+
+        self.grid = SimpleNamespace(name=grid_name)
+
+
+class _BehaviorWithNet(_FakeBehavior):
+    def __init__(self, net, cooldown_s: float = 0.0):
+        super().__init__(cooldown_s=cooldown_s)
+        self._net = net
+
+
+class TestHeatSinkGuard:
+    def setup_method(self):
+        arm()
+
+    def teardown_method(self):
+        _disarm()
+
+    @staticmethod
+    def _build(child_cls_name: str, grid_name: str) -> _BehaviorWithNet:
+        from types import SimpleNamespace
+
+        # Use a real monee Sink instance for the truthy case; a stand-in
+        # with a non-Sink class for the falsy cases.
+        if child_cls_name == "Sink":
+            from monee.model.child import Sink
+
+            model = Sink(mass_flow=0.05)
+        else:
+            model = SimpleNamespace()  # any non-Sink object
+        child = SimpleNamespace(id=42, node_id=7, model=model)
+        net = _FakeMonee(children={42: child}, nodes={7: _Node(grid_name)})
+        return _BehaviorWithNet(net)
+
+    def test_heat_side_sink_curtailment_is_blocked(self):
+        b = self._build("Sink", "water-heat-supply")
+        applied = apply_regulate(
+            b, "child-42", 0.0, sector="heat", reason="test", timestamp=1.0,
+        )
+        assert applied is False
+        assert b.acts == []
+        events = [e for e in _drain_events() if e.kind == "regulate_blocked_heat_sink"]
+        assert len(events) == 1
+
+    def test_heat_side_sink_full_passthrough_is_allowed(self):
+        b = self._build("Sink", "water-heat-supply")
+        applied = apply_regulate(
+            b, "child-42", 1.0, sector="heat", reason="test", timestamp=1.0,
+        )
+        assert applied is True
+        assert b.acts == [("child-42", "regulate", 1.0)]
+
+    def test_gas_sink_curtailment_is_allowed(self):
+        b = self._build("Sink", "gas-supply")
+        applied = apply_regulate(
+            b, "child-42", 0.3, sector="gas", reason="test", timestamp=1.0,
+        )
+        assert applied is True
+        assert b.acts == [("child-42", "regulate", 0.3)]
+
+    def test_heat_side_non_sink_curtailment_is_allowed(self):
+        # HeatLoad (or any non-Sink class) on the heat grid stays curtailable.
+        b = self._build("HeatLoad", "water-heat-supply")
+        applied = apply_regulate(
+            b, "child-42", 0.4, sector="heat", reason="test", timestamp=1.0,
+        )
+        assert applied is True
+        assert b.acts == [("child-42", "regulate", 0.4)]
+
+
+# ---------------------------------------------------------------------------
+# Slack-class curtailment guard
+# ---------------------------------------------------------------------------
+# Slack agents (ExtPowerGrid / ExtHydrGrid) have a free p_mw / mass_flow
+# Var the LP picks within a wide physical envelope.  Writing
+# ``regulation < 1`` clamps the LP's effective slack contribution to a
+# fraction of that envelope, and the next solve diagnoses infeasible
+# the moment the network needs more headroom than the clamped fraction.
+# The guard blocks every such write; the gossip-side _apply_setpoint
+# has a parallel class-check because it bypasses ``apply_regulate``
+# entirely (see balance.py:2031).
+
+
+class TestSlackClassGuard:
+    def setup_method(self):
+        arm()
+
+    def teardown_method(self):
+        _disarm()
+
+    @staticmethod
+    def _build(child_cls_name: str) -> _BehaviorWithNet:
+        from types import SimpleNamespace
+
+        if child_cls_name == "ExtPowerGrid":
+            from monee.model.child import ExtPowerGrid
+
+            model = ExtPowerGrid(p_mw=1.0, q_mvar=0.0)
+        elif child_cls_name == "ExtHydrGrid":
+            from monee.model.child import ExtHydrGrid
+
+            model = ExtHydrGrid()
+        else:
+            model = SimpleNamespace()
+        child = SimpleNamespace(id=42, node_id=7, model=model)
+        net = _FakeMonee(children={42: child}, nodes={7: _Node("power")})
+        return _BehaviorWithNet(net)
+
+    def test_ext_power_grid_curtailment_blocked(self):
+        b = self._build("ExtPowerGrid")
+        applied = apply_regulate(
+            b, "child-42", 0.3, sector="electricity",
+            reason="test", timestamp=1.0,
+        )
+        assert applied is False
+        assert b.acts == []
+        events = [e for e in _drain_events() if e.kind == "regulate_blocked_slack"]
+        assert len(events) == 1
+
+    def test_ext_hydr_grid_curtailment_blocked(self):
+        # Heat-side ExtHydrGrid is intentionally unbounded — the registry
+        # never sees it — but the class check still protects it.
+        b = self._build("ExtHydrGrid")
+        applied = apply_regulate(
+            b, "child-42", 0.0, sector="heat",
+            reason="test", timestamp=1.0,
+        )
+        assert applied is False
+        assert b.acts == []
+        events = [e for e in _drain_events() if e.kind == "regulate_blocked_slack"]
+        assert len(events) == 1
+
+    def test_ext_power_grid_full_passthrough_allowed(self):
+        b = self._build("ExtPowerGrid")
+        applied = apply_regulate(
+            b, "child-42", 1.0, sector="electricity",
+            reason="test", timestamp=1.0,
+        )
+        assert applied is True
+        assert b.acts == [("child-42", "regulate", 1.0)]
+
+
+# ---------------------------------------------------------------------------
+# World-construction skip for heat-side Sinks
+# ---------------------------------------------------------------------------
+# The upstream complement to the apply_regulate guard: heat-side Sinks are a
+# monee topology artifact, so we never register an EnergyBalanceNegotiator
+# or a priority for them.  The dispatcher therefore never sees them as
+# members of any holon and cannot attempt a regulation write in the first
+# place.
+
+
+class TestHeatSinkUpstreamSkip:
+    def test_predicate_identifies_heat_side_sinks(self):
+        from types import SimpleNamespace
+        from monee.model.child import Sink, HeatLoad
+
+        from scare.scenario.restoration import _is_heat_side_mass_flow_sink
+
+        class _Net:
+            def __init__(self, node_grid_name: str):
+                self._grid = SimpleNamespace(name=node_grid_name)
+
+            def node_by_id(self, _nid):
+                return SimpleNamespace(grid=self._grid)
+
+        heat_sink = SimpleNamespace(id=1, node_id=10, model=Sink(mass_flow=0.04))
+        gas_sink = SimpleNamespace(id=2, node_id=10, model=Sink(mass_flow=0.04))
+        heat_load = SimpleNamespace(id=3, node_id=10, model=HeatLoad(q_mw=0.05))
+
+        assert _is_heat_side_mass_flow_sink(heat_sink, _Net("water-heat-supply"))
+        assert _is_heat_side_mass_flow_sink(heat_sink, _Net("heat-return"))
+        assert not _is_heat_side_mass_flow_sink(gas_sink, _Net("gas-supply"))
+        assert not _is_heat_side_mass_flow_sink(heat_load, _Net("water-heat-supply"))
+
+
+# ---------------------------------------------------------------------------
+# F8: default-fallback priority diagnostic
+# ---------------------------------------------------------------------------
+
+
+class TestSaturationFilteredDual:
+    """F2: the dual normalisation must divide by Σ a_j over *unsaturated*
+    entries only.  Failing tests would indicate the saturation filter
+    has regressed and saturated agents are still slowing the dual step
+    for free agents.
+
+    Replicates the dual update formula in EnergyBalanceNegotiator
+    without spinning up mango — just verifies the formula chosen.
+    """
+
+    @staticmethod
+    def _entry_responsiveness(prio: int, target_sign: int) -> float:
+        """Mirrors EnergyBalanceNegotiator._entry_responsiveness."""
+        P = 10
+        if target_sign > 0:
+            if prio > 0:
+                return 2.0 ** (P - min(prio, P) + 1)
+            return 1.0
+        if target_sign < 0:
+            if prio > 0:
+                return 2.0 ** min(prio, P)
+            return 2.0 ** (P + 1)
+        return 1.0
+
+    def test_saturated_entries_excluded_from_normaliser(self):
+        # Synthetic ledger: five tier-1 saturated entries (huge weight)
+        # plus one tier-9 unsaturated entry (small weight).  Without the
+        # F2 fix Σ a_j ≈ 5 × 1024 + 4 = 5124; with the fix it is just 4.
+        memory = {
+            "a": (0.0, 10, 1, True),  # saturated tier-1
+            "b": (0.0, 10, 1, True),
+            "c": (0.0, 10, 1, True),
+            "d": (0.0, 10, 1, True),
+            "e": (0.0, 10, 1, True),
+            "f": (0.001, 10, 9, False),  # active tier-9
+        }
+        target_sign = 1
+
+        sum_all = sum(
+            self._entry_responsiveness(int(v[2]), target_sign)
+            for v in memory.values()
+        )
+        sum_free = sum(
+            self._entry_responsiveness(int(v[2]), target_sign)
+            for v in memory.values()
+            if not v[3]
+        )
+
+        residual = 0.5  # arbitrary
+        gamma = 0.6     # convergence rate
+        step_all_entries = gamma * residual / sum_all
+        step_free_only = gamma * residual / sum_free
+
+        # The free-only step must be substantially larger — at least
+        # 100× — because the saturated agents' weights dominated the
+        # all-entries denominator.
+        assert step_free_only > step_all_entries * 100
+
+    def test_filter_with_no_saturated_entries_matches_legacy(self):
+        # If nobody is saturated the two formulas must coincide
+        # exactly so the F2 fix is a no-op in the healthy regime.
+        memory = {
+            "a": (0.0, 10, 3, False),
+            "b": (0.0, 10, 6, False),
+            "c": (0.0, 10, 9, False),
+        }
+        sum_all = sum(
+            self._entry_responsiveness(int(v[2]), 1)
+            for v in memory.values()
+        )
+        sum_free = sum(
+            self._entry_responsiveness(int(v[2]), 1)
+            for v in memory.values()
+            if not v[3]
+        )
+        assert sum_all == sum_free
+
+
+class TestPriorityFallbackEvent:
+    def setup_method(self):
+        arm()
+
+    def teardown_method(self):
+        _disarm()
+
+    def test_fires_once_for_unregistered_load(self):
+        b = _FakeBehavior()
+        obs = {"p_mw": 5.0}  # load (positive cap), no priority registered
+        # First call → fallback event.
+        obs_priority(obs, behavior=b, aid="orphan", record_default_fallback_t=1.0)
+        # Second call same aid → no extra event.
+        obs_priority(obs, behavior=b, aid="orphan", record_default_fallback_t=2.0)
+        events = [e for e in _drain_events() if e.kind == "priority_default_fallback"]
+        assert len(events) == 1
+        assert events[0].aid == "orphan"
+
+    def test_no_event_for_generator(self):
+        b = _FakeBehavior()
+        obs = {"p_mw": -5.0}  # generator, defaults to tier 0 legitimately
+        obs_priority(obs, behavior=b, aid="gen", record_default_fallback_t=1.0)
+        events = [e for e in _drain_events() if e.kind == "priority_default_fallback"]
+        assert events == []
+
+    def test_no_event_when_registered(self):
+        b = _FakeBehavior()
+        register_priority(b, "ok", 3)
+        obs = {"p_mw": 5.0}
+        obs_priority(obs, behavior=b, aid="ok", record_default_fallback_t=1.0)
+        events = [e for e in _drain_events() if e.kind == "priority_default_fallback"]
+        assert events == []

@@ -1,0 +1,95 @@
+{
+  "$comment": [
+    "Targeted probe of priority-aware dispatch failure modes.",
+    "6 tasks; one shared scenario (line_stress on simbench_lv) to keep",
+    "topology fixed across runs; ablation axis sweeps the three suspected",
+    "weak spots:",
+    "  - h1: clamp_to_constraints deadband behaviour (constraint_aware on/off)",
+    "  - h2: QP saturation-aware vs current denominator (enable_qp_gossip on/off)",
+    "  - h3: supply vs demand vs legacy holon ADMM paths",
+    "All use uniform priority distribution so every tier (1..10) is populated.",
+    "Compare priority_invariant + service-fraction-by-tier outputs."
+  ],
+  "name": "priority_dispatch_probe",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 20.0,
+  "task_timeout_s": 900.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 1,
+    "failure_lambda": 2.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "name": "h2_qp_saturation",
+      "$comment": "QP gossip on vs off — current QP dual update divides by sum(a_j) without filtering saturated agents (balance.py:1343-1346). When tier-1 loads saturate at 0 headroom, they should not slow the dual step for free tier-N agents. Compare priority_invariant on a deficit-bearing run.",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {"enable_qp_gossip": true},
+        {"enable_qp_gossip": false}
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 2.0,
+          "ampacity_scale": 0.4,
+          "slack_budget_pct": 0.35,
+          "priority_assignment": "uniform"
+        }
+      ]
+    },
+    {
+      "name": "h1_clamp_tier_blindness",
+      "$comment": "constraint_aware on vs off — clamp_to_constraints is priority-blind (util.py:882). Above deadband 0.85 every tier gets cut equally. Run line_stress so loading_percent goes well past 0.85 and check tier-1 served fraction relative to lower tiers.",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {"constraint_aware": true},
+        {"constraint_aware": false}
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 2.0,
+          "ampacity_scale": 0.4,
+          "slack_budget_pct": 0.35,
+          "priority_assignment": "uniform"
+        }
+      ]
+    },
+    {
+      "name": "h3_holon_mode",
+      "$comment": "Supply-priority Route-A vs demand-side tier-stratified. Both have enable_tier_stratified_holon_admm=true; only admm_mode flips. Tests whether the alternative path produces different priority allocations on the same deficit pattern.",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {"enable_tier_stratified_holon_admm": true, "holon_admm_mode": "supply"},
+        {"enable_tier_stratified_holon_admm": true, "holon_admm_mode": "demand"}
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 2.0,
+          "ampacity_scale": 0.4,
+          "slack_budget_pct": 0.35,
+          "priority_assignment": "uniform"
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa.p",
+    "time": "00:20:00",
+    "mem": "4G",
+    "cpus": 1,
+    "max_concurrent": 6,
+    "aggregate": true
+  }
+}
