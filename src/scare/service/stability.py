@@ -135,6 +135,8 @@ class GenerationController(Role):
         if cap > 0:
             self._floor = max(self._floor, factor)
 
+        from scare.base.util import lookup_priority
+
         applied = apply_regulate(
             self.behavior,
             self.context.aid,
@@ -142,6 +144,7 @@ class GenerationController(Role):
             sector=self.sector.value,
             reason="stability",
             timestamp=now,
+            priority_tier=lookup_priority(self.behavior, self.context.aid),
         )
         if applied:
             self._last_factor = factor

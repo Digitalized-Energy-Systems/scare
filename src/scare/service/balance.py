@@ -132,6 +132,42 @@ def _start_threshold(sector: Sector) -> float:
     return _START_THRESHOLD.get(sector, _DEFAULT_START_THRESHOLD)
 
 
+def _is_slack_class_child(behavior: Any, aid: str) -> bool:
+    """True iff *aid* refers to a monee ``ExtPowerGrid`` or ``ExtHydrGrid``
+    child — the network's slack-class boundary.
+
+    Used to suppress regulation writes in ``_apply_setpoint`` /
+    elsewhere: slacks absorb whatever the LP needs to balance, and
+    writing ``regulation < 1`` on them clamps the LP's effective slack
+    envelope to a fraction of physical capacity, which the next
+    energy-flow solve diagnoses as infeasible the moment the network
+    needs more headroom than the clamped fraction.
+
+    The slack registry (``register_slack`` / ``lookup_slack``) is the
+    preferred path for callers that need the F1 rating + bounds — but
+    heat-side ExtHydrGrid is intentionally unbounded by
+    ``apply_slack_budget`` (the heat LP has no operator-side slack
+    discipline) and therefore never lands in the registry.  This
+    helper covers both bounded and unbounded slacks uniformly.
+    """
+    if not aid.startswith("child-"):
+        return False
+    try:
+        cid = int(aid[len("child-"):])
+    except ValueError:
+        return False
+    net = getattr(behavior, "_net", None)
+    if net is None:
+        return False
+    try:
+        child = net.child_by_id(cid)
+    except Exception:  # noqa: BLE001
+        return False
+    from monee.model.child import ExtHydrGrid, ExtPowerGrid
+
+    return isinstance(child.model, (ExtPowerGrid, ExtHydrGrid))
+
+
 def _heat_thermal_deficit_mw(obs: dict) -> float:
     """Return MW of demand reduction this heat agent should contribute to
     its group's thermal-deficit target.
@@ -1340,10 +1376,27 @@ class EnergyBalanceNegotiator(Role):
             # caused by box-projection noise once agents saturate.
             total_delta_post = sum(v[0] for v in self._gossip.memory.values())
             residual = target - total_delta_post
+            # Normalise the dual step by Σ a_j over *unsaturated* entries
+            # only.  Saturated agents (v[3] == True) sit at a box bound and
+            # contribute zero additional δ for any further change in λ, so
+            # including their priority weight in the denominator inflates
+            # the sum and slows convergence for the agents that can still
+            # move.  Empirically (priority_dispatch_probe task 0) ~54 % of
+            # ledger entries were saturated, contributing a ~20 % artificial
+            # damping on the dual update with no convergence benefit.
+            # Fall back to all entries if every agent is saturated (no one
+            # can move, so the choice of denominator no longer matters for
+            # the algorithm — but a zero denominator would crash).
             sum_a_est = sum(
                 self._entry_responsiveness(int(v[2]), target_sign)
                 for v in self._gossip.memory.values()
-            ) or 1.0
+                if not v[3]
+            )
+            if sum_a_est <= 0.0:
+                sum_a_est = sum(
+                    self._entry_responsiveness(int(v[2]), target_sign)
+                    for v in self._gossip.memory.values()
+                ) or 1.0
             self._gossip.dual_lambda += (
                 self._step_size(counter) * residual / sum_a_est
             )
@@ -1664,7 +1717,12 @@ class EnergyBalanceNegotiator(Role):
                 supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + abs(cap)
             # Priority-tier demand aggregation (loads only: cap > 0)
             if cap > 0:
-                prio = obs_priority(obs, behavior=self.behavior, aid=aid)
+                prio = obs_priority(
+                    obs,
+                    behavior=self.behavior,
+                    aid=aid,
+                    record_default_fallback_t=self.context.current_timestamp,
+                )
                 demand_by_priority[prio] = demand_by_priority.get(prio, 0.0) + abs(cap)
                 served_by_priority[prio] = served_by_priority.get(prio, 0.0) + abs(sp)
                 # Per-(sector, tier) split for the tier-stratified holon
@@ -1811,6 +1869,7 @@ class EnergyBalanceNegotiator(Role):
                     sector=sec.value,
                     reason="holon_supply_priority",
                     timestamp=self.context.current_timestamp,
+                    priority_tier=int(prio),
                 )
                 applied += 1
 
@@ -1906,6 +1965,7 @@ class EnergyBalanceNegotiator(Role):
                             sector=sec,
                             reason="holon_tier_alloc",
                             timestamp=self.context.current_timestamp,
+                            priority_tier=int(tier),
                         )
                         applied += 1
 
@@ -1953,11 +2013,37 @@ class EnergyBalanceNegotiator(Role):
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         if cap == 0.0:
             return
+        # Slack agents (ExtPowerGrid / ExtHydrGrid) have a *free* p_mw /
+        # mass_flow Var the LP picks within a wide physical envelope.
+        # ``_reported_setpoint`` already surfaces a soft slack-target
+        # contribution into the gossip's imbalance accounting (F2), so
+        # the protocol pushes the *other* agents toward equilibrium
+        # against that target.  Writing ``regulation = sp / rating`` on
+        # the slack itself clamps the LP's effective slack envelope to
+        # an arbitrary mid-gossip fraction — and any subsequent step
+        # that needs more slack to balance the network finds the slack
+        # capped at that fraction, presolving into infeasibility.  The
+        # slack carries the residual; gossip must not curtail it.
+        #
+        # We have to use a class check (not just the slack registry)
+        # because heat-side ExtHydrGrid is intentionally left unbounded
+        # by ``apply_slack_budget`` (the heat LP has no slack-budget
+        # discipline), which means ``_maybe_register_slack`` cannot
+        # derive a rating and skips it — yet it is still structurally
+        # a slack and must never be curtailed.
+        if _is_slack_class_child(self.behavior, self.context.aid):
+            return
 
         # Constraint-aware clamping: reduce the setpoint when local grid
-        # measurements are near or beyond safety bounds.
+        # measurements are near or beyond safety bounds.  Pass the role's
+        # own priority tier so critical loads (tier ≤ 2) get the tighter
+        # 0.99 deadband — without this, the priority-blind clamp
+        # truncates tier-1 demand as soon as any local variable drifts
+        # past 0.85, silently overruling the priority waterfall.
         if self.constraint_aware:
-            new_setpoint = clamp_to_constraints(new_setpoint, obs, self.sector)
+            new_setpoint = clamp_to_constraints(
+                new_setpoint, obs, self.sector, tier=self.priority
+            )
 
         factor = max(0.0, min(1.0, abs(new_setpoint / cap)))
 

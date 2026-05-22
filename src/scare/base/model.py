@@ -280,7 +280,10 @@ class AvailableFlexAnswer:
     # vector instead of collapsing demand to a single per-sector scalar.
     # ``demand_by_sector_priority["electricity"][2] = 5.0`` means: "this
     # group has 5 MW of nominal tier-2 demand in the electricity sector".
-    # Empty for messages from heat sectors that have no per-tier info.
+    # ``_handle_ask_flex`` iterates every member regardless of the
+    # leader's own sector, so the map is sector-agnostic on the
+    # producer side; empty here just means "no positive-cap load in
+    # this group had a registered tier and a known sector".
     demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
     served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
     # Total *supply* (generator-class) capacity per sector.  Used by the

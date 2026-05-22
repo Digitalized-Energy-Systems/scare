@@ -97,6 +97,17 @@ def _check_priority_invariant(
     ``served_by_load.csv``'s ``component`` column), the check evaluates
     only the priority decisions SCARE could plausibly have made.
 
+    Loads marked ``disconnected=1`` are *excluded* from the per-tier
+    aggregation: ``disconnected`` comes from monee's
+    ``find_ignored_nodes`` and flags nodes with no path to a
+    grid-forming source (ExtPowerGrid / ExtHydrGrid) through the active
+    branches.  The LP cannot serve those loads regardless of priority —
+    they are physically unservable, not a SCARE shedding decision.
+    Including them drags down their tier's aggregate fraction and
+    produces a spurious "inversion" whenever the lost-source island
+    happens to contain a single high-tier load.  Reported separately
+    via ``n_loads_stranded`` so the loss is still visible.
+
     Components with no deficit (every tier at 1.0 within the per-tier
     capacity-weighted tolerance) are skipped — they carry no priority
     decision to evaluate.
@@ -113,7 +124,13 @@ def _check_priority_invariant(
         return {"passed": True, "detail": "empty served_by_load.csv"}
 
     # Aggregate per (sector, component, tier): demand and served.
+    # Loads with ``disconnected=1`` are split off into a separate
+    # ``stranded`` bucket so the per-tier aggregation reflects only
+    # the loads SCARE could plausibly have served.
     agg: dict[tuple[str, str], dict[int, dict[str, float]]] = {}
+    stranded_by_sector: dict[str, dict[int, dict[str, float]]] = {}
+    n_loads_stranded = 0
+    stranded_demand_mw = 0.0
     for r in rows:
         try:
             sec = r["sector"]
@@ -122,6 +139,16 @@ def _check_priority_invariant(
             demand = float(r["demand"])
             served = float(r["served"])
         except (KeyError, ValueError):
+            continue
+        # Stranded loads (no source path) — separate bucket.
+        disc_raw = (r.get("disconnected") or "0").strip()
+        if disc_raw in ("1", "true", "True"):
+            n_loads_stranded += 1
+            stranded_demand_mw += demand
+            sec_strand = stranded_by_sector.setdefault(sec, {})
+            entry = sec_strand.setdefault(tier, {"demand": 0.0, "served": 0.0})
+            entry["demand"] += demand
+            entry["served"] += served
             continue
         key = (sec, comp)
         by_tier = agg.setdefault(key, {})
@@ -169,6 +196,8 @@ def _check_priority_invariant(
             "n_components_checked": checked,
             "n_components_skipped_no_deficit": skipped_no_deficit,
             "n_components_skipped_singleton_tier": skipped_singleton,
+            "n_loads_stranded": n_loads_stranded,
+            "stranded_demand_mw": stranded_demand_mw,
         },
     }
 

@@ -12,6 +12,7 @@ from mango.express.topology import (
 )
 
 from scare.base.channel import (
+    CPCommitment,
     CPSetpoint,
     HolonAllocation,
     MonotonicVersion,
@@ -28,6 +29,7 @@ from scare.base.model import (
     Sector,
     StartBalanceNegotiation,
 )
+from scare.base.topology_mirror import LivePeerFilter
 from scare.base.util import clamp_to_constraints, kgps_to_mw, mw_to_kgps, obs_setpoint
 
 if TYPE_CHECKING:
@@ -79,11 +81,34 @@ class EnergyConverterRole(Role):
         behavior: RestorationEnvironmentBehavior,
         flex_actor: ADMMFlexActor,
         sectors: list[Sector],
+        *,
+        live_connector_filter: LivePeerFilter | None = None,
+        coupling_ratios: dict[tuple[str, str], float] | None = None,
     ) -> None:
         super().__init__()
         self.behavior = behavior
         self.flex_actor = flex_actor
         self.sectors = sectors
+        # Concept C — Layer 3 dynamic topology.  Optional sibling role
+        # (:class:`DynamicConnectorRole`) that classifies which group
+        # leaders the CP can still physically reach.  ``None`` keeps
+        # the legacy static-topology behaviour: every connector
+        # returned by ``topology_connectors`` is admitted.
+        self._live_connector_filter = live_connector_filter
+        # Cross-sector coalition advertisement: per-(in_sector,
+        # out_sector) efficiency.  Used when this CP joins a coalition
+        # to tell the initiator how its output supply maps to input
+        # draw.  ``None`` ⇒ CP doesn't advertise coupling (legacy
+        # behaviour; the cross-sector coalition path will skip it).
+        self._coupling_ratios: dict[tuple[str, str], float] = (
+            dict(coupling_ratios) if coupling_ratios else {}
+        )
+        # Active envelope from a cross-sector coalition commitment.
+        # ``None`` ⇒ no envelope (CP runs free).  Read by ``_run_admm``
+        # to clamp per-sector bounds; written by ``_handle_cp_commitment``.
+        self._envelope_flows_mw: dict[Sector, float] | None = None
+        self._envelope_expires_at: float = -1.0
+        self._envelope_coalition_id: str = ""
 
         self._active: bool = False
         self._flex_answers: list[AvailableFlexAnswer] = []
@@ -162,6 +187,16 @@ class EnergyConverterRole(Role):
             self,
             _wrap(self._handle_holon_allocation),
             lambda msg, meta: isinstance(msg, HolonAllocation),
+        )
+        # Cross-sector coalition envelope.  L2.5 dispatches a
+        # CPCommitment per re-assert tick while the coalition is
+        # active; on receipt we narrow the CP's per-sector ADMM bounds
+        # so the coalition's directional decision is honoured until
+        # ttl_s expiry.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_cp_commitment),
+            lambda msg, meta: isinstance(msg, CPCommitment),
         )
 
     async def _handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
@@ -339,6 +374,72 @@ class EnergyConverterRole(Role):
         )
         self.context.schedule_instant_task(self.trigger_cp_negotiation())
 
+    async def _handle_cp_commitment(
+        self, message: CPCommitment, meta: dict
+    ) -> None:
+        """Cross-sector coalition envelope handler.
+
+        Writes the directional sector flows into local envelope state
+        with a TTL; ``_run_admm`` reads this and clamps per-sector
+        bounds so subsequent L3 rounds stay inside the coalition's
+        commitment.  Idempotent: re-asserted commits just refresh the
+        TTL and overwrite the flows (latest-wins semantics matches the
+        coalition store).
+
+        The commitment is only honoured if the message addresses
+        *this* CP — addressed by aid in ``message.cp_id`` so a single
+        coalition broadcast can include multiple CPs without each
+        recipient acting on the others.
+        """
+        if message.cp_id and message.cp_id != str(self.context.aid):
+            return
+        if topology_characteristic(self, tid="cps") != "leader":
+            return
+        # Translate sector-value-keyed flows to Sector enums.  Unknown
+        # sector strings are silently dropped — defensive against
+        # forward-compat channel additions.
+        flows: dict[Sector, float] = {}
+        for sec_v, mw in message.target_flows_mw.items():
+            try:
+                flows[Sector(sec_v)] = float(mw)
+            except (ValueError, TypeError):
+                continue
+        if not flows:
+            return
+        now = float(self.context.current_timestamp)
+        self._envelope_flows_mw = flows
+        self._envelope_expires_at = now + float(message.ttl_s)
+        self._envelope_coalition_id = message.coalition_id
+        logger.info(
+            "[%s] CP envelope set by coalition %s: flows=%s ttl=%.2fs",
+            self.context.aid, message.coalition_id,
+            {s.value: round(v, 4) for s, v in flows.items()},
+            float(message.ttl_s),
+        )
+        # Diagnostic ledger entry — picked up by ``event_log()`` so the
+        # post-run analysis can plot envelope-active intervals and the
+        # cumulative cross-sector transfer the coalition committed to.
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=now,
+            kind="cp_envelope_set",
+            aid=str(self.context.aid),
+            sector="cp",
+            detail=(
+                f"coalition={message.coalition_id} ttl={float(message.ttl_s):.2f} "
+                f"flows={{{', '.join(f'{s.value}: {v:.4f}' for s, v in flows.items())}}}"
+            ),
+        )
+
+    def _envelope_active(self) -> bool:
+        if self._envelope_flows_mw is None:
+            return False
+        if self.context.current_timestamp > self._envelope_expires_at:
+            self._envelope_flows_mw = None
+            return False
+        return True
+
     async def _handle_negotiation_finished(
         self, message: NegotiationFinishedEvent, meta: dict
     ) -> None:
@@ -369,6 +470,26 @@ class EnergyConverterRole(Role):
         self._last_sector_setpoint[sector] = new
         self.context.schedule_instant_task(self.trigger_cp_negotiation())
 
+    def _live_connectors(self, connectors: list) -> list:
+        """Filter ``connectors`` through the sibling
+        :class:`DynamicConnectorRole` when one is attached, otherwise
+        passthrough.  Centralised so every callsite that fans flex
+        requests / decisions out to group leaders honours Concept-C
+        dynamics uniformly (legacy behaviour preserved when no filter
+        is wired).
+        """
+        if self._live_connector_filter is None:
+            return list(connectors)
+        kept = [c for c in connectors if self._live_connector_filter.is_live(c)]
+        if len(kept) != len(connectors) and logger.isEnabledFor(logging.DEBUG):
+            ctx = getattr(self, "context", None)
+            logger.debug(
+                "[%s] CP filter dropped %d unreachable connectors (kept=%d)",
+                getattr(ctx, "aid", "<detached>"),
+                len(connectors) - len(kept), len(kept),
+            )
+        return kept
+
     async def trigger_cp_negotiation(self) -> None:
         if topology_characteristic(self, tid="cps") != "leader":
             return
@@ -376,7 +497,7 @@ class EnergyConverterRole(Role):
             return
         self._active = True
 
-        group_leaders = topology_connectors(self, tid="cps")
+        group_leaders = self._live_connectors(topology_connectors(self, tid="cps"))
         if not group_leaders:
             logger.info(
                 "[%s] CP trigger skipped: no connected group leaders", self.context.aid,
@@ -436,6 +557,16 @@ class EnergyConverterRole(Role):
         imbalance_by_sector: dict[Sector, float] = {}
         unmet_by_sector_total: dict[Sector, float] = {}
         sector_priority_weight: dict[Sector, float] = {}
+        # F4: instead of collapsing every (tier, magnitude) pair into a
+        # single per-sector scalar via ``Σ unserved × 2^(P-tier)`` (which
+        # lets a few large mid-tier loads outweigh a small high-tier
+        # critical load), track the *most critical unmet tier* per
+        # sector and its magnitude separately.  Below the ADMM call we
+        # combine them lexicographically: top-tier-priority dominates,
+        # magnitude breaks ties.  Eliminates the magnitude-leakage
+        # failure mode (50 MW tier-5 vs 0.5 MW tier-1).
+        top_unmet_tier_per_sector: dict[Sector, int] = {}
+        top_unmet_mag_per_sector: dict[Sector, float] = {}
         for answer in answers:
             imbalance_by_sector[answer.sector] = (
                 imbalance_by_sector.get(answer.sector, 0.0) + answer.balance
@@ -454,6 +585,29 @@ class EnergyConverterRole(Role):
             sector_priority_weight[answer.sector] = (
                 sector_priority_weight.get(answer.sector, 0.0) + w
             )
+            # Per-sector top-tier scan: for each (sector, tier) cell
+            # with positive unserved demand, retain the lowest tier
+            # (= highest priority) seen so far and its magnitude.
+            dem_map = getattr(answer, "demand_by_sector_priority", {}) or {}
+            srv_map = getattr(answer, "served_by_sector_priority", {}) or {}
+            for sec_str, tier_to_dem in dem_map.items():
+                try:
+                    sec_enum = Sector(sec_str)
+                except ValueError:
+                    continue
+                sec_srv = srv_map.get(sec_str, {})
+                for tier, dem in tier_to_dem.items():
+                    unmet = max(0.0, float(dem) - float(sec_srv.get(tier, 0.0)))
+                    if unmet < 1e-9:
+                        continue
+                    cur_tier = top_unmet_tier_per_sector.get(sec_enum)
+                    if cur_tier is None or int(tier) < cur_tier:
+                        top_unmet_tier_per_sector[sec_enum] = int(tier)
+                        top_unmet_mag_per_sector[sec_enum] = unmet
+                    elif int(tier) == cur_tier:
+                        top_unmet_mag_per_sector[sec_enum] = (
+                            top_unmet_mag_per_sector.get(sec_enum, 0.0) + unmet
+                        )
 
         # Combine balance + unmet into the T vector.  Unmet is unsigned
         # (always positive deficit) so it shifts T toward positive in
@@ -492,15 +646,54 @@ class EnergyConverterRole(Role):
                     T.tolist(),
                     self._same_sign_skip_count,
                 )
+            # Ledger entry so the CP's wake-up activity is visible to the
+            # post-run analysis even when ADMM bails before publishing a
+            # setpoint.  Without this the cp_setpoint counter undercounts
+            # CP engagement on grids where T is structurally same-sign.
+            from scare.base.diagnostics import record_event
+
+            record_event(
+                t=float(self.context.current_timestamp),
+                kind="cp_admm_skipped_same_sign",
+                aid=str(self.context.aid),
+                sector="cp",
+                detail=f"T={T.tolist()} n_skips={self._same_sign_skip_count}",
+            )
             self._active = False
             return
 
         # Per-sector priority weights for the ADMM sharing problem.
-        # Sectors with higher-priority unserved demand get stronger
-        # weight, biasing the CP operating point toward those sectors.
-        w_el = sector_priority_weight.get(Sector.ELECTRICITY, 1.0)
-        w_heat = sector_priority_weight.get(Sector.HEAT, 1.0)
-        w_gas = sector_priority_weight.get(Sector.GAS, 1.0)
+        # F4: top-tier-dominant — a sector whose most critical unmet
+        # tier is t outranks any sector whose top unmet tier is t'>t,
+        # regardless of magnitudes.  Within the same top-tier, larger
+        # magnitude wins.  Falls back to the legacy magnitude-weighted
+        # sum when there is no per-(sector, tier) info (older
+        # AvailableFlexAnswer messages without ``demand_by_sector_
+        # priority`` populated) so the answer.balance pathway still
+        # produces a working ADMM weighting.
+        from scare.base.util import tier_priority_weight
+
+        def _sector_w(sec: Sector) -> float:
+            top_tier = top_unmet_tier_per_sector.get(sec)
+            if top_tier is None:
+                # No per-tier data — fall back to the legacy aggregated
+                # weight (or 1.0 if neither is populated).
+                return sector_priority_weight.get(sec, 1.0) or 1.0
+            base = tier_priority_weight(
+                top_tier, regime=1, priority_tiers=10
+            )
+            mag = top_unmet_mag_per_sector.get(sec, 0.0)
+            # Magnitude tiebreaker scaled to stay below the next-tier
+            # base (each tier doubles).  log1p keeps the contribution
+            # bounded so a huge tier-5 cannot promote itself past a
+            # small tier-4.
+            import math as _math
+
+            return base * (1.0 + 0.5 * _math.log1p(mag))
+
+        w_el = _sector_w(Sector.ELECTRICITY)
+        w_heat = _sector_w(Sector.HEAT)
+        w_gas = _sector_w(Sector.GAS)
         w_max = max(w_el, w_heat, w_gas, 1e-9)
         priorities = np.array([w_el, w_heat, w_gas]) / w_max  # normalise to [0, 1]
         priorities = np.maximum(priorities, 0.01)  # floor to avoid zero-weight
@@ -515,7 +708,48 @@ class EnergyConverterRole(Role):
                 [self.flex_actor], coordinator, start_msg
             )
             result = list(self.flex_actor.x)
-            logger.info("[%s] ADMM result: %s", self.context.aid, result)
+            # Cross-sector coalition envelope clamp.  When an L2.5
+            # coalition has committed directional sector flows for
+            # this CP, narrow each dimension of the ADMM result to
+            # the committed value (small tolerance for ADMM noise).
+            # The coalition runs ahead of L3 in the protocol stack —
+            # its commitment is the contract; L3's job is only to
+            # honour it.  Cleared by the envelope's TTL or a branch
+            # failure invalidation, after which L3 resumes free
+            # optimisation.
+            if self._envelope_active():
+                envelope = self._envelope_flows_mw or {}
+                pre_clamp = list(result)
+                for sector, idx in _RESULT_INDEX.items():
+                    if idx >= len(result):
+                        continue
+                    if sector in envelope:
+                        committed = float(envelope[sector])
+                        # MW for el/heat, but ADMM works in MW
+                        # everywhere — the same scale as ``envelope``
+                        # so direct substitution is correct.
+                        if sector == Sector.GAS:
+                            committed = mw_to_kgps(committed)
+                            committed = kgps_to_mw(committed)  # round-trip no-op for unit clarity
+                        result[idx] = committed
+                logger.info(
+                    "[%s] CP ADMM result clamped to coalition envelope %s: %s",
+                    self.context.aid, self._envelope_coalition_id, result,
+                )
+                from scare.base.diagnostics import record_event
+
+                record_event(
+                    t=float(self.context.current_timestamp),
+                    kind="cp_envelope_clamp",
+                    aid=str(self.context.aid),
+                    sector="cp",
+                    detail=(
+                        f"coalition={self._envelope_coalition_id} "
+                        f"pre={pre_clamp} post={result}"
+                    ),
+                )
+            else:
+                logger.info("[%s] ADMM result: %s", self.context.aid, result)
             # ``_apply_result`` must run *before* ``emit_event``: nothing
             # subscribes to ``OptimizationFinishedLocalEvent``, so the
             # underlying ``RoleHandler.emit_event`` raises ``KeyError``
@@ -527,7 +761,7 @@ class EnergyConverterRole(Role):
                 self.context.emit_event(OptimizationFinishedLocalEvent(result=result))
             except KeyError:
                 pass
-            group_leaders = topology_connectors(self, tid="cps")
+            group_leaders = self._live_connectors(topology_connectors(self, tid="cps"))
             # Publish CPSetpoint Decision (channel/decision pattern)
             # alongside the legacy StartBalanceNegotiation so subscribed
             # holons can re-evaluate directly.  Result layout matches
@@ -544,6 +778,21 @@ class EnergyConverterRole(Role):
                 cp_id=str(self.context.aid),
                 sector_flows_mw=sector_flows,
                 regulation_factor=float(applied_factor or 1.0),
+            )
+            # Ledger entry — picked up by ``event_log()`` so the plots
+            # can reconstruct each CP's per-sector flow timeline.
+            from scare.base.diagnostics import record_event
+
+            record_event(
+                t=float(self.context.current_timestamp),
+                kind="cp_setpoint",
+                aid=str(self.context.aid),
+                sector="cp",
+                detail=(
+                    f"flows={{{', '.join(f'{s}: {v:.4f}' for s, v in sector_flows.items())}}} "
+                    f"reg={float(applied_factor or 1.0):.3f} "
+                    f"envelope_active={self._envelope_active()}"
+                ),
             )
             logger.debug(
                 "[%s] CP publish: sector_flows=%s reg=%.3f v=%d to %d holons",
@@ -562,7 +811,7 @@ class EnergyConverterRole(Role):
             logger.error("[%s] ADMM failed: %s", self.context.aid, exc)
             # Fallback: trigger intra-group gossip so groups can still
             # rebalance locally even though cross-sector optimisation failed.
-            for addr in topology_connectors(self, tid="cps"):
+            for addr in self._live_connectors(topology_connectors(self, tid="cps")):
                 await self.context.send_message(
                     StartBalanceNegotiation(), receiver_addr=addr
                 )

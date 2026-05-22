@@ -292,6 +292,123 @@ def _last_regulate_t_store(behavior: Any) -> dict[str, float]:
     return store
 
 
+def _stale_obs_state(behavior: Any) -> dict[str, Any]:
+    """Per-behavior tracker of regulate-on-stale-observation events.
+
+    The host environment's ``_accept_or_keep`` re-uses the previous
+    ``SolverResult`` whenever an ``energyflow`` solve returns
+    infeasible (see ``base.infeasibility_capture``).  Concretely:
+    ``behavior._net_results`` is replaced *only* on a successful
+    solve, so its ``id()`` is a cheap freshness oracle.
+
+    This helper tracks the last-seen ``id(_net_results)``.  Each
+    ``apply_regulate`` call compares the current id against the
+    cached one — if unchanged AND at least one apply has already
+    landed on this id, the new regulate is acting on stale state
+    and is counted in ``stale_landed`` / surfaced via a one-shot
+    ``regulate_on_stale_obs`` event for the affected sector.
+    """
+    state = getattr(behavior, "_scare_stale_obs_state", None)
+    if state is None:
+        state = {
+            "last_id": None,
+            "applies_on_current_id": 0,
+            "stale_landed": 0,
+            "warned_for_id": None,
+        }
+        behavior._scare_stale_obs_state = state
+    return state
+
+
+# Tiers at or below this threshold bypass the global cooldown.  A
+# tier-1 dispatch decision that would otherwise be silently dropped by
+# the global cooldown gate (typical case: gossip lands at t and an L2
+# supply-priority decision tries to land at t+ε < cooldown_s) is too
+# important to defer — the cooldown's wallclock-cost rationale does
+# not apply to the rare critical-load update.  Lower tiers still pay
+# the cooldown so the SCADA-cycle scheduling assumption holds for the
+# bulk of dispatches.
+_COOLDOWN_BYPASS_TIER_THRESHOLD: int = 2
+
+
+def _is_slack_class_child(behavior: Any, aid: str) -> bool:
+    """True iff *aid* refers to a monee ``ExtPowerGrid`` or ``ExtHydrGrid``
+    child — the network's slack-class boundary.
+
+    Slacks have a *free* p_mw / mass_flow Var the LP picks within a
+    wide physical envelope; writing ``regulation < 1`` clamps the
+    effective slack contribution to a fraction of that envelope, and
+    the next solve diagnoses infeasible the moment the network needs
+    more headroom than the clamped fraction.  Curtailment / stability
+    / gossip writes must therefore skip slacks.
+
+    Class-based rather than registry-based because heat-side
+    ExtHydrGrid is intentionally unbounded by ``apply_slack_budget``
+    (the heat LP has no operator-side slack discipline) and thus
+    never lands in the ``register_slack`` registry — yet it is still
+    structurally a slack.
+    """
+    if not aid.startswith("child-"):
+        return False
+    try:
+        cid = int(aid[len("child-"):])
+    except ValueError:
+        return False
+    net = getattr(behavior, "_net", None)
+    if net is None:
+        return False
+    try:
+        child = net.child_by_id(cid)
+    except Exception:  # noqa: BLE001
+        return False
+    from monee.model.child import ExtHydrGrid, ExtPowerGrid
+
+    return isinstance(child.model, (ExtPowerGrid, ExtHydrGrid))
+
+
+def _is_heat_side_mass_flow_sink(behavior: Any, aid: str) -> bool:
+    """True iff *aid* refers to a monee ``Sink`` child on a water/heat
+    grid junction.
+
+    On monee's heat-sector convention every heat consumer is modelled
+    as a (HeatLoad, Sink) pair sharing one junction: HeatLoad withdraws
+    thermal energy (``q_mw_heat``), Sink withdraws the matching return-
+    line mass flow.  Forcing ``Sink.regulation < 1`` zeroes the mass-
+    flow withdrawal without zeroing the upstream supply (the pipe is
+    still pushing water in via the SubHE/HeatExchanger) — the junction
+    mass-flow balance becomes ``positive = 0`` and presolve declares
+    the LP infeasible.  Gas-sector Sinks model real gas consumption
+    and remain curtailable.
+
+    Curtailment for thermal control should go through the HeatLoad
+    (``q_mw_heat * regulation``), which leaves mass flow untouched.
+    """
+    if not aid.startswith("child-"):
+        return False
+    try:
+        cid = int(aid[len("child-"):])
+    except ValueError:
+        return False
+    net = getattr(behavior, "_net", None)
+    if net is None:
+        return False
+    try:
+        child = net.child_by_id(cid)
+    except Exception:  # noqa: BLE001
+        return False
+    from monee.model.child import Sink
+
+    if not isinstance(child.model, Sink):
+        return False
+    try:
+        grid_name = str(
+            getattr(net.node_by_id(child.node_id).grid, "name", "")
+        ).lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return "water" in grid_name or "heat" in grid_name
+
+
 def apply_regulate(
     behavior: Any,
     aid: str,
@@ -301,6 +418,7 @@ def apply_regulate(
     reason: str,
     timestamp: float,
     tolerance: float = _REGULATE_DEDUP_TOL,
+    priority_tier: int | None = None,
 ) -> bool:
     """Apply a regulate action, suppressing requests that would set the
     same factor (within ``tolerance``) the agent already holds.
@@ -313,10 +431,39 @@ def apply_regulate(
     reduction; it lets the SCADA-cycle-style scheduling assumption be
     expressed as a single config flag.
 
+    ``priority_tier`` (when set) lets critical loads bypass the global
+    cooldown gate — see ``_COOLDOWN_BYPASS_TIER_THRESHOLD``.  Without
+    this bypass, a tier-1 L2/holon decision that arrives shortly
+    after an unrelated gossip update is silently dropped; with it, the
+    suppression is visible via a ``regulate_suppressed_by_cooldown``
+    event whenever a non-critical update is gated.
+
     Returns ``True`` if the action was applied, ``False`` if suppressed
     (no behavior.act call, no diagnostics record).
     """
     factor = max(0.0, min(1.0, factor))
+    if factor < 1.0 - tolerance and _is_heat_side_mass_flow_sink(behavior, aid):
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=float(timestamp),
+            kind="regulate_blocked_heat_sink",
+            aid=str(aid),
+            sector=str(sector),
+            detail=f"reason={reason} requested_factor={factor:.4f}",
+        )
+        return False
+    if factor < 1.0 - tolerance and _is_slack_class_child(behavior, aid):
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=float(timestamp),
+            kind="regulate_blocked_slack",
+            aid=str(aid),
+            sector=str(sector),
+            detail=f"reason={reason} requested_factor={factor:.4f}",
+        )
+        return False
     last = _last_regulate_store(behavior).get(aid)
     if last is not None and abs(factor - last) < tolerance:
         return False
@@ -326,9 +473,54 @@ def apply_regulate(
         last_t_store = _last_regulate_t_store(behavior)
         last_t = last_t_store.get(aid)
         if last_t is not None and (timestamp - last_t) < cooldown_s:
-            return False
+            critical = (
+                priority_tier is not None
+                and 0 < int(priority_tier) <= _COOLDOWN_BYPASS_TIER_THRESHOLD
+            )
+            if not critical:
+                from scare.base.diagnostics import record_event
+
+                record_event(
+                    t=float(timestamp),
+                    kind="regulate_suppressed_by_cooldown",
+                    aid=str(aid),
+                    sector=str(sector),
+                    detail=(
+                        f"reason={reason} factor={factor:.4f} "
+                        f"since_last={timestamp - last_t:.3f}s "
+                        f"tier={priority_tier}"
+                    ),
+                )
+                return False
     if not behavior.has_action(aid, "regulate"):
         return False
+
+    # Stale-observation detector (H13).  If the LP has not been
+    # re-solved since the previous apply landed on this behavior,
+    # this regulate is computing against the previous net_results
+    # snapshot — the LP infeasibility cascade hides this otherwise.
+    state = _stale_obs_state(behavior)
+    current_id = id(getattr(behavior, "_net_results", None))
+    if state["last_id"] == current_id and state["applies_on_current_id"] > 0:
+        state["stale_landed"] += 1
+        if state["warned_for_id"] != current_id:
+            from scare.base.diagnostics import record_event
+
+            record_event(
+                t=float(timestamp),
+                kind="regulate_on_stale_obs",
+                aid=str(aid),
+                sector=str(sector),
+                detail=(
+                    f"reason={reason} stale_landed_total={state['stale_landed']}"
+                ),
+            )
+            state["warned_for_id"] = current_id
+    elif state["last_id"] != current_id:
+        state["last_id"] = current_id
+        state["applies_on_current_id"] = 0
+        state["warned_for_id"] = None
+    state["applies_on_current_id"] += 1
 
     behavior.act(aid, "regulate", factor)
     _last_regulate_store(behavior)[aid] = factor
@@ -732,6 +924,7 @@ def obs_priority(
     *,
     behavior: Any = None,
     aid: str | None = None,
+    record_default_fallback_t: float | None = None,
 ) -> int:
     """Read an explicit priority value from an observation dict.
 
@@ -749,6 +942,13 @@ def obs_priority(
     regardless of the LP's current sign — the sign flips depending on
     import / export direction, but the role of the slack is always to
     supply / absorb at the network boundary, never to be shed.
+
+    Pass ``record_default_fallback_t`` to surface a one-shot
+    ``priority_default_fallback`` event the first time a given
+    (behavior, aid) takes the tier-0/1 fallback branch.  Used by
+    higher-level callers (e.g. ``_handle_ask_flex``) so missed priority
+    registrations show up in events.csv rather than silently degrading
+    the tier-stratified allocation.
     """
     if behavior is not None and aid is not None:
         if lookup_slack(behavior, aid) is not None:
@@ -759,7 +959,28 @@ def obs_priority(
     if "priority" in obs:
         return int(obs["priority"])
     cap = obs_capacity(obs)
-    return 0 if cap < 0 else 1
+    fallback = 0 if cap < 0 else 1
+    if (
+        record_default_fallback_t is not None
+        and behavior is not None
+        and aid is not None
+        and cap > 0  # only loads — generators legitimately default to tier 0
+    ):
+        seen = getattr(behavior, "_scare_prio_fallback_seen", None)
+        if seen is None:
+            seen = set()
+            behavior._scare_prio_fallback_seen = seen
+        if aid not in seen:
+            seen.add(aid)
+            from scare.base.diagnostics import record_event
+
+            record_event(
+                t=float(record_default_fallback_t),
+                kind="priority_default_fallback",
+                aid=str(aid),
+                detail=f"fallback_tier={fallback}",
+            )
+    return fallback
 
 
 def compute_priority_weighted_shares(
@@ -839,13 +1060,65 @@ def aggregate_priority_weight(
 # load served at 65 % while tier-6 loads at 100 %, because tier-1
 # happened to sit in a slightly higher-voltage neighbourhood).  The
 # deadband restores the intent of "near-violation, throttle".
+# Default number of priority tiers when callers don't override.  Mirrors
+# the schedule used by every priority-aware layer (L1 QP, L2 ADMM,
+# coalition allocator, CP role).
+DEFAULT_PRIORITY_TIERS: int = 10
+
+
+def tier_priority_weight(
+    tier: int,
+    *,
+    regime: int = 1,
+    priority_tiers: int = DEFAULT_PRIORITY_TIERS,
+) -> float:
+    """Single source of truth for the per-tier exponential weight.
+
+    ``regime > 0`` (restoration / lost-load): tier 1 is most urgent, so
+    it gets the highest weight (``2^P``).  Used by the L1 gossip QP's
+    ``_qp_priority_weight``, the L2 tier-stratified and supply-priority
+    ADMMs, and the L3 CP per-sector S-coefficient.
+
+    ``regime < 0`` (curtailment / lost-gen): tier P is most disposable,
+    so low-priority loads shed first.  Used by the curtailment auction
+    in the constraint monitor.
+
+    ``regime == 0``: returns 1.0 — used by ``_qp_priority_weight`` only
+    when a target is exactly zero (no negotiation direction defined).
+    """
+    P = int(priority_tiers)
+    if P <= 0:
+        return 1.0
+    p = max(0, int(tier))
+    if regime > 0:
+        return 2.0 ** max(0, P - min(p, P) + 1)
+    if regime < 0:
+        return 2.0 ** max(0, min(p, P))
+    return 1.0
+
+
 _CLAMP_UTILIZATION_DEADBAND: float = 0.85
+
+# Tier-aware deadband override: critical tiers tolerate measurements
+# closer to a bound before the clamp throttles them.  Empirically the
+# 0.85 default still produces priority-blind cuts on tier 1/2 loads
+# whenever a shared upstream variable (e.g. ``loading_percent``) drifts
+# past 0.85 — the priority waterfall is overruled by the local clamp
+# because the clamp itself doesn't know tier.  Raising the deadband to
+# 0.99 for tier ≤ 2 means: never throttle critical loads until the
+# measurement is essentially at the hard bound; below tier 2 the
+# original conservative behaviour stands.  Lower tiers get the
+# standard 0.85 deadband (and shed first when the bound is approached).
+_CLAMP_CRITICAL_TIER_THRESHOLD: int = 2
+_CLAMP_CRITICAL_DEADBAND: float = 0.99
 
 
 def clamp_to_constraints(
     setpoint: float,
     obs: dict,
     sector: Sector,
+    *,
+    tier: int | None = None,
 ) -> float:
     """Clamp a proposed setpoint so it stays within local constraint bounds.
 
@@ -853,10 +1126,13 @@ def clamp_to_constraints(
     grid measurement is approaching a hard bound, reduce the proposed
     setpoint to avoid actuating a violation.
 
-    Activates only past the ``_CLAMP_UTILIZATION_DEADBAND`` — utilization
-    levels below that represent normal operating drift inside the
-    designed ±5 % LV envelope, not stress.  Above the deadband, the
-    allowed fraction ramps linearly to zero:
+    Activates only past a tier-dependent deadband — the default 0.85
+    is the everyday LV operating drift threshold; tier 1/2 critical
+    loads get a tighter 0.99 deadband so the clamp does not overrule
+    the priority waterfall by truncating critical demand once the
+    shared upstream variable (e.g. ``loading_percent``) drifts past
+    0.85.  Above the deadband, the allowed fraction ramps linearly
+    to zero:
 
         allowed = (1 - util) / (1 - DEADBAND)   for util ∈ [DEADBAND, 1]
         allowed = 1.0                            for util < DEADBAND
@@ -865,6 +1141,11 @@ def clamp_to_constraints(
     cuts every load to 50-70 % of cap — completely overriding the
     priority-aware gossip waterfall.  Confirmed root cause of the
     priority-invariant failure on task-0 simbench_lv.
+
+    ``tier`` is the load's priority tier (1 = most critical, higher =
+    less critical).  When ``None``, the legacy uniform 0.85 deadband
+    is used — preserves byte-compatible behaviour for callers that
+    do not (yet) propagate tier information.
     """
     from scare.base.model import SECTOR_CONSTRAINTS
 
@@ -873,7 +1154,10 @@ def clamp_to_constraints(
     if cap == 0.0:
         return setpoint
 
-    deadband = _CLAMP_UTILIZATION_DEADBAND
+    if tier is not None and 0 < int(tier) <= _CLAMP_CRITICAL_TIER_THRESHOLD:
+        deadband = _CLAMP_CRITICAL_DEADBAND
+    else:
+        deadband = _CLAMP_UTILIZATION_DEADBAND
     width = max(1e-9, 1.0 - deadband)
 
     # Determine the tightest constraint across all local variables.

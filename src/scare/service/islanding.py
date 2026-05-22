@@ -116,7 +116,7 @@ class IslandingFallbackRole(Role):
             current_sp = abs(obs_setpoint(obs, behavior=self.behavior, aid=aid))
             new_factor = min(1.0, (current_sp + share) / cap) if cap > 0 else 0.0
 
-            from scare.base.util import apply_regulate
+            from scare.base.util import apply_regulate, lookup_priority
 
             applied = apply_regulate(
                 self.behavior,
@@ -125,6 +125,7 @@ class IslandingFallbackRole(Role):
                 sector=self.sector.value,
                 reason="islanding",
                 timestamp=self.context.current_timestamp,
+                priority_tier=lookup_priority(self.behavior, aid),
             )
             if applied:
                 covered += share

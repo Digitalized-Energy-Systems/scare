@@ -74,6 +74,17 @@ class TaskArtefacts:
     def timeseries(self) -> pd.DataFrame:
         return _read_csv(self.task_dir / "timeseries.csv")
 
+    @cached_property
+    def trajectories(self) -> pd.DataFrame:
+        """Wide per-aid regulation trajectory CSV (forward-filled).
+
+        Only present when the campaign config sets
+        ``write_trajectories: true``.  Returns an empty DataFrame when
+        the file isn't on disk, so plot helpers can drop straight into
+        their empty-fig placeholder.
+        """
+        return _read_csv(self.task_dir / "trajectories.csv")
+
     # ---- Derived helpers --------------------------------------------
 
     def is_ok(self) -> bool:
@@ -82,6 +93,18 @@ class TaskArtefacts:
     def first_failure_time(self) -> float | None:
         delays = [float(f.get("delay_s", 0.0)) for f in self.failures]
         return min(delays) if delays else None
+
+    def solver_failures(self) -> int:
+        """Count of energyflow solves that returned infeasible during the
+        task run.  Surfaced by the runner from ``_InfeasibilityCounter``
+        and saved into ``status.json``.  Used by trajectory plots to
+        annotate when the observation pipeline froze on a held-over
+        ``_net_results`` snapshot.
+        """
+        try:
+            return int(self.status.get("solver_failures") or 0)
+        except (TypeError, ValueError):
+            return 0
 
 
 # ---------------------------------------------------------------------------

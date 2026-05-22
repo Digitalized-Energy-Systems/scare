@@ -23,6 +23,7 @@ import pandas as pd
 
 from experiment.eval import plots
 from experiment.eval.loader import CampaignData, TaskArtefacts, load_campaign
+from experiment.eval.overview import write_overview
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,18 @@ def _functional_baseline(campaign: CampaignData, out_dir: Path) -> list[str]:
             title=f"Restoration trajectory — task {rep.task_id} ({rep.grid})",
             failure_t=rep.first_failure_time(),
         )))
+        # Constraint-envelope overlay for the same task — directly
+        # surfaces whether voltage / pressure / temperature ever left
+        # the operating band during the recovery.
+        figs.append(str(plots.constraint_envelope_trajectory(
+            rep.timeseries, rep.events,
+            out_dir / "representative_constraint_envelope.png",
+            title=(
+                f"Constraint envelopes — task {rep.task_id} ({rep.grid})"
+            ),
+            failure_t=rep.first_failure_time(),
+            solver_failures=rep.solver_failures(),
+        )))
     return figs
 
 
@@ -81,6 +94,16 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
         str(plots.variant_comparison_bar(
             sub, out_dir / "served_by_variant.png",
             title="Priority-weighted served by variant",
+        )),
+        # "How fast does each variant settle?" — restoration-time view
+        # that mirrors the served-fraction headline metric.
+        str(plots.time_to_stabilise_box(
+            sub, out_dir / "time_to_stabilise.png",
+        )),
+        # "Which control layer actually fires under each variant?" —
+        # exposes the regulate trigger mix so ablations stand out.
+        str(plots.regulates_by_reason_bar(
+            sub, out_dir / "regulates_by_reason.png",
         )),
         str(plots.diary_outcomes_bar(sub, out_dir / "diary_outcomes.png")),
         str(plots.claims_pass_rate(sub, out_dir / "claims_pass_rate.png")),
@@ -164,6 +187,184 @@ def _claims(campaign: CampaignData, out_dir: Path) -> list[str]:
     ))]
 
 
+def _solver_health(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Campaign-wide solver-health view.  Surfaces mean infeasibility /
+    warning counts per task split by variant so regressions in the
+    energy-flow LP (e.g. the failure-mode the run-log audit chased
+    down) show up at a glance instead of needing a grep over run.log.
+    """
+    df = campaign.summary
+    if df.empty:
+        return []
+    return [str(plots.solver_health_bar(
+        df, out_dir / "solver_health.png",
+    ))]
+
+
+def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Validity plots — verify the multi-level controller behaved as
+    the architecture chapter claims.
+
+    Four traces, all drawn for the ``functional_baseline`` scare
+    representative task:
+
+    - **System balance** — per-sector ``Σ regulation`` (does the global
+      controller settle after the failure?).
+    - **Coalition balances** — one line per Level-1 community per
+      sector (do groups individually converge?).
+    - **Holon balances** — one line per Level-2 chunk per sector (does
+      the holonic ADMM smooth the per-coalition signal?).
+    - **Per-child regulation** — every active child agent's factor
+      trace (are devices actually being modulated, or sitting flat?).
+    """
+    df = campaign.summary
+    if df.empty:
+        return []
+    ok = df[(df["status"] == "ok") & (df.get("variant") == "scare")]
+    if ok.empty:
+        return []
+
+    # Validity plots are most informative when the per-coalition /
+    # per-holon balance recordings are present in ``timeseries.csv``
+    # (introduced by the validity-plot landing).  Walk OK scare tasks
+    # in ``functional_baseline``-first order and pick the first one
+    # whose timeseries actually carries the new columns, falling back
+    # to ``functional_baseline``'s representative if no task has them
+    # yet (so the system_balance subplot still renders on legacy data).
+    fb_first = pd.concat([
+        ok[ok["experiment"] == "functional_baseline"],
+        ok[ok["experiment"] != "functional_baseline"],
+    ])
+    rep = None
+    for tid in fb_first["task_id"].astype(int).tolist():
+        candidate = campaign.task(int(tid))
+        cols = list(candidate.timeseries.columns)
+        if any(c.startswith("coalition_balance__") for c in cols):
+            rep = candidate
+            break
+    if rep is None:
+        rep = campaign.representative_task("functional_baseline", "scare")
+    if rep is None:
+        rep = campaign.task(int(ok["task_id"].iloc[0]))
+
+    figs: list[str] = []
+    failure_t = rep.first_failure_time()
+    figs.append(str(plots.system_balance_trajectory(
+        rep.timeseries, rep.events,
+        out_dir / "system_balance.png",
+        title=(
+            f"System balance — task {rep.task_id} ({rep.grid})"
+        ),
+        failure_t=failure_t,
+    )))
+    figs.append(str(plots.coalition_balance_lines(
+        rep.timeseries,
+        out_dir / "coalition_balance.png",
+        title=(
+            f"Coalition balances (Level-1) — task {rep.task_id} ({rep.grid})"
+        ),
+    )))
+    figs.append(str(plots.holon_balance_lines(
+        rep.timeseries,
+        out_dir / "holon_balance.png",
+        title=(
+            f"Holon balances (Level-2) — task {rep.task_id} ({rep.grid})"
+        ),
+    )))
+    figs.append(str(plots.regulation_per_child_lines(
+        rep.trajectories,
+        out_dir / "regulation_per_child.png",
+        title=(
+            f"Per-child regulation — task {rep.task_id} ({rep.grid})"
+        ),
+    )))
+    return figs
+
+
+def _constraints(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Campaign-wide constraint-handling view.  Surfaces the per-sector
+    violation integral (``∫ max(0, util-1) dt``) split by variant so
+    "did the constraint layer keep the network inside its envelope"
+    is answered in one bar.  The constraint envelope trajectories
+    (per-task voltage / pressure / temperature with shaded bands)
+    live next to each ``functional_baseline`` representative task and
+    each per-experiment trajectory pair; the dedicated
+    ``overview_constraints.html`` page collates them all in one view.
+    """
+    df = campaign.summary
+    if df.empty:
+        return []
+    return [str(plots.constraint_violation_integral_bar(
+        df, out_dir / "violation_integral.png",
+    ))]
+
+
+def _per_experiment_trajectories(
+    campaign: CampaignData, plots_root: Path,
+) -> list[tuple[str, list[str]]]:
+    """One trajectory + constraint-envelope per (experiment, variant).
+
+    Previously only ``functional_baseline`` got a representative task
+    drawn — every other experiment had the same per-task artefacts but
+    no figure.  Iterate over the (experiment × variant) cells of the
+    summary and emit a trajectory + envelope for the lowest-id OK task
+    in each.  Skips ``functional_baseline`` since the dedicated
+    dispatcher already covers it.
+    """
+    df = campaign.summary
+    if df.empty or "experiment" not in df.columns or "variant" not in df.columns:
+        return []
+    ok = df[df["status"] == "ok"]
+    if ok.empty:
+        return []
+
+    out: list[tuple[str, list[str]]] = []
+    from experiment.eval.aliases import alias_experiment, alias_variant
+    seen_pairs: set[tuple[str, str]] = set()
+    for exp_name in sorted(ok["experiment"].dropna().unique()):
+        if exp_name == "functional_baseline" or not exp_name:
+            continue
+        for variant in sorted(ok[ok["experiment"] == exp_name]["variant"].dropna().unique()):
+            pair = (str(exp_name), str(variant))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            rep = campaign.representative_task(str(exp_name), str(variant))
+            if rep is None:
+                continue
+            out_dir = plots_root / "trajectories" / str(exp_name) / str(variant)
+            label = f"Trajectory — {alias_experiment(exp_name)} / {alias_variant(variant)}"
+            figs: list[str] = []
+            try:
+                figs.append(str(plots.restoration_trajectory(
+                    rep.timeseries, rep.events,
+                    out_dir / "trajectory.png",
+                    title=(
+                        f"Restoration trajectory — task {rep.task_id} "
+                        f"({rep.grid}, {alias_variant(variant)})"
+                    ),
+                    failure_t=rep.first_failure_time(),
+                )))
+                figs.append(str(plots.constraint_envelope_trajectory(
+                    rep.timeseries, rep.events,
+                    out_dir / "constraint_envelope.png",
+                    title=(
+                        f"Constraint envelopes — task {rep.task_id} "
+                        f"({rep.grid}, {alias_variant(variant)})"
+                    ),
+                    failure_t=rep.first_failure_time(),
+                    solver_failures=rep.solver_failures(),
+                )))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Trajectory for (%s, %s) failed: %s — skipping",
+                    exp_name, variant, exc,
+                )
+            if figs:
+                out.append((label, figs))
+    return out
+
+
 def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
     """Campaign-wide restoration view: pre-failure baseline vs
     post-restoration absolute MW + per-tier ratio.  Only emits figures
@@ -188,6 +389,12 @@ def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
         )),
         str(plots.restoration_by_tier_bar(
             ok, out_dir / "by_tier.png",
+        )),
+        # Per-sector mirror of the per-tier ratio bar — uses the
+        # outcomes__restoration__by_sector__<sec>__ratio columns the
+        # aggregator already flattens.
+        str(plots.restoration_by_sector_bar(
+            ok, out_dir / "by_sector.png",
         )),
         # Split per-tier loss into priority-blind (physical disconnect)
         # vs priority-aware (agent-shed) — the chapter's tier waterfall
@@ -339,6 +546,9 @@ def generate_report(campaign_dir: Path) -> Path:
         ("Sensitivity sweeps", _sweeps, "sweeps"),
         ("Restoration vs baseline", _restoration, "restoration"),
         ("Claims (overall)", _claims, "claims"),
+        ("Solver health", _solver_health, "solver_health"),
+        ("Constraints", _constraints, "constraints"),
+        ("Validity (multi-level balances)", _validity, "validity"),
     ):
         out_dir = plots_root / sub
         try:
@@ -362,10 +572,30 @@ def generate_report(campaign_dir: Path) -> Path:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Auto-dispatch failed: %s — skipping", exc)
 
+    # Representative trajectory + constraint envelope per (experiment,
+    # variant).  ``_functional_baseline`` already covers its own slot;
+    # this dispatcher handles every other experiment so the per-task
+    # artefacts that were collected stop going to waste.
+    try:
+        for label, figs in _per_experiment_trajectories(campaign, plots_root):
+            if figs:
+                sections.append((label, figs))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Per-experiment trajectories failed: %s — skipping", exc)
+
     md = _stitch(campaign, sections)
     report_path = campaign_dir / "REPORT.md"
-    report_path.write_text(md)
+    report_path.write_text(md, encoding="utf-8")
     logger.info("Wrote %s (%d sections)", report_path, len(sections))
+
+    # Generate the multi-plot HTML overviews — non-fatal if it fails,
+    # the per-figure HTML/PDF is still on disk for inclusion.
+    try:
+        overview_path = write_overview(campaign)
+        logger.info("Wrote %s", overview_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Overview generation failed: %s — skipping", exc)
+
     return report_path
 
 

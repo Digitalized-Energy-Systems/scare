@@ -5,7 +5,16 @@
     "campaign's wallclock cost.  Used to validate the full eval pipeline end-to-end:",
     "every grid, every scenario kind, every variant, every ablation, and every",
     "sweep is exercised at least once.  When this passes cleanly, eval_full.json",
-    "with its full seed counts is safe to submit to SLURM."
+    "with its full seed counts is safe to submit to SLURM.",
+    "",
+    "Architectural coverage as of 2026-05: the ablation matrix exercises every",
+    "enable_* flag on RestorationConfiguration including the L2.5 mesh",
+    "(holon_summary, holon_coalition, cross_sector_coalitions), Concept-C dynamic",
+    "topology (dynamic_holon_topology, dynamic_cp_topology), tier-stratified ADMM,",
+    "Hebbian formation, line-loading constraint, and reconfig feasibility ranking.",
+    "Two additional sweep blocks cover the community_partition_method (label",
+    "propagation vs distributed-Louvain modularity) and the holon_admm_mode",
+    "(supply vs demand) code paths so the ablation branches are exercised too."
   ],
   "name": "eval_full_smoke",
   "out_root": "experiment/_runs/eval",
@@ -102,7 +111,18 @@
       ]
     },
     {
-      "name": "ablation",
+      "$comment": [
+        "Ablation matrix split into themed blocks so every flag is paired",
+        "with a scenario that can actually exercise it.  Audit (2026-05) found",
+        "the original single-scenario design left ~14/22 flags inert because",
+        "their gating conditions (CPs, voltage stress, heat sector, line",
+        "overload, Hebbian warmup, etc.) never fired on the concentrated-5",
+        "LV scenario.  Each block below names the flag-set it tests + the",
+        "scenario that triggers them; the {} default in each block is the",
+        "per-block baseline to subtract from."
+      ],
+      "name": "ablation_core",
+      "$comment_block": "Holonic / QP-gossip / priority core.  Concentrated 5-failure on simbench_lv with skewed priorities + slack 0.45 produces a deficit that drives the holon ADMM, gossip, and priority allocation paths.",
       "grids": [
         "simbench_lv"
       ],
@@ -120,37 +140,22 @@
           "enable_holonic": false
         },
         {
-          "enable_cp_admm": false
-        },
-        {
           "enable_qp_gossip": false
-        },
-        {
-          "enable_constraint_aware_gossip": false
-        },
-        {
-          "enable_multihop_constraint": false
-        },
-        {
-          "enable_curtailment_auction": false
         },
         {
           "enable_priority_holon_allocation": false
         },
         {
+          "enable_tier_stratified_holon_admm": false
+        },
+        {
           "enable_monotonic_floor": false
-        },
-        {
-          "enable_clpu_ramp": false
-        },
-        {
-          "enable_heat_recovery": false
         },
         {
           "enable_distributed_failure_notice": false
         },
         {
-          "enable_qv_droop": false
+          "enable_dynamic_holon_topology": false
         }
       ],
       "scenarios": [
@@ -160,6 +165,229 @@
           "n_failures": 5,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent grid with generator failures and tight slack (0.15) is the regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions matter — the only restoration path is through the CP layer.",
+      "name": "ablation_cross_sector",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_cp_admm": false
+        },
+        {
+          "enable_dynamic_cp_topology": false
+        },
+        {
+          "enable_cross_sector_coalitions": false
+        },
+        {
+          "enable_holon_coalition": false,
+          "enable_cross_sector_coalitions": false
+        },
+        {
+          "enable_holon_summary": false,
+          "enable_holon_coalition": false,
+          "enable_cross_sector_coalitions": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ]
+    },
+    {
+      "$comment_block": "Line-loading / constraint-aware path.  line_stress scenario with load_scale=1.8 and ampacity_scale=0.5 forces lines into overload, which is the only regime where line_loading_constraint, constraint_aware_gossip, multihop_constraint, and curtailment_auction all fire.",
+      "name": "ablation_line_stress",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_line_loading_constraint": false
+        },
+        {
+          "enable_constraint_aware_gossip": false
+        },
+        {
+          "enable_multihop_constraint": false
+        },
+        {
+          "enable_curtailment_auction": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Voltage support.  pv_peak scenario pushes vm_pu past the 1.03 pu deadband so the Q-V droop role actually fires — concentrated load failures never trigger it.",
+      "name": "ablation_voltage",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_qv_droop": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ]
+    },
+    {
+      "$comment_block": "Thermal stress.  cold_day scenario on cp_heavy grid forces heat-sector deficit (supply_t_k=343, heat_load_scale=1.5) so heat_recovery and clpu_ramp have signal — both are heat-sector / ramp-rate gated and never fire on pure electricity failures.",
+      "name": "ablation_thermal",
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_heat_recovery": false
+        },
+        {
+          "enable_clpu_ramp": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Reconfiguration ranking.  simbench_lv_reconfig has multiple alternative paths so the path-ranking flag has alternatives to choose between; without alternative paths the flag is a no-op.",
+      "name": "ablation_reconfig",
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_reconfig_feasibility_ranking": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Hebbian formation.  Default hebbian_warmup_s=12 exceeds simulation_duration_s=10, so the recluster never fires.  This block overrides warmup to 2 s in BOTH baseline and ablation so the flag actually has signal to ablate against.",
+      "name": "ablation_hebbian",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {
+          "hebbian_warmup_s": 2.0
+        },
+        {
+          "enable_hebbian_formation": false,
+          "hebbian_warmup_s": 2.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Cross-sector coalition pillar (L2.5).  Mirrors cp_coalition_eval's headline",
+        "ablation on simbench_lv_cp_heavy_dependent — CPs replace primary generation, so",
+        "losing a CP is unrecoverable by intra-sector gossip + islanding alone.  Tight",
+        "slack budget (15%) + generator-class failures make the cross-sector layer the",
+        "only path to recovery.  Three rows: full stack vs xs-off vs all-coalitions-off",
+        "so the smoke exercises every L2.5 code path."
+      ],
+      "name": "cross_sector_coalition",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_cross_sector_coalitions": false
+        },
+        {
+          "enable_holon_coalition": false,
+          "enable_cross_sector_coalitions": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
         }
       ]
     },
@@ -584,6 +812,61 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Community-partition method ablation — label_propagation (radius-bounded) vs distributed-Louvain modularity.  Smoke must exercise both branches because the partition shape drives every downstream topology.",
+      "name": "partition_method_sweep",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "community_partition_method": "label_propagation"
+        },
+        {
+          "community_partition_method": "modularity"
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Holon ADMM mode — supply (Route A default) vs demand (legacy/ablation).  Smoke exercises both code paths so a regression in the ablation branch is caught before eval_full.",
+      "name": "holon_admm_mode_sweep",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 1,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "holon_admm_mode": "supply"
+        },
+        {
+          "holon_admm_mode": "demand"
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
         }
       ]
     },

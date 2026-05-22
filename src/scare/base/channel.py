@@ -139,6 +139,165 @@ class CPSetpoint(Decision):
     regulation_factor: float = 1.0
 
 
+@dataclass
+class HolonSummary(Decision):
+    """Post-rebalance per-tier served/demand summary for one
+    holon-leader's local community.
+
+    Published periodically on the sector-wide ``holon_summary_<sector>``
+    full-mesh topology so every leader can see what every other
+    leader's holon is doing per priority tier.  Consumed by the L2.5
+    coalition-detection logic in
+    :class:`HolonSummaryRole` to identify cross-holon priority
+    inversions ("leader A serves tier-2 at 37% while leader B serves
+    tier-4 at 100% in the same physical component").
+
+    Communication-only — no optimization decisions ride on this
+    channel.  When an inversion fires, a separate coalition message
+    (milestone 2) carries the actual coordination.
+
+    ``per_tier_served_mw`` and ``per_tier_demand_mw`` are the leader's
+    *own community* aggregates per priority tier in the named sector,
+    so subscribers can compute the fraction safely on the receiver
+    side (no division-by-tiny in the publisher).
+    """
+
+    sector: Sector = Sector.ELECTRICITY
+    per_tier_served_mw: dict[int, float] = field(default_factory=dict)
+    per_tier_demand_mw: dict[int, float] = field(default_factory=dict)
+
+
+@dataclass
+class CoalitionInvitation(Decision):
+    """Layer-2.5 milestone-2 invitation to join an ad-hoc rebalance coalition.
+
+    Published by the lex-smallest leader that detected a cross-holon
+    priority inversion in its ``_peer_summaries`` (election keeps a
+    single initiator per inversion cohort).  Sent on the same
+    ``holon_summary_<sector>`` mesh used for the M1 detection signal:
+    no new topology is required, and the initiator already has the
+    full peer address list from the periodic publish.
+
+    ``target_tiers`` carries the (tier_high, tier_low) pair from the
+    inversion so an invited leader can reply with just the demand /
+    supply slices that are relevant — keeping the per-coalition
+    payload small even if the holon has many other tiers in play.
+
+    ``ttl_s`` is the upper bound on how long the resulting constraint
+    is allowed to override the underlying L2 holon-ADMM allocation
+    (see :class:`HolonSummaryRole._active_coalitions`).  TTL is also
+    invalidated early on any ``BranchFailureEvent`` reaching the
+    initiator, per the design directive that failures invalidate
+    coalition constraints immediately.
+    """
+
+    coalition_id: str = ""
+    sector: Sector = Sector.ELECTRICITY
+    target_tiers: tuple[int, ...] = ()
+    member_aids: tuple[str, ...] = ()
+    ttl_s: float = 10.0
+
+
+@dataclass
+class CoalitionAcceptance(Decision):
+    """Reply from an invited leader carrying its scoped flex slice.
+
+    The initiator runs the coalition ADMM on the aggregate of the
+    received acceptances (plus its own state), so the acceptance
+    payload mirrors :class:`AvailableFlexAnswer`'s per-(sector, tier)
+    schema — same shape the existing supply-priority ADMM in
+    :class:`HolonicCommunityRole` already consumes.
+
+    A non-accepting leader can set ``accepted=False`` to opt out (e.g.
+    if it has no demand at the target tiers and no supply that could
+    help).  The initiator simply skips such replies.
+
+    ``home_node_id`` and ``demand_nodes_by_tier`` carry the spatial
+    information the initiator needs to compute per-actor
+    deliverability caps via the shared :class:`GridTopologyMirror`.
+    Without these the coalition ADMM treats supply as fungible across
+    the whole pool — fine for an undamaged grid, but on a post-failure
+    topology it lets the allocator commit supply that the LP cannot
+    physically route to demand on the other side of a broken edge.
+
+    Cross-sector coalition (new)
+    ----------------------------
+
+    When a CP joins a coalition, it advertises supply on the *output*
+    sectors it can drive, and lists ``coupling_ratios`` of the form
+    ``{(in_sector, out_sector): mw_out_per_mw_in}`` (efficiency).  The
+    coalition initiator uses this to compute the implied input-side
+    draw after the supply-priority ADMM has allocated the CP's output.
+    A regular sector leader leaves ``coupling_ratios`` empty.
+    """
+
+    coalition_id: str = ""
+    sector: Sector = Sector.ELECTRICITY
+    accepted: bool = True
+    supply_by_sector: dict[str, float] = field(default_factory=dict)
+    demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    home_node_id: Any = None
+    demand_nodes_by_tier: dict[int, dict[Any, float]] = field(default_factory=dict)
+    # Cross-sector coalition payload — non-empty only for CP members.
+    coupling_ratios: dict[tuple[str, str], float] = field(default_factory=dict)
+    is_cp: bool = False
+
+
+@dataclass
+class CoalitionConstraint(Decision):
+    """Coalition-issued per-(sector, tier) service-fraction constraint
+    with TTL.
+
+    Issued by the coalition initiator to every accepting member after
+    the scoped ADMM converges.  Recipients write it into their
+    :class:`CoalitionConstraintStore` so the underlying
+    :class:`HolonicCommunityRole` consults it before dispatching its
+    own ADMM result — coalition wins per-tier, L2 covers cells the
+    coalition didn't touch.  Constraints expire on ``issued_at +
+    ttl_s`` or on a :class:`BranchFailureEvent`.
+    """
+
+    coalition_id: str = ""
+    sector: Sector = Sector.ELECTRICITY
+    service_fraction_by_tier: dict[int, float] = field(default_factory=dict)
+    ttl_s: float = 8.0
+
+
+@dataclass
+class CPCommitment(Decision):
+    """Cross-sector coalition commitment dispatched to a CP member.
+
+    Issued by the L2.5 coalition initiator alongside the per-sector
+    ``CoalitionConstraint``/``StartBalanceNegotiation`` messages when
+    the coalition spans multiple sectors via a CP (the
+    ``enable_cross_sector_coalitions`` path).  Carries the directional
+    sector flows the CP should commit to for the TTL window:
+
+    * ``target_flows_mw[sector]`` is signed in load convention —
+      positive means "consume from this sector", negative means
+      "produce into this sector".  A P2H given a coalition commit to
+      serve 0.8 MW of heat receives ``{electricity: +X, heat: -0.8}``.
+
+    The CP writes the commitment into its envelope state (see
+    :class:`scare.service.cp.EnergyConverterRole`) and clamps its own
+    L3 ADMM's per-sector bounds so it cannot drift outside the
+    committed range.  Expiry semantics match
+    :class:`CoalitionConstraint`: ``issued_at + ttl_s`` or a
+    ``BranchFailureEvent``.
+
+    Off-by-default ablation knob: when
+    ``RestorationConfiguration.enable_cross_sector_coalitions`` is
+    False the coalition initiator never emits this message and the CP
+    runs without an envelope (legacy L3-free behaviour).
+    """
+
+    coalition_id: str = ""
+    cp_id: str = ""
+    target_flows_mw: dict[str, float] = field(default_factory=dict)
+    ttl_s: float = 8.0
+
+
 # ---- Publisher / subscriber state -----------------------------------------
 
 

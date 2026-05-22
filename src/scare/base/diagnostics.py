@@ -115,9 +115,16 @@ class NegotiationRecord:
 
 
 def arm() -> None:
-    """Enable recording.  Called once from the experiment entry point."""
+    """Enable recording and reset every per-run log to empty.
+
+    Called once at process start by ``install_solver_failure_dump`` and
+    again at the top of each task by the campaign runner so per-task
+    ``result.json`` event counts are not polluted by earlier tasks
+    sharing the same worker process.
+    """
     global _armed
     _armed = True
+    _log.clear()
     _negotiation_log.clear()
     _event_log.clear()
     _trajectory_log.clear()

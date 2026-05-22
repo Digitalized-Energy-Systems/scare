@@ -62,6 +62,11 @@ def aggregate(campaign_dir: Path) -> pd.DataFrame:
             "status": status.get("status", "missing"),
             "duration_s": status.get("duration_s"),
             "solver_failures": status.get("solver_failures"),
+            # Split solver-failure counts (added in the runner so we
+            # can tell LP infeasibility apart from non-OK warnings) —
+            # forwarded so per-variant plots can show the split.
+            "solver_infeasibilities": status.get("solver_infeasibilities"),
+            "solver_warnings": status.get("solver_warnings"),
             "exception_type": (exception or {}).get("type"),
             "exception_message": (exception or {}).get("message"),
             **flat,
@@ -413,7 +418,7 @@ def write_summary(campaign_dir: Path) -> tuple[Path, Path]:
     csv_path = campaign_dir / CAMPAIGN_LAYOUT["summary_csv"]
     md_path = campaign_dir / CAMPAIGN_LAYOUT["summary_md"]
     df.to_csv(csv_path, index=False)
-    md_path.write_text(_format_md(df))
+    md_path.write_text(_format_md(df), encoding="utf-8")
 
     n = len(df)
     by_status = df["status"].value_counts().to_dict() if n else {}

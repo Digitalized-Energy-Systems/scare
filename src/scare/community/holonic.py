@@ -51,6 +51,7 @@ from scare.base.model import (
     Sector,
     StartBalanceNegotiation,
 )
+from scare.base.topology_mirror import LivePeerFilter
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +109,28 @@ class HolonicCommunityRole(Role):
         enable_tier_stratified_admm: bool = True,
         priority_tiers: int = 10,
         admm_mode: str = "demand",
+        enable_priority_allocation: bool = True,
+        live_member_filter: LivePeerFilter | None = None,
+        coalition_constraint_store: Any = None,
+        my_node_id: Any = None,
+        leader_node_ids: dict[str, Any] | None = None,
+        topology_mirror: Any = None,
     ) -> None:
         super().__init__()
         self.sector = sector
+        # Shared constraint store the sibling :class:`HolonSummaryRole`
+        # writes into when a coalition has been formed.  Read here on
+        # every supply-priority dispatch so coalition fractions
+        # override L2's per-tier ADMM result for the TTL window.  None
+        # ⇒ no merge — L2 keeps its pre-M2 last-write-wins behaviour.
+        self._coalition_constraint_store = coalition_constraint_store
+        # Optional sibling role (``DynamicHolonRole``) that classifies
+        # which holon-member addresses are still physically reachable
+        # via live grid edges.  When ``None`` the role operates in
+        # static-topology mode — every member listed in
+        # ``_holon_member_addrs`` is treated as reachable, matching the
+        # pre-Concept-C behaviour.  Consulted by ``_live_members``.
+        self._live_member_filter = live_member_filter
         self.formation_period_s = formation_period_s
         self.max_holon_size = max_holon_size
         # ADMM convergence knobs (configurable via RestorationConfiguration
@@ -126,6 +146,27 @@ class HolonicCommunityRole(Role):
                 f"holon admm_mode must be 'demand' or 'supply', got {admm_mode!r}"
             )
         self.admm_mode = admm_mode
+        # Priority-weighted allocation switch.  When False, both the
+        # legacy per-sector ADMM and the supply-priority ADMM use
+        # uniform per-tier weights — equivalent to the no-priority
+        # ablation.  Wired from ``RestorationConfiguration``'s
+        # ``enable_priority_holon_allocation`` so the eval-campaign
+        # ablation toggle actually changes behaviour (previously the
+        # flag was unread and the ablation column was a no-op).
+        self.enable_priority_allocation = bool(enable_priority_allocation)
+        # Deliverability wiring (F6).  When all three are present, the
+        # supply-priority ADMM passes ``actor_ub_overrides`` that cap
+        # each member's per-tier supply commitment at the sum of tier-t
+        # demand reachable from that member's home node — preventing
+        # the L2 ADMM from allocating supply that the LP cannot route
+        # after a partition.  Mirrors what ``HolonSummaryRole`` already
+        # does for the L2.5 coalition path; without this wiring an L2
+        # round can shed lower-tier loads to "fund" an undeliverable
+        # higher-tier commitment that the LP then rounds to zero, with
+        # the shed staying in effect for ≥ rebalance_period_s seconds.
+        self._my_node_id = my_node_id
+        self._leader_node_ids: dict[str, Any] = dict(leader_node_ids or {})
+        self._topology_mirror = topology_mirror
         # ``rebalance_period_s`` is the *slow* background heartbeat — only
         # there to catch drift from timeseries inputs (load profiles,
         # supply temperatures) that change without firing any
@@ -444,6 +485,33 @@ class HolonicCommunityRole(Role):
     # Inter-group coordination via DRO ADMM
     # ------------------------------------------------------------------
 
+    def _live_members(self, members: list[Any]) -> list[Any]:
+        """Return the subset of ``members`` that the
+        :class:`LivePeerFilter` considers reachable.
+
+        Pure passthrough when no filter is wired (legacy / static-
+        topology mode).  Centralised here so every callsite that
+        iterates holon peers picks up Concept-C dynamics uniformly.
+        """
+        if self._live_member_filter is None:
+            return members
+        kept: list[Any] = []
+        dropped: list[Any] = []
+        for m in members:
+            if self._live_member_filter.is_live(m):
+                kept.append(m)
+            else:
+                dropped.append(m)
+        if dropped and logger.isEnabledFor(logging.DEBUG):
+            # ``self.context`` may be ``None`` in unit-test construction;
+            # only resolve aid for logging when the role is attached.
+            ctx = getattr(self, "context", None)
+            logger.debug(
+                "[%s] holon filter dropped %d unreachable members (kept=%d)",
+                getattr(ctx, "aid", "<detached>"), len(dropped), len(kept),
+            )
+        return kept
+
     async def _try_rebalance(self) -> None:
         """Holon leader collects flex from member groups and runs ADMM
         to redistribute resources.  Fired periodically (slow heartbeat
@@ -494,6 +562,11 @@ class HolonicCommunityRole(Role):
                 members = topology_neighbors(self, tid="holons")
             except Exception:
                 return
+        # Concept C — Layer 2 dynamic topology.  Filter out members that
+        # the sibling ``DynamicHolonRole`` has classified as physically
+        # unreachable.  When no filter is installed, ``_live_members``
+        # returns the input list unchanged so legacy behaviour stands.
+        members = self._live_members(members)
         if not members:
             if not self._logged_no_neighbours:
                 logger.info(
@@ -856,6 +929,25 @@ class HolonicCommunityRole(Role):
             self._rebalance_active = False
             return
 
+        # --- Feasibility cap on T per dimension ---
+        # Same logic as the supply-priority path: when |T[i]| exceeds
+        # the sum of available actor budgets in dimension i, the L1
+        # sharing-distance term plateaus at the structural gap and
+        # the library spuriously logs "ADMM reached max iterations".
+        # Bound T per dim by the actors' absolute budget envelope so
+        # the target is reachable.  Sign is preserved — only magnitude
+        # is reduced when over-budget.
+        budget_pos = np.zeros(n_dims)
+        budget_neg = np.zeros(n_dims)
+        for lb_g, ub_g in group_bounds:
+            budget_pos += np.maximum(ub_g, 0.0)
+            budget_neg += np.maximum(-lb_g, 0.0)
+        for i in range(n_dims):
+            if total_T[i] > 0 and budget_pos[i] < total_T[i]:
+                total_T[i] = budget_pos[i]
+            elif total_T[i] < 0 and budget_neg[i] < -total_T[i]:
+                total_T[i] = -budget_neg[i]
+
         if np.all(np.abs(total_T) < 1e-6):
             logger.info(
                 "[%s] holon ADMM skipped: balanced (sectors=%s)",
@@ -881,11 +973,19 @@ class HolonicCommunityRole(Role):
         total_surplus = sum(max(0.0, -a.balance) for a in answers)
         total_flex = sum(max(0.0, a.flex) for a in answers)
         total_available = total_surplus + total_flex
-        priority_shares = compute_priority_weighted_shares(
-            [a.demand_by_priority for a in answers],
-            [a.served_by_priority for a in answers],
-            total_available,
-        )
+        if self.enable_priority_allocation:
+            priority_shares = compute_priority_weighted_shares(
+                [a.demand_by_priority for a in answers],
+                [a.served_by_priority for a in answers],
+                total_available,
+            )
+        else:
+            # Priority allocation disabled — distribute the available
+            # budget uniformly across answering groups so every group's
+            # share is non-zero (preserves the legacy "balance-only"
+            # behaviour the ablation intended).
+            even = total_available / max(1, len(answers))
+            priority_shares = [even for _ in answers]
 
         for idx, answer in enumerate(answers):
             lb, ub = group_bounds[idx]
@@ -1064,6 +1164,34 @@ class HolonicCommunityRole(Role):
         The result ``actor.x[i]`` is a 2-D allocation that the L1
         honour path dispatches per-tier instead of per-group-sector,
         preserving the priority decision through the L2 → L1 handoff.
+
+        Coalition / L2.5 interaction
+        ----------------------------
+
+        When a same-sector L2.5 coalition is active, the coalition has
+        committed an absolute per-tier service fraction for the cells
+        it claimed.  Its ``_reassert_active_coalitions`` re-fires every
+        tick to hold those fractions against background drift, using
+        ``service_fraction_by_sector_priority`` (absolute regulation
+        factor) on the L1 dispatch path.
+
+        This method operates on the same regulation knob but via
+        ``override_targets_by_sector_priority`` (incremental delta on
+        served setpoint).  If both fired on the same cell, the absolute
+        and incremental control views would compound — every coalition
+        tick rewrites the factor, every L2 delta drags it back, and
+        the setpoint oscillates between the two.
+
+        Resolution: cells with an active coalition record are filtered
+        out of the per-member ``override_strat`` payload before
+        dispatch.  L2 retains exclusive ownership of cells the coalition
+        did not touch; the coalition retains exclusive ownership of the
+        cells it claimed until ``ttl_s`` expiry or a
+        ``BranchFailureEvent`` invalidation drops the record.  This
+        mirrors the merge semantics already in
+        ``_run_supply_priority_admm`` (which calls
+        :meth:`CoalitionConstraintStore.merge_into`) — both demand and
+        supply paths now defer to the coalition for the same cells.
         """
         from distributed_resource_optimization import (
             create_admm_sharing_data,
@@ -1184,14 +1312,19 @@ class HolonicCommunityRole(Role):
 
         # Per-dimension priority weight passed to the coordinator.
         # Larger weight = stronger pull toward target for that
-        # dimension.  ``2^(P - tier + 1)`` mirrors the L1 QP gossip
-        # weight (``_qp_priority_weight``) so the L2 decision and
-        # any residual L1 decision agree on tier ordering.
+        # dimension.  Shared with the L1 QP gossip weight
+        # (``_qp_priority_weight``) and the supply-priority ADMM via
+        # :func:`scare.base.util.tier_priority_weight` so every layer
+        # agrees on tier ordering.
+        from scare.base.util import tier_priority_weight
+
         P = self.priority_tiers
         priorities = np.zeros(n_dims)
         for sec in sectors:
             for tier in tiers:
-                weight = 2.0 ** max(0, P - tier + 1)
+                weight = tier_priority_weight(
+                    tier, regime=1, priority_tiers=P,
+                )
                 priorities[_flat_idx(sec, tier)] = weight
 
         # Per-actor S coefficient.  Encourages each group to absorb
@@ -1366,6 +1499,32 @@ class HolonicCommunityRole(Role):
             except Exception:
                 triggers = []
 
+        # Coalition deferral: when L2.5 has an active coalition
+        # constraint for this leader's sector, the coalition owns the
+        # per-tier regulation for the claimed tiers via absolute service
+        # fractions re-asserted every tick (default 1 s).  L2's per-
+        # tier dispatch is incremental on the *same* regulation knob:
+        # ``new_sp = sp_curr + delta`` in ``_dispatch_per_tier_targets``.
+        # Mixing absolute (coalition) and relative (L2) actuation on
+        # the same knob caused the setpoint to oscillate as the two
+        # paths fought over it.  We resolve it by partitioning: cells
+        # the coalition has claimed are coalition-only until TTL/failure
+        # invalidation; cells the coalition has not claimed remain L2's.
+        # The supply-priority path performs the same merge through
+        # ``CoalitionConstraintStore.merge_into``; this is the
+        # equivalent for the demand-side tier-stratified path.
+        coalition_tiers: set[int] = set()
+        if self._coalition_constraint_store is not None:
+            coalition_tiers = self._coalition_constraint_store.active_tiers(
+                self.sector, float(self.context.current_timestamp),
+            )
+        own_sec = self.sector.value
+        if coalition_tiers:
+            logger.info(
+                "[%s] tier-strat deferring tiers=%s to active coalition (sector=%s)",
+                self.context.aid, sorted(coalition_tiers), own_sec,
+            )
+
         allocation_targets_scalar: dict[str, float] = {}
         for addr in triggers:
             x_vec = sender_to_x.get(str(addr))
@@ -1388,6 +1547,11 @@ class HolonicCommunityRole(Role):
                 for sec in sectors:
                     per_tier: dict[int, float] = {}
                     for tier in tiers:
+                        # Skip tiers an active same-sector coalition
+                        # has claimed (only for our own sector; other
+                        # sectors stay under L2's control).
+                        if sec == own_sec and tier in coalition_tiers:
+                            continue
                         v = float(x_vec[_flat_idx(sec, tier)])
                         per_tier[tier] = v
                     if per_tier:
@@ -1402,12 +1566,19 @@ class HolonicCommunityRole(Role):
                 # legacy gossip-target convention (target<0 ⇒
                 # absorb in QP gossip's framing).
                 if strat:
-                    own_sec = self.sector.value
                     if own_sec in strat:
                         override_legacy = -sum(strat[own_sec].values())
                     else:
                         first_sec = next(iter(strat))
                         override_legacy = -sum(strat[first_sec].values())
+            # If every cell for this member was deferred to the
+            # coalition (override_strat is None and override_legacy is
+            # None), skip the send entirely.  Falling through with a
+            # bare ``StartBalanceNegotiation()`` would otherwise drop
+            # into ``trigger_balance_negotiation`` on the receiver and
+            # fight the coalition's re-asserted fraction.
+            if override_strat is None and override_legacy is None:
+                continue
             if override_legacy is not None:
                 allocation_targets_scalar[str(addr)] = override_legacy
             await self.context.send_message(
@@ -1466,16 +1637,6 @@ class HolonicCommunityRole(Role):
         tier pattern across the holon, regardless of which group
         physically holds the supply.
         """
-        from distributed_resource_optimization import (
-            create_admm_sharing_data,
-            create_admm_start,
-            create_sharing_target_distance_admm_coordinator,
-            start_coordinated_optimization,
-        )
-        from distributed_resource_optimization.algorithm.admm.flex_actor import (
-            ADMMFlexActor,
-        )
-
         if not self._rebalance_active:
             return
         answers = self._flex_answers[:]
@@ -1509,105 +1670,101 @@ class HolonicCommunityRole(Role):
             await self._run_legacy_per_sector_admm()
             return
 
-        n_sec = len(sectors)
-        n_tier = len(tiers)
-        n_dims = n_sec * n_tier
-        sec_idx = {s: i for i, s in enumerate(sectors)}
-        tier_idx = {t: j for j, t in enumerate(tiers)}
-
-        def _flat_idx(s: str, t: int) -> int:
-            return sec_idx[s] * n_tier + tier_idx[t]
-
-        # T = total demand per (sector, tier) across the holon.  This
-        # is the "ideal served" target the coordinator pulls every
-        # actor's allocation toward.  Per-tier total demand at the
-        # holon level lets the priority weighting compare apples to
-        # apples — tier-2 demand vs tier-8 demand vs supply-budget.
-        total_T = np.zeros(n_dims)
-        # Per-cell total demand (= T) is also the natural per-cell
-        # upper bound on what makes sense to allocate.  Setting
-        # actor ub larger than total demand wastes solver effort.
-        total_demand_per_cell = np.zeros(n_dims)
-        for a in answers:
-            dem_map = a.demand_by_sector_priority or {}
-            for sec, tier_to_dem in dem_map.items():
-                if sec not in sec_idx:
-                    continue
-                for tier, dem in tier_to_dem.items():
-                    if tier in tier_idx:
-                        total_T[_flat_idx(sec, tier)] += float(dem)
-                        total_demand_per_cell[_flat_idx(sec, tier)] += float(dem)
-
-        if np.all(np.abs(total_T) < 1e-6):
+        # Pre-check: if there's no demand anywhere the helper would
+        # return a no-op, but the legacy path historically falls back
+        # in this corner case.  Preserve that.
+        total_demand = sum(
+            float(d)
+            for a in answers
+            for tier_to_dem in (a.demand_by_sector_priority or {}).values()
+            for d in tier_to_dem.values()
+        )
+        if total_demand < 1e-6:
             await self._run_legacy_per_sector_admm()
             return
 
-        # Priority weights: 2^(P − tier + 1), mirroring _qp_priority_weight.
-        P = self.priority_tiers
-        priorities = np.zeros(n_dims)
-        for tier in tiers:
-            weight = 2.0 ** max(0, P - tier + 1)
-            for sec in sectors:
-                priorities[_flat_idx(sec, tier)] = weight
-
-        # Per-actor problem.  Each actor can contribute up to its
-        # per-sector supply to any tier within that sector.  Across
-        # tiers, total supply commitment is bounded by the coupling.
-        actors: list[ADMMFlexActor] = []
-        actor_supply_total: list[float] = []
-        for answer in answers:
-            supply_map = answer.supply_by_sector or {}
-            # Per-cell upper bound: cap at min(total demand at this
-            # cell, this actor's supply in that sector).  Smaller of
-            # the two — supply is fungible across tiers within a
-            # sector, but no single cell can absorb more than its
-            # global demand.
-            lb = np.zeros(n_dims)
-            ub = np.full(n_dims, 1e-6)
-            for sec in sectors:
-                supply_s = float(supply_map.get(sec, 0.0))
-                for tier in tiers:
-                    j = _flat_idx(sec, tier)
-                    ub[j] = max(min(supply_s, total_demand_per_cell[j]), 1e-6)
-            # Per-actor coupling: sum of supply commitments ≤ total
-            # supply (across sectors and tiers).  This is the
-            # binding constraint that creates scarcity when supply
-            # < demand.
-            total_supply = sum(float(v) for v in supply_map.values())
-            actor_supply_total.append(total_supply)
-            C = np.ones((1, n_dims))
-            d = np.array([max(total_supply, 0.0)])
-
-            # S coefficient: bias each actor toward contributing to
-            # high-priority cells.  Same direction as the
-            # coordinator's L1 penalty so they reinforce each other.
-            # Magnitude scaled by share of holon supply so actors
-            # with bigger supply pools have a stronger preference
-            # signal.
-            holon_supply_total = sum(
-                sum((a.supply_by_sector or {}).values()) for a in answers
-            ) or 1.0
-            share = total_supply / holon_supply_total
-            S = -share * priorities
-
-            lb = np.nan_to_num(lb, nan=0.0, posinf=0.0, neginf=0.0)
-            ub = np.nan_to_num(ub, nan=1e-6, posinf=1e6, neginf=1e-6)
-            S = np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
-            actors.append(ADMMFlexActor(lb=lb, u=ub, C=C, d=d, S=S))
-
-        coordinator = create_sharing_target_distance_admm_coordinator()
-        coordinator.max_iters = int(self.admm_max_iters)
-        coordinator.abs_tol = float(self.admm_abs_tol)
-        start_msg = create_admm_start(
-            create_admm_sharing_data(
-                total_T.tolist(), priorities=priorities.tolist()
-            )
-        )
+        actor_supplies = [a.supply_by_sector or {} for a in answers]
+        actor_demands = [a.demand_by_sector_priority or {} for a in answers]
 
         from scare.base.diagnostics import record_event
+        from scare.community.supply_priority_admm import (
+            allocate_supply_priority,
+        )
+
+        # F6: deliverability caps.  When we know each member leader's
+        # home node id and have a topology mirror, compute per-actor
+        # ``{(sector, tier): cap}`` overrides so the ADMM does not
+        # commit supply at an actor that cannot physically route it
+        # under the current branch-active mask.  Conservative-by-node
+        # variant: cap each cell at the sum of demand co-located at
+        # nodes reachable from this actor's home node — collapsing
+        # demand to the *leader's* node when we don't have per-load
+        # node information (the L2.5 coalition path tracks per-load
+        # node ids; L2 currently only knows leader nodes).  An
+        # entirely unreachable leader gets all caps at 0; a reachable
+        # leader gets uncapped (None entry) so the per-actor coupling
+        # is the only binding constraint.
+        actor_ub_overrides: list[dict[tuple[str, int], float] | None] | None = None
+        if (
+            self._topology_mirror is not None
+            and self._leader_node_ids
+        ):
+            try:
+                from scare.community.deliverability import (
+                    per_actor_deliverable_caps,
+                )
+
+                actor_node_ids: list[Any | None] = []
+                actor_demand_nodes_by_tier: list[dict[int, dict[Any, float]]] = []
+                for sender, answer in zip(senders, answers):
+                    leader_aid = getattr(sender, "aid", str(sender))
+                    node_id = self._leader_node_ids.get(leader_aid)
+                    actor_node_ids.append(node_id)
+                    # Map this leader's tier-aggregated demand onto its
+                    # own home node — coarse but correct: a leader that
+                    # is reachable will see its own demand contribute
+                    # to every other leader's reachable-cap; a leader
+                    # that is unreachable contributes nothing.
+                    per_tier: dict[int, dict[Any, float]] = {}
+                    if node_id is not None:
+                        for sec, tier_map in (
+                            answer.demand_by_sector_priority or {}
+                        ).items():
+                            if sec not in sectors:
+                                continue
+                            for tier, dem in tier_map.items():
+                                per_tier.setdefault(int(tier), {})[node_id] = (
+                                    per_tier[int(tier)].get(node_id, 0.0)
+                                    + float(dem)
+                                )
+                    actor_demand_nodes_by_tier.append(per_tier)
+
+                actor_ub_overrides = per_actor_deliverable_caps(
+                    actor_node_ids=actor_node_ids,
+                    actor_demand_nodes_by_tier=actor_demand_nodes_by_tier,
+                    sector=self.sector,
+                    mirror=self._topology_mirror,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] supply-priority holon: deliverability caps "
+                    "failed (%s) — falling back to raw supply",
+                    self.context.aid, exc,
+                )
+                actor_ub_overrides = None
 
         try:
-            await start_coordinated_optimization(actors, coordinator, start_msg)
+            service_fraction, _per_actor_x, meta = await allocate_supply_priority(
+                sectors=sectors,
+                tiers=tiers,
+                actor_supplies=actor_supplies,
+                actor_demands=actor_demands,
+                actor_ub_overrides=actor_ub_overrides,
+                priority_tiers=self.priority_tiers,
+                max_iters=int(self.admm_max_iters),
+                abs_tol=float(self.admm_abs_tol),
+                enable_priority_weighting=self.enable_priority_allocation,
+            )
         except Exception as exc:
             logger.error(
                 "[%s] supply-priority holon ADMM failed: %s",
@@ -1622,29 +1779,22 @@ class HolonicCommunityRole(Role):
             )
             return
 
-        results = [a.x.tolist() for a in actors]
-        sum_x_per_cell = np.sum(results, axis=0) if results else np.zeros(n_dims)
+        total_T = meta["T_per_cell"]
+        sum_x_per_cell = meta["sum_x_per_cell"]
+        priorities = meta["priorities"]
+        n_tier = len(tiers)
+        sec_idx = {s: i for i, s in enumerate(sectors)}
+        tier_idx = {t: j for j, t in enumerate(tiers)}
 
-        # Service fraction per cell: how much of the holon-wide
-        # demand at this (sector, tier) the ADMM allocated supply
-        # for.  Each member leader applies this fraction uniformly
-        # to its local loads at that (sec, tier).
-        service_fraction: dict[str, dict[int, float]] = {}
-        for sec in sectors:
-            service_fraction.setdefault(sec, {})
-            for tier in tiers:
-                j = _flat_idx(sec, tier)
-                T_cell = float(total_T[j])
-                committed = float(sum_x_per_cell[j])
-                frac = 1.0 if T_cell <= 1e-9 else min(1.0, max(0.0, committed / T_cell))
-                service_fraction[sec][tier] = frac
+        def _flat_idx(s: str, t: int) -> int:
+            return sec_idx[s] * n_tier + tier_idx[t]
 
         logger.info(
             "[%s] supply-priority holon ADMM result: sectors=%s tiers=%s "
             "T=%s sum_x=%s holon_supply=%.4f",
-            self.context.aid, sectors, tiers, total_T.tolist(),
-            sum_x_per_cell.tolist(),
-            sum(actor_supply_total),
+            self.context.aid, sectors, tiers, total_T,
+            sum_x_per_cell,
+            sum(meta["actor_supply_total"]),
         )
         record_event(
             t=self.context.current_timestamp,
@@ -1668,6 +1818,20 @@ class HolonicCommunityRole(Role):
                 for sec in sectors for tier in tiers
             }),
         )
+
+        # Coalition constraint binding: if the sibling
+        # HolonSummaryRole has an active coalition fraction for any
+        # (sector, tier) cell, that fraction overrides L2's per-cell
+        # result.  L2 retains ownership of cells the coalition didn't
+        # touch.  Without this merge, last-write-wins between L2 and
+        # L2.5 lets each subsequent L2 round reset the per-tier
+        # regulation back to its own (typically more pessimistic)
+        # allocation, undoing the coalition's redistribution.
+        if self._coalition_constraint_store is not None:
+            now = float(self.context.current_timestamp)
+            service_fraction = self._coalition_constraint_store.merge_into(
+                service_fraction, self.sector, now,
+            )
 
         # Send the SAME service fraction map to every member leader
         # — the fractions are holon-global, so each leader applies

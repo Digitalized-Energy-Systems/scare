@@ -128,7 +128,12 @@ class CampaignConfig:
     task_timeout_s: float = 1500.0
     failure_delay_s_max: float = 2.0
     write_timeseries: bool = True
-    write_trajectories: bool = False
+    # Per-aid regulation trajectories — sparse event-driven series so
+    # cost is bounded.  Defaults ON because the validity plots
+    # (regulation-per-child line plot, coalition / holon balance) read
+    # them; disable explicitly when running a high-task-count
+    # production campaign where the extra ~few-MB-per-task is material.
+    write_trajectories: bool = True
     timestamp_dir: bool = True
     notes: str = ""
     defaults: GridDefaults = field(default_factory=GridDefaults)
@@ -190,7 +195,12 @@ class RuntimePlan:
     task_timeout_s: float = 1500.0
     failure_delay_s_max: float = 2.0
     write_timeseries: bool = True
-    write_trajectories: bool = False
+    # Per-aid regulation trajectories — sparse event-driven series so
+    # cost is bounded.  Defaults ON because the validity plots
+    # (regulation-per-child line plot, coalition / holon balance) read
+    # them; disable explicitly when running a high-task-count
+    # production campaign where the extra ~few-MB-per-task is material.
+    write_trajectories: bool = True
     # Claims that flip task status to ``claims_failed`` when they don't
     # pass.  Default set covers the two chapter-claim invariants we
     # cannot silently violate without invalidating the headline numbers.
@@ -205,7 +215,7 @@ class RuntimePlan:
             task_timeout_s=float(data.get("task_timeout_s", 1500.0)),
             failure_delay_s_max=float(data.get("failure_delay_s_max", 2.0)),
             write_timeseries=bool(data.get("write_timeseries", True)),
-            write_trajectories=bool(data.get("write_trajectories", False)),
+            write_trajectories=bool(data.get("write_trajectories", True)),
             fatal_claims=tuple(fatal) if fatal is not None
                          else ("priority_invariant", "monotonic_progress"),
         )

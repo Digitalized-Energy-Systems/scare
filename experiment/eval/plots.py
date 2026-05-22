@@ -1220,3 +1220,819 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
     fig.update_xaxes(title="variant")
     fig.update_yaxes(title="count")
     return _save(_apply_theme(fig, title=title), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Restoration time — the chapter's first-asked metric
+# ---------------------------------------------------------------------------
+
+
+def time_to_stabilise_box(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Time to stabilise by variant",
+) -> Path:
+    """Box-plot of ``outcomes.time_to_stabilise_s`` per variant.
+
+    The metric is the simulation time it took the system to reach a
+    steady-state after the failure (NaN for runs that never stabilised
+    — we drop those, the box-plot only reflects successful tasks).
+    Reviewers ask for "restoration time" first; this is it.
+    """
+    col = "outcomes__time_to_stabilise_s"
+    if df.empty or col not in df.columns:
+        return _save(_empty_fig("no time_to_stabilise_s column", title), out_path)
+    sub = df.dropna(subset=[col, "variant"])
+    if sub.empty:
+        return _save(_empty_fig("no stabilisation samples", title), out_path)
+
+    variants = sorted(sub["variant"].unique())
+    fig = go.Figure()
+    for v in variants:
+        values = sub[sub["variant"] == v][col].astype(float).values
+        if values.size == 0:
+            continue
+        color = _variant_color(str(v))
+        fig.add_trace(go.Box(
+            y=values,
+            name=alias_variant(str(v)),
+            marker=dict(color=color, outliercolor="#D62728", size=4),
+            fillcolor=_hex_to_rgba(color, 0.18),
+            line=dict(width=1.4, color=color),
+            boxmean=True,
+            boxpoints="outliers",
+            hovertemplate=(
+                f"<b>{alias_variant(str(v))}</b><br>"
+                "time: %{y:.2f} s<extra></extra>"
+            ),
+        ))
+    fig.update_yaxes(title="time to stabilise (s)", rangemode="tozero",
+                     tickformat=".2f")
+    fig.update_xaxes(title="variant")
+    fig.update_layout(showlegend=False)
+    return _save(_apply_theme(fig, title=title), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Solver health — regression watch
+# ---------------------------------------------------------------------------
+
+
+def solver_health_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Solver health by variant",
+) -> Path:
+    """Per-variant stacked bars of mean solver-failure counts per task.
+
+    Splits the count into ``solver_infeasibilities`` (LP infeasibilities
+    — the symptom of the energy-flow degeneracy after a branch failure)
+    and ``solver_warnings`` (non-OK terminations like gap / time
+    limit).  ``solver_failures`` is the union; we plot the components
+    so a regression in either pathway is visible.
+    """
+    inf_col = "solver_infeasibilities"
+    warn_col = "solver_warnings"
+    if df.empty or inf_col not in df.columns:
+        return _save(_empty_fig("no solver-health columns", title), out_path)
+    sub = df.dropna(subset=["variant"]).copy()
+    if sub.empty:
+        return _save(_empty_fig("no rows with a variant", title), out_path)
+
+    sub[inf_col] = sub[inf_col].fillna(0).astype(float)
+    if warn_col in sub.columns:
+        sub[warn_col] = sub[warn_col].fillna(0).astype(float)
+    else:
+        sub[warn_col] = 0.0
+
+    grouped = sub.groupby("variant").agg(
+        inf_mean=(inf_col, "mean"),
+        warn_mean=(warn_col, "mean"),
+        n=(inf_col, "count"),
+    )
+    if grouped.empty:
+        return _save(_empty_fig("no grouped rows", title), out_path)
+
+    variants = list(grouped.index)
+    variants_lbl = _variants_display(variants)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name="infeasibilities",
+        x=variants_lbl,
+        y=grouped["inf_mean"].values,
+        marker=dict(color="#D62728", line=dict(width=0.5, color="white")),
+        hovertemplate=(
+            "<b>%{x}</b><br>mean infeasibilities/task: %{y:.2f}<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Bar(
+        name="other warnings",
+        x=variants_lbl,
+        y=grouped["warn_mean"].values,
+        marker=dict(color="#E07A1F", line=dict(width=0.5, color="white")),
+        hovertemplate=(
+            "<b>%{x}</b><br>mean warnings/task: %{y:.2f}<extra></extra>"
+        ),
+    ))
+    fig.update_layout(barmode="stack", bargap=0.28)
+    fig.update_xaxes(title="variant")
+    fig.update_yaxes(title="solver events per task (mean)", rangemode="tozero",
+                     tickformat=".2f")
+    return _save(_apply_theme(fig, title=title), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Regulation actions by reason — which layer actually fired?
+# ---------------------------------------------------------------------------
+
+
+# Human-readable label + colour per reason.  Drawn from the
+# ``record_regulate(... reason=...)`` call sites in ``scare/service/*.py``;
+# unknown reasons that the dynamic discovery picks up are still plotted,
+# coloured from the qualitative palette as a fallback.
+_REGULATE_REASON_LABELS: dict[str, tuple[str, str]] = {
+    # Balance / gossip layer
+    "balance":               ("balance gossip",        "#1F4E96"),
+    "self_island":           ("balance self-island",   "#3F6FBD"),
+    # Holonic ADMM
+    "holon_supply_priority": ("holon supply-priority", "#2E7D32"),
+    "holon_tier_alloc":      ("holon tier-alloc",      "#56A656"),
+    # Cross-sector CP ADMM
+    "cp_admm":               ("CP ADMM",               "#17BECF"),
+    # Constraint-driven local actions
+    "curtail":               ("curtailment auction",   "#E07A1F"),
+    "heat_recovery":         ("heat recovery",         "#FFA959"),
+    # Stability / islanding fallbacks
+    "stability":             ("generation control",    "#9467BD"),
+    "islanding":             ("islanding fallback",    "#D62728"),
+}
+
+
+def regulates_by_reason_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Regulation actions by trigger (per variant)",
+) -> Path:
+    """Stacked bar of mean ``outcomes.regulates_by_reason`` counts per
+    variant.  Answers "did each layer actually fire?" for ablations —
+    a variant that disables the holonic ADMM should show zero
+    ``holon_*`` actions, a variant with the islanding fallback turned
+    off should show zero ``islanding``, etc.
+
+    Discovers reasons *dynamically* from the column set so newly-added
+    triggers in ``scare/service/*.py`` show up without the plot having
+    to be edited.  Reasons not in ``_REGULATE_REASON_LABELS`` get a
+    fallback colour from the qualitative palette and the raw key as
+    label.
+    """
+    prefix = "outcomes__regulates_by_reason__"
+    reason_keys = sorted({c[len(prefix):] for c in df.columns if c.startswith(prefix)})
+    if df.empty or not reason_keys:
+        return _save(_empty_fig("no regulates_by_reason columns", title), out_path)
+    sub = df.dropna(subset=["variant"]).copy()
+    if sub.empty:
+        return _save(_empty_fig("no rows with a variant", title), out_path)
+
+    cols: list[tuple[str, str, str]] = []
+    for i, key in enumerate(reason_keys):
+        label, color = _REGULATE_REASON_LABELS.get(
+            key,
+            (key, _QUAL_PALETTE[i % len(_QUAL_PALETTE)]),
+        )
+        col = f"{prefix}{key}"
+        sub[col] = sub[col].fillna(0).astype(float)
+        cols.append((col, label, color))
+
+    grouped = sub.groupby("variant")[[c[0] for c in cols]].mean()
+    if grouped.empty:
+        return _save(_empty_fig("no grouped data", title), out_path)
+    variants_lbl = _variants_display(list(grouped.index))
+
+    fig = go.Figure()
+    for col, label, color in cols:
+        fig.add_trace(go.Bar(
+            name=label,
+            x=variants_lbl,
+            y=grouped[col].values,
+            marker=dict(color=color, line=dict(width=0.5, color="white")),
+            hovertemplate=(
+                f"<b>{label}</b><br>variant: %{{x}}<br>"
+                "mean count/task: %{y:.2f}<extra></extra>"
+            ),
+        ))
+    fig.update_layout(barmode="stack", bargap=0.28)
+    fig.update_xaxes(title="variant")
+    fig.update_yaxes(title="mean regulation actions per task",
+                     rangemode="tozero", tickformat=".1f")
+    return _save(_apply_theme(fig, title=title), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Per-sector restoration ratio (mirrors restoration_by_tier_bar)
+# ---------------------------------------------------------------------------
+
+
+def restoration_by_sector_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Per-sector restoration ratio (post / baseline served, MW)",
+) -> Path:
+    """Mirror of :func:`restoration_by_tier_bar` along the sector axis:
+    one bar per (grid × sector) showing how much of each carrier's
+    pre-failure served load survived restoration.  Reads the
+    ``outcomes__restoration__by_sector__<sector>__ratio`` columns the
+    aggregator already flattens.
+    """
+    if df.empty or "variant" not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+    sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
+
+    sector_cols: dict[str, str] = {}
+    prefix = "outcomes__restoration__by_sector__"
+    suffix = "__ratio"
+    for col in sub.columns:
+        if col.startswith(prefix) and col.endswith(suffix):
+            sector_cols[col[len(prefix):-len(suffix)]] = col
+    if not sector_cols:
+        return _save(
+            _empty_fig("no per-sector restoration columns", title), out_path,
+        )
+
+    sectors = sorted(sector_cols)
+    grouped = sub.groupby("grid")[[sector_cols[s] for s in sectors]].mean()
+    if grouped.empty:
+        return _save(_empty_fig("empty per-sector table", title), out_path)
+    grids = grouped.index.tolist()
+    grids_lbl = _grids_display(grids)
+
+    fig = go.Figure()
+    for sec in sectors:
+        col = sector_cols[sec]
+        color = _SECTOR_COLOR.get(sec, "#888888")
+        fig.add_trace(go.Bar(
+            name=sec,
+            x=grids_lbl,
+            y=grouped[col].values,
+            marker=dict(color=color, line=dict(width=0.5, color="white")),
+            hovertemplate=(
+                f"<b>{sec}</b><br>grid: %{{x}}<br>"
+                "ratio: %{y:.3f}<extra></extra>"
+            ),
+        ))
+    fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
+    fig.update_layout(barmode="group", bargap=0.22, bargroupgap=0.05)
+    fig.update_yaxes(title="restoration ratio (post / baseline served)",
+                     range=[0, 1.05], tickformat=".2f")
+    fig.update_xaxes(title="grid")
+    return _save(_apply_theme(fig, title=title, height=380), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Constraint-envelope trajectory (voltage / pressure / temperature)
+# ---------------------------------------------------------------------------
+
+
+# Operating envelopes — pulled from scare's authoritative
+# ``SECTOR_CONSTRAINTS`` so the band the plot shades matches the
+# bounds the ``GridConstraintMonitor`` actually fires on.  Lazy import
+# keeps this module importable from environments without the scare
+# package on PYTHONPATH; if the import fails we fall back to the
+# widest envelope the LP would accept so the band is informative even
+# when scare is unavailable.
+def _sector_envelope_bounds() -> dict[str, tuple[float, float]]:
+    try:
+        from scare.base.model import SECTOR_CONSTRAINTS, Sector
+    except Exception:  # pragma: no cover — only on import-path issues
+        # Fallback — relaxed LP bounds (see monee.solve_load_shedding_*).
+        return {
+            "avg_vm_pu":       (0.90, 1.10),
+            "avg_pressure_pu": (0.90, 1.10),
+            "avg_t_k":         (283.15, 403.15),
+        }
+    return {
+        "avg_vm_pu":       SECTOR_CONSTRAINTS[Sector.ELECTRICITY]["vm_pu"],
+        "avg_pressure_pu": SECTOR_CONSTRAINTS[Sector.GAS]["pressure_pu"],
+        "avg_t_k":         SECTOR_CONSTRAINTS[Sector.HEAT]["t_k"],
+    }
+
+
+def _stale_data_segment(
+    timeseries: pd.DataFrame,
+) -> tuple[float | None, int]:
+    """Return ``(stale_from_t, solver_failures)`` derived from the
+    ``last_feasible_solve_t`` column.
+
+    The mango-energy-environments behavior keeps the previous
+    ``_net_results`` whenever an energyflow recompute returns infeasible
+    (see ``_accept_or_keep``).  As a side effect every observation-based
+    metric (avg_vm_pu, *_balance, …) silently freezes at the last-
+    feasible state.  Scenario builder records ``last_feasible_solve_t``
+    as the wallclock of the most recent successful refresh; anything
+    past that timestamp is the same stale snapshot repeated.  The
+    return value is the earliest ``time_s`` after which the rows are
+    stale (``None`` when the column is absent or the whole trace is
+    fresh), plus a coarse count of repeated-state samples that doubles
+    as a "solver failures" proxy when ``result.json`` is not in scope.
+    """
+    if "last_feasible_solve_t" not in timeseries.columns:
+        return None, 0
+    if "time_s" not in timeseries.columns:
+        return None, 0
+    t = timeseries["time_s"].astype(float).values
+    lfs = timeseries["last_feasible_solve_t"].astype(float).values
+    if len(t) == 0:
+        return None, 0
+    stale_mask = t > (lfs + 1e-9)
+    if not stale_mask.any():
+        return None, 0
+    first_stale_idx = int(stale_mask.argmax())
+    return float(t[first_stale_idx]), int(stale_mask.sum())
+
+
+def constraint_envelope_trajectory(
+    timeseries: pd.DataFrame,
+    events: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Constraint envelopes — voltage / pressure / temperature",
+    failure_t: float | None = None,
+    solver_failures: int | None = None,
+) -> Path:
+    """Trajectory of ``avg_vm_pu`` / ``avg_pressure_pu`` / ``avg_t_k``
+    with the operating envelopes shaded.  Three stacked sub-plots, one
+    per sector; missing sectors are skipped (so a single-sector grid
+    just shows one row).  Failure / reconfiguration events are marked
+    as vertical guides on every row so the reader can read causality
+    against the failure.
+
+    When the timeseries carries a ``last_feasible_solve_t`` column,
+    the region past the last successful energyflow recompute is shaded
+    as STALE.  Reason: the underlying behavior keeps the previous
+    ``_net_results`` when a solve goes infeasible, so observations
+    freeze at the last-feasible state and the lines beyond that point
+    are not new measurements but echoes of an old snapshot.
+    ``solver_failures`` (read from ``result.json`` upstream) drives an
+    explicit banner on the figure title when non-zero, so the reader
+    sees the cause without having to dig through ``run.log``.
+    """
+    if timeseries.empty or "time_s" not in timeseries.columns:
+        return _save(_empty_fig("no timeseries", title), out_path)
+    stale_from_t, stale_sample_count = _stale_data_segment(timeseries)
+    if solver_failures and solver_failures > 0:
+        banner = (
+            f" — ⚠ {solver_failures} solver infeasibility(ies); data past "
+            f"t≈{stale_from_t:.2f}s is the last-feasible snapshot held over"
+            if stale_from_t is not None
+            else f" — ⚠ {solver_failures} solver infeasibility(ies)"
+        )
+        title = title + banner
+    elif stale_from_t is not None:
+        title = (
+            f"{title} — ⚠ data past t≈{stale_from_t:.2f}s is a held-over "
+            f"snapshot ({stale_sample_count} stale samples)"
+        )
+
+    envelopes = _sector_envelope_bounds()
+    rows = [
+        ("avg_vm_pu",       "voltage (p.u.)",  envelopes["avg_vm_pu"],
+         _SECTOR_COLOR["electricity"]),
+        ("avg_pressure_pu", "pressure (p.u.)", envelopes["avg_pressure_pu"],
+         _SECTOR_COLOR["gas"]),
+        ("avg_t_k",         "temperature (K)", envelopes["avg_t_k"],
+         _SECTOR_COLOR["heat"]),
+    ]
+    present = [r for r in rows if r[0] in timeseries.columns]
+    if not present:
+        return _save(_empty_fig("no constraint-state recordings", title), out_path)
+
+    fig = make_subplots(
+        rows=len(present), cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[r[1] for r in present],
+    )
+
+    # Determine event markers once — applied as vlines on every row.
+    event_styles = {
+        "line_failure":              dict(color="#1A1A1A", dash="dash"),
+        "branch_failure":            dict(color="#1A1A1A", dash="dash"),
+        "reconfiguration_completed": dict(color="#9467BD", dash="dot"),
+        "islanding_request":         dict(color="#E07A1F", dash="dot"),
+        "constraint_violation":      dict(color="#D62728", dash="dot"),
+    }
+    seen_kinds: set[str] = set()
+    if not events.empty and {"t", "kind"}.issubset(events.columns):
+        seen_kinds = {
+            str(k) for k in events["kind"].unique()
+            if str(k) in event_styles
+        }
+
+    x = timeseries["time_s"].values
+    for row_idx, (col, y_label, bounds, line_color) in enumerate(present, start=1):
+        lo, hi = bounds
+        # Envelope band — drawn as two scatter-fills so it shows up as
+        # a translucent rectangle behind the data series.
+        x_band = list(x) + list(x[::-1])
+        y_band = [hi] * len(x) + [lo] * len(x)
+        fig.add_trace(
+            go.Scatter(
+                x=x_band,
+                y=y_band,
+                fill="toself",
+                fillcolor=_hex_to_rgba(line_color, 0.10),
+                line=dict(color="rgba(0,0,0,0)"),
+                name=f"{y_label} envelope",
+                showlegend=(row_idx == 1),
+                hoverinfo="skip",
+            ),
+            row=row_idx, col=1,
+        )
+        fig.add_hline(y=lo, line=dict(color=line_color, dash="dot", width=1),
+                      row=row_idx, col=1)
+        fig.add_hline(y=hi, line=dict(color=line_color, dash="dot", width=1),
+                      row=row_idx, col=1)
+        # Stale-snapshot overlay: shade the post-``last_feasible_solve_t``
+        # region so the reader can't mistake the held-over snapshot for
+        # a real flat trajectory.  Drawn behind the data line.
+        if stale_from_t is not None:
+            x_max = float(x[-1])
+            if x_max > stale_from_t:
+                fig.add_vrect(
+                    x0=stale_from_t,
+                    x1=x_max,
+                    fillcolor="rgba(150, 150, 150, 0.20)",
+                    line=dict(width=0),
+                    layer="below",
+                    row=row_idx, col=1,
+                )
+        # Data series: solid up to the freshness boundary, dashed
+        # afterwards so the held-over snapshot is visually demoted.
+        y_vals = timeseries[col].astype(float).values
+        if stale_from_t is not None:
+            fresh_mask = x <= stale_from_t
+            if fresh_mask.any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=x[fresh_mask], y=y_vals[fresh_mask],
+                        mode="lines",
+                        line=dict(color=line_color, width=2),
+                        name=y_label,
+                        showlegend=False,
+                        hovertemplate=(
+                            f"<b>{y_label}</b><br>"
+                            "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                        ),
+                    ),
+                    row=row_idx, col=1,
+                )
+            stale_mask = x >= stale_from_t
+            if stale_mask.any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=x[stale_mask], y=y_vals[stale_mask],
+                        mode="lines",
+                        line=dict(color=line_color, width=2, dash="dot"),
+                        name=f"{y_label} (stale)",
+                        showlegend=False,
+                        hovertemplate=(
+                            f"<b>{y_label} (held over)</b><br>"
+                            "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                        ),
+                    ),
+                    row=row_idx, col=1,
+                )
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=x, y=y_vals,
+                    mode="lines",
+                    line=dict(color=line_color, width=2),
+                    name=y_label,
+                    showlegend=False,
+                    hovertemplate=(
+                        f"<b>{y_label}</b><br>"
+                        "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                    ),
+                ),
+                row=row_idx, col=1,
+            )
+        # Event vlines (same on every row for a synced read).
+        if not events.empty and {"t", "kind"}.issubset(events.columns):
+            for kind, style in event_styles.items():
+                ev = events[events["kind"] == kind]
+                if ev.empty:
+                    continue
+                for tx in ev["t"].astype(float).unique():
+                    fig.add_vline(
+                        x=float(tx),
+                        line=dict(color=style["color"], dash=style["dash"], width=1),
+                        opacity=0.6,
+                        row=row_idx, col=1,
+                    )
+        elif failure_t is not None:
+            fig.add_vline(
+                x=failure_t,
+                line=dict(color="#1A1A1A", dash="dash", width=1),
+                opacity=0.6,
+                row=row_idx, col=1,
+            )
+
+        fig.update_yaxes(title=y_label, row=row_idx, col=1)
+
+    # Sentinel scatters for the event-kind legend.
+    for kind in sorted(seen_kinds):
+        style = event_styles[kind]
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(color=style["color"], dash=style["dash"], width=2),
+            name=kind, showlegend=True,
+        ), row=1, col=1)
+
+    fig.update_xaxes(title="simulation time (s)", row=len(present), col=1)
+    height = max(_FIG_HEIGHT, 180 * len(present) + 80)
+    return _save(_apply_theme(fig, title=title, height=height), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Constraint-violation integral by sector × variant
+# ---------------------------------------------------------------------------
+
+
+def constraint_violation_integral_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Constraint-violation integral by sector",
+) -> Path:
+    """Grouped bars: per-variant mean of the per-sector violation
+    integral ``∫ max(0, util(t) − 1) dt``.
+
+    The integral is computed in :func:`metrics.constraint_violation_integral`
+    from the recorded ``avg_vm_pu`` / ``avg_pressure_pu`` / ``avg_t_k``
+    averages.  Zero ↔ the sector never left the operating envelope on
+    average; larger values ↔ longer / deeper excursions.  Together
+    with the envelope trajectory plot this answers "did the constraint
+    layer keep the network inside its safe envelope, and which sector
+    was hardest?".
+    """
+    sectors = ["electricity", "gas", "heat"]
+    cols = {
+        s: f"outcomes__constraint_violation_integral__{s}" for s in sectors
+    }
+    present = [s for s in sectors if cols[s] in df.columns]
+    if df.empty or not present:
+        return _save(_empty_fig(
+            "no constraint_violation_integral columns", title), out_path)
+    sub = df.dropna(subset=["variant"]).copy()
+    if sub.empty:
+        return _save(_empty_fig("no rows with a variant", title), out_path)
+    for s in present:
+        sub[cols[s]] = sub[cols[s]].fillna(0).astype(float)
+
+    grouped = sub.groupby("variant")[[cols[s] for s in present]].mean()
+    if grouped.empty:
+        return _save(_empty_fig("no grouped data", title), out_path)
+    variants = list(grouped.index)
+    variants_lbl = _variants_display(variants)
+
+    fig = go.Figure()
+    for sec in present:
+        fig.add_trace(go.Bar(
+            name=sec,
+            x=variants_lbl,
+            y=grouped[cols[sec]].values,
+            marker=dict(color=_SECTOR_COLOR.get(sec, "#888888"),
+                        line=dict(width=0.5, color="white")),
+            hovertemplate=(
+                f"<b>{sec}</b><br>variant: %{{x}}<br>"
+                "mean integral: %{y:.4g}<extra></extra>"
+            ),
+        ))
+    fig.update_layout(barmode="group", bargap=0.22, bargroupgap=0.05)
+    fig.update_xaxes(title="variant")
+    fig.update_yaxes(
+        title="∫ max(0, util(t) − 1) dt  (mean per task)",
+        rangemode="tozero",
+        tickformat=".3g",
+    )
+    return _save(_apply_theme(fig, title=title, height=380), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Validity plots — verify the multi-level controller behaves the way the
+# architecture chapter claims it should
+# ---------------------------------------------------------------------------
+
+
+def system_balance_trajectory(
+    timeseries: pd.DataFrame,
+    events: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "System balance — Σ regulation per sector",
+    failure_t: float | None = None,
+) -> Path:
+    """Per-sector ``Σ regulation`` over time (the full-system view).
+
+    The same series ``restoration_trajectory`` shows, but with an
+    explicit title that names what's plotted — useful as a standalone
+    "did the global controller settle?" view in the validity overview
+    next to the per-coalition / per-holon decompositions.
+    """
+    return restoration_trajectory(
+        timeseries, events, out_path, title=title, failure_t=failure_t,
+    )
+
+
+def _group_balance_lines(
+    timeseries: pd.DataFrame,
+    out_path: Path,
+    *,
+    column_prefix: str,
+    series_label: str,
+    title: str,
+) -> Path:
+    """Shared body for ``coalition_balance_lines`` / ``holon_balance_lines``.
+
+    Plots every column matching ``<column_prefix>__<sector>__<idx>`` —
+    one line per group, coloured by sector, opacity-faded slightly so
+    overlapping groups stay readable.  Layout uses three sub-rows (one
+    per sector) so the eye doesn't have to disentangle electricity
+    groups from heat groups.
+    """
+    if timeseries.empty or "time_s" not in timeseries.columns:
+        return _save(_empty_fig("no timeseries", title), out_path)
+
+    by_sector: dict[str, list[str]] = {}
+    for col in timeseries.columns:
+        if not col.startswith(f"{column_prefix}__"):
+            continue
+        parts = col.split("__")
+        if len(parts) < 3:
+            continue
+        sec = parts[1]
+        by_sector.setdefault(sec, []).append(col)
+
+    if not by_sector:
+        return _save(_empty_fig(
+            f"no {column_prefix}__* columns", title), out_path)
+
+    sectors = [s for s in ("electricity", "gas", "heat") if s in by_sector]
+    if not sectors:
+        sectors = sorted(by_sector)
+
+    fig = make_subplots(
+        rows=len(sectors), cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[s for s in sectors],
+    )
+    x = timeseries["time_s"].values
+    for row_idx, sec in enumerate(sectors, start=1):
+        cols = sorted(by_sector[sec])
+        base = _SECTOR_COLOR.get(sec, "#888888")
+        for i, col in enumerate(cols):
+            # Slight hue/opacity stagger so overlapping groups stay
+            # readable without a 50-entry legend.
+            opacity = 0.55 if len(cols) > 6 else 0.85
+            fig.add_trace(go.Scatter(
+                x=x, y=timeseries[col].astype(float).values,
+                mode="lines",
+                line=dict(color=base, width=1.4),
+                opacity=opacity,
+                name=col.split("__")[-1],
+                legendgroup=sec,
+                legendgrouptitle_text=sec,
+                showlegend=(row_idx == 1 and i < 10),  # avoid legend explosion
+                hovertemplate=(
+                    f"<b>{series_label} {sec}/{col.split('__')[-1]}</b><br>"
+                    "t: %{x:.2f}s<br>Σ regulation: %{y:.3f}<extra></extra>"
+                ),
+            ), row=row_idx, col=1)
+        fig.update_yaxes(title=f"Σ regulation ({sec})", row=row_idx, col=1)
+
+    fig.update_xaxes(title="simulation time (s)", row=len(sectors), col=1)
+    height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
+    return _save(_apply_theme(fig, title=title, height=height), out_path)
+
+
+def coalition_balance_lines(
+    timeseries: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Coalition balances (Level-1) over time",
+) -> Path:
+    """Per-coalition ``Σ regulation`` lines — one trace per Level-1
+    community, three subplots by sector.  Reads the
+    ``coalition_balance__<sec>__<idx>`` columns emitted by
+    ``_register_recordings`` in ``scare.scenario.restoration``.
+
+    Validity claim: each coalition should converge to a flat (or
+    slowly-trending) Σ-regulation track after its members finish their
+    gossip round.  Outliers that stay oscillating after the rest have
+    settled point at a Level-2 / inter-coalition coordination gap.
+    """
+    return _group_balance_lines(
+        timeseries, out_path,
+        column_prefix="coalition_balance",
+        series_label="coalition",
+        title=title,
+    )
+
+
+def holon_balance_lines(
+    timeseries: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Holon balances (Level-2) over time",
+) -> Path:
+    """Per-holon ``Σ regulation`` lines — one trace per Level-2 chunk,
+    one subplot per sector.  Reads ``holon_balance__<sec>__<idx>``.
+
+    Validity claim: a holon's trace should smooth out faster than its
+    member coalitions individually (the ADMM coupling spreads the
+    burden).  When the holonic layer is disabled (``enable_holonic =
+    False``) the topology stays empty and the corresponding columns
+    are absent — the plot falls back to a "no data" placeholder.
+    """
+    return _group_balance_lines(
+        timeseries, out_path,
+        column_prefix="holon_balance",
+        series_label="holon",
+        title=title,
+    )
+
+
+def regulation_per_child_lines(
+    trajectories: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Per-child regulation factor over time",
+    max_lines: int = 60,
+) -> Path:
+    """One line per child aid showing the applied regulation factor
+    over simulation time.  Reads the wide ``trajectories.csv`` produced
+    by ``write_trajectories_csv`` (event-driven, forward-filled).
+
+    The series cardinality is high (one per child agent), so:
+
+    - Lines are drawn semi-transparent and thin so the cloud reads as
+      a density of behaviour rather than a forest of legend entries.
+    - We pick at most ``max_lines`` aids, prioritising those whose
+      regulation factor *moves* (std > 0) so the plot focuses on the
+      agents that actually did something.  When more than ``max_lines``
+      moved, we show the highest-variance ones and footnote the
+      truncation in the title.
+    """
+    if trajectories.empty or "time_s" not in trajectories.columns:
+        return _save(_empty_fig("no trajectories.csv", title), out_path)
+
+    aid_cols = [c for c in trajectories.columns if c != "time_s"]
+    if not aid_cols:
+        return _save(_empty_fig("no per-aid columns", title), out_path)
+
+    # Variance per column → pick the most active aids.  Constant series
+    # (typical for unmodulated loads) get filtered so the plot doesn't
+    # drown in flat lines at 1.0.
+    arr = trajectories[aid_cols].astype(float).fillna(method="ffill")
+    stds = arr.std(axis=0).fillna(0.0)
+    active = stds[stds > 1e-9].sort_values(ascending=False)
+    truncated = False
+    if len(active) > max_lines:
+        active = active.head(max_lines)
+        truncated = True
+    show_cols = list(active.index) if not active.empty else aid_cols[:max_lines]
+
+    fig = go.Figure()
+    x = trajectories["time_s"].values
+    for i, aid in enumerate(show_cols):
+        color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
+        fig.add_trace(go.Scatter(
+            x=x, y=arr[aid].values,
+            mode="lines",
+            line=dict(color=color, width=1.0),
+            opacity=0.55,
+            name=aid,
+            showlegend=False,
+            hovertemplate=(
+                f"<b>{aid}</b><br>"
+                "t: %{x:.2f}s<br>factor: %{y:.3f}<extra></extra>"
+            ),
+        ))
+
+    if truncated:
+        subtitle = (
+            f"  ·  showing {len(show_cols)} of "
+            f"{len(aid_cols)} aids (highest-variance)"
+        )
+    else:
+        subtitle = ""
+    fig.update_xaxes(title="simulation time (s)")
+    fig.update_yaxes(title="regulation factor", range=[-0.05, 1.5],
+                     tickformat=".2f")
+    return _save(_apply_theme(fig, title=title + subtitle, height=380), out_path)

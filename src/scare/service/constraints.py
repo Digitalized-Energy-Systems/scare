@@ -39,6 +39,7 @@ from scare.base.util import (
     obs_capacity,
     obs_constraint_values,
     obs_setpoint,
+    tier_priority_weight,
 )
 
 if TYPE_CHECKING:
@@ -627,7 +628,12 @@ class GridConstraintMonitor(Role):
         from scare.service.balance import _PRIORITY_TIERS
 
         prio_tier = max(1, obs_priority(obs, behavior=self.behavior, aid=self.context.aid))
-        prio_weight = 2.0 ** min(prio_tier, _PRIORITY_TIERS)
+        # Curtailment regime — low-priority loads bid more willingly
+        # (highest weight at the highest tier number).  Shared helper
+        # keeps this consistent with the L1 QP's curtailment schedule.
+        prio_weight = tier_priority_weight(
+            prio_tier, regime=-1, priority_tiers=_PRIORITY_TIERS,
+        )
         reducible = abs(obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid))
         willingness = prio_weight * self._sensitivity * reducible
         if not math.isfinite(willingness) or willingness <= 0.0:
@@ -712,7 +718,7 @@ class GridConstraintMonitor(Role):
         amount = max(0.0, min(1.0, message.amount))
         new_factor = max(0.0, current * (1.0 - amount))
 
-        from scare.base.util import apply_regulate
+        from scare.base.util import apply_regulate, lookup_priority
 
         applied = apply_regulate(
             self.behavior,
@@ -721,6 +727,7 @@ class GridConstraintMonitor(Role):
             sector=self.sector.value,
             reason="curtail",
             timestamp=self.context.current_timestamp,
+            priority_tier=lookup_priority(self.behavior, self.context.aid),
         )
         if applied:
             logger.info(
@@ -790,7 +797,7 @@ class GridConstraintMonitor(Role):
         if new_factor <= current + 1e-4:
             return
 
-        from scare.base.util import apply_regulate
+        from scare.base.util import apply_regulate, lookup_priority
 
         applied = apply_regulate(
             self.behavior,
@@ -799,6 +806,7 @@ class GridConstraintMonitor(Role):
             sector=self.sector.value,
             reason="heat_recovery",
             timestamp=self.context.current_timestamp,
+            priority_tier=lookup_priority(self.behavior, self.context.aid),
         )
         if applied:
             logger.info(

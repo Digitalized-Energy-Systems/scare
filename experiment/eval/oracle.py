@@ -351,6 +351,19 @@ def compute_baseline_served(
             from experiment.restoration import apply_slack_budget
 
             apply_slack_budget(fresh, float(slack_budget_pct))
+    # Strip ``backup=True`` from every branch on the local copy.  The
+    # baseline LP solves the no-failure case, so any backup tie-line
+    # added by :func:`add_backup_lines` would stay open anyway.  Leaving
+    # the flag set causes ``create_min_load_shedding_problem`` →
+    # ``controllable_backup_lines`` to turn ``on_off`` into a binary
+    # decision variable, which makes the gas / heat node-balance
+    # constraints (``mass_flow × on_off``) bilinear — Pyomo's
+    # shell-gurobi LP writer then refuses with "node_X_eq_K contains
+    # nonlinear terms that cannot be written to LP format".  ``fresh``
+    # is a throwaway network so we don't need to restore the flag.
+    for branch in fresh.branches:
+        if getattr(branch.model, "backup", False):
+            branch.model.backup = False
     out = run_oracle(fresh, [], solver=solver, priorities=priorities)
     served = out["served"]
     # Stash in cache for sibling tasks with identical inputs.

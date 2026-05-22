@@ -112,8 +112,17 @@
       ]
     },
     {
-      "$comment": "Pillar 4 \u2014 ablation matrix.  One ablation per architectural component.  Run on concentrated failures so the architecture has work to do.",
-      "name": "ablation",
+      "$comment": [
+        "Pillar 4 \u2014 ablation matrix, split by theme so each flag runs in a",
+        "scenario that can actually exercise it.  Replaces the original",
+        "single-scenario design that left ~14/22 flags inert (their gating",
+        "conditions \u2014 CPs, voltage stress, heat sector, line overload,",
+        "Hebbian warmup, etc. \u2014 never fired in the concentrated-5 LV regime).",
+        "Each block names the flag set it tests + the scenario that triggers",
+        "them; the {} default in each block is the per-block baseline."
+      ],
+      "name": "ablation_core",
+      "$comment_block": "Holonic / QP-gossip / priority core.  Concentrated 5-failure on simbench_lv drives the deficit-heavy holon ADMM, gossip, and priority-allocation paths.",
       "grids": [
         "simbench_lv"
       ],
@@ -131,10 +140,89 @@
           "enable_holonic": false
         },
         {
+          "enable_qp_gossip": false
+        },
+        {
+          "enable_priority_holon_allocation": false
+        },
+        {
+          "enable_tier_stratified_holon_admm": false
+        },
+        {
+          "enable_monotonic_floor": false
+        },
+        {
+          "enable_distributed_failure_notice": false
+        },
+        {
+          "enable_dynamic_holon_topology": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent + generator failures + slack 0.15 means restoration must flow through CPs \u2014 the only regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions all have signal.",
+      "name": "ablation_cross_sector",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
           "enable_cp_admm": false
         },
         {
-          "enable_qp_gossip": false
+          "enable_dynamic_cp_topology": false
+        },
+        {
+          "enable_cross_sector_coalitions": false
+        },
+        {
+          "enable_holon_coalition": false,
+          "enable_cross_sector_coalitions": false
+        },
+        {
+          "enable_holon_summary": false,
+          "enable_holon_coalition": false,
+          "enable_cross_sector_coalitions": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ]
+    },
+    {
+      "$comment_block": "Line-loading / constraint-aware path.  line_stress (load_scale=1.8, ampacity_scale=0.5) forces lines into overload \u2014 the only regime where line_loading_constraint, constraint_aware_gossip, multihop_constraint, and curtailment_auction all fire.",
+      "name": "ablation_line_stress",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_line_loading_constraint": false
         },
         {
           "enable_constraint_aware_gossip": false
@@ -144,24 +232,116 @@
         },
         {
           "enable_curtailment_auction": false
-        },
+        }
+      ],
+      "scenarios": [
         {
-          "enable_priority_holon_allocation": false
-        },
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Voltage support.  pv_peak pushes vm_pu past the 1.03 pu deadband so the Q-V droop role actually fires.",
+      "name": "ablation_voltage",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
         {
-          "enable_monotonic_floor": false
-        },
+          "enable_qv_droop": false
+        }
+      ],
+      "scenarios": [
         {
-          "enable_clpu_ramp": false
-        },
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ]
+    },
+    {
+      "$comment_block": "Thermal stress.  cold_day on cp_heavy forces heat-sector deficit so heat_recovery (heat-only) and clpu_ramp (ramp-rate-gated) have signal.",
+      "name": "ablation_thermal",
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
         {
           "enable_heat_recovery": false
         },
         {
-          "enable_distributed_failure_notice": false
+          "enable_clpu_ramp": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Reconfiguration ranking.  simbench_lv_reconfig has alternative paths so the path-ranking flag has alternatives to choose between.",
+      "name": "ablation_reconfig",
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_reconfig_feasibility_ranking": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Hebbian formation.  Default hebbian_warmup_s=12 s, so any sim_duration_s \u2264 12 leaves the recluster un-fired.  This block overrides warmup to 2 s in BOTH baseline and ablation so the flag actually has signal to ablate against.",
+      "name": "ablation_hebbian",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {
+          "hebbian_warmup_s": 2.0
         },
         {
-          "enable_qv_droop": false
+          "enable_hebbian_formation": false,
+          "hebbian_warmup_s": 2.0
         }
       ],
       "scenarios": [

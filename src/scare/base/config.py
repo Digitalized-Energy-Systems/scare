@@ -39,6 +39,95 @@ class RestorationConfiguration:
     # for the ablation comparison).
     enable_distributed_failure_notice: bool = True
 
+    # Concept C — Layer-2 dynamic holon-membership filter.  When True,
+    # a ``DynamicHolonRole`` sits next to ``HolonicCommunityRole`` on
+    # every holon-eligible leader and drops members that have become
+    # physically unreachable through the live sector subgraph after a
+    # branch failure (see scare.community.dynamic_holon).  When False
+    # the holon keeps its static chunk-time membership and may try to
+    # allocate flow across islanded members.  Default on so the
+    # holon's allocations stay physically realisable.
+    enable_dynamic_holon_topology: bool = True
+
+    # Concept C — Layer-3 dynamic CP-connector filter.  When True, a
+    # ``DynamicConnectorRole`` sits next to ``EnergyConverterRole`` on
+    # every CP agent and drops group-leader peers that have become
+    # physically unreachable through the cross-sector graph (incl. CP
+    # bridges) after a branch failure.  Default on for the same
+    # physically-realisable-allocations reason as L2.
+    enable_dynamic_cp_topology: bool = True
+
+    # Layer 2.5 — sector-wide holon-summary mesh + cross-holon priority
+    # invariant detection.  Milestone 1: each leader periodically
+    # publishes its per-tier served/demand summary on the
+    # ``holon_summary_<sector>`` topology; every same-sector leader
+    # subscribes and runs a local inversion check across received
+    # summaries.  On detection, ``record_event("priority_inversion_
+    # detected", ...)`` fires for post-run analysis.  Milestone 2
+    # (later) will form an ad-hoc coalition that re-balances across
+    # the inverted holons.  Cheap when off: no topology + no role.
+    enable_holon_summary: bool = True
+
+    # Period between HolonSummary publishes (sim-seconds).  A leader's
+    # role schedules ``_publish`` every ``holon_summary_period_s`` and
+    # ``_check_invariants`` at the same cadence.  Faster picks up
+    # cross-holon inversions sooner but costs O(N²) extra messages
+    # per sector per period.  Default 1 s — short enough that even
+    # the 5 s smoke sims fire the publisher 3–4 times before sim
+    # end, long enough that per-period communication cost stays low.
+    holon_summary_period_s: float = 1.0
+
+    # Per-tier served-fraction tolerance for declaring a priority
+    # inversion.  A pair (tier_high, tier_low) is flagged when
+    # ``frac[tier_high] < frac[tier_low] - holon_summary_inversion_tol``.
+    # Mirrors the priority-invariant claim's 1e-3 tolerance so the
+    # detector and the claim agree on what counts as an inversion.
+    holon_summary_inversion_tol: float = 1e-3
+
+    # Layer 2.5 milestone 2 — coalition formation.  When True, the
+    # lex-smallest leader that detects a cross-holon priority
+    # inversion opens an ad-hoc coalition with the affected peers,
+    # runs a scoped priority-greedy allocation over their flex, and
+    # broadcasts per-tier service-fraction constraints via the same
+    # ``StartBalanceNegotiation(service_fraction_by_sector_priority=
+    # ...)`` handler L2 uses for its supply-priority ADMM result.
+    # Constraints are re-asserted every L2.5 tick until ``ttl_s`` or
+    # a ``BranchFailureEvent`` invalidates them.  Off ⇒ M1 behaviour
+    # (detect + record event, no scoped allocation).
+    enable_holon_coalition: bool = True
+
+    # Window the initiator waits after broadcasting
+    # ``CoalitionInvitation`` before running the allocation pass.
+    # Short enough that the coalition tick cadence (``holon_summary_
+    # period_s``) still dominates; long enough that even loaded peers
+    # have time to reply.  Default 1 s matches the M1 tick period.
+    holon_coalition_accept_window_s: float = 1.0
+
+    # TTL on coalition constraints.  After ``issued_at + ttl_s`` the
+    # constraint is dropped and the underlying L2 holon ADMM
+    # allocation takes over on the next L2 rebalance.  Sized so the
+    # coalition's effect outlasts a few L2.5 ticks (so re-assert keeps
+    # the fraction stable) but doesn't survive past the next
+    # significant grid state change.
+    holon_coalition_constraint_ttl_s: float = 8.0
+
+    # Cross-sector coalition extension (L2.5).  When True,
+    # ``HolonSummaryRole`` additionally detects priority inversions
+    # *across* sectors connected by a CP (e.g. tier-1 electricity
+    # under-served while tier-5 heat fully served, with a P2H
+    # between them) and forms a coalition spanning both sectors plus
+    # the bridging CP(s).  The coalition issues a ``CPCommitment``
+    # envelope to each CP member and per-sector service fractions to
+    # the leader members — both written to the shared
+    # ``CoalitionConstraintStore`` so L2 (per-sector) and L3 (CP
+    # ADMM) honour the commitment for the TTL window.
+    #
+    # Off ⇒ legacy behaviour (per-sector coalitions only).  Provided
+    # as an ablation knob so evaluation campaigns can quantify the
+    # cross-sector contribution in isolation from the rest of the
+    # stack.
+    enable_cross_sector_coalitions: bool = True
+
     # Curtailment auction in GridConstraintMonitor on hard violations.
     # When False, violations only emit a BalanceProblem to re-trigger
     # gossip; no proportional curtailment is broadcast.

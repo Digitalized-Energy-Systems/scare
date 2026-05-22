@@ -281,10 +281,20 @@ def _dump_diagnostics(path: Path) -> None:
     path.write_text(diagnostics.dump_recent() + "\n")
 
 
-async def _run_simulation(plan: RuntimePlan, task: TaskSpec, logger: logging.Logger):
+async def _run_simulation(
+    plan: RuntimePlan,
+    task: TaskSpec,
+    logger: logging.Logger,
+    *,
+    out_dir: Path | None = None,
+):
     """Build and run one scare-variant simulation.  Returns (world,
     failures, net) so the caller can extract metrics + run the
     end-of-sim recordings (e.g. served breakdown via the behavior).
+
+    ``out_dir`` is the task artefact directory; when provided, the
+    root-cause infeasibility-capture writes its one-shot snapshot
+    there as ``infeasibility_snapshot.json``.
     """
     from experiment.restoration import GRIDS
     from scare.base.config import RestorationConfiguration
@@ -324,6 +334,19 @@ async def _run_simulation(plan: RuntimePlan, task: TaskSpec, logger: logging.Log
         simulation_duration_s=plan.simulation_duration_s,
         config=cfg,
     )
+    # Root-cause hunt for the energyflow-infeasibility cascade that
+    # silently freezes every observation column (see plots.py
+    # ``_stale_data_segment``).  Arm a one-shot capture so the very
+    # first failed solve in this task drops a JSON snapshot next to
+    # the other artefacts; the runner ``disarm``-s after the task
+    # finishes so the next task gets its own capture window.
+    if out_dir is not None:
+        from scare.base.infeasibility_capture import arm_infeasibility_capture
+
+        snapshot_path = out_dir / "infeasibility_snapshot.json"
+        arm_infeasibility_capture(
+            world.environment.behavior, snapshot_path, clock=world.clock,
+        )
     logger.info("Running simulation for %.1f s (timeout=%.0f s)",
                 plan.simulation_duration_s, plan.task_timeout_s)
     try:
@@ -612,6 +635,12 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     # the C.5 cluster-synchronisation analysis.
     from scare.base import diagnostics as _diag
 
+    # Reset every per-run diagnostics log so this task's result.json
+    # event counts reflect only this task — workers reuse the same Py
+    # process across tasks, so without an explicit arm() the
+    # ``_event_log`` / ``_negotiation_log`` / action ring buffer carry
+    # over from whichever task ran on this worker before.
+    _diag.arm()
     _diag.set_trajectory_logging(getattr(plan, "write_trajectories", False))
     # Drop any stale exception.json from a prior failed run so the
     # aggregator's exception counts reflect only the *current* status.
@@ -697,7 +726,9 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 json.dumps(payload, indent=2, sort_keys=True, default=str)
             )
         else:
-            world, failures, net = asyncio.run(_run_simulation(plan, task, logger))
+            world, failures, net = asyncio.run(
+                _run_simulation(plan, task, logger, out_dir=out_dir)
+            )
             (out_dir / "failures.json").write_text(
                 json.dumps(_serialize_failures(failures), indent=2)
             )
@@ -822,6 +853,14 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         exit_code = EXIT_ERROR
 
     finally:
+        # Release the per-task infeasibility-capture window — the next
+        # task on this worker gets a fresh slate.  Best-effort: the
+        # module is optional, so swallow ImportError if it's not on path.
+        try:
+            from scare.base.infeasibility_capture import disarm_infeasibility_capture
+            disarm_infeasibility_capture()
+        except Exception:  # noqa: BLE001
+            pass
         status["duration_s"] = round(time.monotonic() - started, 3)
         status["solver_failures"] = solver_counter.count
         status["solver_infeasibilities"] = solver_counter.infeasible_count
