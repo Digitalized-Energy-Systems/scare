@@ -457,7 +457,6 @@ class SectorImbalanceBeacon(Role):
             sector=self.sector,
             local_imbalance_mw=imbalance,
         )
-        self._last_published_imbalance = imbalance
 
         for addr in connectors:
             await self.context.send_message(decision, receiver_addr=addr)

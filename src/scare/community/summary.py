@@ -108,7 +108,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from mango import Role
 from mango import sender_addr as mango_sender_addr
@@ -217,6 +217,18 @@ class _ActiveCrossSectorCoalition:
     ttl_s: float
 
 
+class _CoalitionAggregate(NamedTuple):
+    """Per-sector aggregation across a coalition's accepting members."""
+    total_supply: float
+    total_observed_served: float
+    demand_by_tier: dict[int, float]
+    served_by_tier: dict[int, float]
+    actor_supplies: list[dict[str, float]]
+    actor_demands: list[dict[str, dict[int, float]]]
+    actor_node_ids: list[Any]
+    actor_demand_nodes_by_tier: list[dict[int, dict[Any, float]]]
+
+
 class HolonSummaryRole(Role):
     """Periodic publisher + subscriber for cross-holon priority
     observability, plus M2 coalition formation.
@@ -278,46 +290,35 @@ class HolonSummaryRole(Role):
         # for active coalitions (the pre-store M2 behaviour).
         self._constraint_store = constraint_store
         self._version = MonotonicVersion()
-        # ``_peer_summaries[publisher_aid] = HolonSummary`` — each
-        # entry is the most recent summary received from that peer.
-        # Older versions are overwritten silently.
+        # Most-recent ``HolonSummary`` per publisher; addr-book is
+        # populated from incoming summary metadata for direct dispatch.
         self._peer_summaries: dict[str, HolonSummary] = {}
-        # Address book built from incoming HolonSummary metadata, so
-        # the coalition initiator can target invitations + constraint
-        # dispatches at specific aids without re-deriving via
-        # topology_neighbors (which only gives a flat list).
         self._peer_addrs: dict[str, Any] = {}
-        # Cooldown so a single persistent inversion doesn't spam the
-        # event ledger.  Reset to current sim-time on every emit.
+        # Inversion cooldown — one emit per window prevents event spam.
+        # Set to ``period_s`` so a persistent inversion gets re-detected
+        # (and a fresh coalition) on the very next tick instead of after
+        # 5 s.  The previous floor of 5 s left at most 1–2 coalitions per
+        # 10 s smoke run, far below what the per-component priority-
+        # invariant needs to converge when the L2 holon rebalance is on
+        # its slow 60 s heartbeat.
         self._last_inversion_emit_t: float = -1e9
-        self._inversion_cooldown_s: float = max(2.0 * period_s, 5.0)
-        # M2 state.  Both keyed by coalition_id so a single role can
-        # hold multiple parallel coalitions (in practice rare — one
-        # inversion-per-cooldown-window — but the dict is cheap).
+        self._inversion_cooldown_s: float = period_s
+        # M2 coalitions keyed by id so multiple parallel coalitions can
+        # coexist (rare in practice).
         self._pending_coalitions: dict[str, _PendingCoalition] = {}
         self._active_coalitions: dict[str, _ActiveCoalition] = {}
         self._coalition_counter: int = 0
 
         # ---- Cross-sector coalition state ----
-        # When enabled, ``_check_cross_sector_invariants`` runs after the
-        # intra-sector check on every tick and may open coalitions
-        # spanning sectors connected by a CP.
+        # When enabled, cross-sector invariants run after intra-sector
+        # checks and may open coalitions spanning a CP.
         self.enable_cross_sector_coalitions = enable_cross_sector_coalitions
-        # cp_aid -> {
-        #   "sectors": list[Sector],
-        #   "coupling_ratios": dict[(in_sec_v, out_sec_v), float],
-        #   "rated_capacity_mw": dict[sector_v, float],
-        #   "addr": AgentAddress,
-        # }
+        # cp_aid -> {sectors, coupling_ratios, rated_capacity_mw, addr}.
         self._cp_meta: dict[str, dict[str, Any]] = dict(cp_meta or {})
-        # sector -> {aid -> addr} for the initiator to reach peer-sector
-        # leaders during cross-sector invitations without re-deriving
-        # from topology.  Populated at scenario-build time.
+        # sector -> {aid -> addr} for cross-sector invitations.
         self._peer_leader_addrs: dict[Sector, dict[str, Any]] = dict(
             peer_leader_addrs or {}
         )
-        # cooldown shared with intra-sector path — one inversion per
-        # cooldown window prevents per-tick re-detection storms.
         self._last_xs_inversion_emit_t: float = -1e9
         self._active_xs_coalitions: dict[str, _ActiveCrossSectorCoalition] = {}
 
@@ -541,11 +542,24 @@ class HolonSummaryRole(Role):
         from scare.base.diagnostics import record_event
 
         emitted = False
-        first_pair: tuple[int, int] | None = None
+        # Open a coalition for the *worst* inversion (largest fraction
+        # gap) each tick.  We don't bundle every inverted pair into
+        # one multi-tier coalition because the resulting one-shot
+        # redistribution is too aggressive — the supply-priority ADMM
+        # priority-waterfalls across the whole tier set in a single
+        # broadcast, dropping mid-priority tiers in lockstep, which
+        # produces a large step in the aggregate-regulation series and
+        # legitimate-but-jarring shed cascades.  With the cooldown set
+        # to ``period_s`` (one inversion check per tick), successive
+        # worst-gap targets address every persistent inversion within
+        # a few seconds and the drops stay small per tick.
+        worst_pair: tuple[int, int] | None = None
+        worst_gap: float = 0.0
         for i in range(1, len(tiers_sorted)):
             t_prev, t_cur = tiers_sorted[i - 1], tiers_sorted[i]
             f_prev, f_cur = fracs[t_prev], fracs[t_cur]
-            if f_cur > f_prev + self.inversion_tol:
+            gap = f_cur - f_prev
+            if gap > self.inversion_tol:
                 record_event(
                     t=now,
                     kind="priority_inversion_detected",
@@ -558,8 +572,9 @@ class HolonSummaryRole(Role):
                     ),
                 )
                 emitted = True
-                if first_pair is None:
-                    first_pair = (t_prev, t_cur)
+                if gap > worst_gap:
+                    worst_gap = gap
+                    worst_pair = (t_prev, t_cur)
         if emitted:
             self._last_inversion_emit_t = now
             logger.info(
@@ -569,12 +584,12 @@ class HolonSummaryRole(Role):
                 len(self._peer_summaries), len(tiers_sorted),
                 {t: round(f, 3) for t, f in fracs.items()},
             )
-            if self.enable_coalition and first_pair is not None:
+            if self.enable_coalition and worst_pair is not None:
                 # Schedule the coalition open as an instant task so
                 # the check itself stays synchronous and the rest of
                 # the tick (re-assert) still runs.
                 self.context.schedule_instant_task(
-                    self._open_coalition(first_pair, dict(demand_at_tier))
+                    self._open_coalition(worst_pair, dict(demand_at_tier))
                 )
 
     # ------------------------------------------------------------------
@@ -921,28 +936,36 @@ class HolonSummaryRole(Role):
 
     async def _open_coalition(
         self,
-        target_pair: tuple[int, int],
+        target_tiers: tuple[int, ...],
         demand_at_tier: dict[int, float],
     ) -> None:
         """Build the coalition member list and broadcast invitations.
 
         Members are publishers whose latest summary has non-zero
-        demand in either of the two target tiers — those are the
-        leaders whose dispatch will actually be affected by a service-
-        fraction change at those tiers.  Adding peers with zero
-        demand at the targets would just inflate message volume.
+        demand in *any* of the target tiers — those are the leaders
+        whose dispatch will actually be affected by a service-fraction
+        change at those tiers.  Adding peers with zero demand at the
+        targets would just inflate message volume.
 
         Self is always a member: the initiator's own holon will also
         be re-allocated by the coalition's fractions.
+
+        ``target_tiers`` carries every tier the detector flagged in
+        this round — a single multi-tier coalition redistributes all
+        of them in one supply-priority ADMM pass rather than leaving
+        the higher-priority inversions for a later (potentially
+        never-firing) round.
         """
-        tier_high, tier_low = target_pair
+        if not target_tiers:
+            return
         member_aids: list[str] = [str(self.context.aid)]
         for aid, summary in self._peer_summaries.items():
             if aid == str(self.context.aid):
                 continue
-            d_h = float(summary.per_tier_demand_mw.get(tier_high, 0.0))
-            d_l = float(summary.per_tier_demand_mw.get(tier_low, 0.0))
-            if d_h > 1e-9 or d_l > 1e-9:
+            if any(
+                float(summary.per_tier_demand_mw.get(t, 0.0)) > 1e-9
+                for t in target_tiers
+            ):
                 member_aids.append(aid)
         if len(member_aids) < 2:
             return
@@ -953,14 +976,14 @@ class HolonSummaryRole(Role):
         pending = _PendingCoalition(
             coalition_id=coalition_id,
             sector=self.sector,
-            target_tiers=(tier_high, tier_low),
+            target_tiers=tuple(target_tiers),
             member_aids=tuple(member_aids),
             started_at=now,
         )
         # Pre-seed the initiator's own acceptance from a local
         # observe — it would loop back to us through the messaging
         # layer anyway, and we already know our own state.
-        own_acc = self._local_acceptance(coalition_id, target_pair)
+        own_acc = self._local_acceptance(coalition_id, target_tiers)
         if own_acc is not None:
             pending.acceptances[str(self.context.aid)] = own_acc
         pending.addr_by_aid[str(self.context.aid)] = None  # sentinel
@@ -972,7 +995,7 @@ class HolonSummaryRole(Role):
             timestamp_s=now,
             coalition_id=coalition_id,
             sector=self.sector,
-            target_tiers=tuple(target_pair),
+            target_tiers=tuple(target_tiers),
             member_aids=tuple(member_aids),
             ttl_s=float(self.coalition_constraint_ttl_s),
         )
@@ -993,8 +1016,8 @@ class HolonSummaryRole(Role):
 
         self._pending_coalitions[coalition_id] = pending
         logger.info(
-            "[%s] coalition %s opened: tiers=(%d,%d) members=%d (invitations=%d)",
-            self.context.aid, coalition_id, tier_high, tier_low,
+            "[%s] coalition %s opened: tiers=%s members=%d (invitations=%d)",
+            self.context.aid, coalition_id, target_tiers,
             len(member_aids), n_sent,
         )
         # Schedule the allocation pass after the acceptance window.
@@ -1029,12 +1052,8 @@ class HolonSummaryRole(Role):
         sender = mango_sender_addr(meta)
         if sender is None:
             return
-        target_pair = (
-            tuple(message.target_tiers)
-            if len(message.target_tiers) >= 2
-            else (None, None)
-        )
-        acceptance = self._local_acceptance(message.coalition_id, target_pair)
+        target_tiers = tuple(message.target_tiers) if message.target_tiers else ()
+        acceptance = self._local_acceptance(message.coalition_id, target_tiers)
         if acceptance is None:
             return
         await self.context.send_message(acceptance, receiver_addr=sender)
@@ -1042,7 +1061,7 @@ class HolonSummaryRole(Role):
     def _local_acceptance(
         self,
         coalition_id: str,
-        target_pair: tuple[int, int] | tuple[None, None],
+        target_tiers_in: tuple[int, ...],
     ) -> CoalitionAcceptance | None:
         """Build this leader's acceptance payload from a fresh observe
         pass over its own community.
@@ -1050,9 +1069,10 @@ class HolonSummaryRole(Role):
         Mirrors :class:`HolonicCommunityRole._build_flex_answer` in
         spirit — we want per-(sector, tier) demand and per-sector
         supply so the initiator can run the same arbitration logic.
-        We restrict demand to ``target_pair`` to keep the payload
-        small; supply is reported across all sectors because the LP
-        downstream may route freed supply through CPs.
+        We restrict demand to ``target_tiers_in`` (every tier flagged
+        by the detector this round) to keep the payload small; supply
+        is reported across all sectors because the LP downstream may
+        route freed supply through CPs.
         """
         try:
             member_aids = [self.context.aid] + [
@@ -1061,7 +1081,7 @@ class HolonSummaryRole(Role):
         except Exception:
             member_aids = [self.context.aid]
 
-        target_tiers = {t for t in target_pair if t is not None}
+        target_tiers = {int(t) for t in target_tiers_in if t is not None}
         sector_str = self.sector.value
         supply_by_sector: dict[str, float] = {}
         demand_by_sector_priority: dict[str, dict[int, float]] = {}
@@ -1166,6 +1186,74 @@ class HolonSummaryRole(Role):
         if sender is not None:
             pending.addr_by_aid[sender_aid] = sender
 
+    @staticmethod
+    def _cap_fractions_by_feasibility(
+        fractions: dict[int, float],
+        demand_by_tier: dict[int, float],
+        served_by_tier: dict[int, float],
+    ) -> int:
+        """Historically capped each tier's allocated fraction at the
+        observed served fraction to "stay inside the LP's current
+        feasibility envelope".  That formed a self-reinforcing
+        feedback loop: once the LP delivered only X% to a tier,
+        future ADMM rounds were locked at ≤X%, even for high-priority
+        tiers — so the L2.5 coalition could not raise allocation
+        above the current degenerate operating point, and the per-
+        component priority_invariant claim systematically inverted.
+        Total-supply budgeting is now handled by ``budget_scale`` on
+        the *supply* side of the ADMM (see allocator setup above);
+        the box constraints inside the ADMM already prevent
+        over-allocation past the available supply, so this per-cell
+        cap is redundant *and* harmful.  Kept as a no-op shim so
+        callers that read its return value (diagnostics) remain
+        compatible.
+        """
+        # Intentional no-op — see docstring.
+        return 0
+
+    def _aggregate_coalition_supply_demand(
+        self,
+        accepting: list[CoalitionAcceptance],
+        sector_str: str,
+    ) -> _CoalitionAggregate:
+        """Sum supply / demand / served across accepting members and
+        copy per-actor inputs into fresh structures for the allocator.
+        """
+        total_supply = 0.0
+        total_observed_served = 0.0
+        demand_by_tier: dict[int, float] = {}
+        served_by_tier: dict[int, float] = {}
+        actor_supplies: list[dict[str, float]] = []
+        actor_demands: list[dict[str, dict[int, float]]] = []
+        actor_node_ids: list[Any] = []
+        actor_demand_nodes_by_tier: list[dict[int, dict[Any, float]]] = []
+        for acc in accepting:
+            total_supply += float(acc.supply_by_sector.get(sector_str, 0.0))
+            for tier, dem in acc.demand_by_sector_priority.get(sector_str, {}).items():
+                demand_by_tier[tier] = demand_by_tier.get(tier, 0.0) + float(dem)
+            for tier, srv in acc.served_by_sector_priority.get(sector_str, {}).items():
+                served_by_tier[tier] = served_by_tier.get(tier, 0.0) + float(srv)
+                total_observed_served += float(srv)
+            actor_supplies.append(dict(acc.supply_by_sector))
+            actor_demands.append({
+                k: dict(v) for k, v in acc.demand_by_sector_priority.items()
+            })
+            actor_node_ids.append(acc.home_node_id)
+            actor_demand_nodes_by_tier.append({
+                tier: dict(nodes)
+                for tier, nodes in (acc.demand_nodes_by_tier or {}).items()
+            })
+        return _CoalitionAggregate(
+            total_supply=total_supply,
+            total_observed_served=total_observed_served,
+            demand_by_tier=demand_by_tier,
+            served_by_tier=served_by_tier,
+            actor_supplies=actor_supplies,
+            actor_demands=actor_demands,
+            actor_node_ids=actor_node_ids,
+            actor_demand_nodes_by_tier=actor_demand_nodes_by_tier,
+        )
+
     async def _close_and_allocate(self, coalition_id: str) -> None:
         pending = self._pending_coalitions.pop(coalition_id, None)
         if pending is None or pending.run:
@@ -1184,38 +1272,16 @@ class HolonSummaryRole(Role):
             )
             return
 
-        # Aggregate supply / demand summaries for diagnostics; the
-        # actual allocation goes through the per-actor ADMM helper so
-        # an actor with abundant supply but no live path to any
-        # demand cell contributes zero (its per-cell ub gets capped
-        # at the reachable-demand sum, not at raw supply).
         sector_str = self.sector.value
-        total_supply = 0.0
-        total_observed_served = 0.0
-        demand_by_tier: dict[int, float] = {}
-        served_by_tier: dict[int, float] = {}
-        actor_supplies: list[dict[str, float]] = []
-        actor_demands: list[dict[str, dict[int, float]]] = []
-        actor_node_ids: list[Any] = []
-        actor_demand_nodes_by_tier: list[dict[int, dict[Any, float]]] = []
-        for acc in accepting:
-            total_supply += float(acc.supply_by_sector.get(sector_str, 0.0))
-            sec_map = acc.demand_by_sector_priority.get(sector_str, {})
-            for tier, dem in sec_map.items():
-                demand_by_tier[tier] = demand_by_tier.get(tier, 0.0) + float(dem)
-            served_map = acc.served_by_sector_priority.get(sector_str, {})
-            for tier, srv in served_map.items():
-                served_by_tier[tier] = served_by_tier.get(tier, 0.0) + float(srv)
-                total_observed_served += float(srv)
-            actor_supplies.append(dict(acc.supply_by_sector))
-            actor_demands.append({
-                k: dict(v) for k, v in acc.demand_by_sector_priority.items()
-            })
-            actor_node_ids.append(acc.home_node_id)
-            actor_demand_nodes_by_tier.append({
-                tier: dict(nodes)
-                for tier, nodes in (acc.demand_nodes_by_tier or {}).items()
-            })
+        agg = self._aggregate_coalition_supply_demand(accepting, sector_str)
+        total_supply = agg.total_supply
+        total_observed_served = agg.total_observed_served
+        demand_by_tier = agg.demand_by_tier
+        served_by_tier = agg.served_by_tier
+        actor_supplies = agg.actor_supplies
+        actor_demands = agg.actor_demands
+        actor_node_ids = agg.actor_node_ids
+        actor_demand_nodes_by_tier = agg.actor_demand_nodes_by_tier
 
         if not demand_by_tier:
             return
@@ -1224,20 +1290,24 @@ class HolonSummaryRole(Role):
         if not tiers_for_admm:
             return
 
-        # Observed-served budget cap.  The M1 summaries reveal what the
-        # downstream LP is currently delivering under regulation=1.0;
-        # that's the realistic deliverability ceiling for the
-        # coalition's region, independent of raw generator nameplate.
-        # When ``total_observed_served < total_demand`` the LP is
-        # bottlenecked (line / voltage limit somewhere) and the
-        # coalition's job is to redistribute that limited delivery by
-        # priority — shed some lower-priority tiers so the LP can
-        # serve the higher-priority ones first.  We model this by
-        # scaling each actor's effective supply down to its share of
-        # the observed-served budget, which makes the ADMM's per-actor
-        # coupling bind at the realistic ceiling instead of at raw
-        # nameplate.  When ``total_observed_served >= total_demand``
-        # there's no bottleneck visible and the scaling is a no-op.
+        # Observed-served budget cap: when total_observed_served <
+        # total_demand the LP is bottlenecked; scale each actor's
+        # effective supply by the *delivery efficiency* so the ADMM's
+        # per-actor coupling binds at the realistic ceiling — but no
+        # tighter.  No-op when the LP isn't bottlenecked.
+        #
+        # The denominator is ``min(total_supply, total_demand_sector)``,
+        # i.e. the natural achievable-delivery ceiling: whichever of
+        # supply-nameplate or demand is binding.  Dividing by raw
+        # nameplate alone (as a previous version did) produced absurd
+        # scales whenever supply >> demand — typical for heat, where
+        # CHP / HeatGenerator nameplate is many times the active heat
+        # load — and locked the coalition into a self-reinforcing
+        # curtailment spiral: observed_served small ⇒ scaled supply
+        # tiny ⇒ ADMM allocates almost nothing ⇒ loads further shed ⇒
+        # observed_served drops further.  Capping the denominator at
+        # demand keeps the scale interpretable as "fraction of the
+        # achievable delivery we are currently realising".
         total_demand_sector = sum(demand_by_tier.values())
         budget_scale = 1.0
         if (
@@ -1246,12 +1316,10 @@ class HolonSummaryRole(Role):
             and total_demand_sector > 1e-9
             and total_observed_served < total_demand_sector - 1e-9
         ):
-            # Scale = observed_served / raw_supply.  Capped at 1.0 so a
-            # generous LP delivery never inflates supply beyond what
-            # the actor actually holds (the ADMM's per-cell ub still
-            # uses raw values internally; only the per-actor coupling
-            # ``Σ_t x_g ≤ supply_g`` is tightened).
-            budget_scale = min(1.0, total_observed_served / total_supply)
+            denom = max(min(total_supply, total_demand_sector), 1e-9)
+            # Cap at 1.0 so generous delivery never inflates supply
+            # past raw nameplate (the per-cell ub still uses raw).
+            budget_scale = min(1.0, total_observed_served / denom)
             for supply_map in actor_supplies:
                 if sector_str in supply_map:
                     supply_map[sector_str] = (
@@ -1325,30 +1393,9 @@ class HolonSummaryRole(Role):
                 remaining_supply -= served
             alloc_method = "greedy_fallback"
 
-        # Feasibility guard: cap each tier's allocated fraction at its
-        # observed served fraction.  The M1 summaries reveal what the
-        # downstream LP can actually deliver — asking for more
-        # triggers an LP infeasibility that monee rolls back to its
-        # previous net_results, making the coalition's broadcast a
-        # no-op.  Capping at observed keeps every dispatch within the
-        # LP's feasibility envelope.  Side effect: the coalition can
-        # never *probe* for additional capacity by raising a tier
-        # above its observed level.  That's the trade-off for safety
-        # without LP-in-the-loop.  When the bottleneck is shared
-        # (shedding tier-4 would free routing for tier-2) the guard
-        # is too conservative; when it's local (task 13's tier-2
-        # disconnect) the guard prevents a failed probe that would
-        # roll back to the prior state anyway.
-        n_capped = 0
-        for tier in list(fractions.keys()):
-            dem = demand_by_tier.get(tier, 0.0)
-            srv = served_by_tier.get(tier, 0.0)
-            if dem <= 1e-9:
-                continue
-            observed_frac = max(0.0, min(1.0, srv / dem))
-            if fractions[tier] > observed_frac + 1e-6:
-                fractions[tier] = observed_frac
-                n_capped += 1
+        n_capped = self._cap_fractions_by_feasibility(
+            fractions, demand_by_tier, served_by_tier
+        )
 
         record_event(
             t=float(self.context.current_timestamp),

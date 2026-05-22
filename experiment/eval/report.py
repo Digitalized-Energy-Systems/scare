@@ -224,23 +224,27 @@ def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
     if ok.empty:
         return []
 
-    # Validity plots are most informative when the per-coalition /
-    # per-holon balance recordings are present in ``timeseries.csv``
-    # (introduced by the validity-plot landing).  Walk OK scare tasks
-    # in ``functional_baseline``-first order and pick the first one
-    # whose timeseries actually carries the new columns, falling back
-    # to ``functional_baseline``'s representative if no task has them
-    # yet (so the system_balance subplot still renders on legacy data).
+    # Validity plots are most informative when the most-recently-added
+    # recordings are present in ``timeseries.csv``.  Walk OK scare tasks
+    # in ``functional_baseline``-first order; prefer tasks that carry
+    # the slack columns (latest), fall back to coalition_balance
+    # (previous landing), fall back to ``functional_baseline``'s
+    # representative or just the first OK task.  Each "prefix" needed
+    # is a superset of the previous one, so picking the newest gives
+    # all subplots data.
     fb_first = pd.concat([
         ok[ok["experiment"] == "functional_baseline"],
         ok[ok["experiment"] != "functional_baseline"],
     ])
     rep = None
-    for tid in fb_first["task_id"].astype(int).tolist():
-        candidate = campaign.task(int(tid))
-        cols = list(candidate.timeseries.columns)
-        if any(c.startswith("coalition_balance__") for c in cols):
-            rep = candidate
+    for required in ("slack__", "coalition_balance__"):
+        for tid in fb_first["task_id"].astype(int).tolist():
+            candidate = campaign.task(int(tid))
+            cols = list(candidate.timeseries.columns)
+            if any(c.startswith(required) for c in cols):
+                rep = candidate
+                break
+        if rep is not None:
             break
     if rep is None:
         rep = campaign.representative_task("functional_baseline", "scare")
@@ -277,6 +281,14 @@ def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
         title=(
             f"Per-child regulation — task {rep.task_id} ({rep.grid})"
         ),
+    )))
+    figs.append(str(plots.slack_trajectory(
+        rep.timeseries,
+        out_dir / "slack_trajectory.png",
+        title=(
+            f"External-grid slack — task {rep.task_id} ({rep.grid})"
+        ),
+        failure_t=failure_t,
     )))
     return figs
 

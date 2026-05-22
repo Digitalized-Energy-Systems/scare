@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import math
-import random
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from mango_energy_environments import Failure
 
 from scare.base.model import Sector
 
@@ -132,12 +130,20 @@ def sector_from_grid(grid: Any) -> Sector | None:
     return None
 
 
-def _sector_store(behavior: Any) -> dict[str, Sector]:
-    store = getattr(behavior, "_scare_sectors", None)
+def _get_behavior_store(behavior: Any, attr: str, factory=dict) -> Any:
+    """Lazy ``getattr(behavior, attr) or factory()`` accessor used by the
+    per-behavior registries below.  Storing on the behavior ties the
+    lifetime to the simulation world.
+    """
+    store = getattr(behavior, attr, None)
     if store is None:
-        store = {}
-        behavior._scare_sectors = store
+        store = factory()
+        setattr(behavior, attr, store)
     return store
+
+
+def _sector_store(behavior: Any) -> dict[str, Sector]:
+    return _get_behavior_store(behavior, "_scare_sectors")
 
 
 def register_sector(behavior: Any, aid: str, sector: Sector | None) -> None:
@@ -179,11 +185,7 @@ class _SlackMeta:
 
 
 def _slack_store(behavior: Any) -> dict[str, "_SlackMeta"]:
-    store = getattr(behavior, "_scare_slacks", None)
-    if store is None:
-        store = {}
-        behavior._scare_slacks = store
-    return store
+    return _get_behavior_store(behavior, "_scare_slacks")
 
 
 def register_slack(
@@ -231,11 +233,7 @@ def lookup_slack(behavior: Any, aid: str) -> "_SlackMeta | None":
 
 
 def _priority_store(behavior: Any) -> dict[str, int]:
-    store = getattr(behavior, "_scare_priorities", None)
-    if store is None:
-        store = {}
-        behavior._scare_priorities = store
-    return store
+    return _get_behavior_store(behavior, "_scare_priorities")
 
 
 def register_priority(behavior: Any, aid: str, tier: int) -> None:
@@ -273,23 +271,12 @@ _REGULATE_DEDUP_TOL: float = 1e-3
 
 
 def _last_regulate_store(behavior: Any) -> dict[str, float]:
-    store = getattr(behavior, "_scare_last_regulate", None)
-    if store is None:
-        store = {}
-        behavior._scare_last_regulate = store
-    return store
+    return _get_behavior_store(behavior, "_scare_last_regulate")
 
 
 def _last_regulate_t_store(behavior: Any) -> dict[str, float]:
-    """Per-aid timestamp of the last applied regulate, used by the
-    sim-time cooldown gate.  Lives on the behavior so it tears down
-    with the simulation world.
-    """
-    store = getattr(behavior, "_scare_last_regulate_t", None)
-    if store is None:
-        store = {}
-        behavior._scare_last_regulate_t = store
-    return store
+    """Per-aid timestamp of the last applied regulate (sim-time cooldown gate)."""
+    return _get_behavior_store(behavior, "_scare_last_regulate_t")
 
 
 def _stale_obs_state(behavior: Any) -> dict[str, Any]:
@@ -308,16 +295,16 @@ def _stale_obs_state(behavior: Any) -> dict[str, Any]:
     and is counted in ``stale_landed`` / surfaced via a one-shot
     ``regulate_on_stale_obs`` event for the affected sector.
     """
-    state = getattr(behavior, "_scare_stale_obs_state", None)
-    if state is None:
-        state = {
+    return _get_behavior_store(
+        behavior,
+        "_scare_stale_obs_state",
+        factory=lambda: {
             "last_id": None,
             "applies_on_current_id": 0,
             "stale_landed": 0,
             "warned_for_id": None,
-        }
-        behavior._scare_stale_obs_state = state
-    return state
+        },
+    )
 
 
 # Tiers at or below this threshold bypass the global cooldown.  A
@@ -579,261 +566,25 @@ def get_by_branch_id(centrality: dict, branch_id: tuple) -> float:
     return centrality.get(rev, 0.0)
 
 
-def create_failures(
-    monee_net: Any,
-    failure_type: str = "branch",
-    *,
-    num_failures: int = 1,
-    delay_s_max: float = 5.0,
-    generator_share: float = 0.5,
-) -> list[Failure]:
-    """Sample ``num_failures`` failure events on the network.
-
-    ``failure_type`` selects the population of contingencies:
-
-    - ``"branch"``  — non-CP branches only (lines, pipes).  Original
-      behaviour; matches the simbench-LV stress tests historically used.
-    - ``"generator"`` — generator-class components only.  Covers
-      ``PowerGenerator`` / ``HeatGenerator`` / ``Source`` (childs),
-      ``CHP`` / ``PowerToHeat`` / ``CHPHG`` (compounds), and
-      ``GasToPower`` / ``PowerToGas`` / ``PowerToHeatHG`` (branches).
-      Each deactivation goes through ``net.deactivate(component)`` via
-      the ``Failure.custom`` hook.
-    - ``"mixed"`` — random mix; ``generator_share`` controls what
-      fraction of the draw is generators (rest are non-CP branches).
-      Default 50 / 50.
-    - ``"concentrated"`` — pick a random node with $\ge 2$ incident
-      branches, then sample up to ``num_failures`` of *its* incident
-      branches.  Concentrates the impact on one locale, producing the
-      stark per-group capacity asymmetry that the holonic ADMM layer
-      exists to resolve: the affected sub-community sees a heavy local
-      deficit while adjacent groups still have slack capacity.
-    """
-    if failure_type == "branch":
-        return _sample_branch_failures(monee_net, num_failures, delay_s_max)
-    if failure_type == "generator":
-        return _sample_generator_failures(monee_net, num_failures, delay_s_max)
-    if failure_type == "mixed":
-        n_gen = int(round(num_failures * max(0.0, min(1.0, generator_share))))
-        n_branch = num_failures - n_gen
-        out = _sample_branch_failures(monee_net, n_branch, delay_s_max)
-        out += _sample_generator_failures(monee_net, n_gen, delay_s_max)
-        return out
-    if failure_type == "concentrated":
-        return _sample_concentrated_failures(monee_net, num_failures, delay_s_max)
-    return []
-
-
-def _sample_concentrated_failures(
-    monee_net: Any, num_failures: int, delay_s_max: float
-) -> list[Failure]:
-    """Pick a load-rich node and disconnect up to ``num_failures``
-    branches in its 1-hop neighbourhood.  Concentration target chosen
-    to maximise lost served capacity: among nodes whose 1-hop subtree
-    contains the most load demand, pick one and cut its incident
-    non-CP branches plus the cuts that strand the largest descendants.
-
-    The picker prefers branches whose removal disconnects load-bearing
-    nodes from the rest of the network so the failure creates a
-    measurable per-group deficit.  This is the regime where the
-    holonic ADMM has work to do — without it, the affected
-    sub-community sees a stark deficit while neighbouring groups
-    retain slack.
-    """
-    candidates = [b for b in monee_net.branches if not b.model.is_cp()]
-    if not candidates:
-        return []
-    # Build node → incident-branches map and load-capacity-per-node
-    by_node: dict = {}
-    for b in candidates:
-        for nid in (b.id[0], b.id[1]):
-            by_node.setdefault(nid, []).append(b)
-    load_at_node: dict = {}
-    for child in monee_net.childs:
-        nid = child.node_id
-        obs = dict(child.model.values)
-        cap = obs_capacity(obs)
-        if cap > 0:
-            load_at_node[nid] = load_at_node.get(nid, 0.0) + cap
-    # 1-hop "neighbourhood load" = load at this node + load at neighbours
-    nbr_load: dict = {}
-    for n, branches in by_node.items():
-        score = load_at_node.get(n, 0.0)
-        for b in branches:
-            other = b.id[1] if b.id[0] == n else b.id[0]
-            score += load_at_node.get(other, 0.0)
-        if score > 0 and len(branches) >= 1:
-            nbr_load[n] = score
-    if not nbr_load:
-        # Fall back to original behaviour: any branched node.
-        eligible = [n for n, bs in by_node.items() if len(bs) >= 2]
-        if not eligible:
-            eligible = list(by_node.keys())
-        target_node = random.choice(eligible)
-    else:
-        # Pick from top-25 % by neighbourhood load to keep some
-        # seed-variance while staying in load-rich territory.
-        ranked = sorted(nbr_load.items(), key=lambda kv: -kv[1])
-        top_k = max(1, len(ranked) // 4)
-        target_node = random.choice([n for n, _ in ranked[:top_k]])
-    # BFS outward from the target node, accumulating branches in a
-    # cluster until we have ``num_failures``.  Each frontier expansion
-    # adds the branches incident to the new nodes, keeping the failure
-    # set spatially concentrated rather than spread across the grid.
-    selected: list = []
-    selected_ids: set = set()
-    visited: set = {target_node}
-    frontier: list = [target_node]
-    while frontier and len(selected) < num_failures:
-        # Sort frontier nodes by load impact on their incident branches
-        next_frontier: list = []
-        for node in frontier:
-            incident = sorted(
-                by_node.get(node, []),
-                key=lambda b: -load_at_node.get(
-                    b.id[1] if b.id[0] == node else b.id[0], 0.0
-                ),
-            )
-            for b in incident:
-                if id(b) in selected_ids:
-                    continue
-                if len(selected) >= num_failures:
-                    break
-                selected.append(b)
-                selected_ids.add(id(b))
-                other = b.id[1] if b.id[0] == node else b.id[0]
-                if other not in visited:
-                    visited.add(other)
-                    next_frontier.append(other)
-        frontier = next_frontier
-    return [
-        Failure(delay_s=random.uniform(0.0, delay_s_max), branch_ids=[b.id])
-        for b in selected
-    ]
-
-
-def _sample_branch_failures(
-    monee_net: Any, num_failures: int, delay_s_max: float
-) -> list[Failure]:
-    candidates = [b for b in monee_net.branches if not b.model.is_cp()]
-    selected = random.sample(candidates, min(num_failures, len(candidates)))
-    return [
-        Failure(delay_s=random.uniform(0.0, delay_s_max), branch_ids=[b.id])
-        for b in selected
-    ]
-
-
-def _sample_generator_failures(
-    monee_net: Any, num_failures: int, delay_s_max: float
-) -> list[Failure]:
-    """Pick generator-class components and wrap each in a ``Failure``
-    whose ``custom`` callable deactivates the component on the live
-    network.  The component is captured by closure so the callable
-    works even after the failure has been dispatched.
-    """
-    candidates = list(_iter_generator_candidates(monee_net))
-    if not candidates:
-        return []
-    selected = random.sample(candidates, min(num_failures, len(candidates)))
-    out: list[Failure] = []
-    for kind, component in selected:
-        # Branch-class CP plants (P2G / G2P / P2H-HG) can use the
-        # built-in ``branch_ids`` deactivation pathway directly — that's
-        # cheaper and surfaces the same BranchFailureEvent the rest of
-        # scare's logic listens for.
-        if kind == "branch":
-            out.append(Failure(
-                delay_s=random.uniform(0.0, delay_s_max),
-                branch_ids=[component.id],
-            ))
-            continue
-        # Childs / compounds need ``custom`` because the Failure dataclass
-        # only natively handles branches and nodes.
-        comp = component  # bind for closure
-
-        def _deactivate(net, _c=comp) -> None:
-            net.deactivate(_c)
-
-        out.append(Failure(
-            delay_s=random.uniform(0.0, delay_s_max),
-            custom=_deactivate,
-            custom_id=f"{kind}:{getattr(component, 'id', repr(component))}",
-        ))
-    return out
-
-
-def _iter_generator_candidates(monee_net: Any):
-    """Yield ``(kind, component)`` pairs for every deactivatable
-    generator-class component on the network.
-
-    ``kind`` ∈ {``"child"``, ``"compound"``, ``"branch"``} drives the
-    failure dispatch rule in ``_sample_generator_failures``.
-    """
-    from monee.model.child import HeatGenerator, PowerGenerator, Source
-    from monee.model.multi import (
-        CHP,
-        CHPHG,
-        GasToPower,
-        PowerToGas,
-        PowerToHeat,
-        PowerToHeatHG,
-    )
-
-    child_classes = (PowerGenerator, HeatGenerator, Source)
-    compound_classes = (CHP, CHPHG, PowerToHeat)
-    branch_classes = (GasToPower, PowerToGas, PowerToHeatHG)
-
-    for child in monee_net.childs:
-        if isinstance(child.model, child_classes):
-            yield ("child", child)
-    for compound in getattr(monee_net, "compounds", []):
-        if isinstance(compound.model, compound_classes):
-            yield ("compound", compound)
-    for branch in monee_net.branches:
-        if isinstance(branch.model, branch_classes):
-            yield ("branch", branch)
+# Re-export ``create_failures`` from :mod:`scare.base.failure_sampling`
+# (the actual implementation) for backwards compatibility with existing
+# callers that import it from this module.
+from scare.base.failure_sampling import create_failures  # noqa: E402,F401
 
 
 def efficiency_vector(eta_el: float, eta_heat: float, eta_gas: float) -> np.ndarray:
     return np.array([eta_el, eta_heat, eta_gas], dtype=float)
 
 
-def create_chp_admm_flex_actor(chp_obs: dict, priority: int):
-    """CHP: produces electricity + heat from gas."""
-    from distributed_resource_optimization import create_admm_flex_actor_one_to_many
-
-    cap = kgps_to_mw(float(chp_obs.get("gas_kgps", obs_capacity(chp_obs))))
-    eta = efficiency_vector(
-        chp_obs.get("eta_el", 0.35), chp_obs.get("eta_heat", 0.45), -1.0
-    )
-    return create_admm_flex_actor_one_to_many(cap, eta, np.full(3, float(priority)))
-
-
-def create_p2g_admm_flex_actor(p2g_obs: dict, priority: int):
-    """P2G: consumes electricity, produces gas."""
-    from distributed_resource_optimization import create_admm_flex_actor_one_to_many
-
-    cap = float(p2g_obs.get("el_mw", obs_capacity(p2g_obs)))
-    eta = efficiency_vector(-1.0, 0.0, p2g_obs.get("eta_gas", 0.6))
-    return create_admm_flex_actor_one_to_many(cap, eta, np.full(3, float(priority)))
-
-
-def create_g2p_admm_flex_actor(g2p_obs: dict, priority: int):
-    """G2P: consumes gas, produces electricity."""
-    from distributed_resource_optimization import create_admm_flex_actor_one_to_many
-
-    cap = kgps_to_mw(float(g2p_obs.get("gas_kgps", obs_capacity(g2p_obs))))
-    eta = efficiency_vector(g2p_obs.get("eta_el", 0.45), 0.0, -1.0)
-    return create_admm_flex_actor_one_to_many(cap, eta, np.full(3, float(priority)))
-
-
-def create_p2h_admm_flex_actor(p2h_obs: dict, priority: int):
-    """P2H: consumes electricity, produces heat (high-grade or low-grade)."""
-    from distributed_resource_optimization import create_admm_flex_actor_one_to_many
-
-    cap = float(p2h_obs.get("el_mw", obs_capacity(p2h_obs)))
-    eta = efficiency_vector(-1.0, p2h_obs.get("eta_heat", 0.9), 0.0)
-    return create_admm_flex_actor_one_to_many(cap, eta, np.full(3, float(priority)))
+# Re-export the CP flex-actor factories from
+# :mod:`scare.base.admm_factories` (the actual implementations) for
+# backwards compatibility with existing callers.
+from scare.base.admm_factories import (  # noqa: E402,F401
+    create_chp_admm_flex_actor,
+    create_g2p_admm_flex_actor,
+    create_p2g_admm_flex_actor,
+    create_p2h_admm_flex_actor,
+)
 
 
 def sector_color(sector: Sector) -> str:

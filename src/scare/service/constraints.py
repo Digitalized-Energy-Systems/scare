@@ -58,7 +58,7 @@ _FORWARD_VALUE_TOL: float = 0.02
 
 # Minimum sim-time between re-broadcasts of an unchanged value.  Keeps
 # liveness ticks flowing through the trust ledger while preventing the
-# per-cycle flood that ``_forwarded.clear()`` used to enable.
+# per-cycle flood that ``_state_forwarded.clear()`` used to enable.
 _FORWARD_FRESHNESS_S: float = 5.0
 
 # EMA smoothing factor for the local sensitivity estimate (dV / dP).
@@ -159,13 +159,13 @@ class GridConstraintMonitor(Role):
         # information — task 0 produced 119 480 ``ConstraintStateMessage``
         # in 5 s on simbench_lv (≈ 24 k/s).  Per-cycle clearing is
         # explicitly removed; freshness is governed by the rules above.
-        self._forwarded: dict[
+        self._state_forwarded: dict[
             tuple[str, str], tuple[int, float, float]
         ] = {}
         # When this agent last broadcast its OWN state, indexed by
         # variable.  Used by ``_propagate_state`` to decide whether the
         # local poll has produced a new-enough datum to flood again.
-        self._last_local_propagate: dict[str, tuple[float, float]] = {}
+        self._last_local_broadcast: dict[str, tuple[float, float]] = {}
 
         # Track whether we already emitted a violation this cycle to
         # avoid flooding.
@@ -280,17 +280,87 @@ class GridConstraintMonitor(Role):
     # Periodic monitoring
     # ------------------------------------------------------------------
 
-    async def _monitor(self) -> None:
-        # ``observe`` can raise ``AttributeError`` when the simulation
-        # hasn't run an LP solve yet (``_net_results`` is None on the
-        # very first scheduled tick).  This is benign — the monitor
-        # just has nothing to look at — so swallow it instead of
-        # letting mango's task wrapper log a noisy traceback.  The
-        # next periodic tick will see the populated results.
+    def _safe_observe(self) -> dict | None:
+        """Return ``observe()`` result or ``None`` when the LP hasn't solved
+        yet.  Swallows ``AttributeError``/``KeyError`` so periodic tasks
+        don't log 200+ tracebacks during the bootstrap tick.
+        """
         try:
-            obs = self.behavior.observe(self.context.aid)
+            return self.behavior.observe(self.context.aid)
         except (AttributeError, KeyError):
+            return None
+
+    def _try_emit_event(self, event) -> None:
+        """Emit a local event, swallowing the ``KeyError`` that mango
+        raises when no co-located role subscribes (branch-mode monitor
+        agents have no EnergyBalanceNegotiator).
+        """
+        try:
+            self.context.emit_event(event)
+        except KeyError:
+            pass
+
+    async def _handle_violation(
+        self, obs: dict, var: str, val: float, lo: float, hi: float
+    ) -> None:
+        """Emit ``ConstraintViolation`` + ``BalanceProblem`` for a freshly
+        breached variable; relief-route branch overloads to the home
+        leader; trigger curtailment when enabled.  Re-firing for the
+        same variable is suppressed via ``_violation_emitted``.
+        """
+        if var in self._violation_emitted:
             return
+        self._violation_emitted.add(var)
+        logger.warning(
+            "[%s] CONSTRAINT VIOLATION %s=%.4f bounds=[%.4f,%.4f]",
+            self.context.aid, var, val, lo, hi,
+        )
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=self.context.current_timestamp,
+            kind="constraint_violation",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=f"{var}={val:.4f} bounds=[{lo:.4f},{hi:.4f}]",
+        )
+        self._try_emit_event(ConstraintViolation(
+            sector=self.sector, variable=var, value=val,
+            bound_low=lo, bound_high=hi, node_id=self.node_id,
+        ))
+        self._try_emit_event(BalanceProblem(
+            sector=self.sector,
+            imbalance=val - hi if val > hi else lo - val,
+        ))
+        if (
+            self.branch_id is not None
+            and var == "loading_percent"
+            and self.home_leader_addr is not None
+        ):
+            # Branch-mode BalanceProblem has no local listener — drive
+            # the home leader to rebalance via StartBalanceNegotiation.
+            await self._send_line_overload_relief(obs, val, lo, hi)
+        if self.enable_curtailment_auction:
+            await self._request_curtailment(var, val, lo, hi)
+
+    def _handle_warning(
+        self, var: str, val: float, lo: float, hi: float, util: float
+    ) -> None:
+        """Emit ``ConstraintWarning`` for a variable above the proactive
+        threshold but not yet over the bound.
+        """
+        self._try_emit_event(ConstraintWarning(
+            sector=self.sector, variable=var, value=val,
+            bound_low=lo, bound_high=hi, utilization=util,
+            node_id=self.node_id,
+        ))
+        logger.debug(
+            "[%s] constraint warning %s=%.4f util=%.2f",
+            self.context.aid, var, val, util,
+        )
+
+    async def _monitor(self) -> None:
+        obs = self._safe_observe()
         if not obs:
             return
 
@@ -307,106 +377,21 @@ class GridConstraintMonitor(Role):
 
         for var, val in values.items():
             # Skip readings the solver hasn't populated (post-failure
-            # infeasibility reports t_k=0, NaN shows up on isolated nodes).
-            # Acting on those triggers spurious curtailment cascades.
+            # infeasibility reports t_k=0, NaN on isolated nodes).
             if not math.isfinite(val) or (var == "t_k" and val <= 0.0):
                 continue
 
             lo, hi = bounds.get(var, (float("-inf"), float("inf")))
             util = constraint_utilization(val, lo, hi)
 
-            # --- Hard violation ---
             if val < lo or val > hi:
-                if var not in self._violation_emitted:
-                    self._violation_emitted.add(var)
-                    violation = ConstraintViolation(
-                        sector=self.sector,
-                        variable=var,
-                        value=val,
-                        bound_low=lo,
-                        bound_high=hi,
-                        node_id=self.node_id,
-                    )
-                    logger.warning(
-                        "[%s] CONSTRAINT VIOLATION %s=%.4f bounds=[%.4f,%.4f]",
-                        self.context.aid,
-                        var,
-                        val,
-                        lo,
-                        hi,
-                    )
-                    from scare.base.diagnostics import record_event
-
-                    record_event(
-                        t=self.context.current_timestamp,
-                        kind="constraint_violation",
-                        aid=self.context.aid,
-                        sector=self.sector.value,
-                        detail=f"{var}={val:.4f} bounds=[{lo:.4f},{hi:.4f}]",
-                    )
-                    # Local emits raise ``KeyError`` in mango when no
-                    # co-located role subscribes — branch agents in
-                    # branch mode have no EnergyBalanceNegotiator, and
-                    # the inter-agent signal goes via ``_send_line_overload_relief``
-                    # below.  Swallow defensively so the monitor task
-                    # doesn't abort before that send executes.
-                    try:
-                        self.context.emit_event(violation)
-                    except KeyError:
-                        pass
-                    try:
-                        self.context.emit_event(
-                            BalanceProblem(
-                                sector=self.sector,
-                                imbalance=val - hi if val > hi else lo - val,
-                            )
-                        )
-                    except KeyError:
-                        pass
-                    if (
-                        self.branch_id is not None
-                        and var == "loading_percent"
-                        and self.home_leader_addr is not None
-                    ):
-                        # Branch mode: BalanceProblem is local and has no
-                        # listener here.  Drive the home group leader to
-                        # rebalance by sending an explicit
-                        # StartBalanceNegotiation with a relief-MW target.
-                        await self._send_line_overload_relief(
-                            obs, val, lo, hi
-                        )
-                    if self.enable_curtailment_auction:
-                        await self._request_curtailment(var, val, lo, hi)
+                await self._handle_violation(obs, var, val, lo, hi)
             else:
                 self._violation_emitted.discard(var)
 
-            # --- Proactive warning ---
             if util >= PROACTIVE_WARNING_FRACTION and var not in self._violation_emitted:
-                warning = ConstraintWarning(
-                    sector=self.sector,
-                    variable=var,
-                    value=val,
-                    bound_low=lo,
-                    bound_high=hi,
-                    utilization=util,
-                    node_id=self.node_id,
-                )
-                # Same defensive pattern as the ``ConstraintViolation``
-                # / ``BalanceProblem`` emits above: branch-mode monitor
-                # agents have no co-located negotiator to subscribe.
-                try:
-                    self.context.emit_event(warning)
-                except KeyError:
-                    pass
-                logger.debug(
-                    "[%s] constraint warning %s=%.4f util=%.2f",
-                    self.context.aid,
-                    var,
-                    val,
-                    util,
-                )
+                self._handle_warning(var, val, lo, hi, util)
 
-            # --- Propagate state to neighbours ---
             if self.enable_multihop_constraint:
                 await self._propagate_state(var, val, util)
 
@@ -424,7 +409,7 @@ class GridConstraintMonitor(Role):
         # to every neighbour, swamping the network — task-0 baseline had
         # 119 480 ConstraintStateMessages in 5 s on this path alone.
         now = self.context.current_timestamp
-        prev = self._last_local_propagate.get(variable)
+        prev = self._last_local_broadcast.get(variable)
         if prev is not None:
             prev_t, prev_util = prev
             stale = (now - prev_t) >= _FORWARD_FRESHNESS_S
@@ -442,8 +427,8 @@ class GridConstraintMonitor(Role):
             origin_addr=origin,
         )
         origin_key = (str(origin), variable)
-        self._forwarded[origin_key] = (self.max_hops, now, utilization)
-        self._last_local_propagate[variable] = (now, utilization)
+        self._state_forwarded[origin_key] = (self.max_hops, now, utilization)
+        self._last_local_broadcast[variable] = (now, utilization)
 
         for addr in topology_neighbors(self, tid="groups"):
             await self.context.send_message(msg, receiver_addr=addr)
@@ -469,7 +454,7 @@ class GridConstraintMonitor(Role):
         # origin), or the freshness window has elapsed, or the value
         # moved by more than the tolerance.  Updated lazily; never
         # cleared (the per-cycle clear caused the message flood).
-        prev = self._forwarded.get(origin_key)
+        prev = self._state_forwarded.get(origin_key)
         if prev is not None:
             prev_hops, prev_t, prev_util = prev
             improves_hops = message.hops_remaining > prev_hops
@@ -477,7 +462,7 @@ class GridConstraintMonitor(Role):
             changed = abs(message.utilization - prev_util) >= _FORWARD_VALUE_TOL
             if not (improves_hops or stale or changed):
                 return
-        self._forwarded[origin_key] = (
+        self._state_forwarded[origin_key] = (
             message.hops_remaining, now, message.utilization,
         )
 
@@ -756,14 +741,7 @@ class GridConstraintMonitor(Role):
             return
         if not self.behavior.has_action(self.context.aid, "regulate"):
             return
-        # ``observe`` raises ``AttributeError`` when the simulation hasn't
-        # run a solve yet (``_net_results`` is None on the very first
-        # scheduled tick).  Match the defensive pattern in ``_monitor``
-        # so the periodic task doesn't log 200+ tracebacks per run.
-        try:
-            obs = self.behavior.observe(self.context.aid)
-        except (AttributeError, KeyError):
-            return
+        obs = self._safe_observe()
         if not obs:
             return
 

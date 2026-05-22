@@ -86,7 +86,7 @@ class ProblemDetector(Role):
         # forwarded for each ``(origin_addr_str, branch_id)``.  A later
         # notice with strictly higher TTL overrides (because it can
         # reach farther); equal/lower TTLs are suppressed.  Same shape
-        # as ``GridConstraintMonitor._forwarded`` for consistency.
+        # as ``GridConstraintMonitor._state_forwarded`` for consistency.
         self._forwarded_ttl: dict[tuple, int] = {}
         # Same key, separate ledger for *delivered* (to local children)
         # so each child gets exactly one notice per unique failure.

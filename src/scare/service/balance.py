@@ -49,82 +49,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_START_THRESHOLD = 1e-4
-# All sectors share the same start threshold.  Monee now reports heat
-# capacities in MW (``q_mw_heat`` ≈ 0.005 for residential), so a single
-# stressed agent at util≈0.85 contributes ~1.25 kW = 0.00125 MW to the
-# group's thermal-deficit target — comfortably above 1e-4 yet
-# distinguishable from sub-kW solver noise.  The chapter's "10 W"
-# literal predates the W→MW migration and was effectively masking all
-# heat gossip; it has been removed.
+# Sector-specific overrides of ``_DEFAULT_START_THRESHOLD``.  All sectors
+# currently share the same threshold (MW magnitudes).
 _START_THRESHOLD: dict[Sector, float] = {}
 
-# Per-group threshold floor: noise vs. signal in setpoint imbalance is
-# fundamentally a *fraction* of group capacity, not a fixed magnitude.
-# A group with Σ|cap| = 0.02 MW (4 × 5 kW residential heat) gets
-# threshold ≈ 1e-4 MW (0.5 % of capacity), a group with Σ|cap| = 2 MW
-# gets ≈ 0.01 MW.  Both reject sub-half-percent imbalances while
-# accepting any meaningful deficit.
+# Per-group threshold = max(_THRESHOLD_ABS_FLOOR,
+# _THRESHOLD_CAPACITY_FRACTION · Σ|cap|).  Scales noise tolerance with
+# group capacity so we reject sub-half-percent imbalances.
 _THRESHOLD_CAPACITY_FRACTION: float = 0.005
-# Absolute floor for empty / zero-capacity groups so we never end up
-# with a zero threshold (which would treat solver noise as signal).
 _THRESHOLD_ABS_FLOOR: float = 1e-6
 
-# Heat-specific clearance utilization: above this fraction of the
-# feasible band, an agent contributes its remaining headroom to the
-# group's thermal-deficit target (drives the gossip negotiation).
-# Below it, the agent is "comfortable" and reports zero deficit.
-# Tuned slightly below the proactive-warning threshold (0.85) so
-# warmups/cooldowns trigger gossip before a hard violation.
+# Heat utilization above which an agent contributes headroom to the
+# group's thermal-deficit target.  Just below the 0.85 proactive
+# warning so warmup/cooldown triggers gossip pre-violation.
 _HEAT_CLEAR_FRACTION: float = 0.6
 
 _MAX_HOPS = 100
 
-# Robbins-Monro step-size decay constant.  The per-step gain is
-# ``gamma_s / (1 + k / k0)``: at k=0 the step matches the historical
-# constant ``gamma_s``; by k=k0 it has halved; by k=k_max=100 with
-# k0=20 it is roughly 1/6 of the initial value.  This satisfies
-# ``Σ γ_k = ∞`` and ``Σ γ_k² < ∞``, the standard conditions for
-# almost-sure convergence under the noise that constraint-feedback
-# / saturation place the gossip in.  k0 ≈ n (typical group size of
-# the simbench LV grids) keeps the early phase fast.
+# Robbins-Monro step decay: gain = gamma_s / (1 + k / k0).  Satisfies
+# Σ γ_k = ∞, Σ γ_k² < ∞.  k0 ≈ typical simbench LV group size.
 _STEP_DECAY_K0_DEFAULT: int = 20
 
-# P2 stall-detection parameters.  The gap window holds the last
-# ``_STALL_WINDOW_FACTOR · n_act`` post-update gap values; when the
-# range across the window is below ``_STALL_TOL_FRACTION · |T|`` and
-# the current gap still exceeds the per-group threshold, we declare
-# the protocol stuck and emit IslandingRequest immediately rather
-# than spinning to k_max.  Brings the termination logic in line with
-# the dynamics of (F1) "saturation stalling".
+# P2 stall detection.  When the recent gap window's range falls below
+# _STALL_TOL_FRACTION · |T| and the gap still exceeds the per-group
+# threshold, declare stuck and emit IslandingRequest.
 _STALL_WINDOW_FACTOR: int = 2
 _STALL_TOL_FRACTION: float = 0.005
 _STALL_TOL_FLOOR: float = 1e-6
 
-# Base wallclock deadline per sector.  Electricity is fastest (agents
-# need few rounds), heat is slowest (high decision delay, low
-# convergence rate).  The actual deadline is further scaled by the
-# group size — larger groups need more rounds to converge.
+# Base wallclock deadline per sector (heat is slowest due to high
+# decision delay).  Scaled further by group size at use site.
 _GOSSIP_TIMEOUT_BASE_S: dict[Sector, float] = {
     Sector.ELECTRICITY: 5.0,
     Sector.GAS: 15.0,
     Sector.HEAT: 30.0,
 }
 _GOSSIP_TIMEOUT_DEFAULT_S = 15.0
-_GOSSIP_TIMEOUT_PER_AGENT_S = 0.5  # added per group member
+_GOSSIP_TIMEOUT_PER_AGENT_S = 0.5
 
-# Neighbour is considered stale (pruned from the live set) after this
-# many poll periods of silence.  Tuned per sector: heat ramps so slow
-# that long gaps between messages are normal and should not trigger
-# pruning, while electricity needs a tight threshold.
+# Stale-neighbour pruning: how many poll periods of silence count as
+# dead.  Heat tolerates long gaps; electricity does not.
 _HEARTBEAT_MAX_AGE_MULTIPLE: float = 8.0
 
-# Number of discrete priority tiers for intra-sector ordering.
-# Lower tier = higher urgency = participates earlier in gossip rounds.
+# Intra-sector priority tiers (lower = higher urgency, gossips earlier).
 _PRIORITY_TIERS = 10
 
-# A single participant's delta is clipped to this multiple of the
-# negotiation target magnitude.  A misbehaving or faulty agent cannot
-# corrupt the ledger sum by reporting an implausibly large contribution.
+# Byzantine cap: a single participant's delta is clipped to this
+# multiple of the negotiation target magnitude.
 _BYZANTINE_DELTA_CAP_MULTIPLE: float = 5.0
 
 
@@ -136,19 +107,10 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
     """True iff *aid* refers to a monee ``ExtPowerGrid`` or ``ExtHydrGrid``
     child — the network's slack-class boundary.
 
-    Used to suppress regulation writes in ``_apply_setpoint`` /
-    elsewhere: slacks absorb whatever the LP needs to balance, and
-    writing ``regulation < 1`` on them clamps the LP's effective slack
-    envelope to a fraction of physical capacity, which the next
-    energy-flow solve diagnoses as infeasible the moment the network
-    needs more headroom than the clamped fraction.
-
-    The slack registry (``register_slack`` / ``lookup_slack``) is the
-    preferred path for callers that need the F1 rating + bounds — but
-    heat-side ExtHydrGrid is intentionally unbounded by
-    ``apply_slack_budget`` (the heat LP has no operator-side slack
-    discipline) and therefore never lands in the registry.  This
-    helper covers both bounded and unbounded slacks uniformly.
+    Used to suppress regulation writes on slacks; writing
+    ``regulation < 1`` clamps the LP's effective slack envelope and the
+    next energy-flow solve goes infeasible.  Covers both bounded
+    (registered) and unbounded (heat-side) slacks uniformly.
     """
     if not aid.startswith("child-"):
         return False
@@ -172,14 +134,10 @@ def _heat_thermal_deficit_mw(obs: dict) -> float:
     """Return MW of demand reduction this heat agent should contribute to
     its group's thermal-deficit target.
 
-    Computed as ``max(0, util - ϑ_clear) · |cap|`` with the dominant local
-    constraint utilization; only loads (cap > 0) contribute, since heat
-    generators *increasing* output relieves the constraint and is handled
-    by the islanding fallback.  Capacity is read from ``q_mw_heat`` (or
-    ``q_mw_set`` for branch-side heat exchangers), so the result is in
-    MW and directly addable to ``obs_setpoint`` for the negotiation
-    target.  Returns 0 for non-heat agents — the caller is responsible
-    for restricting invocation to heat sector.
+    ``max(0, util - ϑ_clear) · |cap|`` with the dominant local
+    constraint utilization.  Only loads (cap > 0) contribute; heat
+    generators are handled by islanding fallback.  Caller must
+    restrict invocation to heat sector.
     """
     from scare.base.model import SECTOR_CONSTRAINTS
 
@@ -197,6 +155,17 @@ def _heat_thermal_deficit_mw(obs: dict) -> float:
         return 0.0
     deficit_fraction = worst_util - _HEAT_CLEAR_FRACTION
     return deficit_fraction * abs(cap)
+
+
+def _is_saturated(delta: float, dmin: float, dmax: float) -> bool:
+    """True iff *delta* sits within numerical tolerance of either box bound.
+
+    Tolerance scales with box magnitude (``1e-9 + 1e-6 · max(|dmin|, |dmax|, 1)``)
+    so large-box problems don't reject near-bound primal values as
+    unsaturated due to ADMM solver noise.
+    """
+    sat_tol = 1e-9 + 1e-6 * max(abs(dmin), abs(dmax), 1.0)
+    return delta <= dmin + sat_tol or delta >= dmax - sat_tol
 
 
 def _deterministic_next(neighbours: list, negotiation_id: str, counter: int) -> Any:
@@ -553,7 +522,7 @@ class EnergyBalanceNegotiator(Role):
                     event.variable,
                 )
                 if self._gossip.is_originator:
-                    total_delta = sum(v[0] for v in self._gossip.memory.values())
+                    total_delta = self._gossip_total_delta()
                     record_negotiation(
                         t=self.context.current_timestamp,
                         aid=self.context.aid,
@@ -581,6 +550,36 @@ class EnergyBalanceNegotiator(Role):
         worst utilization reported by any 1-N hop neighbour."""
         monitor = self._find_constraint_monitor()
         return monitor.worst_neighbour_utilization() if monitor is not None else 0.0
+
+    def _gossip_total_delta(self) -> float:
+        """``Σ δ_i`` across all participants in the active gossip ledger
+        (``0`` when no gossip is active)."""
+        if self._gossip is None:
+            return 0.0
+        return sum(v[0] for v in self._gossip.memory.values())
+
+    def _compute_participation_scale(self, obs: dict) -> float:
+        """Constraint-aware throttle ``∈ [0, 1]`` blending local
+        utilization, worst-neighbour utilization, and proactive
+        warnings.  Heat is exempt: thermal violations want stressed
+        loads to shed (handled by priority + clamp), not throttle.
+        """
+        if not self.constraint_aware or self.sector == Sector.HEAT:
+            return 1.0
+        from scare.base.model import SECTOR_CONSTRAINTS
+
+        scale = 1.0
+        for var, (lo, hi) in SECTOR_CONSTRAINTS.get(self.sector, {}).items():
+            if var in obs:
+                util = constraint_utilization(float(obs[var]), lo, hi)
+                scale = min(scale, max(0.0, 1.0 - util))
+        neigh_util = self._worst_neighbour_utilization()
+        if neigh_util > 0.0:
+            scale = min(scale, max(0.0, 1.0 - neigh_util))
+        if self._proactive_util:
+            worst_proactive = max(self._proactive_util.values())
+            scale = min(scale, max(0.0, 1.0 - worst_proactive))
+        return scale
 
     def _find_constraint_monitor(self):
         from scare.service.constraints import GridConstraintMonitor
@@ -670,7 +669,7 @@ class EnergyBalanceNegotiator(Role):
         """
         if self._gossip is None:
             return
-        total_delta = sum(v[0] for v in self._gossip.memory.values())
+        total_delta = self._gossip_total_delta()
         target = self._gossip.target
         residual = target - total_delta
         logger.info(
@@ -758,6 +757,21 @@ class EnergyBalanceNegotiator(Role):
         ramp up).  Box clamping enforces feasibility unconditionally.
         """
         return max(dmin, min(dmax, a_i * lam))
+
+    def _compute_lambda_seed(self, target: float, n_neighbours: int) -> float:
+        """Seed λ so the originator's first primal step makes meaningful
+        progress while leaving the dual update room to correct.
+
+        Aims the originator's first-step δ at its fair share
+        ``target / n_seed``, giving ``λ₀ = target / (n_seed · a_self)``.
+        Clamped to ``|target|`` so pathological tier combinations cannot
+        inject an unbounded first step.
+        """
+        target_sign = 1 if target > 0 else (-1 if target < 0 else 0)
+        a_self = max(self._qp_priority_weight(target_sign), 1.0)
+        n_seed = max(2, n_neighbours + 1)
+        lambda_seed = target / (n_seed * a_self)
+        return max(-abs(target), min(abs(target), lambda_seed))
 
     def _entry_responsiveness(self, prio: int, target_sign: int) -> float:
         """``a_i`` from a ledger entry's stored priority — used by the
@@ -1020,41 +1034,7 @@ class EnergyBalanceNegotiator(Role):
             obs, behavior=self.behavior, aid=self.context.aid
         )
 
-        # Seed ``λ`` so the originator's own first primal step makes
-        # meaningful progress while the dual update has room to fix
-        # under/over-shoots on subsequent hops.
-        #
-        # History:
-        #   * λ₀ = 0 wastes the first hop (δ = clamp(0, …) = 0).
-        #   * λ₀ = target / a_self over-shoots: a low-priority
-        #     originator (a_self=2) hands a huge λ to a high-priority
-        #     recipient (a_r=1024), saturating everyone.
-        #   * λ₀ = target / (a_max · n_seed) under-shoots so badly that
-        #     high-priority originators (target≈1e-3 MW, a_self=1024)
-        #     produced δ ≈ 1e-4 — far below the threshold, so the
-        #     gossip ran for the full 100 hops without ever closing
-        #     the residual and got classified as ``abandoned``.  This
-        #     was the source of the 87 % abandonment rate observed on
-        #     simbench_lv.
-        #
-        # New rule: aim the originator's own first-step δ at
-        # ``target / n_seed`` (its fair share), which yields
-        # ``λ₀ = target / (n_seed · a_self)``.  The box clamp on each
-        # recipient bounds over-shoot regardless of how aggressive
-        # ``a_self`` is, and the dual update on the originator-step's
-        # error term self-corrects within a couple of hops.
-        P = _PRIORITY_TIERS
-        target_sign = 1 if target > 0 else (-1 if target < 0 else 0)
-        a_self = max(self._qp_priority_weight(target_sign), 1.0)
-        n_seed = max(2, len(neighbours) + 1)
-        lambda_seed = target / (n_seed * a_self)
-        # Defensive cap against pathological tier combinations: clamp
-        # |λ₀| to ``|target|`` so even a tier-1 originator with
-        # a_self = 2^P cannot inject an unbounded step.
-        if lambda_seed > abs(target):
-            lambda_seed = abs(target)
-        elif lambda_seed < -abs(target):
-            lambda_seed = -abs(target)
+        lambda_seed = self._compute_lambda_seed(target, len(neighbours))
 
         self._gossip = _GossipState(
             negotiation_id=nid,
@@ -1172,7 +1152,7 @@ class EnergyBalanceNegotiator(Role):
                 negotiation_id[:8],
             )
             if self._gossip.is_originator:
-                total_delta = sum(v[0] for v in self._gossip.memory.values())
+                total_delta = self._gossip_total_delta()
                 residual = self._gossip.target - total_delta
                 record_negotiation(
                     t=self.context.current_timestamp,
@@ -1210,7 +1190,7 @@ class EnergyBalanceNegotiator(Role):
                 and self._gossip.is_originator
                 and self._gossip.negotiation_id != nid
             ):
-                prev_total = sum(v[0] for v in self._gossip.memory.values())
+                prev_total = self._gossip_total_delta()
                 record_negotiation(
                     t=self.context.current_timestamp,
                     aid=self.context.aid,
@@ -1280,45 +1260,10 @@ class EnergyBalanceNegotiator(Role):
         dmax = self._gossip.dmax_starting
 
         prev_own = self._gossip.memory.get(self_key, (0.0, 0, self.priority, False))[0]
-        total_delta = sum(v[0] for v in self._gossip.memory.values())
+        total_delta = self._gossip_total_delta()
         open_gap = target - total_delta
 
-        # --- Constraint-aware participation scaling ---
-        # Blend local utilization with the worst utilization reported by
-        # a 1-N hop neighbour.  An agent near a stressed neighbourhood
-        # throttles itself even if its own readings are still healthy.
-        #
-        # Heat-sector exception: thermal violations are dominated by the
-        # *lower* bound (severed supply path → cooling junctions), and
-        # there shedding the stressed agent *helps* (less demand on the
-        # surviving thermal corridor).  Throttling stressed agents would
-        # invert the desired response, so for heat we keep
-        # participation_scale = 1 and rely on the priority ordering and
-        # ``clamp_to_constraints`` for the per-step magnitude.
-        participation_scale = 1.0
-        if self.constraint_aware and self.sector != Sector.HEAT:
-            from scare.base.model import SECTOR_CONSTRAINTS
-            bounds = SECTOR_CONSTRAINTS.get(self.sector, {})
-            for var, (lo, hi) in bounds.items():
-                if var in obs:
-                    util = constraint_utilization(float(obs[var]), lo, hi)
-                    participation_scale = min(participation_scale, max(0.0, 1.0 - util))
-            neigh_util = self._worst_neighbour_utilization()
-            if neigh_util > 0.0:
-                participation_scale = min(
-                    participation_scale, max(0.0, 1.0 - neigh_util)
-                )
-            # Proactive-warning channel: if the co-located monitor has
-            # flagged any local variable above PROACTIVE_WARNING_FRACTION,
-            # the recorded utilization is already > 0.85 — translate it
-            # into an additional throttle.  This is the consumer that
-            # closes the open ConstraintWarning loop (previously the
-            # event had no subscribers and crashed mango.emit_event).
-            if self._proactive_util:
-                worst_proactive = max(self._proactive_util.values())
-                participation_scale = min(
-                    participation_scale, max(0.0, 1.0 - worst_proactive)
-                )
+        participation_scale = self._compute_participation_scale(obs)
 
         active_count = max(1, len(self._gossip.memory))
         n_free = max(1, sum(
@@ -1344,11 +1289,7 @@ class EnergyBalanceNegotiator(Role):
             new_delta = self._qp_primal(
                 a_i, self._gossip.dual_lambda, dmin, dmax, target_sign, cap
             )
-            sat_tol = 1e-9 + 1e-6 * max(abs(dmin), abs(dmax), 1.0)
-            saturated = (
-                new_delta <= dmin + sat_tol
-                or new_delta >= dmax - sat_tol
-            )
+            saturated = _is_saturated(new_delta, dmin, dmax)
             self._gossip.memory[self_key] = (
                 new_delta, counter, self.priority, saturated
             )
@@ -1374,7 +1315,7 @@ class EnergyBalanceNegotiator(Role):
             # converges in essentially one step when no agent is
             # clamped.  γ_k (Robbins-Monro decay) damps oscillations
             # caused by box-projection noise once agents saturate.
-            total_delta_post = sum(v[0] for v in self._gossip.memory.values())
+            total_delta_post = self._gossip_total_delta()
             residual = target - total_delta_post
             # Normalise the dual step by Σ a_j over *unsaturated* entries
             # only.  Saturated agents (v[3] == True) sit at a box bound and
@@ -1426,11 +1367,7 @@ class EnergyBalanceNegotiator(Role):
 
                 current_own = prev_own
                 new_delta = max(dmin, min(dmax, current_own + own_change))
-                sat_tol = 1e-9 + 1e-6 * max(abs(dmin), abs(dmax), 1.0)
-                saturated = (
-                    new_delta <= dmin + sat_tol
-                    or new_delta >= dmax - sat_tol
-                )
+                saturated = _is_saturated(new_delta, dmin, dmax)
                 self._gossip.memory[self_key] = (
                     new_delta, counter, self.priority, saturated
                 )
@@ -1439,7 +1376,7 @@ class EnergyBalanceNegotiator(Role):
                     self._apply_setpoint(self._gossip.starting_setpoint + new_delta)
 
         # Recompute total after own update
-        total_delta = sum(v[0] for v in self._gossip.memory.values())
+        total_delta = self._gossip_total_delta()
         open_gap = target - total_delta
 
         # P2: stall detection — append the post-update gap to the window;
@@ -1490,7 +1427,7 @@ class EnergyBalanceNegotiator(Role):
         new_sp = starting_sp + delta
 
         if self._gossip is not None:
-            total_delta = sum(v[0] for v in self._gossip.memory.values())
+            total_delta = self._gossip_total_delta()
             target = self._gossip.target
             residual = target - total_delta
             logger.info(
@@ -1627,7 +1564,7 @@ class EnergyBalanceNegotiator(Role):
         if self._gossip is None:
             return
         if self._gossip.is_originator:
-            total_delta = sum(v[0] for v in self._gossip.memory.values())
+            total_delta = self._gossip_total_delta()
             target = self._gossip.target
             residual = target - total_delta
             # Progress threshold: closed ≥ 30 % of the target's magnitude.

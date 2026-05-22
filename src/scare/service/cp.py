@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from mango import Role
 from mango import sender_addr as mango_sender_addr
@@ -73,6 +73,15 @@ _CP_DEFAULT_TOLERANCE = 0.01
 # cannot self-thrash if two beacons publish in rapid succession.
 _PREDICATE_DEAD_BAND_MW: float = 1e-4
 _PREDICATE_MIN_GAP_S: float = 1.0
+
+
+class _FlexAggregate(NamedTuple):
+    """Per-sector aggregation of a batch of ``AvailableFlexAnswer``."""
+    imbalance_by_sector: dict[Sector, float]
+    unmet_by_sector_total: dict[Sector, float]
+    sector_priority_weight: dict[Sector, float]
+    top_unmet_tier_per_sector: dict[Sector, int]
+    top_unmet_mag_per_sector: dict[Sector, float]
 
 
 class EnergyConverterRole(Role):
@@ -440,6 +449,39 @@ class EnergyConverterRole(Role):
             return False
         return True
 
+    def _clamp_to_envelope(self, result: list) -> list:
+        """Replace each sector dimension of the ADMM result with the
+        coalition-committed flow when an L2.5 envelope is active; return
+        the untouched result otherwise.  Logs + records ``cp_envelope_clamp``
+        when a clamp lands.
+        """
+        if not self._envelope_active():
+            logger.info("[%s] ADMM result: %s", self.context.aid, result)
+            return result
+        envelope = self._envelope_flows_mw or {}
+        pre_clamp = list(result)
+        for sector, idx in _RESULT_INDEX.items():
+            if idx >= len(result) or sector not in envelope:
+                continue
+            result[idx] = float(envelope[sector])
+        logger.info(
+            "[%s] CP ADMM result clamped to coalition envelope %s: %s",
+            self.context.aid, self._envelope_coalition_id, result,
+        )
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=float(self.context.current_timestamp),
+            kind="cp_envelope_clamp",
+            aid=str(self.context.aid),
+            sector="cp",
+            detail=(
+                f"coalition={self._envelope_coalition_id} "
+                f"pre={pre_clamp} post={result}"
+            ),
+        )
+        return result
+
     async def _handle_negotiation_finished(
         self, message: NegotiationFinishedEvent, meta: dict
     ) -> None:
@@ -527,67 +569,38 @@ class EnergyConverterRole(Role):
         if len(self._flex_answers) >= self._flex_expected:
             await self._run_admm()
 
-    async def _run_admm(self) -> None:
-        import numpy as np
-        from distributed_resource_optimization import (
-            create_admm_sharing_data,
-            create_admm_start,
-            create_sharing_target_distance_admm_coordinator,
-            start_coordinated_optimization,
-        )
+    def _aggregate_flex_answers(
+        self, answers: list[AvailableFlexAnswer]
+    ) -> _FlexAggregate:
+        """Aggregate a batch of flex answers per-sector.
 
+        Tracks signed balance, unsigned ``unmet`` (LP-undelivered demand
+        — surfaces sectors whose disconnected loads would otherwise
+        cancel against generation in ``balance``), and the most
+        critical (lowest-tier) unmet (sector, tier) pair so the ADMM
+        weight is top-tier-dominant rather than magnitude-weighted.
+        """
         from scare.base.util import aggregate_priority_weight
 
-        answers = self._flex_answers[:]
-        self._flex_answers = []
-        self._flex_expected = 0
-
-        # Per-sector aggregation.  Two channels:
-        # * ``balance_by_sector`` — net signed setpoint (generation + load
-        #   in load-convention).  Reflects what's actually flowing.
-        # * ``unmet_by_sector`` — load that the LP could not deliver
-        #   (regulation forced to 0 by monee's disconnect handling).
-        #   Without this, a sector that loses all its loads to physical
-        #   disconnect reports ``balance = 0`` and the CP layer treats it
-        #   as balanced — exactly when CP help is most needed.  Adding
-        #   ``unmet`` shifts the imbalance toward the deficit side so
-        #   ``T`` carries a real positive entry for the disconnected
-        #   sector and ADMM can find a cross-sector shift instead of
-        #   skipping with ``same-sign T``.
-        imbalance_by_sector: dict[Sector, float] = {}
-        unmet_by_sector_total: dict[Sector, float] = {}
-        sector_priority_weight: dict[Sector, float] = {}
-        # F4: instead of collapsing every (tier, magnitude) pair into a
-        # single per-sector scalar via ``Σ unserved × 2^(P-tier)`` (which
-        # lets a few large mid-tier loads outweigh a small high-tier
-        # critical load), track the *most critical unmet tier* per
-        # sector and its magnitude separately.  Below the ADMM call we
-        # combine them lexicographically: top-tier-priority dominates,
-        # magnitude breaks ties.  Eliminates the magnitude-leakage
-        # failure mode (50 MW tier-5 vs 0.5 MW tier-1).
-        top_unmet_tier_per_sector: dict[Sector, int] = {}
-        top_unmet_mag_per_sector: dict[Sector, float] = {}
+        agg = _FlexAggregate({}, {}, {}, {}, {})
         for answer in answers:
-            imbalance_by_sector[answer.sector] = (
-                imbalance_by_sector.get(answer.sector, 0.0) + answer.balance
+            agg.imbalance_by_sector[answer.sector] = (
+                agg.imbalance_by_sector.get(answer.sector, 0.0) + answer.balance
             )
             for sec_str, val in (getattr(answer, "unmet_by_sector", {}) or {}).items():
                 try:
                     sec_enum = Sector(sec_str)
                 except ValueError:
                     continue
-                unmet_by_sector_total[sec_enum] = (
-                    unmet_by_sector_total.get(sec_enum, 0.0) + float(val)
+                agg.unmet_by_sector_total[sec_enum] = (
+                    agg.unmet_by_sector_total.get(sec_enum, 0.0) + float(val)
                 )
             w = aggregate_priority_weight(
                 answer.demand_by_priority, answer.served_by_priority
             )
-            sector_priority_weight[answer.sector] = (
-                sector_priority_weight.get(answer.sector, 0.0) + w
+            agg.sector_priority_weight[answer.sector] = (
+                agg.sector_priority_weight.get(answer.sector, 0.0) + w
             )
-            # Per-sector top-tier scan: for each (sector, tier) cell
-            # with positive unserved demand, retain the lowest tier
-            # (= highest priority) seen so far and its magnitude.
             dem_map = getattr(answer, "demand_by_sector_priority", {}) or {}
             srv_map = getattr(answer, "served_by_sector_priority", {}) or {}
             for sec_str, tier_to_dem in dem_map.items():
@@ -600,18 +613,64 @@ class EnergyConverterRole(Role):
                     unmet = max(0.0, float(dem) - float(sec_srv.get(tier, 0.0)))
                     if unmet < 1e-9:
                         continue
-                    cur_tier = top_unmet_tier_per_sector.get(sec_enum)
+                    cur_tier = agg.top_unmet_tier_per_sector.get(sec_enum)
                     if cur_tier is None or int(tier) < cur_tier:
-                        top_unmet_tier_per_sector[sec_enum] = int(tier)
-                        top_unmet_mag_per_sector[sec_enum] = unmet
+                        agg.top_unmet_tier_per_sector[sec_enum] = int(tier)
+                        agg.top_unmet_mag_per_sector[sec_enum] = unmet
                     elif int(tier) == cur_tier:
-                        top_unmet_mag_per_sector[sec_enum] = (
-                            top_unmet_mag_per_sector.get(sec_enum, 0.0) + unmet
+                        agg.top_unmet_mag_per_sector[sec_enum] = (
+                            agg.top_unmet_mag_per_sector.get(sec_enum, 0.0) + unmet
                         )
+        return agg
 
-        # Combine balance + unmet into the T vector.  Unmet is unsigned
-        # (always positive deficit) so it shifts T toward positive in
-        # sectors with disconnected loads.
+    def _compute_sector_priorities(self, np, agg: _FlexAggregate):
+        """F4 top-tier-dominant priority weights for the ADMM sharing
+        problem.  A sector whose lowest unmet tier is ``t`` outranks any
+        sector with top tier ``t' > t``; within a tier, magnitude is a
+        bounded ``log1p`` tiebreaker.  Falls back to the aggregated
+        magnitude weight when ``demand_by_sector_priority`` is absent.
+        Result normalised to ``[0.01, 1]``.
+        """
+        from scare.base.util import tier_priority_weight
+
+        def _sector_w(sec: Sector) -> float:
+            top_tier = agg.top_unmet_tier_per_sector.get(sec)
+            if top_tier is None:
+                return agg.sector_priority_weight.get(sec, 1.0) or 1.0
+            base = tier_priority_weight(top_tier, regime=1, priority_tiers=10)
+            mag = agg.top_unmet_mag_per_sector.get(sec, 0.0)
+            return base * (1.0 + 0.5 * math.log1p(mag))
+
+        w_el = _sector_w(Sector.ELECTRICITY)
+        w_heat = _sector_w(Sector.HEAT)
+        w_gas = _sector_w(Sector.GAS)
+        w_max = max(w_el, w_heat, w_gas, 1e-9)
+        priorities = np.array([w_el, w_heat, w_gas]) / w_max
+        return np.maximum(priorities, 0.01)
+
+    async def _run_admm(self) -> None:
+        import numpy as np
+        from distributed_resource_optimization import (
+            create_admm_sharing_data,
+            create_admm_start,
+            create_sharing_target_distance_admm_coordinator,
+            start_coordinated_optimization,
+        )
+
+        answers = self._flex_answers[:]
+        self._flex_answers = []
+        self._flex_expected = 0
+
+        agg = self._aggregate_flex_answers(answers)
+        imbalance_by_sector = agg.imbalance_by_sector
+        unmet_by_sector_total = agg.unmet_by_sector_total
+        sector_priority_weight = agg.sector_priority_weight
+        top_unmet_tier_per_sector = agg.top_unmet_tier_per_sector
+        top_unmet_mag_per_sector = agg.top_unmet_mag_per_sector
+
+        # Combine balance + unsigned ``unmet`` into the T vector so a
+        # sector whose loads are disconnected (balance≈0) is still
+        # represented as a positive deficit.
         imb_el = (
             imbalance_by_sector.get(Sector.ELECTRICITY, 0.0)
             + unmet_by_sector_total.get(Sector.ELECTRICITY, 0.0)
@@ -662,41 +721,7 @@ class EnergyConverterRole(Role):
             self._active = False
             return
 
-        # Per-sector priority weights for the ADMM sharing problem.
-        # F4: top-tier-dominant — a sector whose most critical unmet
-        # tier is t outranks any sector whose top unmet tier is t'>t,
-        # regardless of magnitudes.  Within the same top-tier, larger
-        # magnitude wins.  Falls back to the legacy magnitude-weighted
-        # sum when there is no per-(sector, tier) info (older
-        # AvailableFlexAnswer messages without ``demand_by_sector_
-        # priority`` populated) so the answer.balance pathway still
-        # produces a working ADMM weighting.
-        from scare.base.util import tier_priority_weight
-
-        def _sector_w(sec: Sector) -> float:
-            top_tier = top_unmet_tier_per_sector.get(sec)
-            if top_tier is None:
-                # No per-tier data — fall back to the legacy aggregated
-                # weight (or 1.0 if neither is populated).
-                return sector_priority_weight.get(sec, 1.0) or 1.0
-            base = tier_priority_weight(
-                top_tier, regime=1, priority_tiers=10
-            )
-            mag = top_unmet_mag_per_sector.get(sec, 0.0)
-            # Magnitude tiebreaker scaled to stay below the next-tier
-            # base (each tier doubles).  log1p keeps the contribution
-            # bounded so a huge tier-5 cannot promote itself past a
-            # small tier-4.
-            import math as _math
-
-            return base * (1.0 + 0.5 * _math.log1p(mag))
-
-        w_el = _sector_w(Sector.ELECTRICITY)
-        w_heat = _sector_w(Sector.HEAT)
-        w_gas = _sector_w(Sector.GAS)
-        w_max = max(w_el, w_heat, w_gas, 1e-9)
-        priorities = np.array([w_el, w_heat, w_gas]) / w_max  # normalise to [0, 1]
-        priorities = np.maximum(priorities, 0.01)  # floor to avoid zero-weight
+        priorities = self._compute_sector_priorities(np, agg)
 
         coordinator = create_sharing_target_distance_admm_coordinator()
         start_msg = create_admm_start(
@@ -707,49 +732,7 @@ class EnergyConverterRole(Role):
             await start_coordinated_optimization(
                 [self.flex_actor], coordinator, start_msg
             )
-            result = list(self.flex_actor.x)
-            # Cross-sector coalition envelope clamp.  When an L2.5
-            # coalition has committed directional sector flows for
-            # this CP, narrow each dimension of the ADMM result to
-            # the committed value (small tolerance for ADMM noise).
-            # The coalition runs ahead of L3 in the protocol stack —
-            # its commitment is the contract; L3's job is only to
-            # honour it.  Cleared by the envelope's TTL or a branch
-            # failure invalidation, after which L3 resumes free
-            # optimisation.
-            if self._envelope_active():
-                envelope = self._envelope_flows_mw or {}
-                pre_clamp = list(result)
-                for sector, idx in _RESULT_INDEX.items():
-                    if idx >= len(result):
-                        continue
-                    if sector in envelope:
-                        committed = float(envelope[sector])
-                        # MW for el/heat, but ADMM works in MW
-                        # everywhere — the same scale as ``envelope``
-                        # so direct substitution is correct.
-                        if sector == Sector.GAS:
-                            committed = mw_to_kgps(committed)
-                            committed = kgps_to_mw(committed)  # round-trip no-op for unit clarity
-                        result[idx] = committed
-                logger.info(
-                    "[%s] CP ADMM result clamped to coalition envelope %s: %s",
-                    self.context.aid, self._envelope_coalition_id, result,
-                )
-                from scare.base.diagnostics import record_event
-
-                record_event(
-                    t=float(self.context.current_timestamp),
-                    kind="cp_envelope_clamp",
-                    aid=str(self.context.aid),
-                    sector="cp",
-                    detail=(
-                        f"coalition={self._envelope_coalition_id} "
-                        f"pre={pre_clamp} post={result}"
-                    ),
-                )
-            else:
-                logger.info("[%s] ADMM result: %s", self.context.aid, result)
+            result = self._clamp_to_envelope(list(self.flex_actor.x))
             # ``_apply_result`` must run *before* ``emit_event``: nothing
             # subscribes to ``OptimizationFinishedLocalEvent``, so the
             # underlying ``RoleHandler.emit_event`` raises ``KeyError``

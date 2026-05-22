@@ -75,13 +75,6 @@ _SECTOR_GRID_MATCH: dict[Sector, str] = {
     Sector.HEAT: "water",
 }
 
-# NB: ``model.is_cp()`` is the only authoritative check.  Earlier
-# revisions kept a substring-matcher fallback against names like
-# ``"powertogasmodel"`` — but monee's actual class names lack the
-# ``"model"`` suffix (``PowerToGas`` / ``Chp`` / ``GasToPower``), so
-# that branch never matched and was inert defensive code.  Removed.
-
-
 def _branch_sector_str(branch: Any, monee_net: Any) -> str:
     """Sector tag for a physical branch — used by the distributed
     failure-notice propagation in ``ProblemDetector`` to decide which
@@ -436,34 +429,14 @@ def _flush_pending_negotiations(world: SimulationWorld) -> None:
                 role.flush_pending()
 
 
-def _populate_world(
-    world: SimulationWorld,
+def _build_branch_sector_tables(
     monee_net: Any,
-    behavior: RestorationEnvironmentBehavior,
-    priorities: dict[str, int],
-    config: RestorationConfiguration,
-) -> None:
-    from distributed_resource_optimization import (
-        create_sharing_target_distance_admm_coordinator,
-    )
-    from distributed_resource_optimization.carrier.mango import CoordinatorRole
-
-    from scare.base.admm import (
-        ScareDistributedOptimizationRole as DistributedOptimizationRole,
-    )
-
-
-    centrality = edge_centrality(monee_net)
-
-    # --- Build distributed-propagation lookup tables ---------------------
-    # ``ProblemDetector`` needs three pieces of locally-acquirable state:
-    #   - the failing branch's sector (read once at endpoint detection)
-    #   - the sector of each grid edge leaving its node (decides forward
-    #     cost in ``_propagate``)
-    #   - the addresses of children co-located on its node (where the
-    #     notice is delivered for negotiator triggering)
-    # Computed once at scenario time so each detector receives only what
-    # it locally needs — no detector ever queries the global graph.
+) -> tuple[dict[tuple, str], dict[Any, dict[Any, str]]]:
+    """Build the per-branch + per-node sector lookup tables that the
+    ``ProblemDetector`` needs to decide forward-cost on each grid edge
+    without ever consulting the global graph.  Returned tuple is
+    ``(branch_sector_by_id, neighbour_sector_by_node)``.
+    """
     branch_sector_by_id: dict[tuple, str] = {}
     neighbour_sector_by_node: dict[Any, dict[Any, str]] = {}
     for branch in monee_net.branches:
@@ -474,8 +447,16 @@ def _populate_world(
         a, b = branch.id[0], branch.id[1]
         neighbour_sector_by_node.setdefault(a, {})[b] = sec
         neighbour_sector_by_node.setdefault(b, {})[a] = sec
-    behavior._scare_branch_sector = branch_sector_by_id
+    return branch_sector_by_id, neighbour_sector_by_node
 
+
+def _populate_children(
+    world: SimulationWorld,
+    monee_net: Any,
+    behavior: RestorationEnvironmentBehavior,
+    priorities: dict[str, int],
+    config: RestorationConfiguration,
+) -> None:
     for child in monee_net.childs:
         aid = _child_aid(child.id)
         # Read from network model directly — behavior.observe() requires energyflow
@@ -527,20 +508,7 @@ def _populate_world(
 
         roles = []
         if sector is not None:
-            roles.append(
-                create_energy_balance_role(
-                    behavior,
-                    sector,
-                    obs,
-                    priority=explicit_priority,
-                    constraint_aware=config.enable_constraint_aware_gossip,
-                    enable_monotonic_floor=config.enable_monotonic_floor,
-                    enable_clpu_ramp=config.enable_clpu_ramp,
-                    termination_tolerance=config.gossip_termination_tolerance,
-                    max_hops=config.gossip_max_hops,
-                    enable_qp_gossip=config.enable_qp_gossip,
-                )
-            )
+            roles.append(_make_balance_role(behavior, sector, obs, config, priority=explicit_priority))
             roles.append(GenerationController(behavior, sector))
             # Grid constraint monitoring (voltage / pressure / temperature)
             roles.append(
@@ -583,11 +551,17 @@ def _populate_world(
                     )
                 )
 
-        agent = world.register(RoleAgent(), suggested_aid=aid)
-        for role in roles:
-            agent.add_role(role)
-        behavior.install(agent, id=child.id, type="child")
+        _register_agent(world, behavior, aid, roles, monee_id=child.id, monee_type="child")
 
+
+def _populate_nodes(
+    world: SimulationWorld,
+    monee_net: Any,
+    behavior: RestorationEnvironmentBehavior,
+    priorities: dict[str, int],
+    config: RestorationConfiguration,
+    neighbour_sector_by_node: dict[Any, dict[Any, str]],
+) -> None:
     for node in monee_net.nodes:
         aid = _node_aid(node.id)
         register_sector(behavior, aid, sector_from_grid(node.grid))
@@ -621,21 +595,19 @@ def _populate_world(
         obs = dict(node.model.values)
         cp_type = _detect_cp_type_for_node(node, monee_net)
         if cp_type is not None and config.enable_cp_admm:
-            flex_actor, sectors = _build_cp_flex_actor(
-                cp_type, obs, priorities.get(aid, 0)
-            )
-            if flex_actor is not None:
-                roles.append(EnergyConverterRole(behavior, flex_actor, sectors))
-                roles.append(DistributedOptimizationRole(flex_actor))
-                roles.append(
-                    CoordinatorRole(create_sharing_target_distance_admm_coordinator())
-                )
+            _attach_cp_roles(roles, behavior, cp_type, obs, priorities.get(aid, 0))
 
-        agent = world.register(RoleAgent(), suggested_aid=aid)
-        for role in roles:
-            agent.add_role(role)
-        behavior.install(agent, id=node.id, type="node")
+        _register_agent(world, behavior, aid, roles, monee_id=node.id, monee_type="node")
 
+
+def _populate_branches(
+    world: SimulationWorld,
+    monee_net: Any,
+    behavior: RestorationEnvironmentBehavior,
+    priorities: dict[str, int],
+    config: RestorationConfiguration,
+    centrality: dict,
+) -> None:
     for branch in monee_net.branches:
         aid = create_branch_aid(branch.id)
         obs = dict(branch.model.values)
@@ -644,72 +616,23 @@ def _populate_world(
         roles = []
 
         if "heatexchanger" in branch_type:
-            roles.append(
-                create_energy_balance_role(
-                    behavior,
-                    Sector.HEAT,
-                    obs,
-                    constraint_aware=config.enable_constraint_aware_gossip,
-                    enable_monotonic_floor=config.enable_monotonic_floor,
-                    enable_clpu_ramp=config.enable_clpu_ramp,
-                    termination_tolerance=config.gossip_termination_tolerance,
-                    max_hops=config.gossip_max_hops,
-                    enable_qp_gossip=config.enable_qp_gossip,
-                )
-            )
+            roles.append(_make_balance_role(behavior, Sector.HEAT, obs, config))
             roles.append(GenerationController(behavior, Sector.HEAT))
 
         elif "powertogas" in branch_type and config.enable_cp_admm:
-            # NB: monee's model class names are lowercased to ``"powertogas"``
-            # / ``"gastopower"`` / ``"powertoheathg"`` (no ``"model"`` suffix).
-            # The earlier substring check required ``"powertogasmodel"`` and
-            # therefore never matched in practice — every P2G branch became a
-            # bare ``RoleAgent`` with no ``EnergyConverterRole``, and the
-            # Layer-3 cross-sector ADMM never fired on cp_heavy_45 / cp_heavy_
-            # dependent_30 grids.  ``"powertogas"`` matches both names.
-            flex_actor, sectors = _build_cp_flex_actor(
-                "p2g", obs, priorities.get(aid, 0)
-            )
-            if flex_actor:
-                roles.append(EnergyConverterRole(behavior, flex_actor, sectors))
-                roles.append(DistributedOptimizationRole(flex_actor))
-                roles.append(
-                    CoordinatorRole(create_sharing_target_distance_admm_coordinator())
-                )
-
+            _attach_cp_roles(roles, behavior, "p2g", obs, priorities.get(aid, 0))
         elif "gastopower" in branch_type and config.enable_cp_admm:
-            flex_actor, sectors = _build_cp_flex_actor(
-                "g2p", obs, priorities.get(aid, 0)
-            )
-            if flex_actor:
-                roles.append(EnergyConverterRole(behavior, flex_actor, sectors))
-                roles.append(DistributedOptimizationRole(flex_actor))
-                roles.append(
-                    CoordinatorRole(create_sharing_target_distance_admm_coordinator())
-                )
-
+            _attach_cp_roles(roles, behavior, "g2p", obs, priorities.get(aid, 0))
         elif "powertoheat" in branch_type and config.enable_cp_admm:
-            # ``powertoheathg`` is the high-grade-heat variant exposed as
-            # a branch in cp_heavy_dependent grids; previously absent
-            # from the if-chain so these CPs had no role installed.
-            flex_actor, sectors = _build_cp_flex_actor(
-                "p2h", obs, priorities.get(aid, 0)
-            )
-            if flex_actor:
-                roles.append(EnergyConverterRole(behavior, flex_actor, sectors))
-                roles.append(DistributedOptimizationRole(flex_actor))
-                roles.append(
-                    CoordinatorRole(create_sharing_target_distance_admm_coordinator())
-                )
+            _attach_cp_roles(roles, behavior, "p2h", obs, priorities.get(aid, 0))
 
         elif hasattr(branch.model, "on_off"):
             cent = get_by_branch_id(centrality, branch.id)
             roles.append(GridTieSwitchOperator(behavior, branch.id, centrality=cent))
 
-        # Line-loading monitor on every electricity power line (whether
-        # switchable or not, whether the if-chain above already added a
-        # GridTieSwitchOperator or not).  home_leader_addr is filled in
-        # by ``_assign_line_monitor_home_leaders`` after the groups
+        # Line-loading monitor on electricity power lines (whether
+        # switchable or not).  home_leader_addr is filled in by
+        # ``_assign_line_monitor_home_leaders`` after the groups
         # topology is built.
         branch_sector = _branch_sector_str(branch, monee_net)
         if (
@@ -729,10 +652,24 @@ def _populate_world(
             )
 
         if roles:
-            agent = world.register(RoleAgent(), suggested_aid=aid)
-            for role in roles:
-                agent.add_role(role)
-            behavior.install(agent, id=branch.id, type="branch")
+            _register_agent(world, behavior, aid, roles, monee_id=branch.id, monee_type="branch")
+
+
+def _populate_world(
+    world: SimulationWorld,
+    monee_net: Any,
+    behavior: RestorationEnvironmentBehavior,
+    priorities: dict[str, int],
+    config: RestorationConfiguration,
+) -> None:
+    centrality = edge_centrality(monee_net)
+    branch_sector_by_id, neighbour_sector_by_node = _build_branch_sector_tables(monee_net)
+    behavior._scare_branch_sector = branch_sector_by_id
+    _populate_children(world, monee_net, behavior, priorities, config)
+    _populate_nodes(
+        world, monee_net, behavior, priorities, config, neighbour_sector_by_node
+    )
+    _populate_branches(world, monee_net, behavior, priorities, config, centrality)
 
 
 def _detect_cp_type_for_node(node: Any, monee_net: Any) -> str | None:
@@ -747,6 +684,81 @@ def _detect_cp_type_for_node(node: Any, monee_net: Any) -> str | None:
         if any(s in t for s in ("chp", "powertogas", "gastopower", "powertoheat")):
             return t
     return None
+
+
+def _make_balance_role(
+    behavior: Any,
+    sector: Sector,
+    obs: dict,
+    config: RestorationConfiguration,
+    *,
+    priority: int | None = None,
+):
+    """``create_energy_balance_role`` with the per-scenario gossip flags
+    plumbed from *config* in one place.
+    """
+    return create_energy_balance_role(
+        behavior,
+        sector,
+        obs,
+        priority=priority,
+        constraint_aware=config.enable_constraint_aware_gossip,
+        enable_monotonic_floor=config.enable_monotonic_floor,
+        enable_clpu_ramp=config.enable_clpu_ramp,
+        termination_tolerance=config.gossip_termination_tolerance,
+        max_hops=config.gossip_max_hops,
+        enable_qp_gossip=config.enable_qp_gossip,
+    )
+
+
+def _register_agent(
+    world: SimulationWorld,
+    behavior: Any,
+    aid: str,
+    roles: list,
+    *,
+    monee_id: Any,
+    monee_type: str,
+) -> Any:
+    """Register a ``RoleAgent`` with *aid*, attach each role, and bind it
+    to its monee object via ``behavior.install``.
+    """
+    agent = world.register(RoleAgent(), suggested_aid=aid)
+    for role in roles:
+        agent.add_role(role)
+    behavior.install(agent, id=monee_id, type=monee_type)
+    return agent
+
+
+def _attach_cp_roles(
+    roles: list,
+    behavior: Any,
+    cp_type: str,
+    obs: dict,
+    priority: int,
+) -> None:
+    """Mutate *roles* in place: append the three CP roles
+    (``EnergyConverterRole`` + ``DistributedOptimizationRole`` +
+    ``CoordinatorRole``).  No-op when ``_build_cp_flex_actor`` returns
+    ``None`` (unknown *cp_type*).  Returns ``None``.
+    """
+    from distributed_resource_optimization import (
+        create_sharing_target_distance_admm_coordinator,
+    )
+    from distributed_resource_optimization.carrier.mango import CoordinatorRole
+
+    from scare.base.admm import (
+        ScareDistributedOptimizationRole as DistributedOptimizationRole,
+    )
+
+    flex_actor, sectors = _build_cp_flex_actor(cp_type, obs, priority)
+    if flex_actor is None:
+        return
+    roles.append(EnergyConverterRole(behavior, flex_actor, sectors))
+    roles.append(DistributedOptimizationRole(flex_actor))
+    roles.append(
+        CoordinatorRole(create_sharing_target_distance_admm_coordinator())
+    )
 
 
 def _build_cp_flex_actor(
@@ -1665,6 +1677,47 @@ def _register_recordings(
     record_world(world, "electrical_balance", lambda: _sum_regulation(el_child_aids))
     record_world(world, "gas_balance", lambda: _sum_regulation(gas_child_aids))
     record_world(world, "heat_balance", lambda: _sum_regulation(heat_child_aids))
+
+    # External-grid slack trajectory.  One column per ExtPowerGrid /
+    # ExtHydrGrid child, named ``slack__<sector>__<aid>``, carrying the
+    # LP-chosen operating point at each tick — ``p_mw`` on ExtPowerGrid
+    # (electricity) and ``mass_flow`` on ExtHydrGrid (gas / heat).  Used
+    # by the validity overview's slack-trajectory plot to confirm the
+    # MAS is driving the slack toward the operator's budgeted infeed
+    # rather than letting it absorb everything.
+    from monee.model.child import ExtHydrGrid, ExtPowerGrid
+
+    def _slack_obs(aid: str, key: str) -> float:
+        obs = behavior.observe(aid)
+        if not obs or key not in obs:
+            return 0.0
+        try:
+            return float(obs[key])
+        except (TypeError, ValueError):
+            return 0.0
+
+    for child in monee_net.childs:
+        m = child.model
+        if isinstance(m, ExtPowerGrid):
+            obs_key = "p_mw"
+        elif isinstance(m, ExtHydrGrid):
+            obs_key = "mass_flow"
+        else:
+            continue
+        try:
+            node = monee_net.node_by_id(child.node_id)
+            sector = sector_from_grid(node.grid)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("slack recording: sector lookup failed for %s: %s",
+                         child.id, exc)
+            continue
+        if sector is None:
+            continue
+        aid = _child_aid(child.id)
+        col = f"slack__{sector.value}__{aid}"
+        # Closure-captures ``aid`` / ``obs_key`` per child via default
+        # args so the lambda doesn't see the loop's last values.
+        record_world(world, col, lambda a=aid, k=obs_key: _slack_obs(a, k))
 
     # Per-coalition (Level-1 group) and per-holon (Level-2 chunk)
     # regulation sums.  Emitted as ``coalition_balance__<sec>__<idx>`` /

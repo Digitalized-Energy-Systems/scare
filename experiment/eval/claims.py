@@ -244,6 +244,10 @@ def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_WARMUP_S: float = 1.0
+_DROP_TOL: float = 0.05
+
+
 def _check_monotonic_progress(
     timeseries_path: Path, events_path: Path
 ) -> dict[str, Any]:
@@ -256,6 +260,27 @@ def _check_monotonic_progress(
     ``electrical_balance`` / ``gas_balance`` / ``heat_balance`` series.
     A drop below ``_DROP_TOL`` of the series' max counts as a
     violation.
+
+    The check excludes:
+
+    1. **Warm-up window** (``t < _WARMUP_S``): the simulation starts
+       with every child at ``regulation = 1.0`` (the LP default before
+       any MAS decision) and the first holon-ADMM / coalition
+       dispatch lands around ``t ≈ 0.1–0.5 s``.  The transition from
+       "everyone at 1.0" to "MAS-equilibrium" is *initial dispatch*,
+       not a restoration regression — counting it as a violation
+       conflated agent convergence with the no-regret-switching
+       property this claim is meant to test.  Drops inside the
+       window are skipped.
+    2. **Active constraint-violation windows** (per sector): drops
+       inside a ``constraint_violation`` window are part of the
+       defensive shed path and pre-existed before this claim's
+       formulation.
+    3. **Post-failure ringing** (``Δt ≤ _POST_FAILURE_S``): every
+       branch / node / custom ``*FailureEvent`` opens a short
+       quiescence window.  Disconnecting a node forces the LP to
+       drop served loads on disconnected components — a legitimate
+       physical drop, not an agent-level regression.
     """
     if not timeseries_path.exists():
         return {"passed": True, "detail": "no timeseries"}
@@ -268,6 +293,9 @@ def _check_monotonic_progress(
     # available these tighten the check; otherwise we treat the entire
     # run as "no violation" — coarse but safe.
     violations_by_sec = _violation_windows(events_path) if events_path.exists() else {}
+    failure_windows = (
+        _failure_windows(events_path) if events_path.exists() else []
+    )
 
     sectors = {
         "electricity": "electrical_balance",
@@ -285,20 +313,61 @@ def _check_monotonic_progress(
         worst = 0.0
         windows = violations_by_sec.get(sec, []) + violations_by_sec.get("*", [])
         for i in range(1, len(ys)):
+            if t[i] < _WARMUP_S:
+                continue
             in_violation = any(lo <= t[i] <= hi for lo, hi in windows)
             if in_violation:
+                continue
+            in_failure_ringdown = any(lo <= t[i] <= hi for lo, hi in failure_windows)
+            if in_failure_ringdown:
                 continue
             drop = ys[i - 1] - ys[i]   # positive if value dropped
             if drop > worst:
                 worst = drop
         drops[sec] = worst / max_y
 
-    _DROP_TOL = 0.05
     passed = all(d < _DROP_TOL for d in drops.values())
     return {
         "passed": passed,
-        "detail": {"per_sector_relative_drop": drops, "tol": _DROP_TOL},
+        "detail": {
+            "per_sector_relative_drop": drops,
+            "tol": _DROP_TOL,
+            "warmup_s": _WARMUP_S,
+        },
     }
+
+
+_POST_FAILURE_S: float = 2.0
+
+
+def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
+    """Return ``[(t_fail, t_fail + _POST_FAILURE_S)]`` for every
+    failure event in the run.  Branch / node / custom failures all
+    qualify — each opens a short quiescence window in which a
+    monotonic-progress drop is physical, not a SCARE regression.
+
+    Coalition / holon-priority allocations are *not* excluded —
+    those represent the system deliberately re-allocating among
+    tiers, and silencing the aggregate-regulation drop they produce
+    would mask exactly the regret-switching the claim exists to
+    detect.  When the per-tick redistribution is small enough (as
+    with the worst-gap-only target in the L2.5 coalition), this
+    aggregate metric tolerates it; if a coalition shows up here as
+    a violation, the redistribution was large enough that it
+    deserves attention rather than a free pass.
+    """
+    rows = _read_csv(events_path)
+    windows: list[tuple[float, float]] = []
+    for r in rows:
+        kind = r.get("kind", "")
+        if kind not in ("branch_failure", "node_failure", "custom_failure", "line_failure"):
+            continue
+        try:
+            t = float(r.get("t", ""))
+        except (TypeError, ValueError):
+            continue
+        windows.append((t, t + _POST_FAILURE_S))
+    return windows
 
 
 # ---------------------------------------------------------------------------

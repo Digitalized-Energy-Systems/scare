@@ -146,13 +146,9 @@ class HolonicCommunityRole(Role):
                 f"holon admm_mode must be 'demand' or 'supply', got {admm_mode!r}"
             )
         self.admm_mode = admm_mode
-        # Priority-weighted allocation switch.  When False, both the
-        # legacy per-sector ADMM and the supply-priority ADMM use
-        # uniform per-tier weights — equivalent to the no-priority
-        # ablation.  Wired from ``RestorationConfiguration``'s
-        # ``enable_priority_holon_allocation`` so the eval-campaign
-        # ablation toggle actually changes behaviour (previously the
-        # flag was unread and the ablation column was a no-op).
+        # Priority-weighted allocation switch.  When False, legacy and
+        # supply-priority ADMM use uniform per-tier weights (no-priority
+        # ablation).
         self.enable_priority_allocation = bool(enable_priority_allocation)
         # Deliverability wiring (F6).  When all three are present, the
         # supply-priority ADMM passes ``actor_ub_overrides`` that cap
@@ -234,9 +230,7 @@ class HolonicCommunityRole(Role):
         # (no holon yet, not leader, no neighbours) surface once at INFO
         # per leader instead of either (a) being silent at DEBUG or (b)
         # spamming on every periodic tick.
-        self._logged_no_holon: bool = False
-        self._logged_not_leader: bool = False
-        self._logged_no_neighbours: bool = False
+        self._idle_logged: set[str] = set()
 
         # --- B.2: Hebbian co-variance state ---
         # Each leader keeps a per-peer running mean of (delta_g · delta_h)
@@ -463,15 +457,7 @@ class HolonicCommunityRole(Role):
             hid,
             len(accepted_addrs) + 1,
         )
-        from scare.base.diagnostics import record_event
-
-        record_event(
-            t=self.context.current_timestamp,
-            kind="holon_formed",
-            aid=self.context.aid,
-            sector=self.sector.value,
-            detail=f"members={len(accepted_addrs) + 1}",
-        )
+        self._record_event("holon_formed", f"members={len(accepted_addrs) + 1}")
         # Reactive Layer-2 trigger: rebalance immediately after the
         # holon has finished forming.  The periodic ``_try_rebalance``
         # loop alone would otherwise wait up to ``rebalance_period_s``
@@ -512,6 +498,44 @@ class HolonicCommunityRole(Role):
             )
         return kept
 
+    def _log_idle_once(self, reason: str) -> None:
+        """One-shot info log for a recurring idle condition (per-reason)."""
+        if reason in self._idle_logged:
+            return
+        self._idle_logged.add(reason)
+        logger.info(
+            "[%s] holon rebalance idle: %s (sector=%s)",
+            self.context.aid, reason, self.sector.value,
+        )
+
+    def _record_event(self, kind: str, detail: str) -> None:
+        """Record a diagnostic event with the standard
+        ``(t, kind, aid, sector, detail)`` shape used throughout this
+        role.  Lazy import of ``record_event`` so optional diagnostics
+        machinery doesn't load at import-time.
+        """
+        from scare.base.diagnostics import record_event
+
+        record_event(
+            t=self.context.current_timestamp,
+            kind=kind,
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=detail,
+        )
+
+    def _resolve_holon_members(self) -> list[Any]:
+        """Return holon member addresses, preferring the formation-time
+        list and falling back to the ``"holons"`` topology neighbours
+        ([] if the topology isn't wired).
+        """
+        if self._holon_member_addrs:
+            return list(self._holon_member_addrs)
+        try:
+            return topology_neighbors(self, tid="holons")
+        except Exception:
+            return []
+
     async def _try_rebalance(self) -> None:
         """Holon leader collects flex from member groups and runs ADMM
         to redistribute resources.  Fired periodically (slow heartbeat
@@ -529,22 +553,10 @@ class HolonicCommunityRole(Role):
             return
         assignment = self.context.get_or_create_model(HolonicAssignment)
         if assignment.holon_id is None:
-            if not self._logged_no_holon:
-                logger.info(
-                    "[%s] holon rebalance idle: no holon assigned (sector=%s)",
-                    self.context.aid,
-                    self.sector.value,
-                )
-                self._logged_no_holon = True
+            self._log_idle_once("no holon assigned")
             return
         if assignment.parent_addr is not None:
-            if not self._logged_not_leader:
-                logger.info(
-                    "[%s] holon rebalance idle: not leader (sector=%s)",
-                    self.context.aid,
-                    self.sector.value,
-                )
-                self._logged_not_leader = True
+            self._log_idle_once("not leader")
             return
         if self._rebalance_active:
             logger.debug("[%s] rebalance skipped: active", self.context.aid)
@@ -568,13 +580,7 @@ class HolonicCommunityRole(Role):
         # returns the input list unchanged so legacy behaviour stands.
         members = self._live_members(members)
         if not members:
-            if not self._logged_no_neighbours:
-                logger.info(
-                    "[%s] holon rebalance idle: no neighbours (sector=%s)",
-                    self.context.aid,
-                    self.sector.value,
-                )
-                self._logged_no_neighbours = True
+            self._log_idle_once("no neighbours")
             return
 
         self._rebalance_active = True
@@ -1033,8 +1039,6 @@ class HolonicCommunityRole(Role):
         coordinator.abs_tol = float(self.admm_abs_tol)
         start_msg = create_admm_start(create_admm_sharing_data(total_T.tolist()))
 
-        from scare.base.diagnostics import record_event
-
         try:
             await start_coordinated_optimization(actors, coordinator, start_msg)
             results = [a.x.tolist() for a in actors]
@@ -1045,22 +1049,13 @@ class HolonicCommunityRole(Role):
                 results,
                 total_T.tolist(),
             )
-            record_event(
-                t=self.context.current_timestamp,
-                kind="holon_admm_result",
-                aid=self.context.aid,
-                sector=self.sector.value,
-                detail=f"sectors={all_sectors} T={total_T.tolist()}",
+            self._record_event(
+                "holon_admm_result",
+                f"sectors={all_sectors} T={total_T.tolist()}",
             )
         except Exception as exc:
             logger.error("[%s] holon ADMM failed: %s", self.context.aid, exc)
-            record_event(
-                t=self.context.current_timestamp,
-                kind="holon_admm_failed",
-                aid=self.context.aid,
-                sector=self.sector.value,
-                detail=str(exc),
-            )
+            self._record_event("holon_admm_failed", str(exc))
             # Fallback: still trigger intra-group gossip so member groups
             # can rebalance locally even without inter-group redistribution.
 
@@ -1080,13 +1075,7 @@ class HolonicCommunityRole(Role):
         for sender, answer, actor in zip(senders, answers, actors):
             sender_to_actor[str(sender)] = (actor, answer)
 
-        if self._holon_member_addrs:
-            triggers = list(self._holon_member_addrs)
-        else:
-            try:
-                triggers = topology_neighbors(self, tid="holons")
-            except Exception:
-                triggers = []
+        triggers = self._resolve_holon_members()
         # Collect per-member overrides into the targets dict the
         # ``HolonAllocation`` Decision will carry, *and* push the
         # legacy ``StartBalanceNegotiation`` to keep L1's existing
@@ -1412,8 +1401,6 @@ class HolonicCommunityRole(Role):
             )
         )
 
-        from scare.base.diagnostics import record_event
-
         try:
             await start_coordinated_optimization(actors, coordinator, start_msg)
         except Exception as exc:
@@ -1421,13 +1408,7 @@ class HolonicCommunityRole(Role):
                 "[%s] tier-stratified holon ADMM failed: %s",
                 self.context.aid, exc,
             )
-            record_event(
-                t=self.context.current_timestamp,
-                kind="holon_admm_failed",
-                aid=self.context.aid,
-                sector=self.sector.value,
-                detail=f"tier_stratified: {exc}",
-            )
+            self._record_event("holon_admm_failed", f"tier_stratified: {exc}")
             return
 
         results = [a.x.tolist() for a in actors]
@@ -1454,26 +1435,16 @@ class HolonicCommunityRole(Role):
             self.context.aid, sectors, tiers, total_T.tolist(),
             sum_x_per_cell.tolist(),
         )
-        record_event(
-            t=self.context.current_timestamp,
-            kind="holon_admm_result",
-            aid=self.context.aid,
-            sector=self.sector.value,
-            detail=(
-                f"tier_stratified sectors={sectors} tiers={tiers} "
-                f"per_cell={per_cell_summary}"
-            ),
+        self._record_event(
+            "holon_admm_result",
+            f"tier_stratified sectors={sectors} tiers={tiers} per_cell={per_cell_summary}",
         )
-        # New diagnostic event specifically for priority-awareness
-        # verification: aggregate absorption per tier, weighted by
-        # priority, lets the post-run analysis check that the
-        # allocation respects the priority ordering.
-        record_event(
-            t=self.context.current_timestamp,
-            kind="holon_priority_allocation",
-            aid=self.context.aid,
-            sector=self.sector.value,
-            detail=str({
+        # Priority-awareness diagnostic: aggregate absorption per
+        # (sector, tier) cell with weight + T so post-run analysis can
+        # verify the allocation respects the priority ordering.
+        self._record_event(
+            "holon_priority_allocation",
+            str({
                 f"{sec}:tier{tier}": {
                     "T": round(float(total_T[_flat_idx(sec, tier)]), 6),
                     "weight": float(priorities[_flat_idx(sec, tier)]),
@@ -1491,13 +1462,7 @@ class HolonicCommunityRole(Role):
         for sender, x_vec in zip(senders, results):
             sender_to_x[str(sender)] = x_vec
 
-        if self._holon_member_addrs:
-            triggers = list(self._holon_member_addrs)
-        else:
-            try:
-                triggers = topology_neighbors(self, tid="holons")
-            except Exception:
-                triggers = []
+        triggers = self._resolve_holon_members()
 
         # Coalition deferral: when L2.5 has an active coalition
         # constraint for this leader's sector, the coalition owns the
@@ -1686,7 +1651,6 @@ class HolonicCommunityRole(Role):
         actor_supplies = [a.supply_by_sector or {} for a in answers]
         actor_demands = [a.demand_by_sector_priority or {} for a in answers]
 
-        from scare.base.diagnostics import record_event
         from scare.community.supply_priority_admm import (
             allocate_supply_priority,
         )
@@ -1733,9 +1697,19 @@ class HolonicCommunityRole(Role):
                             if sec not in sectors:
                                 continue
                             for tier, dem in tier_map.items():
-                                per_tier.setdefault(int(tier), {})[node_id] = (
-                                    per_tier[int(tier)].get(node_id, 0.0)
-                                    + float(dem)
+                                # NB: Python evaluates the RHS *before*
+                                # the LHS subscript target, so
+                                # ``per_tier.setdefault(k, {})[n] =
+                                # per_tier[k].get(...)`` raises
+                                # ``KeyError`` on the very first
+                                # encounter of each ``k`` — the
+                                # setdefault on the LHS hasn't run
+                                # yet when ``per_tier[k]`` on the RHS
+                                # is dereferenced.  Bind the inner
+                                # dict to a local first.
+                                inner = per_tier.setdefault(int(tier), {})
+                                inner[node_id] = (
+                                    inner.get(node_id, 0.0) + float(dem)
                                 )
                     actor_demand_nodes_by_tier.append(per_tier)
 
@@ -1748,8 +1722,8 @@ class HolonicCommunityRole(Role):
             except Exception as exc:
                 logger.warning(
                     "[%s] supply-priority holon: deliverability caps "
-                    "failed (%s) — falling back to raw supply",
-                    self.context.aid, exc,
+                    "failed (%s: %s) — falling back to raw supply",
+                    self.context.aid, type(exc).__name__, exc,
                 )
                 actor_ub_overrides = None
 
@@ -1770,13 +1744,7 @@ class HolonicCommunityRole(Role):
                 "[%s] supply-priority holon ADMM failed: %s",
                 self.context.aid, exc,
             )
-            record_event(
-                t=self.context.current_timestamp,
-                kind="holon_admm_failed",
-                aid=self.context.aid,
-                sector=self.sector.value,
-                detail=f"supply_priority: {exc}",
-            )
+            self._record_event("holon_admm_failed", f"supply_priority: {exc}")
             return
 
         total_T = meta["T_per_cell"]
@@ -1796,19 +1764,13 @@ class HolonicCommunityRole(Role):
             sum_x_per_cell,
             sum(meta["actor_supply_total"]),
         )
-        record_event(
-            t=self.context.current_timestamp,
-            kind="holon_admm_result",
-            aid=self.context.aid,
-            sector=self.sector.value,
-            detail=f"supply_priority sectors={sectors} tiers={tiers} fractions={service_fraction}",
+        self._record_event(
+            "holon_admm_result",
+            f"supply_priority sectors={sectors} tiers={tiers} fractions={service_fraction}",
         )
-        record_event(
-            t=self.context.current_timestamp,
-            kind="holon_priority_allocation",
-            aid=self.context.aid,
-            sector=self.sector.value,
-            detail=str({
+        self._record_event(
+            "holon_priority_allocation",
+            str({
                 f"{sec}:tier{tier}": {
                     "T": round(float(total_T[_flat_idx(sec, tier)]), 6),
                     "weight": float(priorities[_flat_idx(sec, tier)]),
@@ -1836,13 +1798,7 @@ class HolonicCommunityRole(Role):
         # Send the SAME service fraction map to every member leader
         # — the fractions are holon-global, so each leader applies
         # them locally.  This is the L1 honour path for Route A.
-        if self._holon_member_addrs:
-            triggers = list(self._holon_member_addrs)
-        else:
-            try:
-                triggers = topology_neighbors(self, tid="holons")
-            except Exception:
-                triggers = []
+        triggers = self._resolve_holon_members()
         for addr in triggers:
             await self.context.send_message(
                 StartBalanceNegotiation(
@@ -1889,17 +1845,10 @@ class HolonicCommunityRole(Role):
     async def _hebbian_beacon(self) -> None:
         """Periodic broadcast of own δ_g to same-sector neighbours.
 
-        The leader ALSO asks itself for fresh flex on each tick.
-        ``_peer_last_delta[own_key]`` is only populated by
-        ``_handle_flex_answer``, which fires on incoming
-        ``AvailableFlexAnswer`` messages.  Non-holon-leader leaders
-        never trigger a rebalance round (no ``_try_rebalance`` call),
-        so without an explicit self-ask their own δ_g stays at 0
-        forever — making every pairwise product δ_g · δ_h zero and
-        H_{gh} unable to cross any threshold.  Pre-2026-05 this
-        latent bug rendered the Hebbian co-variance estimate
-        identically zero for every peer; the recluster's
-        ``no_candidates`` early-return was the symptom.
+        The leader also asks itself for fresh flex each tick so its own
+        δ_g actually moves; without that self-ask, ``_peer_last_delta``
+        for the leader's own key would stay at 0 and every pairwise
+        H_{gh} term would be identically zero.
         """
         if not self.enable_hebbian_formation:
             return
@@ -1998,20 +1947,12 @@ class HolonicCommunityRole(Role):
         'await' expression``.  Pre-2026-05 this was an undiagnosed
         latent bug — Hebbian reclustering never actually fired.
         """
-        from scare.base.diagnostics import record_event
-
         if not self.enable_hebbian_formation:
             return
         if topology_characteristic(self, tid="groups") != "leader":
             return
         if self.context.current_timestamp < self._hebbian_warmup_until:
-            record_event(
-                t=self.context.current_timestamp,
-                kind="hebbian_recluster_attempted",
-                aid=self.context.aid,
-                sector=self.sector.value,
-                detail="warmup",
-            )
+            self._record_event("hebbian_recluster_attempted", "warmup")
             return
         assignment = self.context.get_or_create_model(HolonicAssignment)
         if assignment.holon_id is None or assignment.parent_addr is not None:
@@ -2019,13 +1960,7 @@ class HolonicCommunityRole(Role):
 
         candidates = self.hebbian_membership_candidates()
         if not candidates:
-            record_event(
-                t=self.context.current_timestamp,
-                kind="hebbian_recluster_attempted",
-                aid=self.context.aid,
-                sector=self.sector.value,
-                detail="no_candidates",
-            )
+            self._record_event("hebbian_recluster_attempted", "no_candidates")
             return
 
         # Resolve candidate keys back to addresses via the topology.
@@ -2047,13 +1982,7 @@ class HolonicCommunityRole(Role):
 
         prev_keys = self._holon_member_keys
         if new_keys == prev_keys:
-            record_event(
-                t=self.context.current_timestamp,
-                kind="hebbian_recluster_attempted",
-                aid=self.context.aid,
-                sector=self.sector.value,
-                detail="no_drift",
-            )
+            self._record_event("hebbian_recluster_attempted", "no_drift")
             return  # no drift
 
         self._holon_member_addrs = new_addrs
@@ -2066,10 +1995,7 @@ class HolonicCommunityRole(Role):
             self.sector.value,
         )
 
-        record_event(
-            t=self.context.current_timestamp,
-            kind="hebbian_recluster",
-            aid=self.context.aid,
-            sector=self.sector.value,
-            detail=f"members={len(new_keys)} drift={len(new_keys ^ prev_keys)}",
+        self._record_event(
+            "hebbian_recluster",
+            f"members={len(new_keys)} drift={len(new_keys ^ prev_keys)}",
         )

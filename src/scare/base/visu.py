@@ -6,6 +6,18 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _emit_figure(fig: Any, write_to: str | None, show: bool, *, log: bool = False) -> None:
+    if write_to:
+        if write_to.endswith(".html"):
+            fig.write_html(write_to)
+        else:
+            fig.write_image(write_to)
+        if log:
+            logger.info("Results written to %s", write_to)
+    if show:
+        fig.show()
+
+
 def visualize_results(
     world: Any,
     *,
@@ -56,15 +68,7 @@ def visualize_results(
     )
     fig.update_xaxes(title_text="Time [s]", row=n_plots, col=1)
 
-    if write_to:
-        fig.write_html(write_to) if write_to.endswith(".html") else fig.write_image(
-            write_to
-        )
-        logger.info("Results written to %s", write_to)
-
-    if show:
-        fig.show()
-
+    _emit_figure(fig, write_to, show, log=True)
     return fig
 
 
@@ -87,6 +91,7 @@ def visualize_network(
         if all(v == (0.0, 0.0) for v in pos.values()):
             raise ValueError
     except Exception:
+        logger.debug("visualize_network: no node positions; falling back to spring layout", exc_info=True)
         pos = nx.spring_layout(g, seed=42)
 
     edge_x, edge_y = [], []
@@ -146,13 +151,7 @@ def visualize_network(
         ),
     )
 
-    if write_to:
-        fig.write_html(write_to) if write_to.endswith(".html") else fig.write_image(
-            write_to
-        )
-    if show:
-        fig.show()
-
+    _emit_figure(fig, write_to, show)
     return fig
 
 
@@ -187,13 +186,7 @@ def plot_performance_comparison(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
 
-    if write_to:
-        fig.write_html(write_to) if write_to.endswith(".html") else fig.write_image(
-            write_to
-        )
-    if show:
-        fig.show()
-
+    _emit_figure(fig, write_to, show)
     return fig
 
 
@@ -215,13 +208,7 @@ def plot_message_counts(
         template="plotly_white",
     )
 
-    if write_to:
-        fig.write_html(write_to) if write_to.endswith(".html") else fig.write_image(
-            write_to
-        )
-    if show:
-        fig.show()
-
+    _emit_figure(fig, write_to, show)
     return fig
 
 
@@ -283,11 +270,5 @@ def plot_sector_timeseries(
         template="plotly_white",
     )
 
-    if write_to:
-        fig.write_html(write_to) if write_to.endswith(".html") else fig.write_image(
-            write_to
-        )
-    if show:
-        fig.show()
-
+    _emit_figure(fig, write_to, show)
     return fig

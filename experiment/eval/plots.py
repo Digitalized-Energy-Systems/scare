@@ -1921,6 +1921,91 @@ def _group_balance_lines(
     return _save(_apply_theme(fig, title=title, height=height), out_path)
 
 
+def slack_trajectory(
+    timeseries: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "External-grid slack — operating point over time",
+    failure_t: float | None = None,
+) -> Path:
+    """Per-slack-child trajectory — one line per ExtPowerGrid /
+    ExtHydrGrid child, three subplots (electricity / gas / heat).
+
+    Reads the ``slack__<sector>__<aid>`` columns emitted by
+    ``_register_recordings`` in ``scare.scenario.restoration``.
+    Electricity rows carry ``p_mw``; gas / heat rows carry
+    ``mass_flow``.  A dashed vertical line marks the first failure
+    time so the post-failure transient is visually anchored.
+
+    Validity claim: with ``slack_target_fraction > 0`` the MAS should
+    drive each slack toward ``rating · target``, not let it absorb the
+    entire residual — flat near-rating lines with no recovery after
+    failure indicate the MAS isn't engaging.
+    """
+    if timeseries.empty or "time_s" not in timeseries.columns:
+        return _save(_empty_fig("no timeseries", title), out_path)
+
+    by_sector: dict[str, list[str]] = {}
+    for col in timeseries.columns:
+        if not col.startswith("slack__"):
+            continue
+        parts = col.split("__")
+        if len(parts) < 3:
+            continue
+        by_sector.setdefault(parts[1], []).append(col)
+
+    if not by_sector:
+        return _save(_empty_fig("no slack__* columns", title), out_path)
+
+    sectors = [s for s in ("electricity", "gas", "heat") if s in by_sector]
+    if not sectors:
+        sectors = sorted(by_sector)
+
+    fig = make_subplots(
+        rows=len(sectors), cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[s for s in sectors],
+    )
+    x = timeseries["time_s"].values
+    _y_unit = {
+        "electricity": "p_mw",
+        "gas": "mass_flow (kg/s)",
+        "heat": "mass_flow (kg/s)",
+    }
+    for row_idx, sec in enumerate(sectors, start=1):
+        cols = sorted(by_sector[sec])
+        base = _SECTOR_COLOR.get(sec, "#888888")
+        for i, col in enumerate(cols):
+            opacity = 0.55 if len(cols) > 6 else 0.85
+            aid = col.split("__", 2)[-1]
+            fig.add_trace(go.Scatter(
+                x=x, y=timeseries[col].astype(float).values,
+                mode="lines",
+                line=dict(color=base, width=1.4),
+                opacity=opacity,
+                name=aid,
+                legendgroup=sec,
+                legendgrouptitle_text=sec,
+                showlegend=(row_idx == 1 and i < 10),
+                hovertemplate=(
+                    f"<b>slack {sec}/{aid}</b><br>"
+                    "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                ),
+            ), row=row_idx, col=1)
+        fig.update_yaxes(title=_y_unit.get(sec, "value"), row=row_idx, col=1)
+        if failure_t is not None:
+            fig.add_vline(
+                x=float(failure_t),
+                line=dict(color="#888888", dash="dash", width=1),
+                row=row_idx, col=1,
+            )
+
+    fig.update_xaxes(title="simulation time (s)", row=len(sectors), col=1)
+    height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
+    return _save(_apply_theme(fig, title=title, height=height), out_path)
+
+
 def coalition_balance_lines(
     timeseries: pd.DataFrame,
     out_path: Path,
