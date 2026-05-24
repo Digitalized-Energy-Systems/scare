@@ -100,6 +100,7 @@
       "variants": [
         "scare",
         "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -652,7 +653,7 @@
         "  cp_dependent_45        : CP rated output 1x, replaces primary gen (loss of CP",
         "                            disables BOTH the unit and the displaced primary gen)",
         "  cp_heavy_dependent_45  : both knobs combined (maximum cross-carrier dependence)",
-        "On the dependent variants, gossip + islanding alone cannot recover from a CP",
+        "On the dependent variants, gossip + local-gen fallback alone cannot recover from a CP",
         "failure because the displaced primary gen is gone \u2014 the cross-sector ADMM is",
         "the only path to compensate.",
         "Failures: generator-class so CPs themselves are part of the failure population."

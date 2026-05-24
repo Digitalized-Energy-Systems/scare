@@ -14,9 +14,12 @@ from mango.express.topology import (
     topology_connectors,
     topology_neighbors,
 )
+from monee.model.child import ExtHydrGrid, ExtPowerGrid
 
-from scare.base.diagnostics import record_negotiation
+from scare.base.diagnostics import record_event, record_negotiation, record_regulate
 from scare.base.model import (
+    SECTOR_CONSTRAINTS,
+    SECTOR_TIMESCALE,
     AskEnergyMessage,
     AskForAvailableFlex,
     AvailableFlexAnswer,
@@ -25,14 +28,16 @@ from scare.base.model import (
     ConstraintWarning,
     EnergyNegotiationMessage,
     FailureNotice,
-    IslandingRequest,
+    LocalGenerationApproval,
+    LocalGenerationRequest,
     NegotiationFinishedEvent,
     ResponseEnergyMessage,
     Sector,
     StartBalanceNegotiation,
 )
-from scare.base.trust import TrustLedger, hash_weighted_choice
+from scare.base.trust import TrustLedger, TrustParams, hash_weighted_choice
 from scare.base.util import (
+    apply_regulate,
     clamp_to_constraints,
     constraint_utilization,
     lookup_slack,
@@ -42,6 +47,7 @@ from scare.base.util import (
     obs_sector,
     obs_setpoint,
 )
+from scare.community.holonic import HolonicCommunityRole
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -72,7 +78,7 @@ _STEP_DECAY_K0_DEFAULT: int = 20
 
 # P2 stall detection.  When the recent gap window's range falls below
 # _STALL_TOL_FRACTION · |T| and the gap still exceeds the per-group
-# threshold, declare stuck and emit IslandingRequest.
+# threshold, declare stuck and emit LocalGenerationRequest.
 _STALL_WINDOW_FACTOR: int = 2
 _STALL_TOL_FRACTION: float = 0.005
 _STALL_TOL_FLOOR: float = 1e-6
@@ -125,8 +131,6 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
         child = net.child_by_id(cid)
     except Exception:  # noqa: BLE001
         return False
-    from monee.model.child import ExtHydrGrid, ExtPowerGrid
-
     return isinstance(child.model, (ExtPowerGrid, ExtHydrGrid))
 
 
@@ -136,11 +140,9 @@ def _heat_thermal_deficit_mw(obs: dict) -> float:
 
     ``max(0, util - ϑ_clear) · |cap|`` with the dominant local
     constraint utilization.  Only loads (cap > 0) contribute; heat
-    generators are handled by islanding fallback.  Caller must
+    generators are handled by the local-generation fallback.  Caller must
     restrict invocation to heat sector.
     """
-    from scare.base.model import SECTOR_CONSTRAINTS
-
     cap = obs_capacity(obs)
     if cap <= 0:
         return 0.0
@@ -240,7 +242,7 @@ class _GossipState:
     # Sized at ``_STALL_WINDOW_FACTOR · n_active`` rounds; when the
     # range across the window is below threshold and the gap still
     # exceeds the per-group threshold, the originator emits
-    # IslandingRequest and finishes with terminal "stalled".
+    # LocalGenerationRequest and finishes with terminal "stalled".
     gap_window: list[float] = field(default_factory=list)
     # P6: scalar dual variable for the primal-dual QP gossip.  At the
     # KKT optimum, ``dual_lambda`` equals the unique scarcity price
@@ -310,8 +312,6 @@ class EnergyBalanceNegotiator(Role):
         self.enable_qp_gossip = enable_qp_gossip
 
         # Apply sector-specific convergence rate if not overridden.
-        from scare.base.model import SECTOR_TIMESCALE
-
         ts = SECTOR_TIMESCALE.get(sector, {})
         self.convergence_rate = (
             convergence_rate if convergence_rate is not None
@@ -363,8 +363,6 @@ class EnergyBalanceNegotiator(Role):
         # is replaced by K >= liveness_threshold.  Decay rate scales with
         # the sector poll period so heat (slow polling) doesn't pessimise
         # K too aggressively.
-        from scare.base.trust import TrustParams
-
         self._trust = TrustLedger(
             TrustParams(
                 decay_rate_per_s=1.0 / max(poll * _HEARTBEAT_MAX_AGE_MULTIPLE, 1.0),
@@ -459,12 +457,13 @@ class EnergyBalanceNegotiator(Role):
             self, ConstraintWarning, self._on_constraint_warning
         )
         # Mango requires at least one local subscriber per emitted event
-        # type.  IslandingFallbackRole is attached only to group leaders,
-        # so non-leader members would crash mango.emit_event without
-        # this no-op safety net.  The actual islanding logic still lives
-        # on the leader; this handler just satisfies the dispatch path.
+        # type.  LocalGenerationFallbackRole is attached only to group
+        # leaders, so non-leader members that hit the singleton-fallback
+        # path would crash mango.emit_event without this no-op safety
+        # net.  The actual fallback logic still lives on the leader;
+        # this handler just satisfies the dispatch path.
         self.context.subscribe_event(
-            self, IslandingRequest, self._on_islanding_request_noop
+            self, LocalGenerationApproval, self._on_local_gen_approval_noop
         )
         # Same defensive pattern for NegotiationFinishedEvent: in the
         # production scenario every child also hosts ``GenerationController``
@@ -481,11 +480,12 @@ class EnergyBalanceNegotiator(Role):
     # Constraint violation tracking (for monotonic progress override)
     # ------------------------------------------------------------------
 
-    def _on_islanding_request_noop(
-        self, _event: IslandingRequest, _src: Any
+    def _on_local_gen_approval_noop(
+        self, _event: LocalGenerationApproval, _src: Any
     ) -> None:
         # Intentionally empty — see setup() for the rationale.  The
-        # leader's IslandingFallbackRole handles the actual response.
+        # leader's LocalGenerationFallbackRole handles the actual
+        # response.
         return
 
     def _on_finished_noop(
@@ -566,8 +566,6 @@ class EnergyBalanceNegotiator(Role):
         """
         if not self.constraint_aware or self.sector == Sector.HEAT:
             return 1.0
-        from scare.base.model import SECTOR_CONSTRAINTS
-
         scale = 1.0
         for var, (lo, hi) in SECTOR_CONSTRAINTS.get(self.sector, {}).items():
             if var in obs:
@@ -657,12 +655,13 @@ class EnergyBalanceNegotiator(Role):
         return abs(open_gap) > self._per_group_threshold()
 
     async def _finish_negotiation_stalled(self) -> None:
-        """P2: terminate a stalled gossip and escalate to islanding.
+        """P2: terminate a stalled gossip and escalate to the local-
+        generation fallback.
 
         Only the originator records the ``stalled`` diary terminal so
         the ``started == Σ terminals`` invariant remains exact.
-        Emits IslandingRequest with the residual deficit if this agent
-        is the group leader (the same gate as in
+        Emits LocalGenerationRequest with the residual deficit if this
+        agent is the group leader (the same gate as in
         ``_finish_negotiation``); ``_finish_negotiation`` is then
         called with ``record_finished=False`` so it does not double-
         count a ``finished`` terminal.
@@ -947,6 +946,20 @@ class EnergyBalanceNegotiator(Role):
         zero" (which the LP achieves trivially) to "the rest of the
         group should balance such that the slack only draws its
         target" — which is the real operator objective.
+
+        NB: gossip is per-community, but the slack budget is a global
+        property of the connected component.  The gossip target
+        derived from this setpoint only matches the operator's
+        intent when the slack's community spans (most of) the
+        component — which is only true for ``component_level``.
+        For ``single_level`` and the holonic ``scare`` variant the
+        community is small and the gossip target derived here is
+        incoherent with the global budget.  Budget enforcement for
+        those variants happens via
+        :class:`~scare.service.slack_budget.SlackBudgetMonitor` 's
+        signed ``override_target`` (the over-budget magnitude in
+        gossip-target convention), not via the per-community
+        ``-total_sp`` target.
         """
         slack = lookup_slack(self.behavior, self.context.aid)
         if slack is not None:
@@ -1050,13 +1063,14 @@ class EnergyBalanceNegotiator(Role):
         )
 
         if not neighbours:
-            # Isolated agent: gossip can't help. Emit IslandingRequest
-            # directly with the full deficit so a co-located
-            # IslandingFallbackRole (or the agent itself) can activate
-            # local DGs.  We also self-activate islanding inline for the
-            # common case where the fallback role is absent.
+            # Isolated agent: gossip can't help and there is no L2 to
+            # consult (no group, therefore no holon).  Approve the
+            # fallback directly with the full deficit so a co-located
+            # LocalGenerationFallbackRole (or the agent itself) can
+            # activate local DGs.  We also self-dispatch inline for
+            # the common case where the fallback role is absent.
             logger.info(
-                "[%s] gossip skipped: singleton (target=%.4f) — escalating to islanding",
+                "[%s] gossip skipped: singleton (target=%.4f) — escalating to local-gen fallback",
                 self.context.aid,
                 target,
             )
@@ -1070,21 +1084,19 @@ class EnergyBalanceNegotiator(Role):
                 group_size=1,
             )
             if abs(target) > threshold:
-                from scare.base.diagnostics import record_event
-
                 record_event(
                     t=self.context.current_timestamp,
-                    kind="islanding_request",
+                    kind="local_gen_request",
                     aid=self.context.aid,
                     sector=self.sector.value,
                     detail=f"residual={target:.4f} (singleton)",
                 )
                 self.context.emit_event(
-                    IslandingRequest(
+                    LocalGenerationApproval(
                         sector=self.sector, residual_deficit=target
                     )
                 )
-                self._try_self_island(target)
+                self._try_self_dispatch(target)
             self._active = False
             self._gossip = None
             return
@@ -1382,7 +1394,7 @@ class EnergyBalanceNegotiator(Role):
         # P2: stall detection — append the post-update gap to the window;
         # if the window range is below tolerance and the gap is still
         # above the per-group threshold, the protocol has saturated
-        # without converging.  Emit IslandingRequest immediately rather
+        # without converging.  Emit LocalGenerationRequest immediately rather
         # than spinning to k_max.
         stalled = self._update_gap_window_and_check_stall(open_gap, target)
 
@@ -1456,30 +1468,50 @@ class EnergyBalanceNegotiator(Role):
                     group_size=len(self._gossip.memory),
                 )
 
-            # Unresolved deficit escalates to islanding fallback.  Only
-            # the group leader emits the request — IslandingFallbackRole
-            # is attached only there, and mango.emit_event raises
-            # KeyError if no role on the same agent subscribes.  Members
-            # converging with residual still surface the residual via
+            # Unresolved deficit escalates to the local-generation
+            # fallback, but only via L2 so the holon can attempt to
+            # absorb the residual cross-group before L1 falls back to
+            # local DGs.  Only the group leader escalates —
+            # LocalGenerationFallbackRole is attached only there.
+            # Members converging with residual still surface it via
             # the normal NegotiationFinishedEvent broadcast.
             if (
                 abs(residual) > self._per_group_threshold() * 10
                 and topology_characteristic(self, tid="groups") == "leader"
             ):
-                from scare.base.diagnostics import record_event
-
                 record_event(
                     t=self.context.current_timestamp,
-                    kind="islanding_request",
+                    kind="local_gen_request",
                     aid=self.context.aid,
                     sector=self.sector.value,
                     detail=f"residual={residual:.4f}",
                 )
-                self.context.emit_event(
-                    IslandingRequest(
-                        sector=self.sector, residual_deficit=residual
-                    )
+                request = LocalGenerationRequest(
+                    sector=self.sector, residual_deficit=residual
                 )
+                # Prefer routing through the L2 holon: the holon role
+                # will trigger an early ADMM rebalance attempt and
+                # reply with a LocalGenerationApproval whose residual
+                # reflects what L2 could not absorb.  If no holon
+                # peers exist (non-holonic config) the originator
+                # approves the request locally so the fallback still
+                # fires.
+                try:
+                    holon_peers = list(topology_neighbors(self, tid="holons"))
+                except KeyError:
+                    holon_peers = []
+                if holon_peers:
+                    for addr in holon_peers:
+                        await self.context.send_message(
+                            request, receiver_addr=addr
+                        )
+                else:
+                    self.context.emit_event(
+                        LocalGenerationApproval(
+                            sector=self.sector,
+                            residual_deficit=residual,
+                        )
+                    )
 
         self.context.emit_event(
             NegotiationFinishedEvent(new_setpoint=new_sp, sector=self.sector)
@@ -1772,8 +1804,6 @@ class EnergyBalanceNegotiator(Role):
         supply via the grid to satisfy the served demand.
         """
         try:
-            from scare.base.util import apply_regulate, obs_priority
-
             members = [self.context.aid]
             for neigh in self._live_neighbours():
                 members.append(neigh.aid)
@@ -1817,6 +1847,33 @@ class EnergyBalanceNegotiator(Role):
                     {sec: {t: round(v, 3) for t, v in tm.items()}
                      for sec, tm in service_fraction.items()},
                 )
+                # S1 — close the L2→L1→L2 cascade.  Applying factors via
+                # ``apply_regulate`` mutates community state but emits
+                # nothing on its own; without an event the L2 watchdog
+                # short-circuits on ``_rebalance_dirty=False`` and L3
+                # never re-fires either.  Mark dirty + schedule a
+                # rebalance directly on the local HolonicCommunityRole
+                # via ``_maybe_schedule_rebalance``, which already
+                # encapsulates the gate logic (group-leader check,
+                # min-gap throttle).  We deliberately do NOT
+                # ``emit_event(NegotiationFinishedEvent(...))`` here:
+                # the gossip path's NFE carries the leader's converged
+                # setpoint and ``GenerationController`` re-applies
+                # that setpoint as a regulation factor.  Emitting NFE
+                # from the dispatch path with a placeholder setpoint
+                # mis-triggers stability and resets the leader's own
+                # factor to 0.  Direct schedule keeps the cascade
+                # without that side-effect.
+                for role in getattr(self.context, "roles", []):
+                    if isinstance(role, HolonicCommunityRole):
+                        try:
+                            role._maybe_schedule_rebalance()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug(
+                                "[%s] dispatch L2 re-fire skipped: %s",
+                                self.context.aid, exc,
+                            )
+                        break
         finally:
             self._active = False
 
@@ -1840,8 +1897,6 @@ class EnergyBalanceNegotiator(Role):
         sector config and clamps regulation increases accordingly.
         """
         try:
-            from scare.base.util import apply_regulate, obs_priority
-
             members = [self.context.aid]
             for neigh in self._live_neighbours():
                 members.append(neigh.aid)
@@ -2019,8 +2074,6 @@ class EnergyBalanceNegotiator(Role):
         # converging.  monee's warm-start absorbs consecutive small
         # deltas efficiently, so they are not the bottleneck here.
         if self.behavior.has_action(self.context.aid, "regulate"):
-            from scare.base.diagnostics import record_regulate
-
             self.behavior.act(self.context.aid, "regulate", factor)
             record_regulate(
                 t=self.context.current_timestamp,
@@ -2044,8 +2097,9 @@ class EnergyBalanceNegotiator(Role):
         return min(requested, prev + max_delta)
 
 
-    def _try_self_island(self, deficit: float) -> None:
-        """Inline islanding for isolated agents without IslandingFallbackRole.
+    def _try_self_dispatch(self, deficit: float) -> None:
+        """Inline local-gen fallback for isolated agents without a
+        co-located LocalGenerationFallbackRole.
 
         If this agent is a generator with available headroom, ramp up to
         cover as much of the deficit as possible.
@@ -2062,19 +2116,17 @@ class EnergyBalanceNegotiator(Role):
             return
         share = min(headroom, deficit)
         new_factor = min(1.0, (abs(sp) + share) / abs(cap))
-        from scare.base.util import apply_regulate
-
         applied = apply_regulate(
             self.behavior,
             self.context.aid,
             new_factor,
             sector=self.sector.value,
-            reason="self_island",
+            reason="self_local_gen",
             timestamp=self.context.current_timestamp,
         )
         if applied:
             logger.info(
-                "[%s] self-island: ramped to %.1f%% (deficit=%.4f)",
+                "[%s] self local-gen: ramped to %.1f%% (deficit=%.4f)",
                 self.context.aid,
                 new_factor * 100,
                 deficit,

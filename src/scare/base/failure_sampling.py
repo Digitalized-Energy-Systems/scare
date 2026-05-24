@@ -10,6 +10,17 @@ import random
 from typing import Any
 
 from mango_energy_environments import Failure
+from monee.model.child import HeatGenerator, PowerGenerator, Source
+from monee.model.multi import (
+    CHP,
+    CHPHG,
+    GasToPower,
+    PowerToGas,
+    PowerToHeat,
+    PowerToHeatHG,
+)
+
+from scare.base.util import obs_capacity
 
 
 def create_failures(
@@ -58,8 +69,6 @@ def _sample_concentrated_failures(
     load-bearing nodes so the failure produces a measurable per-group
     deficit (the regime where the holonic ADMM has work to do).
     """
-    from scare.base.util import obs_capacity
-
     candidates = [b for b in monee_net.branches if not b.model.is_cp()]
     if not candidates:
         return []
@@ -172,16 +181,6 @@ def _iter_generator_candidates(monee_net: Any):
     component.  ``kind`` ∈ {``"child"``, ``"compound"``, ``"branch"``}
     selects the dispatch rule in ``_sample_generator_failures``.
     """
-    from monee.model.child import HeatGenerator, PowerGenerator, Source
-    from monee.model.multi import (
-        CHP,
-        CHPHG,
-        GasToPower,
-        PowerToGas,
-        PowerToHeat,
-        PowerToHeatHG,
-    )
-
     child_classes = (PowerGenerator, HeatGenerator, Source)
     compound_classes = (CHP, CHPHG, PowerToHeat)
     branch_classes = (GasToPower, PowerToGas, PowerToHeatHG)

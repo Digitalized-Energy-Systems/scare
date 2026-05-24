@@ -26,6 +26,15 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import numpy as np
+from distributed_resource_optimization import (
+    create_admm_sharing_data,
+    create_admm_start,
+    create_sharing_target_distance_admm_coordinator,
+    start_coordinated_optimization,
+)
+from distributed_resource_optimization.algorithm.admm.flex_actor import (
+    ADMMFlexActor,
+)
 from mango import Role
 from mango import sender_addr as mango_sender_addr
 from mango.express.topology import (
@@ -35,23 +44,35 @@ from mango.express.topology import (
 )
 
 from scare.base.channel import (
+    CoalitionConstraint,
+    ComponentAdmmReport,
+    ComponentAllocation,
     CPSetpoint,
     HolonAllocation,
+    L3RebalanceWakeup,
     MonotonicVersion,
     SeenVersions,
 )
+from scare.base.diagnostics import record_event
 from scare.base.model import (
+    AskForAvailableFlex,
     AvailableFlexAnswer,
     CommunityAssignment,
+    CommunityReassignedEvent,
     HebbianFlexBeacon,
     HolonicAssignment,
     HolonicJoinAnswer,
     HolonicJoinRequest,
+    LocalGenerationApproval,
+    LocalGenerationRequest,
     NegotiationFinishedEvent,
     Sector,
     StartBalanceNegotiation,
 )
 from scare.base.topology_mirror import LivePeerFilter
+from scare.base.util import compute_priority_weighted_shares, tier_priority_weight
+from scare.community.deliverability import per_actor_deliverable_caps
+from scare.community.supply_priority_admm import allocate_supply_priority
 
 logger = logging.getLogger(__name__)
 
@@ -96,25 +117,42 @@ class HolonicCommunityRole(Role):
         *,
         formation_period_s: float = 4.0,
         max_holon_size: int = DEFAULT_MAX_HOLON_SIZE,
-        rebalance_period_s: float = 60.0,
-        rebalance_min_gap_s: float = 2.0,
+        # ``rebalance_period_s`` was 60.0 originally — designed as a
+        # slow "drift catching" heartbeat assuming the reactive path
+        # (L1 NegotiationFinishedEvent → L2) would handle real
+        # failures.  But the 2026-05-23 cascade work showed L1 gossip
+        # often falls dormant after the initial flurry, leaving the
+        # first (incomplete, peer-reports-not-in) L2 dispatch as the
+        # final allocation for the whole sim.  Lowered to 1.0 s so L2
+        # fires every sim-second regardless of L1 activity; the
+        # ``rebalance_min_gap_s`` fuse below still bounds reactive
+        # bursts.  Each L2 round re-converges to the current correct
+        # answer, so any wrong first-round dispatch corrects within
+        # one second.
+        rebalance_period_s: float = 1.0,
+        rebalance_min_gap_s: float = 0.5,
         flex_timeout_s: float = 5.0,
         enable_hebbian_formation: bool = True,
         hebbian_beacon_period_s: float = 4.0,
         hebbian_eta: float = 0.25,
         hebbian_threshold: float = 0.35,
         hebbian_warmup_s: float = 12.0,
+        hebbian_delta_tol: float = 0.05,
+        hebbian_recluster_tol: float = 0.05,
+        watchdog_s: float = 30.0,
         admm_max_iters: int = 50,
         admm_abs_tol: float = 1e-3,
         enable_tier_stratified_admm: bool = True,
         priority_tiers: int = 10,
         admm_mode: str = "demand",
+        admm_scope: str = "sector",
         enable_priority_allocation: bool = True,
         live_member_filter: LivePeerFilter | None = None,
         coalition_constraint_store: Any = None,
         my_node_id: Any = None,
         leader_node_ids: dict[str, Any] | None = None,
         topology_mirror: Any = None,
+        cp_node_ids: set[Any] | None = None,
     ) -> None:
         super().__init__()
         self.sector = sector
@@ -146,6 +184,18 @@ class HolonicCommunityRole(Role):
                 f"holon admm_mode must be 'demand' or 'supply', got {admm_mode!r}"
             )
         self.admm_mode = admm_mode
+        # ADMM scope: "holon" (legacy per-holon, each leader solves over
+        # its 4 holon-members), "sector" (deprecated, every holon leader
+        # in the sector is one actor), or "component" (current default —
+        # every group leader on the same active subgraph is one actor,
+        # coordinator elected per (sector, active-component)).  See
+        # ``RestorationConfiguration.holon_admm_scope`` for rationale.
+        if admm_scope not in {"holon", "sector", "component"}:
+            raise ValueError(
+                "holon admm_scope must be 'holon', 'sector', or 'component', "
+                f"got {admm_scope!r}"
+            )
+        self.admm_scope = admm_scope
         # Priority-weighted allocation switch.  When False, legacy and
         # supply-priority ADMM use uniform per-tier weights (no-priority
         # ablation).
@@ -163,6 +213,14 @@ class HolonicCommunityRole(Role):
         self._my_node_id = my_node_id
         self._leader_node_ids: dict[str, Any] = dict(leader_node_ids or {})
         self._topology_mirror = topology_mirror
+        # Set of node ids hosting a CP agent.  Used by the per-component
+        # L2 path to detect whether a CP exists in the leader's multi-
+        # sector component — when one does, L2 defers to that CP's L3
+        # coordinator (Option B): the L3 coord will ask this leader for
+        # flex anyway, and running L2's per-sector solve in parallel
+        # would race the L3 dispatch.  Empty set ⇒ L2 always runs (no
+        # CPs to defer to; pre-Option-B behaviour).
+        self._cp_node_ids: set[Any] = set(cp_node_ids or set())
         # ``rebalance_period_s`` is the *slow* background heartbeat — only
         # there to catch drift from timeseries inputs (load profiles,
         # supply temperatures) that change without firing any
@@ -198,6 +256,19 @@ class HolonicCommunityRole(Role):
         self.hebbian_eta = hebbian_eta              # learning rate
         self.hebbian_threshold = hebbian_threshold  # H_gh > τ → same cluster
         self.hebbian_warmup_s = hebbian_warmup_s    # cold-start grace
+        # Delta gates for event-driven Hebbian publishing/reclustering.
+        # ``hebbian_delta_tol`` skips a beacon send when our own δ_g
+        # hasn't moved since the last broadcast; ``hebbian_recluster_tol``
+        # skips a recluster when no per-peer H entry has moved enough
+        # to change membership.  Both are in the same scaled units as
+        # δ_g (roughly [-1, 1]).
+        self.hebbian_delta_tol = hebbian_delta_tol
+        self.hebbian_recluster_tol = hebbian_recluster_tol
+        # Long-cadence watchdog for the event-driven schedulers: the
+        # role still installs slow periodic safety nets so a leader
+        # that missed every trigger event still publishes / reclusters
+        # / retries holon formation eventually.
+        self.watchdog_s = watchdog_s
 
         # holon_id -> {sender_key: (addr, accept_or_None)}.  Storing the
         # address alongside the response so we can build the resolved
@@ -217,6 +288,15 @@ class HolonicCommunityRole(Role):
         # rebalance start time; new reactive triggers below this gap
         # are dropped.
         self._last_rebalance_t: float = float("-inf")
+        # No-change skip for the slow watchdog tick: each reactive
+        # trigger (NegotiationFinishedEvent, CPSetpoint,
+        # CoalitionConstraint, LocalGenerationRequest) sets this to
+        # True; a successful rebalance clears it.  When the watchdog
+        # fires with the flag still False we know nothing has moved
+        # since the last successful rebalance and can skip the round.
+        # ``True`` initially so the first watchdog tick still runs
+        # (covers the no-events-since-boot edge case).
+        self._rebalance_dirty: bool = True
 
         # Resolved holon membership on the leader side.  Populated when
         # ``_handle_join_answer`` confirms acceptances; consulted by
@@ -240,6 +320,14 @@ class HolonicCommunityRole(Role):
         self._hebbian_H: dict[str, tuple[float, int]] = {}
         # Last own delta_g surrogate broadcast (for diagnostics + own-pair).
         self._last_own_delta_g: float = 0.0
+        # Last broadcast δ_g — used by the event-driven beacon to
+        # short-circuit a send when our own δ_g hasn't moved.  ``None``
+        # forces the first beacon to send unconditionally.
+        self._last_sent_delta_g: float | None = None
+        # Snapshot of the Hebbian H matrix at the time of the last
+        # recluster — used by the event-driven recluster to skip when
+        # no entry has moved beyond ``hebbian_recluster_tol``.
+        self._last_recluster_H: dict[str, float] = {}
         # Most recent flex aggregate per peer; used to gauge own delta_g
         # by comparison after each rebalance cycle.
         self._peer_last_delta: dict[str, float] = {}
@@ -259,20 +347,79 @@ class HolonicCommunityRole(Role):
         self._cp_setpoint_state: dict[tuple[str, str], float] = {}
         self._last_cp_predicate_fire_t: float = -1e9
 
+        # --- Component-scoped L2 ADMM state (admm_scope="component") ---
+        # The component coordinator (lex-smallest group-leader aid
+        # among leaders mutually reachable on the active branch
+        # subgraph in this sector) buffers ``ComponentAdmmReport``
+        # from every reachable group leader and runs ONE ADMM with N
+        # actors (= N communities in the component).  Buffer keyed by
+        # ``leader_aid`` — latest report per leader wins, so a peer
+        # that re-reports its flex in a later round overwrites the
+        # older entry.  ``_component_round_counter`` is the
+        # coordinator's monotonic round id.  The debounce timer
+        # ``_component_dispatch_pending`` collapses a burst of reports
+        # into one ADMM solve.
+        self._component_round_counter: int = 0
+        self._component_report_buffer: dict[str, tuple[str, Any]] = {}
+        self._component_dispatch_pending: bool = False
+        # Throttle on coordinator-side dispatches so a reactive cascade
+        # of reports (e.g. every leader pushing on the same
+        # NegotiationFinishedEvent) collapses to one solve.  Same
+        # semantics as ``rebalance_min_gap_s`` but tracked separately
+        # because the coordinator may receive reports for an idle
+        # round between its own community's rebalances.
+        self._last_component_dispatch_t: float = float("-inf")
+        # Latest service_fraction the coordinator dispatched — kept so
+        # newly-arriving reports can be merged against the last result
+        # and the coordinator can detect "no material change since last
+        # dispatch, skip" cases on the periodic heartbeat.
+        self._last_component_fraction: dict[str, dict[int, float]] | None = None
+
     def setup(self) -> None:
+        # Holon formation: event-driven via _on_member_finished /
+        # _handle_join_request / repartition events (see below).  A
+        # slow watchdog covers the case where every trigger event
+        # is missed — e.g. a leader that came up after its peers
+        # had already finished initial gossip.
         self.context.schedule_periodic_task(
-            self._try_form_holon, delay=self.formation_period_s
+            self._try_form_holon, delay=self.watchdog_s
         )
+        # Inter-group rebalance: PURELY event-driven via the seven
+        # reactive handlers
+        #   - ``_on_member_finished`` / ``_on_member_finished_local``
+        #     (L1 NegotiationFinishedEvent)
+        #   - ``_handle_cp_setpoint`` (L3 channel-pattern)
+        #   - ``_handle_coalition_constraint`` (L2.5 store)
+        #   - ``_handle_local_gen_request`` (L1 fallback escalation)
+        #   - ``_handle_l3_wakeup`` (L3 multi-sector dispatch)
+        #   - ``_dispatch_service_fractions``'s S1 hook on this leader's
+        #     own EBN, which mirrors L1's NFE for the dispatch path
+        # plus the slow watchdog below.  No 1 s "drift probe" timer:
+        # every cause of drift is itself an event; the heartbeat
+        # added redundant ADMM rounds on stable inputs without
+        # adding information.  See the 2026-05-24 timing audit.
         self.context.schedule_periodic_task(
-            self._try_rebalance, delay=self.rebalance_period_s
+            self._try_rebalance, delay=self.watchdog_s
         )
         if self.enable_hebbian_formation:
-            self.context.schedule_periodic_task(
-                self._hebbian_beacon, delay=self.hebbian_beacon_period_s
+            # Hebbian beacon: event-driven on local gossip
+            # convergence (_on_local_gossip_finished) — the only
+            # time our own δ_g actually shifts.  Watchdog keeps the
+            # baseline fresh during long silent windows.
+            self.context.subscribe_event(
+                self,
+                NegotiationFinishedEvent,
+                self._on_local_gossip_finished,
             )
             self.context.schedule_periodic_task(
-                self._hebbian_recluster,
-                delay=max(2.0 * self.hebbian_beacon_period_s, self.formation_period_s),
+                self._hebbian_beacon, delay=self.watchdog_s
+            )
+            # Reclustering is now triggered inside _handle_hebbian_beacon
+            # whenever an incoming beacon shifts any H entry by more
+            # than hebbian_recluster_tol.  Watchdog catches drift
+            # that no individual update tripped.
+            self.context.schedule_periodic_task(
+                self._hebbian_recluster, delay=self.watchdog_s,
             )
             self._hebbian_warmup_until = (
                 self.context.current_timestamp + self.hebbian_warmup_s
@@ -340,10 +487,97 @@ class HolonicCommunityRole(Role):
             _wrap(self._handle_cp_setpoint),
             lambda msg, meta: isinstance(msg, CPSetpoint),
         )
+        # Direct L2.5 -> L2 trigger.  When a cross-holon coalition lands
+        # a fresh ``CoalitionConstraint`` for this sector, kick off an
+        # L2 rebalance immediately so the merged service fractions
+        # (L2's own ADMM result ⊕ coalition's per-tier overrides via
+        # the ``CoalitionConstraintStore``) propagate to L1 in the
+        # same tick.  Without this, the coalition's constraint sat in
+        # the store until the next slow heartbeat (``rebalance_period_s``,
+        # default 60 s) — far too late for the 10 s smoke and the
+        # dominant reason per-component priority_invariant didn't
+        # converge.  ``L2.5`` already broadcasts ``StartBalanceNegotiation``
+        # to L1 in parallel for the coalition's pair of tiers, but L2
+        # owns the holon-wide allocation across *all* tiers and is the
+        # natural place to merge the cross-holon update.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_coalition_constraint),
+            lambda msg, meta: isinstance(msg, CoalitionConstraint)
+            and msg.sector == self.sector,
+        )
+        # L1 stall escalation: a member group's gossip converged with
+        # an unresolved deficit and is asking L2 to arbitrate before
+        # the local-generation fallback fires.  Routing this through
+        # L2 prevents L1 from silently ramping local DGs in parallel
+        # to a holon allocation it doesn't know about.  The handler
+        # triggers an early rebalance attempt and then approves the
+        # fallback for whatever the rebalance cannot absorb.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_local_gen_request),
+            lambda msg, meta: isinstance(msg, LocalGenerationRequest)
+            and msg.sector == self.sector,
+        )
+        # S2 — L3 multi-sector coord wake-up.  When the L3 ADMM solve
+        # dispatches new CP setpoints, the CP-side commit changes per-
+        # sector supply/demand for the next LP step.  L2 needs to
+        # re-evaluate on the post-CP-commit state, but otherwise has
+        # no reactive trigger for the L3 path (L1 may stay quiet
+        # between cascades).  ``L3RebalanceWakeup`` is a no-payload
+        # nudge that marks ``_rebalance_dirty=True`` via
+        # ``_maybe_schedule_rebalance``; the throttle there still
+        # bounds firing frequency.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_l3_wakeup),
+            lambda msg, meta: isinstance(msg, L3RebalanceWakeup)
+            and msg.sector == self.sector,
+        )
+        # Component-scoped L2 ADMM (admm_scope == "component"): every
+        # group leader subscribes to both message types.
+        # ``ComponentAdmmReport`` is only acted on if this leader is
+        # the elected coordinator for its component (the handler does
+        # its own coordinator gate).  ``ComponentAllocation`` is acted
+        # on by every group leader — it's the coordinator's dispatch
+        # envelope and the addressee applies the per-tier service
+        # fractions directly to its own community members (no holon
+        # hop).
+        if self.admm_scope == "component":
+            self.context.subscribe_message(
+                self,
+                _wrap(self._handle_component_admm_report),
+                lambda msg, meta: isinstance(msg, ComponentAdmmReport)
+                and msg.sector == self.sector,
+            )
+            self.context.subscribe_message(
+                self,
+                _wrap(self._handle_component_allocation),
+                lambda msg, meta: isinstance(msg, ComponentAllocation)
+                and msg.sector == self.sector,
+            )
+
+        # Holon-formation event triggers: retry when the
+        # eligible-neighbour set could have changed.  The watchdog
+        # in setup() is the slow fallback; these triggers cover the
+        # cases where the periodic retry would otherwise wait a full
+        # ``watchdog_s`` to react to a known-relevant event.
+        self.context.subscribe_event(
+            self, CommunityReassignedEvent, self._on_community_reassigned
+        )
 
     # ------------------------------------------------------------------
     # Holon formation
     # ------------------------------------------------------------------
+
+    def _on_community_reassigned(
+        self, _event: CommunityReassignedEvent, _src: Any
+    ) -> None:
+        """Repartition just changed our community membership — our
+        holon-eligibility set may have moved too.  Kick a formation
+        attempt without waiting for the watchdog.
+        """
+        self.context.schedule_instant_task(self._try_form_holon())
 
     async def _try_form_holon(self) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
@@ -435,6 +669,12 @@ class HolonicCommunityRole(Role):
         del self._pending_proposals[hid]
 
         if not accepted_addrs:
+            # Every candidate rejected.  Schedule another formation
+            # attempt now (with whatever neighbour set is current)
+            # rather than waiting for the watchdog — a peer that
+            # rejected because they were busy may have completed
+            # their own formation and is now available again.
+            self.context.schedule_instant_task(self._try_form_holon())
             return
 
         # Record the resolved member set (initiator + acceptors) so
@@ -511,11 +751,8 @@ class HolonicCommunityRole(Role):
     def _record_event(self, kind: str, detail: str) -> None:
         """Record a diagnostic event with the standard
         ``(t, kind, aid, sector, detail)`` shape used throughout this
-        role.  Lazy import of ``record_event`` so optional diagnostics
-        machinery doesn't load at import-time.
+        role.
         """
-        from scare.base.diagnostics import record_event
-
         record_event(
             t=self.context.current_timestamp,
             kind=kind,
@@ -537,29 +774,101 @@ class HolonicCommunityRole(Role):
             return []
 
     async def _try_rebalance(self) -> None:
-        """Holon leader collects flex from member groups and runs ADMM
-        to redistribute resources.  Fired periodically (slow heartbeat
-        for input drift) AND reactively (on holon formation, on member
-        ``NegotiationFinishedEvent``).  See class docstring on
-        ``rebalance_period_s`` vs ``rebalance_min_gap_s``.
+        """Collect flex for the next L2 ADMM round.
+
+        Two code paths depending on ``admm_scope``:
+
+        * ``"component"`` (default): every group-topology leader
+          collects its OWN community's flex via a single
+          ``AskForAvailableFlex`` to self.  The reply (one
+          aggregated ``AvailableFlexAnswer`` covering this whole
+          community) then drives ``_run_inter_group_admm`` →
+          ``_run_component_scoped_admm`` which pushes a
+          ``ComponentAdmmReport`` to the component coordinator.
+          Holon membership is irrelevant: leaders outside any
+          holon still participate, closing the coverage gap the
+          sector-scope path had.
+
+        * ``"holon"``/``"sector"`` (legacy): only holon-leaders
+          collect flex from their holon-members and run the
+          per-holon ADMM (or push to the sector coord in the
+          deprecated sector mode).
+
+        Fired periodically (slow heartbeat for input drift) AND
+        reactively (on holon formation, on member
+        ``NegotiationFinishedEvent``).  Throttled by
+        ``rebalance_min_gap_s``.
         """
-        # Fast-loop fuse: at most one rebalance start every
-        # ``rebalance_min_gap_s`` (decoupled from the slow heartbeat).
-        # Prevents the holon→member→finished→holon feedback loop where
-        # each ADMM round triggers per-member balance which fires
-        # ``NegotiationFinishedEvent``, re-arming the reactive path.
         now = self.context.current_timestamp
         if (now - self._last_rebalance_t) < self.rebalance_min_gap_s:
             return
+        if self._rebalance_active:
+            logger.debug("[%s] rebalance skipped: active", self.context.aid)
+            return
+        # Watchdog skip: when no reactive trigger has fired since the
+        # last successful rebalance, the input state hasn't materially
+        # moved and the round would re-derive the same allocation.
+        # Reactive callers go through ``_maybe_schedule_rebalance``
+        # which sets ``_rebalance_dirty`` first, so this check only
+        # short-circuits the slow periodic invocation.
+        if not self._rebalance_dirty:
+            logger.debug(
+                "[%s] rebalance skipped: no trigger since last run",
+                self.context.aid,
+            )
+            return
+
+        if self.admm_scope == "component":
+            # Component-scope: every group leader participates; no
+            # holon-membership gate.  Each leader's own community is
+            # represented by one ComponentAdmmReport (= one ADMM
+            # actor), so coverage matches the active subgraph.
+            if topology_characteristic(self, tid="groups") != "leader":
+                return
+            # L2 runs in parallel with L3 (no defer).  Per the
+            # 2026-05-23 architectural reset: L3 decides cross-sector
+            # flows (CP setpoints) and applies them via the LP; the
+            # leader's NEXT flex collection then reflects the
+            # post-CP state and L2 refines per-sector per-tier
+            # service fractions.  The defer-to-L3 path I shipped
+            # earlier broke this cascade — L1 gossip then won the
+            # equilibrium and PI regressed to 15 % vs 51 % under
+            # pure per-sector L2.
+            self._rebalance_active = True
+            self._last_rebalance_t = now
+            # Clear the dirty flag now that we are committed to a run.
+            # A new reactive trigger arriving during execution will set
+            # it back to True, so the next watchdog tick will still
+            # fire; absent any new trigger the watchdog skips.
+            self._rebalance_dirty = False
+            self._flex_answers = []
+            self._flex_answer_senders = []
+            # Single self-ask: the EnergyBalanceNegotiator on this
+            # agent aggregates the whole community's flex into one
+            # AvailableFlexAnswer.
+            self._flex_expected = 1
+            await self.context.send_message(
+                AskForAvailableFlex(include_connectors=False),
+                receiver_addr=self.context.addr,
+            )
+            base = _FLEX_TIMEOUT_BASE_S.get(
+                self.sector, _FLEX_TIMEOUT_DEFAULT_S
+            )
+            timeout = base + _FLEX_TIMEOUT_PER_MEMBER_S
+            deadline = now + timeout
+            self.context.schedule_timestamp_task(
+                self._flex_collection_timeout(), timestamp=deadline
+            )
+            return
+
+        # Legacy per-holon (and deprecated sector) path: only holon
+        # leaders gather flex from their holon members.
         assignment = self.context.get_or_create_model(HolonicAssignment)
         if assignment.holon_id is None:
             self._log_idle_once("no holon assigned")
             return
         if assignment.parent_addr is not None:
             self._log_idle_once("not leader")
-            return
-        if self._rebalance_active:
-            logger.debug("[%s] rebalance skipped: active", self.context.aid)
             return
 
         # Prefer the resolved member list (populated when the holon was
@@ -585,13 +894,14 @@ class HolonicCommunityRole(Role):
 
         self._rebalance_active = True
         self._last_rebalance_t = self.context.current_timestamp
+        # Clear the watchdog dirty flag now that a run is committed;
+        # new triggers during execution will set it again.
+        self._rebalance_dirty = False
         self._flex_answers = []
         self._flex_answer_senders = []
         # The leader contributes its own group's flex too — without that
         # ADMM would be a single-actor problem and bail out early.
         self._flex_expected = len(members) + 1
-
-        from scare.base.model import AskForAvailableFlex
 
         logger.debug(
             "[%s] holon rebalance: asking %d members (+self) for flex",
@@ -685,18 +995,113 @@ class HolonicCommunityRole(Role):
         )
         self._maybe_schedule_rebalance()
 
-    def _maybe_schedule_rebalance(self) -> None:
-        """Shared throttle + gate logic for both the message- and
-        event-driven reactive paths.  Returns silently if any gate
-        rejects (not in a holon, not the holon leader, rebalance
-        already running, or within the ``rebalance_min_gap_s`` fuse
-        window).  ``_try_rebalance`` itself does its own holon-
-        membership and leader checks too, so this method is a fast
-        pre-filter that avoids scheduling a no-op task.
+    async def _handle_coalition_constraint(
+        self, message: CoalitionConstraint, meta: dict
+    ) -> None:
+        """Direct L2.5 -> L2 trigger.
+
+        A fresh cross-holon ``CoalitionConstraint`` carries per-tier
+        service fractions the L2.5 coalition has decided we should
+        honour.  Without this trigger the constraint sits in the
+        shared store and is only consulted on L2's slow heartbeat,
+        which means a 60 s round-trip before it reaches L1 — far
+        longer than the inversion's lifetime in practice.  Re-running
+        L2 now re-merges the holon's local ADMM result with the
+        constraint store and re-dispatches the merged service
+        fractions to every member group leader.
+
+        Only the holon leader acts; other members would double-trigger.
+        The shared ``_maybe_schedule_rebalance`` throttle prevents
+        a flood when many coalitions land in rapid succession.
         """
         assignment = self.context.get_or_create_model(HolonicAssignment)
         if assignment.holon_id is None or assignment.parent_addr is not None:
             return
+        self._maybe_schedule_rebalance()
+
+    async def _handle_l3_wakeup(
+        self, message: L3RebalanceWakeup, meta: dict
+    ) -> None:
+        """S2 — L3 multi-sector coord just dispatched new CP setpoints
+        for this leader's sector.  Mark the L2 path dirty and let the
+        existing throttle / scheduler decide when to re-fire.  Gates
+        on group-leader membership inside ``_maybe_schedule_rebalance``;
+        non-leaders no-op.
+        """
+        self._maybe_schedule_rebalance()
+
+    async def _handle_local_gen_request(
+        self, message: LocalGenerationRequest, meta: dict
+    ) -> None:
+        """L1 stall escalation handler.
+
+        A member's group leader broadcast ``LocalGenerationRequest``
+        over the holons topology because its gossip converged with an
+        unresolved residual.  L2's response has two parts:
+
+        1. Trigger an early rebalance — the holon ADMM may absorb the
+           residual cross-group before any local DG ramps.
+        2. Approve the fallback for the residual, so the originator's
+           ``LocalGenerationFallbackRole`` can still fire for whatever
+           L2 cannot cover.
+
+        The originator addresses every holon neighbour, so every peer
+        runs this handler.  To avoid N approvals for one request, only
+        the lex-smallest co-recipient sends the reply; every peer
+        triggers the rebalance, which is throttled by
+        ``_maybe_schedule_rebalance``.
+        """
+        sender = mango_sender_addr(meta)
+        if sender is None:
+            return
+        try:
+            co_recipients = [
+                a for a in topology_neighbors(self, tid="holons")
+                if a.aid != sender.aid
+            ]
+        except KeyError:
+            co_recipients = []
+
+        self._maybe_schedule_rebalance()
+
+        if any(a.aid < self.context.aid for a in co_recipients):
+            return
+
+        approval = LocalGenerationApproval(
+            sector=message.sector,
+            residual_deficit=float(message.residual_deficit),
+        )
+        await self.context.send_message(approval, receiver_addr=sender)
+
+    def _maybe_schedule_rebalance(self) -> None:
+        """Shared throttle + gate logic for both the message- and
+        event-driven reactive paths.  Returns silently if any gate
+        rejects.  ``_try_rebalance`` itself does its own group-
+        leadership / holon-membership checks too, so this method is
+        a fast pre-filter that avoids scheduling a no-op task.
+
+        Gates depend on ``admm_scope``:
+
+        * ``"component"``: any group-topology leader can rebalance.
+          The component-scope path covers every community on the
+          active subgraph; holon membership is irrelevant.
+        * ``"holon"``/``"sector"``: only holon-leaders (legacy).
+        """
+        if self.admm_scope == "component":
+            if topology_characteristic(self, tid="groups") != "leader":
+                return
+        else:
+            assignment = self.context.get_or_create_model(HolonicAssignment)
+            if assignment.holon_id is None or assignment.parent_addr is not None:
+                return
+        # Mark that *something* triggered a rebalance attempt.  The
+        # watchdog tick reads this flag to decide whether to skip a
+        # round when nothing has happened since the last successful
+        # rebalance.  Setting it here (before the throttle below)
+        # means a throttled reactive trigger still counts as "dirty"
+        # — the watchdog will pick up the work next tick instead of
+        # losing it.
+        self._rebalance_dirty = True
         if self._rebalance_active:
             return
         now = self.context.current_timestamp
@@ -768,9 +1173,10 @@ class HolonicCommunityRole(Role):
             await self._run_inter_group_admm()
 
     async def _run_inter_group_admm(self) -> None:
-        """Dispatch to either the legacy per-sector ADMM or the
-        tier-stratified per-(sector, priority) ADMM (Package C) based
-        on the ``enable_tier_stratified_admm`` flag.
+        """Dispatch to the legacy per-sector ADMM, the tier-stratified
+        per-(sector, priority) ADMM (Package C), the sector-wide ADMM
+        (admm_scope="sector"), or back to per-holon based on the
+        configured scope + mode.
 
         The tier-stratified path replaces the single scalar override
         per (member, sector) — which loses the holon's priority
@@ -787,14 +1193,26 @@ class HolonicCommunityRole(Role):
         provided — observed empirically as a regression on
         label-propagation partitions where the legacy fired ~32
         rounds but the strict tier-stratified fired only 1.
+
+        admm_scope == "component": the per-community flex collection
+        ran, but instead of solving locally this leader aggregates the
+        flex into one community-scale ``ComponentAdmmReport`` and
+        pushes it to the elected component coordinator.  The
+        coordinator (which may be this leader) runs the per-component
+        ADMM once enough reports have arrived and dispatches a
+        component-uniform ``ComponentAllocation`` to every leader on
+        the same active subgraph.
         """
+        if self.admm_scope == "component" and self.admm_mode == "supply":
+            await self._run_component_scoped_admm()
+            return
         if not self.enable_tier_stratified_admm:
             await self._run_legacy_per_sector_admm()
             return
         if self.admm_mode == "supply":
-            # Route A: supply-priority ADMM.  Fires whenever the
-            # holon has any supply at all to allocate; the priority
-            # weighting takes over once supply < demand.
+            # Route A: supply-priority ADMM (per-holon scope).  Fires
+            # whenever the holon has any supply at all to allocate;
+            # the priority weighting takes over once supply < demand.
             if self._supply_priority_has_anything_to_do():
                 await self._run_supply_priority_admm()
                 return
@@ -865,17 +1283,6 @@ class HolonicCommunityRole(Role):
         tier.  The ADMM ``S`` parameter (linear cost) is set to pull
         each actor's allocation toward its priority-weighted share.
         """
-        from distributed_resource_optimization import (
-            create_admm_sharing_data,
-            create_admm_start,
-            create_sharing_target_distance_admm_coordinator,
-            start_coordinated_optimization,
-        )
-        from distributed_resource_optimization.algorithm.admm.flex_actor import (
-            ADMMFlexActor,
-        )
-
-        from scare.base.util import compute_priority_weighted_shares
 
         if not self._rebalance_active:
             return
@@ -1182,15 +1589,6 @@ class HolonicCommunityRole(Role):
         :meth:`CoalitionConstraintStore.merge_into`) — both demand and
         supply paths now defer to the coalition for the same cells.
         """
-        from distributed_resource_optimization import (
-            create_admm_sharing_data,
-            create_admm_start,
-            create_sharing_target_distance_admm_coordinator,
-            start_coordinated_optimization,
-        )
-        from distributed_resource_optimization.algorithm.admm.flex_actor import (
-            ADMMFlexActor,
-        )
 
         if not self._rebalance_active:
             return
@@ -1305,8 +1703,6 @@ class HolonicCommunityRole(Role):
         # (``_qp_priority_weight``) and the supply-priority ADMM via
         # :func:`scare.base.util.tier_priority_weight` so every layer
         # agrees on tier ordering.
-        from scare.base.util import tier_priority_weight
-
         P = self.priority_tiers
         priorities = np.zeros(n_dims)
         for sec in sectors:
@@ -1651,10 +2047,6 @@ class HolonicCommunityRole(Role):
         actor_supplies = [a.supply_by_sector or {} for a in answers]
         actor_demands = [a.demand_by_sector_priority or {} for a in answers]
 
-        from scare.community.supply_priority_admm import (
-            allocate_supply_priority,
-        )
-
         # F6: deliverability caps.  When we know each member leader's
         # home node id and have a topology mirror, compute per-actor
         # ``{(sector, tier): cap}`` overrides so the ADMM does not
@@ -1674,10 +2066,6 @@ class HolonicCommunityRole(Role):
             and self._leader_node_ids
         ):
             try:
-                from scare.community.deliverability import (
-                    per_actor_deliverable_caps,
-                )
-
                 actor_node_ids: list[Any | None] = []
                 actor_demand_nodes_by_tier: list[dict[int, dict[Any, float]]] = []
                 for sender, answer in zip(senders, answers):
@@ -1808,6 +2196,523 @@ class HolonicCommunityRole(Role):
             )
 
     # ------------------------------------------------------------------
+    # Per-(sector, active-component) L2 ADMM (admm_scope="component")
+    # ------------------------------------------------------------------
+    #
+    # Replaces both the per-holon supply-priority ADMM and the
+    # intermediate sector-wide variant with one ADMM scoped to each
+    # active connected component of the sector graph.  Each *community
+    # leader* (one per group-topology leader) is an ADMM actor — the
+    # holon abstraction is not used for optimisation here.
+    #
+    # Pipeline per round:
+    #   1. Every group leader collects its own community's flex (via
+    #      the existing ``AskForAvailableFlex`` machinery — sent to
+    #      self; the ``EnergyBalanceNegotiator._handle_ask_flex``
+    #      aggregates the community's per-(sector, tier) demand and
+    #      per-sector supply into one ``AvailableFlexAnswer``).
+    #   2. The leader pushes a ``ComponentAdmmReport`` to the
+    #      coordinator for its component (lex-smallest leader aid
+    #      among leaders mutually reachable on the active branch
+    #      subgraph).
+    #   3. The coordinator buffers reports keyed by ``leader_aid``,
+    #      debounces a burst into one solve, runs the supply-priority
+    #      ADMM with N_community actors, and dispatches a
+    #      ``ComponentAllocation`` to every leader in the component.
+    #   4. Each leader applies the per-tier service fractions to its
+    #      OWN community members (sends ``StartBalanceNegotiation``
+    #      to self; the local EnergyBalanceNegotiator dispatches the
+    #      fractions to every community member via apply_regulate).
+    #
+    # Key invariants delivered:
+    #   * Every load at the same tier in the same (sector, active-
+    #     component) is served at the same fraction.  Cross-leader
+    #     inversions cannot arise — they would require two leaders
+    #     in the same component to land different per-tier fractions,
+    #     which the per-component solve produces only one of.
+    #   * Every group leader in the component participates in both
+    #     the input (flex report) and the output (allocation dispatch)
+    #     — closing the coverage gap the holon-leader-only path had.
+    #   * A failure that splits a sector into two components re-elects
+    #     two coordinators that decide independently for their halves.
+
+    def _resolve_sector_peer_addrs(self) -> dict[str, Any]:
+        """Return ``{leader_aid: leader_addr}`` for every same-sector
+        leader on the ``holon_summary_<sector>`` topology, INCLUDING
+        self.  Built from ``topology_neighbors`` plus the local
+        context address.  Used by ``_resolve_component_peer_addrs``
+        as the unfiltered baseline; not consulted directly by the
+        component-scoped path.
+        """
+        addrs: dict[str, Any] = {self.context.aid: self.context.addr}
+        try:
+            peers = list(
+                topology_neighbors(self, tid=f"holon_summary_{self.sector.value}")
+            )
+        except Exception:
+            return addrs
+        for addr in peers:
+            aid = getattr(addr, "aid", None)
+            if aid is None:
+                aid = str(addr)
+            addrs[str(aid)] = addr
+        return addrs
+
+    def _resolve_component_peer_addrs(self) -> dict[str, Any]:
+        """Return ``{leader_aid: leader_addr}`` for every same-sector
+        leader that is mutually reachable on the active branch
+        subgraph — i.e. lives in the same connected component of the
+        sector graph as this leader.  Falls back to the unfiltered
+        sector peer set when topology mirror or my own node id are
+        unavailable (defensive — keeps the path runnable in
+        configurations that don't wire the mirror in).
+        """
+        sector_peers = self._resolve_sector_peer_addrs()
+        mirror = self._topology_mirror
+        my_node = self._my_node_id
+        if mirror is None or my_node is None:
+            return sector_peers
+        try:
+            reachable = mirror.reachable_from(my_node, sector=self.sector)
+        except Exception:
+            return sector_peers
+        out: dict[str, Any] = {}
+        for aid, addr in sector_peers.items():
+            if aid == self.context.aid:
+                # Always include self — the "component a leader is in"
+                # contains the leader, even if leader_node_ids has no
+                # entry for some reason.
+                out[aid] = addr
+                continue
+            node_id = self._leader_node_ids.get(aid)
+            if node_id is None or node_id in reachable:
+                out[aid] = addr
+        return out
+
+    def _component_coordinator_aid(self) -> str | None:
+        """Lex-smallest aid among current component peers — the
+        coordinator for this leader's component.  Returns None only
+        when even self is missing from the peer set (defensive — the
+        caller falls back to the per-holon path in that case).
+        """
+        peers = self._resolve_component_peer_addrs()
+        if not peers:
+            return None
+        return min(peers.keys())
+
+    def _multi_sector_l3_active(self) -> bool:
+        """True iff this leader sits in a multi-sector connected
+        component containing at least one CP agent — meaning an L3
+        coordinator is responsible for the L2 decision here and this
+        leader's per-sector L2 should defer (Option B).
+
+        Uses ``topology_mirror.reachable_from(..., allow_cp_bridges=
+        True)`` to traverse the joint multi-sector subgraph (active
+        branches AND active CP edges), then intersects with the
+        statically-known set of CP host node ids.  Empty intersection
+        ⇒ no CP in this component ⇒ L2 runs locally as today.
+        """
+        if not self._cp_node_ids:
+            return False
+        mirror = self._topology_mirror
+        my_node = self._my_node_id
+        if mirror is None or my_node is None:
+            return False
+        try:
+            reachable = mirror.reachable_from(
+                my_node, sector=None, allow_cp_bridges=True,
+            )
+        except Exception:
+            return False
+        return any(n in reachable for n in self._cp_node_ids)
+
+    def _aggregate_holon_flex(self) -> tuple[
+        dict[str, float],
+        dict[str, dict[int, float]],
+        dict[str, dict[int, float]],
+    ]:
+        """Roll up the holon's collected ``AvailableFlexAnswer`` list
+        into one (supply_by_sector, demand_by_sector_priority,
+        served_by_sector_priority) triple — the inputs the supply-
+        priority ADMM consumes per actor.
+
+        Called once per sector-scoped round, just before pushing a
+        ``SectorAdmmReport`` upstream.  The same answers are kept on
+        ``self._flex_answers`` so the per-holon legacy fallback
+        remains callable.
+        """
+        supply: dict[str, float] = {}
+        demand: dict[str, dict[int, float]] = {}
+        served: dict[str, dict[int, float]] = {}
+        for a in self._flex_answers:
+            for sec, val in (a.supply_by_sector or {}).items():
+                supply[sec] = supply.get(sec, 0.0) + float(val)
+            for sec, tmap in (a.demand_by_sector_priority or {}).items():
+                bucket = demand.setdefault(sec, {})
+                for tier, mw in tmap.items():
+                    bucket[int(tier)] = bucket.get(int(tier), 0.0) + float(mw)
+            for sec, tmap in (a.served_by_sector_priority or {}).items():
+                bucket = served.setdefault(sec, {})
+                for tier, mw in tmap.items():
+                    bucket[int(tier)] = bucket.get(int(tier), 0.0) + float(mw)
+        return supply, demand, served
+
+    async def _run_component_scoped_admm(self) -> None:
+        """Component-scoped variant of ``_run_supply_priority_admm``.
+
+        The leader has already collected its community's flex answers
+        via the same path the per-holon route uses (one
+        ``AskForAvailableFlex`` self-message → one
+        ``AvailableFlexAnswer`` aggregating the whole community).
+        Branch:
+
+        * coordinator (lex-smallest aid in this leader's active
+          component) → stash own report in the buffer + schedule a
+          debounced component ADMM solve (so a burst of own/peer
+          reports collapses to a single ADMM round).
+        * non-coordinator → push a ``ComponentAdmmReport`` to the
+          coordinator and wait for the ``ComponentAllocation`` that
+          comes back.
+
+        Either way, this leader's per-holon ADMM does *not* run —
+        the component coordinator's result will arrive via
+        ``_handle_component_allocation`` and be applied to community
+        members on receipt.  ``_flex_answers`` is drained here so a
+        follow-up reactive trigger doesn't re-fire on the stale
+        buffer.
+        """
+        if not self._rebalance_active:
+            return
+        answers = self._flex_answers[:]
+        # Drain — same lifecycle as the per-holon ADMM's snapshot.
+        self._flex_answers = []
+        self._flex_answer_senders = []
+        self._flex_expected = 0
+        self._rebalance_active = False
+
+        if not answers:
+            return
+
+        supply, demand, served = self._aggregate_holon_flex_from(answers)
+        # Skip only when there's literally nothing to contribute
+        # (neither supply nor demand).  A demand-only community must
+        # still report so the coordinator sees its demand in the
+        # sector-wide T vector; a supply-only community must still
+        # report so its supply enters the holon-wide supply pool.
+        # Earlier sector-scope code used ``and`` here, silently
+        # excluding load-only communities — the headline cause of
+        # the dispatch coverage gap that produced apparent
+        # priority inversions in the 2026-05-22 smoke.
+        any_supply = any(v > 1e-9 for v in supply.values())
+        any_demand = any(
+            mw > 1e-9 for tmap in demand.values() for mw in tmap.values()
+        )
+        if not (any_supply or any_demand):
+            return
+
+        coord_aid = self._component_coordinator_aid()
+        if coord_aid is None:
+            # No peer topology available; degenerate to the per-holon
+            # legacy path so we don't drop the work entirely.
+            self._flex_answers = answers  # restore for the fallback
+            self._rebalance_active = True
+            await self._run_supply_priority_admm()
+            return
+
+        round_id = f"r{self._component_round_counter}"
+        self._component_round_counter += 1
+        now = float(self.context.current_timestamp)
+        leader_aid = self.context.aid
+
+        report = ComponentAdmmReport(
+            publisher=leader_aid,
+            version=self._version.next(),
+            timestamp_s=now,
+            round_id=round_id,
+            sector=self.sector,
+            leader_aid=leader_aid,
+            supply_by_sector=supply,
+            demand_by_sector_priority=demand,
+            served_by_sector_priority=served,
+        )
+
+        if coord_aid == leader_aid:
+            # I'm the coordinator — buffer my own report and trigger
+            # the debounced solve.
+            self._component_report_buffer[leader_aid] = (round_id, report)
+            await self._maybe_run_component_admm(reason="self_report")
+            return
+
+        # Push to the coordinator.  No reply timeout: if the
+        # coordinator silently drops, the next reactive trigger will
+        # push again (idempotent on the coordinator side since the
+        # buffer is keyed by leader_aid).
+        peers = self._resolve_component_peer_addrs()
+        coord_addr = peers.get(coord_aid)
+        if coord_addr is None:
+            # Coordinator aid present but address not resolved — fall
+            # back to the per-holon path so this round still produces
+            # some allocation.
+            self._flex_answers = answers
+            self._rebalance_active = True
+            await self._run_supply_priority_admm()
+            return
+        await self.context.send_message(report, receiver_addr=coord_addr)
+        self._record_event(
+            "component_report_sent",
+            f"coord={coord_aid} leader={leader_aid} round={round_id} "
+            f"supply={sum(supply.values()):.4f} demand_tiers={len(demand)}",
+        )
+
+    def _aggregate_holon_flex_from(
+        self, answers: list[AvailableFlexAnswer]
+    ) -> tuple[
+        dict[str, float],
+        dict[str, dict[int, float]],
+        dict[str, dict[int, float]],
+    ]:
+        """Stateless variant of :meth:`_aggregate_holon_flex` that
+        operates on a passed-in answer list.  Used by the sector-scope
+        path which has already drained ``self._flex_answers`` into a
+        local snapshot.
+        """
+        prev = self._flex_answers
+        self._flex_answers = answers
+        try:
+            return self._aggregate_holon_flex()
+        finally:
+            self._flex_answers = prev
+
+    async def _handle_component_admm_report(
+        self, message: ComponentAdmmReport, meta: dict
+    ) -> None:
+        """Coordinator-side: buffer the report from a peer leader and
+        schedule the debounced ADMM solve.  Non-coordinator leaders
+        silently drop the message.
+
+        Buffer is keyed by ``leader_aid`` — a later report from the
+        same leader overwrites the earlier one (the freshest flex
+        view wins).  The coordinator's own report is buffered the
+        same way via ``_run_component_scoped_admm``.
+
+        Defensive: drop reports from peers we no longer consider in
+        our component (e.g. a branch failure cut them off after the
+        sender pushed but before we received).  Keeps the actor set
+        consistent with the current active subgraph.
+        """
+        if self.admm_scope != "component":
+            return
+        if self._component_coordinator_aid() != self.context.aid:
+            return
+        # L2 runs in parallel with L3; do NOT defer here.  See the
+        # comment in ``_try_rebalance``'s component branch.
+        # Filter: only buffer reports from leaders still in our active
+        # component view.  A peer that's now disconnected shouldn't
+        # contribute to OUR sub-component's allocation.
+        component_peers = self._resolve_component_peer_addrs()
+        if message.leader_aid not in component_peers:
+            return
+        self._component_report_buffer[message.leader_aid] = (
+            message.round_id, message
+        )
+        await self._maybe_run_component_admm(reason="peer_report")
+
+    async def _maybe_run_component_admm(self, *, reason: str) -> None:
+        """Debounce + dispatch.  Collapses a burst of incoming reports
+        into one ADMM solve when they arrive within
+        ``rebalance_min_gap_s`` of each other, so the
+        post-NegotiationFinishedEvent cascade doesn't fan out into
+        many solves.
+
+        Coalesces by re-scheduling: each report sets
+        ``_component_dispatch_pending`` and the *first* arrival owns
+        the actual solve invocation.  This produces "one solve per
+        burst" with bounded latency.
+        """
+        if self._component_dispatch_pending:
+            return
+        self._component_dispatch_pending = True
+        self.context.schedule_instant_task(
+            self._run_component_admm_now(reason=reason),
+        )
+
+    async def _run_component_admm_now(self, *, reason: str) -> None:
+        """Run the per-component ADMM against the current report
+        buffer and dispatch the resulting per-tier service fractions
+        to every same-component leader (including self).
+
+        Idempotent: callers debounce via
+        ``_component_dispatch_pending``; this method clears the flag
+        when it returns.  The buffer is NOT drained — late reports
+        for the same leader overwrite, and the next solve picks up
+        the freshest entries.
+        """
+        try:
+            await self._run_component_admm_now_inner(reason=reason)
+        finally:
+            self._component_dispatch_pending = False
+            self._last_component_dispatch_t = float(self.context.current_timestamp)
+
+    async def _run_component_admm_now_inner(self, *, reason: str) -> None:
+        if not self._component_report_buffer:
+            return
+        # Only include leaders still on this coordinator's component
+        # view.  A leader that's been disconnected since pushing its
+        # last report shouldn't participate in this round's
+        # allocation; the report stays in the buffer (overwriting is
+        # cheap) but the round skips it.
+        component_peers = self._resolve_component_peer_addrs()
+        leader_aids = sorted(
+            aid for aid in self._component_report_buffer
+            if aid in component_peers
+        )
+        if not leader_aids:
+            return
+        reports = [self._component_report_buffer[a][1] for a in leader_aids]
+
+        actor_supplies = [r.supply_by_sector for r in reports]
+        actor_demands = [r.demand_by_sector_priority for r in reports]
+
+        sectors = sorted({
+            s for r in reports for s in (r.demand_by_sector_priority or {})
+        })
+        if not sectors:
+            return
+        tiers_present: set[int] = set()
+        for r in reports:
+            for tmap in (r.demand_by_sector_priority or {}).values():
+                tiers_present.update(tmap.keys())
+        tiers = sorted(t for t in tiers_present if t >= 1)
+        if not tiers:
+            return
+        total_demand = sum(
+            float(d) for r in reports
+            for tmap in (r.demand_by_sector_priority or {}).values()
+            for d in tmap.values()
+        )
+        if total_demand < 1e-6:
+            return
+
+        try:
+            service_fraction, _per_actor_x, meta = await allocate_supply_priority(
+                sectors=sectors,
+                tiers=tiers,
+                actor_supplies=actor_supplies,
+                actor_demands=actor_demands,
+                actor_ub_overrides=None,
+                priority_tiers=self.priority_tiers,
+                max_iters=int(self.admm_max_iters),
+                abs_tol=float(self.admm_abs_tol),
+                enable_priority_weighting=self.enable_priority_allocation,
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] component-scope ADMM failed: %s", self.context.aid, exc,
+            )
+            self._record_event("holon_admm_failed", f"component_scope: {exc}")
+            return
+
+        # NB: deliberately no sub-tolerance noise scrub here.  Tried
+        # mirroring L3's clamp-below-1e-3 in 2026-05-23 and it
+        # regressed PI rather than helping — the first L2 round
+        # often runs before all peer reports have arrived, producing
+        # near-zero fractions on tiers whose demand was missing from
+        # this round's actor set.  Scrubbing those to exact 0 then
+        # locked them in via the per-load ``cooldown_s`` gate, since
+        # the next (complete) L2 round's correct fraction landed
+        # inside the cooldown window and got suppressed.  The PI
+        # claim's 1e-3 tolerance already absorbs unscrubbed
+        # per-sector noise; we don't gain anything by clamping.
+
+        self._last_component_fraction = service_fraction
+        logger.info(
+            "[%s] component-scope ADMM result (reason=%s): sectors=%s "
+            "tiers=%s n_communities=%d fractions=%s",
+            self.context.aid, reason, sectors, tiers, len(reports),
+            service_fraction,
+        )
+        self._record_event(
+            "holon_admm_result",
+            f"component_scope reason={reason} sectors={sectors} tiers={tiers} "
+            f"n_communities={len(reports)} fractions={service_fraction}",
+        )
+
+        # Dispatch the same ComponentAllocation to every leader in the
+        # active component (including self).  Each leader handles it
+        # via ``_handle_component_allocation`` and applies the
+        # fractions directly to its own community members.
+        round_id = max(
+            (self._component_report_buffer[a][0] for a in leader_aids),
+            default="",
+        )
+        now = float(self.context.current_timestamp)
+        allocation = ComponentAllocation(
+            publisher=self.context.aid,
+            version=self._version.next(),
+            timestamp_s=now,
+            round_id=round_id,
+            sector=self.sector,
+            service_fraction_by_tier=service_fraction.get(self.sector.value, {}),
+        )
+        for addr in component_peers.values():
+            await self.context.send_message(allocation, receiver_addr=addr)
+
+    async def _handle_component_allocation(
+        self, message: ComponentAllocation, meta: dict
+    ) -> None:
+        """Leaf-side handler: a ComponentAllocation arrived from the
+        coordinator.  Apply the per-tier service fraction to this
+        leader's OWN community members (no holon hop) via the L1
+        honour path.
+
+        Coverage: every group leader on the holon_summary topology
+        for this sector handles this message — *not* gated on holon
+        membership.  Communities outside any holon used to fall
+        through the sector-scope dispatch; this is the closes-the-
+        coverage-gap fix from 2026-05-23.
+
+        Coalition merge: if the local coalition store carries an
+        active fraction for any tier, that fraction wins per-tier
+        (mirrors the legacy ``_run_supply_priority_admm`` behaviour).
+        """
+        if self.admm_scope != "component":
+            return
+        # Defensive: leaders only act on this if they are still
+        # group-topology leaders.  The subscription is at agent
+        # level; non-leader agents shouldn't have one but the gate
+        # is cheap and protects against drift.
+        if topology_characteristic(self, tid="groups") != "leader":
+            return
+        # Rebuild a {sector_value: {tier: frac}} envelope from the
+        # single-sector message so the existing L1 honour path can
+        # consume it unchanged.
+        service_fraction: dict[str, dict[int, float]] = {
+            self.sector.value: dict(message.service_fraction_by_tier),
+        }
+        if self._coalition_constraint_store is not None:
+            now = float(self.context.current_timestamp)
+            service_fraction = self._coalition_constraint_store.merge_into(
+                service_fraction, self.sector, now,
+            )
+        # Send StartBalanceNegotiation to SELF — this agent's own
+        # EnergyBalanceNegotiator handles it via _dispatch_service_
+        # fractions, applying factor=service_fraction[sec][tier] to
+        # every community member (the live group-topology neighbours).
+        # That covers the whole community, including loads outside
+        # any holon.
+        await self.context.send_message(
+            StartBalanceNegotiation(
+                service_fraction_by_sector_priority=service_fraction,
+            ),
+            receiver_addr=self.context.addr,
+        )
+        self._record_event(
+            "holon_priority_allocation",
+            f"component_scope round={message.round_id} "
+            f"fractions={service_fraction}",
+        )
+
+    # ------------------------------------------------------------------
     # B.2: Hebbian-emergent holon formation
     # ------------------------------------------------------------------
     #
@@ -1842,36 +2747,55 @@ class HolonicCommunityRole(Role):
         denom = max(abs(bal) + abs(flex), 1e-9)
         return bal / denom
 
-    async def _hebbian_beacon(self) -> None:
-        """Periodic broadcast of own δ_g to same-sector neighbours.
+    def _on_local_gossip_finished(
+        self, event: NegotiationFinishedEvent, _src: Any
+    ) -> None:
+        """Local L1 gossip just converged — δ_g has shifted, so kick
+        the (delta-gated) Hebbian beacon.  Same-agent local-event
+        bus; ``_hebbian_beacon`` itself checks role/topology gates.
+        """
+        if event.sector != self.sector:
+            return
+        if not self.enable_hebbian_formation:
+            return
+        self.context.schedule_instant_task(self._hebbian_beacon())
 
-        The leader also asks itself for fresh flex each tick so its own
-        δ_g actually moves; without that self-ask, ``_peer_last_delta``
-        for the leader's own key would stay at 0 and every pairwise
-        H_{gh} term would be identically zero.
+    async def _hebbian_beacon(self) -> None:
+        """Broadcast own δ_g to same-sector neighbours, but only when
+        it has moved beyond ``hebbian_delta_tol`` since the last send.
+
+        Fires on the local ``NegotiationFinishedEvent`` (the only time
+        the leader's own balance can actually change) and on a slow
+        watchdog so a leader whose triggers were all missed still
+        publishes eventually.  The self-ask refreshes
+        ``_peer_last_delta[own_key]`` for the *next* call — the
+        current call uses whatever was cached from the previous
+        self-ask reply (or 0 on first invocation).
         """
         if not self.enable_hebbian_formation:
             return
         if topology_characteristic(self, tid="groups") != "leader":
             return
-        from scare.base.model import AskForAvailableFlex
-
-        # Self-ask so this tick (or the next, if the reply lands after
-        # the send below) sees a non-zero own δ_g in
-        # ``_peer_last_delta``.  The handler is already subscribed
-        # because the leader handles its own AskForAvailableFlex
-        # exactly like a member's.
+        # Self-ask so the *next* beacon (or this one's δ gate
+        # comparison) reads a fresh δ_g.  Reply lands asynchronously
+        # via ``_handle_flex_answer``.
         await self.context.send_message(
             AskForAvailableFlex(include_connectors=False),
             receiver_addr=self.context.addr,
         )
 
-        # Compute own delta_g from the latest known flex (if any) or
-        # simply 0 during warmup before the first self-ask reply
-        # arrives.
         own_key = str(self.context.addr)
         delta_g = self._peer_last_delta.get(own_key, self._last_own_delta_g)
         self._last_own_delta_g = delta_g
+
+        # Delta gate: skip the broadcast if our own δ_g hasn't moved
+        # enough.  ``None`` sentinel forces the first send through so
+        # peers always see at least one beacon to learn our address.
+        if (
+            self._last_sent_delta_g is not None
+            and abs(delta_g - self._last_sent_delta_g) < self.hebbian_delta_tol
+        ):
+            return
 
         try:
             neighbours = topology_neighbors(self, tid="holons")
@@ -1886,11 +2810,15 @@ class HolonicCommunityRole(Role):
         )
         for addr in neighbours:
             await self.context.send_message(msg, receiver_addr=addr)
+        self._last_sent_delta_g = float(delta_g)
 
     async def _handle_hebbian_beacon(
         self, message: HebbianFlexBeacon, meta: dict
     ) -> None:
-        """Update the per-peer Hebbian co-variance estimate."""
+        """Update the per-peer Hebbian co-variance estimate, then
+        trigger a recluster only when the new H entry has moved
+        beyond ``hebbian_recluster_tol`` since the last recluster.
+        """
         sender = mango_sender_addr(meta)
         if sender is None:
             return
@@ -1902,6 +2830,15 @@ class HolonicCommunityRole(Role):
         prev_h, prev_n = self._hebbian_H.get(sender_key, (0.0, 0))
         new_h = (1.0 - self.hebbian_eta) * prev_h + self.hebbian_eta * product
         self._hebbian_H[sender_key] = (new_h, prev_n + 1)
+
+        # H-delta gate: defer reclustering to the watchdog unless this
+        # update could plausibly change membership.  Comparison is
+        # against the snapshot taken at the last recluster, so a
+        # sequence of small updates that sum to a meaningful drift
+        # still trips the gate.
+        last_h = self._last_recluster_H.get(sender_key, 0.0)
+        if abs(new_h - last_h) >= self.hebbian_recluster_tol:
+            self.context.schedule_instant_task(self._hebbian_recluster())
 
     def hebbian_membership_candidates(self) -> set[str]:
         """Return the set of peer-keys whose H_{gh} crosses the threshold
@@ -1981,6 +2918,15 @@ class HolonicCommunityRole(Role):
             return
 
         prev_keys = self._holon_member_keys
+        # Snapshot H after every recluster attempt (even when membership
+        # didn't change) so the H-delta gate in _handle_hebbian_beacon
+        # measures drift since *this* point, not since the last
+        # successful membership change.  Without this, a leader whose
+        # membership stays stable would keep tripping the gate on
+        # every incoming beacon.
+        self._last_recluster_H = {
+            k: h for k, (h, _n) in self._hebbian_H.items()
+        }
         if new_keys == prev_keys:
             self._record_event("hebbian_recluster_attempted", "no_drift")
             return  # no drift

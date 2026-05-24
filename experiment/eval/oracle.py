@@ -12,8 +12,28 @@ defines the upper bound on what's achievable.  Optimality gap =
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 from typing import Any
+
+from monee import run_energy_flow_optimization
+from monee.model.child import ExtHydrGrid, ExtPowerGrid
+from monee.problem import (
+    WEIGHT_DEMAND,
+    create_min_load_shedding_problem,
+)
+from monee.solver.pyo import PyomoSolver
+
+from experiment.eval.metrics import restoration_breakdown, served_breakdown
+from experiment.restoration import (
+    GRIDS,
+    apply_cold_day,
+    apply_line_stress,
+    apply_microgrid_islanding,
+    apply_pv_peak,
+    apply_slack_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +138,87 @@ def _weight_for_load_factory(
     return _w
 
 
+def _collect_slack_budgets(monee_net: Any) -> dict[str, float | None]:
+    """Scan slack children for budgets stamped by ``apply_slack_budget``.
+
+    Returns the per-sector budget in monee's native units (MW for
+    electricity, kg/s for gas/heat).  ``apply_slack_budget`` stamps
+    the same value on every slack child of a given sector — we just
+    read the first non-None we find per sector.  Returns ``None`` for
+    a sector when no budget was registered (e.g. heat is intentionally
+    left unbounded — apply_slack_budget never stamps it).
+    """
+    out: dict[str, float | None] = {
+        "electricity": None, "gas": None, "heat": None,
+    }
+    for child in monee_net.childs:
+        m = child.model
+        if isinstance(m, ExtPowerGrid) and out["electricity"] is None:
+            cap = getattr(m, "_scare_slack_budget_mw", None)
+            if cap is not None:
+                out["electricity"] = float(cap)
+        elif isinstance(m, ExtHydrGrid):
+            cap_kgs = getattr(m, "_scare_slack_budget_kgs", None)
+            if cap_kgs is None:
+                continue
+            # Route by parent-node grid name: gas vs water (heat).
+            try:
+                grid_name = str(
+                    getattr(monee_net.node_by_id(child.node_id).grid, "name", "")
+                ).lower()
+            except Exception:
+                grid_name = ""
+            if "gas" in grid_name and out["gas"] is None:
+                out["gas"] = float(cap_kgs)
+            elif "water" in grid_name and out["heat"] is None:
+                out["heat"] = float(cap_kgs)
+    return out
+
+
+def _slack_budget_summary(monee_net: Any) -> dict[str, Any]:
+    """Compute realised slack draw vs operator budget on the post-LP
+    network.  Returns ``{aid: {budget, draw, violated}}`` for every
+    slack child carrying an explicit budget.  Used to derive the
+    slack-budget-compliance claim for the oracle (and to surface
+    budget headroom in the result.json for any variant).
+    """
+    out: dict[str, Any] = {}
+    for child in monee_net.childs:
+        m = child.model
+        # After Pyomo solve the model attributes are Var objects; the
+        # ``.values`` dict resolves each via ``pyomo.value(...)``.
+        vals = m.values if hasattr(m, "values") else {}
+        if isinstance(m, ExtPowerGrid):
+            cap = getattr(m, "_scare_slack_budget_mw", None)
+            if cap is None:
+                continue
+            try:
+                draw = abs(float(vals.get("p_mw", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                draw = 0.0
+            out[f"child-{child.id}"] = {
+                "sector": "electricity",
+                "budget_mw": float(cap),
+                "draw_mw": draw,
+                "violated": draw > float(cap) * 1.001,
+            }
+        elif isinstance(m, ExtHydrGrid):
+            cap = getattr(m, "_scare_slack_budget_kgs", None)
+            if cap is None:
+                continue
+            try:
+                draw = abs(float(vals.get("mass_flow", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                draw = 0.0
+            out[f"child-{child.id}"] = {
+                "sector": "gas_or_heat",
+                "budget_kgs": float(cap),
+                "draw_kgs": draw,
+                "violated": draw > float(cap) * 1.001,
+            }
+    return out
+
+
 def _adapter_observe(monee_net: Any) -> Any:
     """Return a behavior-like object whose ``observe(aid)`` reads the
     model state directly (so ``served_breakdown`` works unchanged
@@ -153,18 +254,46 @@ def run_oracle(
     Returns a dict with the optimal regulation per child + the served
     breakdown, in the same shape the scare result composer uses.
     """
-    from monee import run_energy_flow_optimization
     # NB: ``create_min_load_shedding_problem`` is exposed only via
     # the submodule ``monee.problem`` — top-level ``monee`` re-imports
     # it but it gets filtered out of the public namespace.
-    from monee.problem import (
-        WEIGHT_DEMAND,
-        create_min_load_shedding_problem,
-    )
-
-    from experiment.eval.metrics import served_breakdown
-
     _apply_failures(monee_net, failures)
+    # 2026-05-24: enforce the operator slack budget on the LP itself
+    # via ``create_min_load_shedding_problem``'s native
+    # ``ext_grid_*_bounds`` parameters (no Var.min/max mutation).
+    # The grid factory leaves the LP envelope at 10× budget for
+    # energy-flow feasibility while stashing the policy target as
+    # ``_scare_slack_budget_*`` on each slack child.  SCARE's agents
+    # enforce that target via regulation; the oracle previously saw
+    # the full 10× envelope and "won" by violating the policy.
+    # Passing the per-sector budget through here puts SCARE and
+    # oracle on the same problem: max served subject to the same
+    # operator constraint.
+    budgets = _collect_slack_budgets(monee_net)
+    # monee defaults: el ±3 MW, gas ±10 kg/s, heat ±10 kg/s.  When
+    # ``apply_slack_budget`` was not invoked (e.g. test paths without
+    # a slack scenario knob), we keep the monee defaults rather than
+    # falling back to "unbounded" — that matches the legacy contract.
+    ext_grid_el_bounds = (
+        (-budgets["electricity"], +budgets["electricity"])
+        if budgets["electricity"] is not None else (-3, 3)
+    )
+    ext_grid_gas_bounds = (
+        (-budgets["gas"], +budgets["gas"])
+        if budgets["gas"] is not None else (-10, 10)
+    )
+    # Heat-side ExtHydrGrid is intentionally left unbounded by
+    # ``apply_slack_budget`` (heating-loop mass flow is constrained
+    # by HE physics, not by policy).  Keep the monee default so the
+    # LP retains the slack envelope it always had.
+    ext_grid_heat_bounds = (
+        (-budgets["heat"], +budgets["heat"])
+        if budgets["heat"] is not None else (-10, 10)
+    )
+    logger.info(
+        "oracle: ext-grid budget bounds — el=%s, gas=%s, heat=%s",
+        ext_grid_el_bounds, ext_grid_gas_bounds, ext_grid_heat_bounds,
+    )
 
     # GEKKO (monee's default) hits "Max Equation Length" on grids with
     # several hundred children because the LP objective is built as a
@@ -174,8 +303,6 @@ def run_oracle(
     # ``mango_energy_environments`` uses at simulation time so we don't
     # require any additional binaries beyond what scare already needs.
     if solver is None:
-        from monee.solver.pyo import PyomoSolver
-
         solver = PyomoSolver()
 
     # When ``priorities`` is supplied, attach a per-load weight
@@ -186,8 +313,20 @@ def run_oracle(
     weight_for_load = _weight_for_load_factory(
         monee_net, priorities, base_demand_weight=WEIGHT_DEMAND,
     )
+    # ``bounds_el / bounds_gas / bounds_heat`` mirror SCARE's
+    # ``SECTOR_CONSTRAINTS`` so the LP is solved on the *same*
+    # voltage / pressure / temperature operating envelope SCARE
+    # enforces via the clamp deadband.  Heat is converted from
+    # SCARE's t_k = (283.15, 403.15) using monee's water-grid
+    # reference ``t_ref = 356 K`` → t_pu ≈ (0.7954, 1.1325).
     prob = create_min_load_shedding_problem(
         weight_for_load=weight_for_load,
+        ext_grid_el_bounds=ext_grid_el_bounds,
+        ext_grid_gas_bounds=ext_grid_gas_bounds,
+        ext_grid_heat_bounds=ext_grid_heat_bounds,
+        bounds_el=(0.95, 1.05),
+        bounds_gas=(0.90, 1.10),
+        bounds_heat=(0.7954, 1.1325),
     )
     if weight_for_load is not None:
         logger.info(
@@ -212,25 +351,50 @@ def run_oracle(
     lp_success = bool(getattr(result, "success", True))
     logger.info("oracle: solve done (success=%s).", lp_success)
 
-    behavior = _adapter_observe(monee_net)
-    served = served_breakdown(monee_net, behavior, priorities=priorities)
+    # Read the metric off ``result.network`` — the solver's internal
+    # COPY of the input network, where the LP's optimal ``regulation``
+    # values live as Pyomo Vars (via :func:`_apply` / ``inject_vars``).
+    # The input ``monee_net`` is the wrong source: monee's
+    # ``persist_solution`` only back-writes via ``_copy_var_values``,
+    # which checks ``isinstance(dst_attr, (Var, Intermediate))`` before
+    # copying.  ``ChildModel.regulation`` starts as the Python float
+    # ``1.0`` on the input network and is *promoted* to a Var only on
+    # the LP copy — so the back-write silently skips every load's
+    # optimal regulation.  The metric on the input network then reads
+    # all loads at ``regulation = 1.0`` and reports ``served = full
+    # demand`` even when the LP correctly shed lower-priority tiers
+    # (2026-05-24 audit: deficit scenarios showed oracle reporting
+    # ``served = 0.374 MW`` despite physical supply of ``0.268 MW``).
+    # Slack ``p_mw`` DOES back-write correctly because it was a Var
+    # on both networks — that's why ``_slack_budget_summary`` works
+    # on either net, but the regulation-dependent metric does not.
+    solved_net = getattr(result, "network", monee_net)
+    behavior = _adapter_observe(solved_net)
+    served = served_breakdown(solved_net, behavior, priorities=priorities)
 
     # The oracle has no time-series; constraint integral is degenerate.
     # We still report it as zero so the result.json schema is uniform.
     integral = {"electricity": 0.0, "gas": 0.0, "heat": 0.0}
 
-    # Per-child regulation factors for downstream analysis.
+    # Per-child regulation factors for downstream analysis — read off
+    # the solved copy for the same reason as above.  Use ``model.values``
+    # (which calls ``pyomo.value(var)`` per attribute) rather than
+    # ``getattr(model, 'regulation')`` directly — on ``result.network``
+    # ``regulation`` is a monee ``Var`` object after the LP-promoted
+    # ``_apply`` step, and ``float(Var)`` raises ``TypeError``.
     regulations: dict[str, float] = {}
-    for child in monee_net.childs:
-        regulations[f"child-{child.id}"] = float(
-            getattr(child.model, "regulation", 1.0)
-        )
+    for child in solved_net.childs:
+        vals = child.model.values if hasattr(child.model, "values") else {}
+        regulations[f"child-{child.id}"] = float(vals.get("regulation", 1.0))
+
+    slack_summary = _slack_budget_summary(solved_net)
 
     return {
         "served": served,
         "constraint_violation_integral": integral,
         "regulations": regulations,
         "lp_success": lp_success,
+        "slack_budget_summary": slack_summary,
     }
 
 
@@ -249,7 +413,6 @@ def _baseline_cache_key(
     this cache.  JSON with sorted keys keeps the key stable across
     re-orderings of equivalent dicts.
     """
-    import json
     payload = {
         "grid": grid_name,
         "scenario": scenario or {},
@@ -289,10 +452,7 @@ def compute_baseline_served(
     cache_key = _baseline_cache_key(grid_name, scenario, priorities)
     cached = _BASELINE_CACHE.get(cache_key)
     if cached is not None:
-        import copy
         return copy.deepcopy(cached)
-
-    from experiment.restoration import GRIDS
 
     if grid_name not in GRIDS:
         raise SystemExit(f"Unknown grid {grid_name!r}")
@@ -301,8 +461,6 @@ def compute_baseline_served(
     if scenario:
         kind = scenario.get("kind", "clean")
         if kind == "cold_day":
-            from experiment.restoration import apply_cold_day
-
             kwargs = {
                 k: scenario[k]
                 for k in ("supply_t_k", "heat_load_scale")
@@ -310,8 +468,6 @@ def compute_baseline_served(
             }
             apply_cold_day(fresh, **kwargs)
         elif kind == "pv_peak":
-            from experiment.restoration import apply_pv_peak
-
             kwargs = {
                 k: scenario[k]
                 for k in ("gen_scale", "load_scale")
@@ -319,8 +475,6 @@ def compute_baseline_served(
             }
             apply_pv_peak(fresh, **kwargs)
         elif kind == "line_stress":
-            from experiment.restoration import apply_line_stress
-
             kwargs = {
                 k: scenario[k]
                 for k in ("load_scale", "ampacity_scale", "affect_branch_fraction")
@@ -333,8 +487,6 @@ def compute_baseline_served(
             # would be computed without islanding and overstate the
             # post-failure restoration loss.  Mirrors the runner's
             # ``_apply_scenario`` microgrid branch.
-            from experiment.restoration import apply_microgrid_islanding
-
             carriers = scenario.get(
                 "carriers", ("electricity", "water", "gas")
             )
@@ -348,8 +500,6 @@ def compute_baseline_served(
             )
         slack_budget_pct = scenario.get("slack_budget_pct")
         if slack_budget_pct is not None:
-            from experiment.restoration import apply_slack_budget
-
             apply_slack_budget(fresh, float(slack_budget_pct))
     # Strip ``backup=True`` from every branch on the local copy.  The
     # baseline LP solves the no-failure case, so any backup tie-line
@@ -367,7 +517,6 @@ def compute_baseline_served(
     out = run_oracle(fresh, [], solver=solver, priorities=priorities)
     served = out["served"]
     # Stash in cache for sibling tasks with identical inputs.
-    import copy
     _BASELINE_CACHE[cache_key] = copy.deepcopy(served)
     return served
 
@@ -384,12 +533,27 @@ def compose_oracle_result(
 ) -> dict[str, Any]:
     """Build a result.json payload identical in shape to the scare
     composer so the aggregator can read both off the same schema."""
-    from experiment.eval.metrics import restoration_breakdown
-
     out = run_oracle(monee_net, failures, solver=solver, priorities=priorities)
     served = out["served"]
     integral = out["constraint_violation_integral"]
     restoration = restoration_breakdown(served, baseline_served)
+
+    # Slack budget compliance: with the LP envelope now tightened to
+    # ±budget in run_oracle, a successful solve necessarily satisfies
+    # the budget by construction.  Surface it via the same ``claims``
+    # shape SCARE uses so the aggregator can compare apples to apples.
+    slack_summary = out.get("slack_budget_summary", {})
+    any_violation = any(
+        bool(d.get("violated")) for d in slack_summary.values()
+    )
+    slack_claim = {
+        "passed": (not any_violation) and bool(out.get("lp_success", True)),
+        "detail": {
+            "per_slack": slack_summary,
+            "n_violations": sum(1 for d in slack_summary.values() if d.get("violated")),
+            "enforced_at_lp": True,
+        },
+    }
 
     return {
         "task": task_meta,
@@ -411,6 +575,14 @@ def compose_oracle_result(
             "regulates_by_reason": {},
             "restoration": restoration,
             "oracle_lp_success": out.get("lp_success", True),
+            "slack_budget_summary": slack_summary,
+        },
+        "claims": {
+            # Vacuous for the priority claim (oracle minimises shed
+            # subject to LP constraints; there is no MAS-side priority
+            # dispatch to invariant-check).  Other variants populate
+            # this dict from claims.evaluate_task.
+            "slack_budget_compliance": slack_claim,
         },
         "diary": {"invariant_holds": True},   # vacuous
         "events": {},

@@ -85,6 +85,19 @@ class TaskArtefacts:
         """
         return _read_csv(self.task_dir / "trajectories.csv")
 
+    @cached_property
+    def slack_meta(self) -> dict[str, dict[str, Any]]:
+        """Per-slack-child metadata (``budget``, ``lp_envelope``,
+        ``sector``, ``obs_key``, ``node_id``) keyed by aid.
+
+        Written by the runner via ``write_slack_meta`` when the task
+        finishes.  Empty dict when the file is absent (legacy tasks or
+        a no-slack grid), so plot helpers fall back to drawing the
+        trajectory without overlays.
+        """
+        data = _read_json(self.task_dir / "slack_meta.json", default={})
+        return data if isinstance(data, dict) else {}
+
     # ---- Derived helpers --------------------------------------------
 
     def is_ok(self) -> bool:

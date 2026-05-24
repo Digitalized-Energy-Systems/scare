@@ -36,8 +36,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+from experiment.eval.report import generate_report
+from experiment.hpc.aggregate import write_summary
 from experiment.hpc.config import CAMPAIGN_LAYOUT, CampaignConfig
-from experiment.hpc.plan import create_campaign, read_manifest
+from experiment.hpc.plan import compress_ranges, create_campaign, filter_task_ids, read_manifest
+from experiment.hpc.run_local import run_campaign
+from experiment.hpc.submit import (
+    _aggregator_command,
+    _array_command,
+    _python_bin,
+    _run_sbatch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +74,6 @@ def _resolve_mode(mode: str) -> str:
 
 
 def _run_local(campaign_dir: Path, workers: int) -> Path:
-    from experiment.eval.report import generate_report
-    from experiment.hpc.aggregate import write_summary
-    from experiment.hpc.run_local import run_campaign
-
     tasks = read_manifest(campaign_dir)
     if not tasks:
         raise SystemExit("Campaign has no tasks — nothing to run.")
@@ -96,14 +101,6 @@ def _run_slurm(campaign_dir: Path) -> Path:
     """Submit the array → aggregator → report dependency chain.  Returns
     the path the report *will* land at once the chain finishes.
     """
-    from experiment.hpc.submit import (
-        _aggregator_command,
-        _array_command,
-        _python_bin,
-        _run_sbatch,
-    )
-    from experiment.hpc.plan import compress_ranges, filter_task_ids
-
     cfg = CampaignConfig.from_json(campaign_dir / CAMPAIGN_LAYOUT["config"])
     tasks = read_manifest(campaign_dir)
     selected = filter_task_ids(campaign_dir, tasks, "all")

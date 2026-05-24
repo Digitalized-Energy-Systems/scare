@@ -18,7 +18,7 @@ suffix) so the caller can reference both the .html and .pdf alongside.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import math
 import numpy as np
@@ -35,9 +35,10 @@ from plotly.subplots import make_subplots
 # Variant palette — picked for a) good contrast on white, b) print-friendly,
 # c) consistent meaning across every figure that splits by variant.
 _VARIANT_COLOR = {
-    "oracle": "#2E7D32",         # green — upper bound
-    "scare": "#1F4E96",          # deep blue — the protagonist
-    "single_level": "#E07A1F",   # warm orange — the strawman
+    "oracle": "#2E7D32",            # green — upper bound
+    "scare": "#1F4E96",             # deep blue — the protagonist
+    "single_level": "#E07A1F",      # warm orange — the strawman
+    "component_level": "#9467BD",   # purple — component-scoped variant
 }
 
 # Sector palette — used in trajectory + per-tier views.
@@ -200,6 +201,52 @@ def _empty_fig(message: str, title: str) -> go.Figure:
     return _apply_theme(fig, title=title)
 
 
+# Compliance column for slack-budget claim.  Plots that aggregate PWSF
+# must restrict to the compliant subset, otherwise a variant that
+# violates the budget (drawing slack past the operator-allowed
+# envelope) is rewarded for inflated served MW.  Mirrors the aggregator's
+# ``_compliant_split`` in ``experiment/hpc/aggregate.py``.
+_COMPLIANCE_COL = "claims__slack_budget_compliance__passed"
+
+
+def _compliant_mask(df: pd.DataFrame) -> pd.Series:
+    """Return a boolean Series aligned with ``df.index`` selecting
+    budget-compliant rows.  Treats missing compliance data as failure
+    (better to drop than reward unverifiable rows).  Returns an
+    all-True mask when the campaign has no compliance column
+    (back-compat for runs predating the slack-budget claim).
+    """
+    if _COMPLIANCE_COL not in df.columns:
+        return pd.Series(True, index=df.index)
+    return df[_COMPLIANCE_COL].fillna(False).astype(bool)
+
+
+def _compliance_rate(df: pd.DataFrame) -> float | None:
+    """Fraction of rows in ``df`` that pass slack-budget compliance.
+    ``None`` when the compliance column is missing (so callers can
+    suppress the annotation rather than print a fictional 100 %).
+    """
+    if _COMPLIANCE_COL not in df.columns or df.empty:
+        return None
+    passed = df[_COMPLIANCE_COL].fillna(False).astype(bool)
+    return float(passed.sum() / len(passed))
+
+
+def _compliance_subtitle(rate: float | None, n_compliant: int, n_total: int) -> str:
+    """Build the ``"compliant runs: M/N (X%)"`` subtitle line for
+    plots that aggregate over the compliant subset.  Empty when the
+    campaign predates the compliance column (rate is None)."""
+    if rate is None:
+        return ""
+    if n_total == 0:
+        return ""
+    return (
+        f"<span style='font-size:11px;color:{_MUTED_COLOR}'>"
+        f"compliant runs: {n_compliant}/{n_total} ({rate * 100:.0f}%)"
+        f"</span>"
+    )
+
+
 def _variant_color(variant: str, fallback: str | None = None) -> str:
     return _VARIANT_COLOR.get(variant, fallback or _QUAL_PALETTE[hash(variant) % len(_QUAL_PALETTE)])
 
@@ -240,31 +287,45 @@ def variant_comparison_bar(
     out_path: Path,
     *,
     metric_col: str = "outcomes__priority_weighted_fraction",
-    title: str = "Priority-weighted served fraction by variant",
+    title: str = "Priority-weighted served fraction by variant (compliant runs)",
 ) -> Path:
     if df.empty or metric_col not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
 
-    grouped = df.groupby(["grid", "variant"])[metric_col].apply(list)
-    grids = sorted({k[0] for k in grouped.index})
-    variants = sorted({k[1] for k in grouped.index})
+    # Restrict the PWSF mean to slack-budget-compliant rows.  See
+    # ``_compliant_mask`` for rationale: a variant violating the
+    # budget gets inflated served MW because the LP draws slack past
+    # the operator envelope, masking the priority-shedding quality
+    # we actually want to compare.  Compliance rate is reported as
+    # a per-(grid, variant) hover field + an overall subtitle.
+    compliant = df[_compliant_mask(df)]
+    grouped_c = compliant.groupby(["grid", "variant"])[metric_col].apply(list)
+    # Full counts so the hover can report ``n_compliant/n_total``.
+    grouped_full = df.groupby(["grid", "variant"])[metric_col].apply(list)
+    grids = sorted({k[0] for k in grouped_full.index})
+    variants = sorted({k[1] for k in grouped_full.index})
     grids_lbl = _grids_display(grids)
 
     fig = go.Figure()
     for variant in variants:
         means: list[float] = []
         cis: list[float] = []
-        ns: list[int] = []
+        n_c: list[int] = []
+        n_t: list[int] = []
         for grid in grids:
-            vals = grouped.get((grid, variant), [])
-            mean, ci = _mean_ci(vals)
+            vals_c = grouped_c.get((grid, variant), [])
+            vals_t = grouped_full.get((grid, variant), [])
+            mean, ci = _mean_ci(vals_c)
             means.append(mean)
             cis.append(ci)
-            ns.append(len(vals))
+            n_c.append(len(vals_c))
+            n_t.append(len(vals_t))
         hover = [
             f"<b>{alias_variant(variant)}</b><br>grid: {g}<br>"
-            f"mean: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {n}"
-            for g, m, c, n in zip(grids, means, cis, ns)
+            f"mean PWSF (compliant): {m:.4f}<br>95% CI: ±{c:.4f}<br>"
+            f"compliant: {nc}/{nt}"
+            + (f" ({nc / nt * 100:.0f}%)" if nt else "")
+            for g, m, c, nc, nt in zip(grids, means, cis, n_c, n_t)
         ]
         fig.add_trace(go.Bar(
             name=alias_variant(variant),
@@ -276,6 +337,13 @@ def variant_comparison_bar(
             hovertemplate="%{customdata}<extra></extra>",
             customdata=hover,
         ))
+
+    rate = _compliance_rate(df)
+    if rate is not None:
+        n_c_total = int(_compliant_mask(df).sum())
+        title = (
+            f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(df))}"
+        )
 
     fig.update_layout(barmode="group", bargap=0.22, bargroupgap=0.06)
     fig.update_yaxes(range=[0, 1.05], title="priority-weighted served fraction",
@@ -290,16 +358,22 @@ def variant_comparison_bar(
 
 
 def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
-    title = "Optimality gap: scare vs centralised oracle"
+    title = "Optimality gap: scare vs centralised oracle (compliant pairs)"
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
+    # Restrict the pair to rows where BOTH variants pass the slack-
+    # budget claim.  Otherwise an over-drawing scare run plotted
+    # against a compliant oracle reports a misleading "negative gap"
+    # (scare > oracle) that comes from scare violating the budget,
+    # not from genuinely outperforming the LP.
+    df = df[_compliant_mask(df)]
     pivot = df.pivot_table(index=["grid", "seed"], columns="variant", values=metric)
     if "scare" not in pivot.columns or "oracle" not in pivot.columns:
         return _save(_empty_fig("need both 'scare' and 'oracle' variants", title), out_path)
     pivot = pivot.dropna(subset=["scare", "oracle"], how="any")
     if pivot.empty:
-        return _save(_empty_fig("no scare/oracle pairs", title), out_path)
+        return _save(_empty_fig("no compliant scare/oracle pairs", title), out_path)
 
     fig = go.Figure()
     # Parity line first so points draw on top.
@@ -353,16 +427,18 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
 
 
 def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
-    title = "Optimality gap distribution by grid"
+    title = "Optimality gap distribution by grid (compliant pairs)"
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
+    # Same compliance filter as the scatter — see ``optimality_gap_scatter``.
+    df = df[_compliant_mask(df)]
     pivot = df.pivot_table(index=["grid", "seed"], columns="variant", values=metric)
     if "scare" not in pivot.columns or "oracle" not in pivot.columns:
         return _save(_empty_fig("need both 'scare' and 'oracle' variants", title), out_path)
     pivot = pivot.dropna(subset=["scare", "oracle"], how="any")
     if pivot.empty:
-        return _save(_empty_fig("no scare/oracle pairs", title), out_path)
+        return _save(_empty_fig("no compliant scare/oracle pairs", title), out_path)
     pivot["gap"] = (pivot["oracle"] - pivot["scare"]) / pivot["oracle"].replace(0, np.nan)
     pivot = pivot.dropna(subset=["gap"])
     if pivot.empty:
@@ -397,23 +473,35 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
 
 
 def ablation_impact_bar(df: pd.DataFrame, out_path: Path) -> Path:
-    title = "Ablation impact (scare variant)"
+    title = "Ablation impact (scare variant, compliant runs)"
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
-    grouped = df.groupby("ablation")[metric].agg(mean="mean", count="count", std="std")
+    # Per-ablation compliance counts before filtering, so the hover
+    # can show ``n_compliant/n_total`` and the reader can spot an
+    # ablation where the flag actively breaks budget compliance.
+    full_counts = df.groupby("ablation").size()
+    df_c = df[_compliant_mask(df)]
+    grouped = df_c.groupby("ablation")[metric].agg(mean="mean", count="count", std="std")
+    if grouped.empty:
+        return _save(_empty_fig("no compliant ablation rows", title), out_path)
     grouped["ci"] = grouped["std"].fillna(0) / np.sqrt(grouped["count"]) * 1.96
     grouped = grouped.sort_values("mean", ascending=True)
 
     baseline_mean = grouped.loc["default", "mean"] if "default" in grouped.index else None
     colors = ["#7F7F7F" if k == "default" else _VARIANT_COLOR["scare"] for k in grouped.index]
 
-    hover = [
-        f"<b>{k}</b><br>mean: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {n}<br>"
-        f"Δ vs default: {(m - baseline_mean):+.4f}" if baseline_mean is not None else
-        f"<b>{k}</b><br>mean: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {n}"
-        for k, m, c, n in zip(grouped.index, grouped["mean"], grouped["ci"], grouped["count"])
-    ]
+    hover = []
+    for k, m, c, n in zip(grouped.index, grouped["mean"], grouped["ci"], grouped["count"]):
+        n_total = int(full_counts.get(k, n))
+        rate_str = f" ({n / n_total * 100:.0f}%)" if n_total else ""
+        base = (
+            f"<b>{k}</b><br>mean PWSF (compliant): {m:.4f}<br>"
+            f"95% CI: ±{c:.4f}<br>compliant: {n}/{n_total}{rate_str}"
+        )
+        if baseline_mean is not None:
+            base += f"<br>Δ vs default: {(m - baseline_mean):+.4f}"
+        hover.append(base)
 
     fig = go.Figure(go.Bar(
         x=grouped["mean"],
@@ -464,9 +552,17 @@ def robustness_curve(
     if parsed.empty:
         return _save(_empty_fig(f"no {sweep_param} sweep", title), out_path)
 
-    grouped = parsed.groupby("x")[metric].agg(["mean", "std", "count"])
+    # Per-sweep-point compliance + PWSF on compliant subset.  A sweep
+    # value that pushes the variant out of compliance (e.g. very tight
+    # ``slack_budget_pct``) should still show its compliance rate even
+    # when the mean PWSF column is empty.
+    full_counts = parsed.groupby("x").size()
+    parsed_c = parsed[_compliant_mask(parsed)]
+    grouped = parsed_c.groupby("x")[metric].agg(["mean", "std", "count"])
     grouped["ci"] = grouped["std"].fillna(0) / np.sqrt(grouped["count"]) * 1.96
     grouped = grouped.sort_index()
+    if grouped.empty:
+        return _save(_empty_fig(f"no compliant {sweep_param} rows", title), out_path)
 
     x = grouped.index.tolist()
     y = grouped["mean"].tolist()
@@ -490,13 +586,18 @@ def robustness_curve(
         line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
         marker=dict(size=8, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)),
         customdata=[
-            f"x={xv}<br>mean: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {int(n)}"
+            f"x={xv}<br>mean PWSF (compliant): {m:.4f}<br>95% CI: ±{c:.4f}<br>"
+            f"compliant: {int(n)}/{int(full_counts.get(xv, n))}"
             for xv, m, c, n in zip(x, grouped["mean"], grouped["ci"], grouped["count"])
         ],
         hovertemplate="%{customdata}<extra></extra>",
         name="scare",
     ))
-    fig.update_yaxes(title="priority-weighted served fraction", range=[0, 1.05],
+    rate = _compliance_rate(parsed)
+    if rate is not None:
+        n_c_total = int(_compliant_mask(parsed).sum())
+        title = f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(parsed))}"
+    fig.update_yaxes(title="priority-weighted served fraction (compliant)", range=[0, 1.05],
                      tickformat=".2f")
     fig.update_xaxes(title=x_label)
     fig.update_layout(showlegend=False)
@@ -524,14 +625,23 @@ def _extract_sweep_value(sweep_key: str, param: str) -> float | None:
 
 
 def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
-    title = "Restoration quality vs simultaneous failure count"
+    title = "Restoration quality vs simultaneous failure count (compliant runs)"
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns or "n_failures" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
 
-    grouped = df.groupby("n_failures")[metric].agg(["mean", "std", "count"])
+    # Per-failure-count compliance: higher n_failures pushes the
+    # variant toward deficit where the budget is harder to honor.
+    # The curve should plot PWSF over the compliant subset so the
+    # cliff at high n_failures reflects "lost compliance" rather
+    # than "scare got generous with the slack budget".
+    full_counts = df.groupby("n_failures").size()
+    df_c = df[_compliant_mask(df)]
+    grouped = df_c.groupby("n_failures")[metric].agg(["mean", "std", "count"])
     grouped["ci"] = grouped["std"].fillna(0) / np.sqrt(grouped["count"]) * 1.96
     grouped = grouped.sort_index()
+    if grouped.empty:
+        return _save(_empty_fig("no compliant rows", title), out_path)
 
     x = grouped.index.tolist()
     y = grouped["mean"].tolist()
@@ -554,13 +664,18 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
         line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
         marker=dict(size=9, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)),
         customdata=[
-            f"failures: {xv}<br>mean served: {m:.4f}<br>95% CI: ±{c:.4f}<br>n: {int(n)}"
+            f"failures: {xv}<br>mean PWSF (compliant): {m:.4f}<br>"
+            f"95% CI: ±{c:.4f}<br>compliant: {int(n)}/{int(full_counts.get(xv, n))}"
             for xv, m, c, n in zip(x, grouped["mean"], grouped["ci"], grouped["count"])
         ],
         hovertemplate="%{customdata}<extra></extra>",
         name="scare",
     ))
-    fig.update_yaxes(title="priority-weighted served fraction", range=[0, 1.05],
+    rate = _compliance_rate(df)
+    if rate is not None:
+        n_c_total = int(_compliant_mask(df).sum())
+        title = f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(df))}"
+    fig.update_yaxes(title="priority-weighted served fraction (compliant)", range=[0, 1.05],
                      tickformat=".2f")
     fig.update_xaxes(title="number of simultaneous failures", dtick=1)
     fig.update_layout(showlegend=False)
@@ -590,15 +705,20 @@ def sweep_curve_dual(
     if parsed.empty:
         return _save(_empty_fig(f"no {sweep_param} sweep", title), out_path)
 
-    served = parsed.groupby("x")[metric].mean().sort_index()
+    # Compliant subset for the served axis; wallclock axis uses all
+    # rows (timing is a system property, not a metric-validity property).
+    parsed_c = parsed[_compliant_mask(parsed)]
+    if parsed_c.empty:
+        return _save(_empty_fig(f"no compliant {sweep_param} rows", title), out_path)
+    served = parsed_c.groupby("x")[metric].mean().sort_index()
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(
         x=served.index, y=served.values,
         mode="lines+markers",
-        name="served",
+        name="served (compliant)",
         line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
         marker=dict(size=8, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)),
-        hovertemplate=f"{sweep_param}: %{{x}}<br>served: %{{y:.4f}}<extra></extra>",
+        hovertemplate=f"{sweep_param}: %{{x}}<br>served (compliant): %{{y:.4f}}<extra></extra>",
     ), secondary_y=False)
 
     if "duration_s" in parsed.columns:
@@ -620,10 +740,16 @@ def sweep_curve_dual(
         )
 
     fig.update_yaxes(
-        title="priority-weighted served fraction", range=[0, 1.05],
+        title="priority-weighted served fraction (compliant)", range=[0, 1.05],
         color=_VARIANT_COLOR["scare"], secondary_y=False, tickformat=".2f",
     )
     fig.update_xaxes(title=x_label)
+    rate = _compliance_rate(parsed)
+    if rate is not None:
+        n_c_total = int(_compliant_mask(parsed).sum())
+        title = f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(parsed))}"
+        # Re-apply title (theme override) so the updated subtitle shows.
+        fig.update_layout(title=dict(text=title))
     return _save(_apply_theme(fig, title=title), out_path)
 
 
@@ -697,8 +823,8 @@ def restoration_trajectory(
         event_styles = {
             "line_failure": dict(color="#1A1A1A", dash="dash"),
             "reconfiguration_completed": dict(color="#9467BD", dash="dot"),
-            "islanding_request": dict(color="#E07A1F", dash="dot"),
-            "islanding_covered": dict(color="#2E7D32", dash="dot"),
+            "local_gen_request": dict(color="#E07A1F", dash="dot"),
+            "local_gen_covered": dict(color="#2E7D32", dash="dot"),
             "constraint_violation": dict(color="#D62728", dash="dot"),
         }
         for kind, style in event_styles.items():
@@ -1239,11 +1365,18 @@ def time_to_stabilise_box(
     steady-state after the failure (NaN for runs that never stabilised
     — we drop those, the box-plot only reflects successful tasks).
     Reviewers ask for "restoration time" first; this is it.
+
+    Oracle is excluded: it does a single snapshot solve and has no
+    temporal dynamics, so the result schema hard-codes
+    ``time_to_stabilise_s = 0.0`` for every oracle task.  Including it
+    would draw a degenerate strip at y=0 that just visually crushes the
+    scare / single_level distributions.
     """
     col = "outcomes__time_to_stabilise_s"
     if df.empty or col not in df.columns:
         return _save(_empty_fig("no time_to_stabilise_s column", title), out_path)
     sub = df.dropna(subset=[col, "variant"])
+    sub = sub[sub["variant"] != "oracle"]
     if sub.empty:
         return _save(_empty_fig("no stabilisation samples", title), out_path)
 
@@ -1356,7 +1489,7 @@ def solver_health_bar(
 _REGULATE_REASON_LABELS: dict[str, tuple[str, str]] = {
     # Balance / gossip layer
     "balance":               ("balance gossip",        "#1F4E96"),
-    "self_island":           ("balance self-island",   "#3F6FBD"),
+    "self_local_gen":        ("balance self local-gen", "#3F6FBD"),
     # Holonic ADMM
     "holon_supply_priority": ("holon supply-priority", "#2E7D32"),
     "holon_tier_alloc":      ("holon tier-alloc",      "#56A656"),
@@ -1365,9 +1498,9 @@ _REGULATE_REASON_LABELS: dict[str, tuple[str, str]] = {
     # Constraint-driven local actions
     "curtail":               ("curtailment auction",   "#E07A1F"),
     "heat_recovery":         ("heat recovery",         "#FFA959"),
-    # Stability / islanding fallbacks
+    # Stability / local-gen fallback
     "stability":             ("generation control",    "#9467BD"),
-    "islanding":             ("islanding fallback",    "#D62728"),
+    "local_gen_fallback":    ("local-gen fallback",    "#D62728"),
 }
 
 
@@ -1380,8 +1513,8 @@ def regulates_by_reason_bar(
     """Stacked bar of mean ``outcomes.regulates_by_reason`` counts per
     variant.  Answers "did each layer actually fire?" for ablations —
     a variant that disables the holonic ADMM should show zero
-    ``holon_*`` actions, a variant with the islanding fallback turned
-    off should show zero ``islanding``, etc.
+    ``holon_*`` actions, a variant with the local-generation fallback
+    turned off should show zero ``local_gen_fallback``, etc.
 
     Discovers reasons *dynamically* from the column set so newly-added
     triggers in ``scare/service/*.py`` show up without the plot having
@@ -1622,7 +1755,7 @@ def constraint_envelope_trajectory(
         "line_failure":              dict(color="#1A1A1A", dash="dash"),
         "branch_failure":            dict(color="#1A1A1A", dash="dash"),
         "reconfiguration_completed": dict(color="#9467BD", dash="dot"),
-        "islanding_request":         dict(color="#E07A1F", dash="dot"),
+        "local_gen_request":         dict(color="#E07A1F", dash="dot"),
         "constraint_violation":      dict(color="#D62728", dash="dot"),
     }
     seen_kinds: set[str] = set()
@@ -1927,6 +2060,7 @@ def slack_trajectory(
     *,
     title: str = "External-grid slack — operating point over time",
     failure_t: float | None = None,
+    slack_meta: dict[str, dict[str, Any]] | None = None,
 ) -> Path:
     """Per-slack-child trajectory — one line per ExtPowerGrid /
     ExtHydrGrid child, three subplots (electricity / gas / heat).
@@ -1937,10 +2071,14 @@ def slack_trajectory(
     ``mass_flow``.  A dashed vertical line marks the first failure
     time so the post-failure transient is visually anchored.
 
-    Validity claim: with ``slack_target_fraction > 0`` the MAS should
-    drive each slack toward ``rating · target``, not let it absorb the
-    entire residual — flat near-rating lines with no recovery after
-    failure indicate the MAS isn't engaging.
+    When ``slack_meta`` is supplied (loaded from ``slack_meta.json``),
+    the plot overlays per-slack-child reference lines: ``±budget``
+    (the operator-policy target stamped by ``apply_slack_budget``) as
+    a thin solid horizontal, and ``±lp_envelope`` (the actual LP Var
+    bound, typically 10× budget) as a thin dotted horizontal.  Slack
+    children left unbudgeted (heat-side ExtHydrGrid) get no overlay.
+    The combination makes "did the MAS keep the slack inside its
+    budget envelope?" answerable at a glance.
     """
     if timeseries.empty or "time_s" not in timeseries.columns:
         return _save(_empty_fig("no timeseries", title), out_path)
@@ -1968,11 +2106,13 @@ def slack_trajectory(
         subplot_titles=[s for s in sectors],
     )
     x = timeseries["time_s"].values
+    x_span = [float(x[0]), float(x[-1])] if len(x) else [0.0, 1.0]
     _y_unit = {
         "electricity": "p_mw",
         "gas": "mass_flow (kg/s)",
         "heat": "mass_flow (kg/s)",
     }
+    meta = slack_meta or {}
     for row_idx, sec in enumerate(sectors, start=1):
         cols = sorted(by_sector[sec])
         base = _SECTOR_COLOR.get(sec, "#888888")
@@ -1993,6 +2133,47 @@ def slack_trajectory(
                     "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
                 ),
             ), row=row_idx, col=1)
+
+            # Overlay operator-policy ±budget and LP ±envelope when
+            # ``slack_meta`` carries them for this aid.  Legend entries
+            # collapse onto the first child of each sector so the
+            # legend stays compact when many slack children share the
+            # same budget.
+            child_meta = meta.get(aid) or {}
+            budget = child_meta.get("budget")
+            envelope = child_meta.get("lp_envelope")
+            show_legend_overlay = (row_idx == 1 and i == 0)
+            if isinstance(budget, (int, float)):
+                for sign, label in ((1.0, "+budget"), (-1.0, "−budget")):
+                    fig.add_trace(go.Scatter(
+                        x=x_span,
+                        y=[sign * float(budget), sign * float(budget)],
+                        mode="lines",
+                        line=dict(color="#444444", dash="solid", width=1.2),
+                        name=f"budget ({sec})",
+                        legendgroup=f"budget_{sec}",
+                        showlegend=(show_legend_overlay and sign > 0),
+                        hovertemplate=(
+                            f"<b>{label} {sec}/{aid}</b><br>"
+                            f"value: {sign * float(budget):.4f}<extra></extra>"
+                        ),
+                    ), row=row_idx, col=1)
+            if isinstance(envelope, (int, float)):
+                for sign in (1.0, -1.0):
+                    fig.add_trace(go.Scatter(
+                        x=x_span,
+                        y=[sign * float(envelope), sign * float(envelope)],
+                        mode="lines",
+                        line=dict(color="#999999", dash="dot", width=1.0),
+                        name=f"LP envelope ({sec})",
+                        legendgroup=f"envelope_{sec}",
+                        showlegend=(show_legend_overlay and sign > 0),
+                        hovertemplate=(
+                            f"<b>LP envelope {sec}/{aid}</b><br>"
+                            f"value: {sign * float(envelope):.4f}<extra></extra>"
+                        ),
+                    ), row=row_idx, col=1)
+
         fig.update_yaxes(title=_y_unit.get(sec, "value"), row=row_idx, col=1)
         if failure_t is not None:
             fig.add_vline(
@@ -2121,3 +2302,303 @@ def regulation_per_child_lines(
     fig.update_yaxes(title="regulation factor", range=[-0.05, 1.5],
                      tickformat=".2f")
     return _save(_apply_theme(fig, title=title + subtitle, height=380), out_path)
+
+
+# ---------------------------------------------------------------------------
+# Per-task system-state overview (slack + control vars + lines + tiers)
+# ---------------------------------------------------------------------------
+
+
+_TIER_PALETTE = [
+    "#D62728", "#E55A4E", "#E07A1F", "#FFA959", "#BCBD22",
+    "#2E7D32", "#56A656", "#17BECF", "#1F4E96", "#7F7F7F",
+]
+
+
+def _tier_color(tier: int) -> str:
+    # Tier 1 = red (critical), fades through the palette to grey (low).
+    if 1 <= tier <= len(_TIER_PALETTE):
+        return _TIER_PALETTE[tier - 1]
+    return _QUAL_PALETTE[tier % len(_QUAL_PALETTE)]
+
+
+def system_state_overview(
+    timeseries: pd.DataFrame,
+    events: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "System-state overview",
+    failure_t: float | None = None,
+) -> Path:
+    """Per-task stacked-subplots view of the system state over time.
+
+    Five vertically-stacked panels share the simulation-time x-axis:
+
+    1. **External-grid slack** — one trace per slack child, coloured by
+       sector (read from ``slack__<sector>__<aid>``).
+    2. **Control variables** — ``avg_vm_pu`` / ``avg_pressure_pu`` /
+       ``avg_t_k`` with the operating envelopes shaded.
+    3. **Line loading** — ``max / p95 / avg`` aggregate of every
+       electricity-branch ``loading_percent`` observation, with a 100 %
+       reference line.
+    4. **Per-tier served fraction** — ``tier_served_mw__<i>`` /
+       ``tier_demand_mw__<i>`` per tier, clamped to ``[0, 1]``.
+    5. **Per-tier served MW** — absolute served-load timeseries per
+       tier so the absolute loss is visible alongside the fraction view.
+
+    Reads all signals from the per-task ``timeseries.csv`` that
+    ``_register_recordings`` emits.  Missing columns degrade gracefully:
+    panels without any input data are drawn but tagged "(no data)".
+    Failure / reconfiguration events are marked as synced vertical
+    guides across every panel so causality is readable end-to-end.
+    """
+    if timeseries.empty or "time_s" not in timeseries.columns:
+        return _save(_empty_fig("no timeseries", title), out_path)
+
+    x = timeseries["time_s"].astype(float).values
+
+    # --- Panel inventory --------------------------------------------------
+    slack_cols_by_sector: dict[str, list[str]] = {}
+    for col in timeseries.columns:
+        if not col.startswith("slack__"):
+            continue
+        parts = col.split("__")
+        if len(parts) >= 3:
+            slack_cols_by_sector.setdefault(parts[1], []).append(col)
+
+    ctrl_rows: list[tuple[str, str, tuple[float, float], str]] = []
+    envelopes = _sector_envelope_bounds()
+    for col, label, sector_key in (
+        ("avg_vm_pu", "vm (p.u.)", "electricity"),
+        ("avg_pressure_pu", "pressure (p.u.)", "gas"),
+        ("avg_t_k", "t (K)", "heat"),
+    ):
+        if col in timeseries.columns:
+            ctrl_rows.append((col, label, envelopes[col], _SECTOR_COLOR[sector_key]))
+
+    line_cols = [
+        c for c in ("max_line_loading_percent", "p95_line_loading_percent",
+                    "avg_line_loading_percent")
+        if c in timeseries.columns
+    ]
+
+    tier_demand_cols: dict[int, str] = {}
+    tier_served_cols: dict[int, str] = {}
+    for col in timeseries.columns:
+        if col.startswith("tier_demand_mw__"):
+            try:
+                tier_demand_cols[int(col.split("__")[-1])] = col
+            except ValueError:
+                continue
+        elif col.startswith("tier_served_mw__"):
+            try:
+                tier_served_cols[int(col.split("__")[-1])] = col
+            except ValueError:
+                continue
+    tiers = sorted(set(tier_demand_cols) & set(tier_served_cols))
+
+    panel_specs = [
+        ("Slack injection", bool(slack_cols_by_sector)),
+        ("Control variables (vm / pressure / t)", bool(ctrl_rows)),
+        ("Line loading (%)", bool(line_cols)),
+        ("Demand fulfilment by tier (fraction)", bool(tiers)),
+        ("Demand fulfilment by tier (MW)", bool(tiers)),
+    ]
+    rows = len(panel_specs)
+    fig = make_subplots(
+        rows=rows, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        subplot_titles=[t for t, _ in panel_specs],
+    )
+
+    # --- Panel 1: slack ---------------------------------------------------
+    panel_idx = 1
+    if slack_cols_by_sector:
+        # One trace per slack child, coloured by sector.  Legend grouped
+        # so the reader can toggle a whole sector at once.
+        legend_seen: set[str] = set()
+        for sec in sorted(slack_cols_by_sector):
+            base = _SECTOR_COLOR.get(sec, "#888888")
+            for col in sorted(slack_cols_by_sector[sec]):
+                aid = col.split("__", 2)[-1]
+                fig.add_trace(go.Scatter(
+                    x=x, y=timeseries[col].astype(float).values,
+                    mode="lines",
+                    line=dict(color=base, width=1.4),
+                    opacity=0.85 if len(slack_cols_by_sector[sec]) <= 4 else 0.55,
+                    name=sec if sec not in legend_seen else None,
+                    legendgroup=sec,
+                    showlegend=sec not in legend_seen,
+                    hovertemplate=(
+                        f"<b>slack {sec}/{aid}</b><br>"
+                        "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                    ),
+                ), row=panel_idx, col=1)
+                legend_seen.add(sec)
+        fig.update_yaxes(title="MW / kg·s⁻¹", row=panel_idx, col=1)
+    panel_idx += 1
+
+    # --- Panel 2: control variables --------------------------------------
+    if ctrl_rows:
+        # Use per-variable secondary axes so vm_pu (≈1) and t_k (≈300+)
+        # don't collapse onto one scale.  Plotly subplots can't have
+        # multiple y-axes per row natively without the secondary_y dance,
+        # so we normalise each variable to its envelope-band centre
+        # (0 = lo, 1 = hi) and plot the normalised value so the three
+        # series share one axis with the band-edges drawn at 0 and 1.
+        # Hover still reports the raw value via customdata.
+        for col, label, bounds, color in ctrl_rows:
+            lo, hi = bounds
+            raw = timeseries[col].astype(float).values
+            denom = hi - lo if hi != lo else 1.0
+            norm = (raw - lo) / denom
+            fig.add_trace(go.Scatter(
+                x=x, y=norm,
+                mode="lines",
+                line=dict(color=color, width=1.6),
+                name=label,
+                customdata=raw,
+                hovertemplate=(
+                    f"<b>{label}</b><br>"
+                    "t: %{x:.2f}s<br>"
+                    "raw: %{customdata:.4f}<br>"
+                    "normalised: %{y:.3f}"
+                    "<extra></extra>"
+                ),
+                legendgroup="ctrl",
+                showlegend=True,
+            ), row=panel_idx, col=1)
+        # Operating-envelope band at [0, 1] (since values are normalised).
+        fig.add_hrect(y0=0.0, y1=1.0, fillcolor="rgba(150,150,150,0.10)",
+                      line=dict(width=0), layer="below",
+                      row=panel_idx, col=1)
+        fig.add_hline(y=0.0, line=dict(color=_MUTED_COLOR, dash="dot", width=1),
+                      row=panel_idx, col=1)
+        fig.add_hline(y=1.0, line=dict(color=_MUTED_COLOR, dash="dot", width=1),
+                      row=panel_idx, col=1)
+        fig.update_yaxes(title="normalised to envelope", row=panel_idx, col=1)
+    panel_idx += 1
+
+    # --- Panel 3: line loading -------------------------------------------
+    if line_cols:
+        # max in red, p95 in orange, avg in muted blue.  100 % reference
+        # line so an overload reads at a glance.
+        colors = {
+            "max_line_loading_percent": ("#D62728", "max"),
+            "p95_line_loading_percent": ("#E07A1F", "p95"),
+            "avg_line_loading_percent": ("#1F4E96", "avg"),
+        }
+        for col in line_cols:
+            c, label = colors.get(col, ("#888888", col))
+            fig.add_trace(go.Scatter(
+                x=x, y=timeseries[col].astype(float).values,
+                mode="lines",
+                line=dict(color=c, width=1.6),
+                name=label,
+                legendgroup="line_loading",
+                showlegend=True,
+                hovertemplate=(
+                    f"<b>{label} loading</b><br>"
+                    "t: %{x:.2f}s<br>%{y:.1f} %%"
+                    "<extra></extra>"
+                ),
+            ), row=panel_idx, col=1)
+        fig.add_hline(y=100.0, line=dict(color="#D62728", dash="dash", width=1),
+                      row=panel_idx, col=1)
+        fig.update_yaxes(title="loading (%)", row=panel_idx, col=1,
+                         rangemode="tozero")
+    panel_idx += 1
+
+    # --- Panel 4: per-tier fraction --------------------------------------
+    if tiers:
+        for tier in tiers:
+            demand = timeseries[tier_demand_cols[tier]].astype(float).values
+            served = timeseries[tier_served_cols[tier]].astype(float).values
+            with np.errstate(divide="ignore", invalid="ignore"):
+                frac = np.where(demand > 1e-9, served / demand, 1.0)
+            frac = np.clip(frac, 0.0, 1.05)
+            color = _tier_color(tier)
+            fig.add_trace(go.Scatter(
+                x=x, y=frac,
+                mode="lines",
+                line=dict(color=color, width=1.6),
+                name=f"tier {tier}",
+                legendgroup="tiers",
+                showlegend=True,
+                hovertemplate=(
+                    f"<b>tier {tier}</b><br>"
+                    "t: %{x:.2f}s<br>fraction: %{y:.3f}"
+                    "<extra></extra>"
+                ),
+            ), row=panel_idx, col=1)
+        fig.update_yaxes(title="served / demand", row=panel_idx, col=1,
+                         range=[-0.05, 1.10], tickformat=".2f")
+    panel_idx += 1
+
+    # --- Panel 5: per-tier MW --------------------------------------------
+    if tiers:
+        for tier in tiers:
+            served = timeseries[tier_served_cols[tier]].astype(float).values
+            color = _tier_color(tier)
+            fig.add_trace(go.Scatter(
+                x=x, y=served,
+                mode="lines",
+                line=dict(color=color, width=1.4),
+                name=f"tier {tier} MW",
+                legendgroup="tiers_mw",
+                showlegend=False,  # legend already shows tiers in panel 4
+                hovertemplate=(
+                    f"<b>tier {tier}</b><br>"
+                    "t: %{x:.2f}s<br>served: %{y:.4f} MW"
+                    "<extra></extra>"
+                ),
+            ), row=panel_idx, col=1)
+        fig.update_yaxes(title="MW served", row=panel_idx, col=1,
+                         rangemode="tozero")
+
+    # --- Synced event markers across every panel -------------------------
+    event_styles = {
+        "line_failure":              dict(color="#1A1A1A", dash="dash"),
+        "branch_failure":            dict(color="#1A1A1A", dash="dash"),
+        "reconfiguration_completed": dict(color="#9467BD", dash="dot"),
+        "local_gen_request":         dict(color="#E07A1F", dash="dot"),
+        "constraint_violation":      dict(color="#D62728", dash="dot"),
+    }
+    seen_kinds: set[str] = set()
+    if not events.empty and {"t", "kind"}.issubset(events.columns):
+        for kind, style in event_styles.items():
+            sub = events[events["kind"] == kind]
+            if sub.empty:
+                continue
+            seen_kinds.add(kind)
+            for tx in sub["t"].astype(float).unique():
+                for r in range(1, rows + 1):
+                    fig.add_vline(
+                        x=float(tx),
+                        line=dict(color=style["color"], dash=style["dash"], width=1),
+                        opacity=0.55,
+                        row=r, col=1,
+                    )
+    elif failure_t is not None:
+        for r in range(1, rows + 1):
+            fig.add_vline(
+                x=float(failure_t),
+                line=dict(color="#1A1A1A", dash="dash", width=1),
+                opacity=0.55,
+                row=r, col=1,
+            )
+
+    # Sentinel scatters for the event-kind legend (one per kind).
+    for kind in sorted(seen_kinds):
+        style = event_styles[kind]
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(color=style["color"], dash=style["dash"], width=2),
+            name=kind, legendgroup="events", showlegend=True,
+        ), row=1, col=1)
+
+    fig.update_xaxes(title="simulation time (s)", row=rows, col=1)
+    height = 180 * rows + 100
+    return _save(_apply_theme(fig, title=title, height=height,
+                              width=int(_FIG_WIDTH * 1.4)), out_path)

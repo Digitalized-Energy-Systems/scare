@@ -21,8 +21,11 @@ from distributed_resource_optimization.algorithm.admm.core import (
     ADMMMessage,
     ADMMStart,
 )
+from distributed_resource_optimization.algorithm.core import on_exchange_message
 from distributed_resource_optimization.carrier.mango import (
     DistributedOptimizationRole,
+    MangoCarrier,
+    _CarrierReply,
     _CarrierRequest,
 )
 
@@ -36,16 +39,12 @@ _ADMM_CONTENT_TYPES: tuple[type, ...] = (
 
 class ScareDistributedOptimizationRole(DistributedOptimizationRole):
     def setup(self) -> None:
-        from distributed_resource_optimization.carrier.mango import MangoCarrier
-
         self._carrier = MangoCarrier(self, self._include_self)
         self.context.subscribe_message(
             self,
             self._handle_optimization,
             lambda c, m: isinstance(c, _ADMM_CONTENT_TYPES),
         )
-        from distributed_resource_optimization.carrier.mango import _CarrierReply
-
         self.context.subscribe_message(
             self,
             self._handle_reply,
@@ -53,8 +52,6 @@ class ScareDistributedOptimizationRole(DistributedOptimizationRole):
         )
 
     def _handle_optimization(self, content: Any, meta: dict) -> None:
-        from distributed_resource_optimization.algorithm.core import on_exchange_message
-
         if isinstance(content, _CarrierRequest):
             actual_meta = {**meta, "_request_id": content.request_id}
             actual_content = content.content

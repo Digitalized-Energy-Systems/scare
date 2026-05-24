@@ -4,7 +4,7 @@
     "Designed so task success is heavily dependent on CP integration:",
     "  * Grids: simbench_lv_cp_dependent + simbench_lv_cp_heavy_dependent.",
     "    On both, CPs replace primary generation — losing a CP creates",
-    "    a deficit that intra-sector gossip + islanding alone cannot recover.",
+    "    a deficit that intra-sector gossip + local-gen fallback alone cannot recover.",
     "  * Failures: high failure_lambda + small max_failures + tight",
     "    slack_budget_pct so the system actually has something to recover from.",
     "    Generator-class failures bias toward CP loss (CPs are the dominant",
@@ -98,7 +98,7 @@
       ]
     },
     {
-      "$comment": "Negative control: same flag-on/off ablation on a grid where CPs do NOT replace primary generation.  Cross-sector coalitions should have a small effect because intra-sector gossip+islanding can recover most deficits on its own.",
+      "$comment": "Negative control: same flag-on/off ablation on a grid where CPs do NOT replace primary generation.  Cross-sector coalitions should have a small effect because intra-sector gossip+local-gen fallback can recover most deficits on its own.",
       "name": "non_dependent_control",
       "grids": ["simbench_lv_cp_heavy"],
       "n_seeds": 3,

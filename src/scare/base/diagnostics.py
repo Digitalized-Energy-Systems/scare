@@ -33,7 +33,7 @@ _log: Deque["ActionRecord"] = deque(maxlen=_MAX_ACTIONS)
 # Cleared by ``arm()`` so each experiment run starts fresh.
 _negotiation_log: list["NegotiationRecord"] = []
 
-# Event ledger — failures, reconfigurations, islanding requests,
+# Event ledger — failures, reconfigurations, local-gen fallback requests,
 # constraint violations.  One row per occurrence so the aggregator can
 # count by type and reconstruct timing.  Same lifecycle as the
 # negotiation log: unbounded, cleared on ``arm()``.
@@ -94,7 +94,7 @@ class NegotiationRecord:
 
     - ``"started"``           → ``_start_gossip`` past the threshold check
     - ``"skipped_balanced"``  → target below the per-group threshold
-    - ``"skipped_singleton"`` → no group neighbours; emitted IslandingRequest
+    - ``"skipped_singleton"`` → no group neighbours; emitted LocalGenerationRequest
     - ``"finished"``          → ``_finish_negotiation`` ran with a residual
     - ``"timed_out"``         → wallclock deadline forced ``_finish_negotiation``
     - ``"cancelled"``         → ``ConstraintViolation`` aborted active gossip
@@ -243,8 +243,8 @@ def record_event(
     detail: str = "",
 ) -> None:
     """Append a domain-level event record (branch_failure, line_failure,
-    reconfiguration_completed, tie_switch_close, islanding_request,
-    islanding_covered, constraint_violation, constraint_warning,
+    reconfiguration_completed, tie_switch_close, local_gen_request,
+    local_gen_covered, constraint_violation, constraint_warning,
     holon_formed, holon_admm_result, holon_admm_failed).
 
     Cheap (single list append).  No-op until ``arm()`` is called.

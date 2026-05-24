@@ -1,10 +1,24 @@
 import argparse
 import asyncio
 import logging
+import random
 from collections.abc import Callable
+from statistics import median
 
+import monee.express as mx
 import simbench
+from monee import enable_islanding
 from monee.io.from_pandapower import from_pandapower_net
+from monee.model.child import (
+    ExtHydrGrid,
+    ExtPowerGrid,
+    HeatLoad,
+    PowerGenerator,
+    PowerLoad,
+    Sink,
+    Source,
+)
+from monee.model.extension import GridFormingGenerator, GridFormingSource
 from monee.model.formulation import (
     MISOCP_NETWORK_FORMULATION,
     make_mccormick_dhs_formulation,
@@ -13,8 +27,8 @@ from monee.network import (
     generate_supply_return_mes_based_on_power_net,
 )
 
-from scare.base.diagnostics import install_solver_failure_dump
-from scare.base.util import create_failures
+from scare.base.diagnostics import install_solver_failure_dump, negotiation_summary
+from scare.base.util import create_failures, obs_capacity
 from scare.base.visu import visualize_results
 from scare.scenario.restoration import (
     create_restoration_scenario_world,
@@ -164,10 +178,6 @@ def apply_microgrid_islanding(
         capacity), and the chapter's CP-coordination claim can build
         on top with the per-aid ``grid_former_aids`` knob.
     """
-    from monee import enable_islanding
-    from monee.model.child import PowerGenerator, Source
-    from monee.model.extension import GridFormingGenerator, GridFormingSource
-
     carrier_set = frozenset(carriers)
     if not carrier_set:
         return {"electricity": 0, "water": 0, "gas": 0}
@@ -247,13 +257,6 @@ def apply_slack_budget(mes, fraction: float) -> None:
     network make up the remainder, and the MAS drives toward that
     distribution.
     """
-    from monee.model.child import (
-        ExtHydrGrid,
-        ExtPowerGrid,
-        PowerLoad,
-        Sink,
-    )
-
     # Aggregate nominal demand per sector.  Heat is excluded — heat-side
     # ExtHydrGrid imports mass-flow at fixed supply temperature, and
     # its consumption is constrained by the WaterPipe / HeatExchanger
@@ -417,12 +420,7 @@ def add_backup_lines(
         ids, useful for downstream analysis (e.g. measuring how many
         of them the reconfigurator actually closes).
     """
-    import random as _random
-    from statistics import median
-
-    import monee.express as mx
-
-    rng = _random.Random(seed) if seed is not None else _random.Random()
+    rng = random.Random(seed) if seed is not None else random.Random()
 
     sector_specs: dict[str, dict] = {
         "electricity": {
@@ -519,9 +517,7 @@ def add_backup_lines(
             except Exception as exc:
                 # If the underlying constructor rejects the pair (e.g.
                 # incompatible grid attributes), skip and keep going.
-                import logging
-
-                logging.getLogger(__name__).debug(
+                logger.debug(
                     "Backup branch creation skipped for (%s, %s) in %s: %s",
                     a, b, sector, exc,
                 )
@@ -612,11 +608,7 @@ def assign_load_priorities(
 
     ``seed`` makes the random assignments deterministic.
     """
-    import random as _random
-
-    from scare.base.util import obs_capacity
-
-    rng = _random.Random(seed * 7919 + 31)
+    rng = random.Random(seed * 7919 + 31)
     P = 10
     out: dict[str, int] = {}
 
@@ -687,8 +679,6 @@ def apply_cold_day(
     Idempotent in the sense of "build a fresh net then call once" — do
     not call this twice on the same net or the load scale stacks.
     """
-    from monee.model.child import ExtHydrGrid, HeatLoad
-
     for child in mes.childs:
         m = child.model
         if isinstance(m, HeatLoad):
@@ -735,8 +725,6 @@ def apply_pv_peak(
     Idempotent in the sense of "build a fresh net then call once" — do
     not call this twice on the same net or the scales stack.
     """
-    from monee.model.child import ExtPowerGrid, PowerGenerator, PowerLoad
-
     # Track totals so we can size the slack-budget relaxation.
     total_gen_p = 0.0
     total_load_p = 0.0
@@ -819,8 +807,6 @@ def apply_line_stress(
     Idempotent in the "build fresh net then call once" sense — calling
     twice stacks the scales.
     """
-    from monee.model.child import PowerLoad
-
     for child in mes.childs:
         m = child.model
         if isinstance(m, PowerLoad):
@@ -850,7 +836,6 @@ def apply_line_stress(
 
 async def run(grid: str, seed: int | None = None, write_html: bool = True) -> None:
     if seed is not None:
-        import random
         random.seed(seed)
 
     factory = GRIDS[grid]
@@ -871,8 +856,6 @@ async def run(grid: str, seed: int | None = None, write_html: bool = True) -> No
     logger.info("Running simulation for %.0f s …", SIMULATION_DURATION_S)
     await start_restoration_simulation(world, failures, SIMULATION_DURATION_S)
     logger.info("Simulation complete.")
-
-    from scare.base.diagnostics import negotiation_summary
 
     logger.info("Negotiation diary: %s", negotiation_summary())
 

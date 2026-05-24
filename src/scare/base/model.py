@@ -336,10 +336,35 @@ class StartBalanceNegotiation:
 
 
 @dataclass
-class IslandingRequest:
-    """Emitted when gossip negotiation converges with unresolved deficit,
-    triggering the islanding fallback (improvements.txt §5 SHOULD
-    "Fallback / islanding capability")."""
+class LocalGenerationRequest:
+    """Sent by an L1 group leader to its L2 holon peers when gossip
+    converges with an unresolved deficit.  The holon decides whether
+    to absorb the residual cross-group via an early rebalance, and
+    replies with a ``LocalGenerationApproval`` so the originator's
+    fallback role activates only after L2 has had a chance to act.
+
+    See improvements.txt §5 SHOULD "Fallback / islanding capability".
+    The §5 wording speaks of "islanding"; in this implementation the
+    fallback is a dispatch heuristic that ramps local generator-class
+    children to cover the residual — no physical islanding (switch
+    opening, grid-forming) is performed by the receiver.  That lives
+    in monee's ``enable_islanding`` extension."""
+
+    sector: Sector
+    residual_deficit: float
+
+
+@dataclass
+class LocalGenerationApproval:
+    """L2's response to a ``LocalGenerationRequest``: green-lights the
+    originator's ``LocalGenerationFallbackRole`` for the (possibly
+    reduced) residual that L2 could not absorb cross-group.
+
+    Carried back to the originator over the holons topology so L1
+    fallback activation is mediated by L2 rather than fired locally
+    behind L2's back.  In configurations without a holon layer
+    (``enable_holonic=False``) the originating role emits this event
+    directly so the fallback path still works."""
 
     sector: Sector
     residual_deficit: float

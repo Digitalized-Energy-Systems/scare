@@ -16,11 +16,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from experiment.eval.aliases import alias_grid, alias_variant
 from experiment.hpc.config import CAMPAIGN_LAYOUT
 from experiment.hpc.plan import read_manifest
 
@@ -163,15 +165,10 @@ def _format_md(df: pd.DataFrame) -> str:
             mean_duration_s=("duration_s", "mean"),
             mean_solver_failures=("solver_failures", "mean"),
         )
-        try:
-            from experiment.eval.aliases import alias_grid as _alias_grid
-        except Exception:  # pragma: no cover
-            def _alias_grid(g):
-                return g
         rows = []
         for grid, r in agg.iterrows():
             rows.append([
-                _alias_grid(grid), int(r["total"]), int(r["ok"]),
+                alias_grid(grid), int(r["total"]), int(r["ok"]),
                 int(r["claims_failed"]), int(r["error"]),
                 int(r["timeout"]), int(r["killed"]), int(r["missing"]),
                 f"{r['mean_duration_s']:.1f}" if pd.notna(r["mean_duration_s"]) else "—",
@@ -195,14 +192,9 @@ def _format_md(df: pd.DataFrame) -> str:
             parts.append("_(no successful runs)_")
         else:
             agg = ok_df.groupby("grid")[metric_cols].mean()
-            try:
-                from experiment.eval.aliases import alias_grid as _alias_grid_m
-            except Exception:  # pragma: no cover
-                def _alias_grid_m(g):
-                    return g
             rows = []
             for grid, r in agg.iterrows():
-                rows.append([_alias_grid_m(grid), *[f"{r[c]:.4g}" if pd.notna(r[c]) else "—" for c in metric_cols]])
+                rows.append([alias_grid(grid), *[f"{r[c]:.4g}" if pd.notna(r[c]) else "—" for c in metric_cols]])
             parts.append(_markdown_table(["grid", *metric_cols], rows))
 
     if "exception_type" in df.columns and df["exception_type"].notna().any():
@@ -229,6 +221,45 @@ def _format_md(df: pd.DataFrame) -> str:
 _PRIMARY_OUTCOME = "outcomes__priority_weighted_fraction"
 _TIME_TO_STABILISE = "outcomes__time_to_stabilise_s"
 _REGULATES_TOTAL = "outcomes__regulates_total"
+_COMPLIANCE_COL = "claims__slack_budget_compliance__passed"
+
+
+def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
+    """Split a group of task rows into its compliance-conditional view.
+
+    Returns ``(pwsf_compliant, compliance_rate, n_compliant, n_total)``:
+
+    * ``pwsf_compliant`` — the ``priority_weighted_fraction`` series
+      restricted to tasks that passed the slack-budget claim.  This is
+      the series the headline mean should be computed over.
+    * ``compliance_rate`` — fraction of tasks (with a defined PWSF) that
+      passed compliance, in ``[0, 1]``.  ``nan`` when no compliance
+      column is present (older runs) so the caller can suppress the
+      column instead of reporting fictional 100 %.
+    * ``n_compliant`` / ``n_total`` — counts for the table.
+
+    Layer-2 rationale: a variant that violates the slack budget can
+    over-serve MW by drawing the slack past the operator-allowed
+    envelope (e.g. single_level in tight-deficit scenarios draws
+    ~3× budget).  Including its inflated PWSF in the mean rewards
+    cheating.  This helper restricts the PWSF mean to compliant
+    runs and reports the compliance rate as a paired metric — the
+    reader can rank by either axis and discuss the trade.
+    """
+    full = g[_PRIMARY_OUTCOME].dropna() if _PRIMARY_OUTCOME in g.columns else pd.Series(dtype=float)
+    n_total = int(len(full))
+    if _COMPLIANCE_COL not in g.columns:
+        return full, float("nan"), n_total, n_total
+    # Align the compliance bool with the PWSF series so masking lines up.
+    passed = g.loc[full.index, _COMPLIANCE_COL]
+    # Coerce to bool: NaN ⇒ False (treat unknown compliance as failure,
+    # since we'd rather under-report PWSF than over-report by including
+    # rows we can't verify).
+    passed_bool = passed.fillna(False).astype(bool)
+    n_compliant = int(passed_bool.sum())
+    pwsf_compliant = full[passed_bool]
+    rate = float(n_compliant / n_total) if n_total else float("nan")
+    return pwsf_compliant, rate, n_compliant, n_total
 
 
 def _format_eval_sections(df: pd.DataFrame) -> list[str]:
@@ -242,24 +273,34 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
     if ok.empty or _PRIMARY_OUTCOME not in ok.columns:
         return parts
 
-    # Variant comparison: scare vs single_level vs oracle, per grid.
-    try:
-        from experiment.eval.aliases import alias_grid as _ag, alias_variant as _av
-    except Exception:  # pragma: no cover
-        def _ag(x): return x
-        def _av(x): return x
+    # Variant comparison: scare vs single_level vs component_level vs oracle, per grid.
+    # PWSF mean is restricted to budget-compliant tasks per ``_compliant_split``;
+    # ``compliance`` column reports the fraction of tasks that honored the
+    # operator's slack-budget policy.  See ``_compliant_split`` for rationale.
     parts.append("")
-    parts.append("## Variant comparison (priority-weighted served, mean ± 95% CI)")
+    parts.append("## Variant comparison (priority-weighted served on compliant runs, mean ± 95% CI)")
     rows = []
     for (grid, variant), g in ok.groupby(["grid", "variant"]):
-        s = g[_PRIMARY_OUTCOME].dropna()
-        if s.empty:
+        pwsf_c, rate, n_c, n_t = _compliant_split(g)
+        if n_t == 0:
             continue
-        mean, ci = _mean_ci95(s)
-        rows.append([_ag(grid), _av(variant), len(s), f"{mean:.4f}", f"±{ci:.4f}"])
+        if pwsf_c.empty:
+            mean_str, ci_str = "—", "—"
+        else:
+            mean, ci = _mean_ci95(pwsf_c)
+            mean_str, ci_str = f"{mean:.4f}", f"±{ci:.4f}"
+        rate_str = "—" if pd.isna(rate) else f"{rate*100:.0f}%"
+        rows.append([
+            alias_grid(grid), alias_variant(variant),
+            f"{n_c}/{n_t}", rate_str, mean_str, ci_str,
+        ])
     if rows:
         rows.sort(key=lambda r: (r[0], r[1]))
-        parts.append(_markdown_table(["grid", "variant", "n", "mean", "95% CI"], rows))
+        parts.append(_markdown_table(
+            ["grid", "variant", "n_compliant/n_total", "compliance",
+             "mean PWSF", "95% CI"],
+            rows,
+        ))
 
     # Ablation impact: only rows belonging to an experiment that
     # actually defines an ablation matrix (otherwise the "default"
@@ -276,64 +317,72 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
     abl = abl_all[abl_all["experiment"].isin(abl_experiments)] if abl_experiments else abl_all.iloc[0:0]
     if "ablation" in abl.columns and abl["ablation"].nunique() > 1:
         parts.append("")
-        parts.append("## Ablation impact (scare variant only)")
-        baseline_key = "default"
-        baseline = abl[abl["ablation"] == baseline_key][_PRIMARY_OUTCOME]
-        b_mean = baseline.mean() if not baseline.empty else float("nan")
+        parts.append("## Ablation impact (scare variant only, compliant runs)")
+        baseline_pwsf_c, _, _, _ = _compliant_split(abl[abl["ablation"] == "default"])
+        b_mean = float(baseline_pwsf_c.mean()) if not baseline_pwsf_c.empty else float("nan")
         rows = []
         for ablation_key, g in abl.groupby("ablation"):
-            s = g[_PRIMARY_OUTCOME].dropna()
-            if s.empty:
+            pwsf_c, rate, n_c, n_t = _compliant_split(g)
+            if n_t == 0:
                 continue
-            mean = float(s.mean())
-            diff = mean - b_mean if not pd.isna(b_mean) else float("nan")
+            mean = float(pwsf_c.mean()) if not pwsf_c.empty else float("nan")
+            diff = mean - b_mean if not (pd.isna(b_mean) or pd.isna(mean)) else float("nan")
+            rate_str = "—" if pd.isna(rate) else f"{rate*100:.0f}%"
             rows.append([
-                ablation_key, len(s),
-                f"{mean:.4f}",
+                ablation_key, f"{n_c}/{n_t}", rate_str,
+                "—" if pd.isna(mean) else f"{mean:.4f}",
                 "—" if pd.isna(diff) else f"{diff:+.4f}",
             ])
         rows.sort(key=lambda r: (r[0] != "default", r[0]))
         parts.append(_markdown_table(
-            ["ablation", "n", "mean", "Δ vs default"],
+            ["ablation", "n_compliant/n_total", "compliance",
+             "mean PWSF", "Δ vs default"],
             rows,
         ))
 
     # Sweep curves.
     if "sweep" in ok.columns and ok["sweep"].nunique() > 1:
         parts.append("")
-        parts.append("## Sensitivity sweeps (priority-weighted served, mean)")
+        parts.append("## Sensitivity sweeps (priority-weighted served on compliant runs)")
         rows = []
         for sweep_key, g in ok.groupby("sweep"):
-            s = g[_PRIMARY_OUTCOME].dropna()
-            if s.empty:
+            pwsf_c, rate, n_c, n_t = _compliant_split(g)
+            if n_t == 0:
                 continue
             t = g[_TIME_TO_STABILISE].dropna()
             r = g[_REGULATES_TOTAL].dropna()
+            mean_str = "—" if pwsf_c.empty else f"{pwsf_c.mean():.4f}"
+            rate_str = "—" if pd.isna(rate) else f"{rate*100:.0f}%"
             rows.append([
-                sweep_key, len(s),
-                f"{s.mean():.4f}",
+                sweep_key, f"{n_c}/{n_t}", rate_str, mean_str,
                 f"{t.mean():.2f}" if not t.empty else "—",
                 f"{int(r.mean())}" if not r.empty else "—",
             ])
         rows.sort(key=lambda r: (r[0] != "default", r[0]))
         parts.append(_markdown_table(
-            ["sweep", "n", "mean served", "mean t_stab (s)", "mean regulates"],
+            ["sweep", "n_compliant/n_total", "compliance",
+             "mean PWSF", "mean t_stab (s)", "mean regulates"],
             rows,
         ))
 
     # Scenarios — robustness + cascading.
     if "scenario" in ok.columns and ok["scenario"].nunique() > 1:
         parts.append("")
-        parts.append("## Scenario comparison")
+        parts.append("## Scenario comparison (compliant runs)")
         rows = []
         for scenario_key, g in ok.groupby("scenario"):
-            s = g[_PRIMARY_OUTCOME].dropna()
-            if s.empty:
+            pwsf_c, rate, n_c, n_t = _compliant_split(g)
+            if n_t == 0:
                 continue
-            rows.append([scenario_key, len(s), f"{s.mean():.4f}"])
+            mean_str = "—" if pwsf_c.empty else f"{pwsf_c.mean():.4f}"
+            rate_str = "—" if pd.isna(rate) else f"{rate*100:.0f}%"
+            rows.append([
+                scenario_key, f"{n_c}/{n_t}", rate_str, mean_str,
+            ])
         rows.sort(key=lambda r: r[0])
         parts.append(_markdown_table(
-            ["scenario", "n", "mean served"], rows
+            ["scenario", "n_compliant/n_total", "compliance", "mean PWSF"],
+            rows,
         ))
 
     # Restoration vs no-failure baseline — surface absolute load lost
@@ -360,7 +409,7 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
                 pwsf_r  = float(g[pwsf_col].mean()) if pwsf_col in g.columns else float("nan")
                 pct     = drop_mw / base_mw if base_mw else 0.0
                 rows.append([
-                    _ag(grid), len(g),
+                    alias_grid(grid), len(g),
                     f"{base_mw:.3f}", f"{post_mw:.3f}",
                     f"{drop_mw:.3f}", f"{pct*100:.1f}%",
                     f"{raw_r:.3f}",
@@ -384,7 +433,7 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
             if s.empty:
                 continue
             ok_pct = 100.0 * float(s.astype(bool).sum()) / len(s)
-            rows.append([_av(variant), len(s), f"{ok_pct:.1f}%"])
+            rows.append([alias_variant(variant), len(s), f"{ok_pct:.1f}%"])
         parts.append(_markdown_table(
             ["variant", "n", "invariant holds"], rows,
         ))
@@ -396,8 +445,6 @@ def _mean_ci95(s: pd.Series) -> tuple[float, float]:
     """Sample mean and 95 % CI half-width via t-distribution (robust to
     small n).  ``ci`` is the half-width — display as ``mean ± ci``.
     """
-    import math
-
     n = len(s)
     if n <= 1:
         return float(s.mean()) if n else 0.0, 0.0

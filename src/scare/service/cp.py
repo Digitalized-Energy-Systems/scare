@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
+import numpy as np
+from distributed_resource_optimization import (
+    create_admm_sharing_data,
+    create_admm_start,
+    create_sharing_target_distance_admm_coordinator,
+    start_coordinated_optimization,
+)
 from mango import Role
 from mango import sender_addr as mango_sender_addr
 from mango.express.topology import (
@@ -12,13 +19,17 @@ from mango.express.topology import (
 )
 
 from scare.base.channel import (
+    ComponentAllocation,
+    CPAllocation,
     CPCommitment,
+    CPFlexReport,
     CPSetpoint,
     HolonAllocation,
+    L3RebalanceWakeup,
     MonotonicVersion,
-    SectorImbalanceUpdate,
     SeenVersions,
 )
+from scare.base.diagnostics import record_event
 from scare.base.model import (
     AskEnergyMessage,
     AskForAvailableFlex,
@@ -30,7 +41,16 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.topology_mirror import LivePeerFilter
-from scare.base.util import clamp_to_constraints, kgps_to_mw, mw_to_kgps, obs_setpoint
+from scare.base.util import (
+    aggregate_priority_weight,
+    apply_regulate,
+    clamp_to_constraints,
+    kgps_to_mw,
+    mw_to_kgps,
+    obs_setpoint,
+    tier_priority_weight,
+)
+from scare.community.supply_priority_admm import allocate_supply_priority
 
 if TYPE_CHECKING:
     from distributed_resource_optimization import ADMMFlexActor
@@ -66,11 +86,13 @@ _CP_SETPOINT_TOLERANCE: dict[Sector, float] = {
 }
 _CP_DEFAULT_TOLERANCE = 0.01
 
-# --- Predicate-driven trigger (channel/decision path) ---
-# Below ``_PREDICATE_DEAD_BAND`` the cross-sector imbalance is treated
-# as noise and the predicate stays False.  ``_PREDICATE_MIN_GAP_S``
-# enforces a cooldown between predicate-driven fires so the role
-# cannot self-thrash if two beacons publish in rapid succession.
+# --- Reactive-trigger noise filter (used by HolonAllocation path) ---
+# Below ``_PREDICATE_DEAD_BAND`` the L2-dispatched cross-sector signal
+# is treated as noise and the trigger is suppressed.  ``_PREDICATE_MIN_GAP_S``
+# enforces a cooldown so a burst of L2 dispatches cannot self-thrash
+# the CP.  Both were previously also used by the deprecated beacon-
+# driven ``_handle_sector_imbalance`` path; that path has been removed
+# in favour of purely event-driven CP triggering.
 _PREDICATE_DEAD_BAND_MW: float = 1e-4
 _PREDICATE_MIN_GAP_S: float = 1.0
 
@@ -134,15 +156,6 @@ class EnergyConverterRole(Role):
         # such skip at INFO so it is visible without flooding.
         self._same_sign_skip_count: int = 0
 
-        # --- Predicate path state ---
-        # Per-publisher version memory for SectorImbalanceUpdate so we
-        # don't re-evaluate the predicate against stale beacon decisions.
-        self._seen_beacons = SeenVersions()
-        # Latest signed imbalance per (publisher, sector).  Aggregated
-        # by sector in ``_predicate_inputs`` when the predicate runs.
-        self._beacon_imbalance: dict[tuple[str, Sector], float] = {}
-        self._last_predicate_fire_t: float = -1e9
-
         # --- L2 -> L3 channel state ---
         # Same shape as the beacon path but for ``HolonAllocation``: a
         # holon committed a cross-sector setpoint shift; we may want
@@ -155,6 +168,176 @@ class EnergyConverterRole(Role):
         # --- L3 publishing identity ---
         self._cp_version = MonotonicVersion()
 
+        # --- Multi-sector L3 (Option B) wiring ---
+        # Injected via ``wire_multi_sector_l3`` after world construction
+        # so the topology mirror + the CP meta table (which require the
+        # full world graph) can reach the role.  ``None`` until wired —
+        # legacy per-CP path runs in that case.
+        self._topology_mirror: Any = None
+        self._my_node_id: Any = None
+        # All CPs in the world: ``{cp_aid: {"sectors": [Sector, ...],
+        # "capacity_mw": float, "coupling_ratios": dict[(in, out), float],
+        # "addr": Address, "node_id": Any}}``.  The L3 coord uses this
+        # to broadcast :class:`CPAllocation` to other CPs in its multi-
+        # sector component.
+        self._cp_meta_by_aid: dict[str, dict[str, Any]] = {}
+        # Per-sector ``{leader_aid: addr}`` for every group leader; the
+        # L3 coord filters this through ``topology_mirror.reachable_from``
+        # to find the leaders in its multi-sector component.
+        self._leader_addrs_by_sector: dict[Sector, dict[str, Any]] = {}
+        # ``{leader_aid: node_id}`` so the L3 coord can resolve which
+        # leaders are reachable from its own node.
+        self._leader_node_ids: dict[str, Any] = {}
+
+        # --- Multi-sector L3 coordinator runtime state ---
+        # Latest CPAllocation result this CP applied (for warm-start
+        # tracking and to suppress no-op re-dispatches).
+        self._last_l3_setpoint_by_sector: dict[str, float] = {}
+        # Round counter for the multi-sector ADMM the L3 coord drives.
+        self._l3_round_counter: int = 0
+        # Set to True while the L3 coord's collect→solve→dispatch cycle
+        # is in flight, so reactive triggers coalesce instead of
+        # stacking.  Distinct from ``_active`` (which guards the
+        # legacy per-CP ADMM path).
+        self._l3_active: bool = False
+
+    # ------------------------------------------------------------------
+    # Multi-sector L3 (Option B) wiring + helpers
+    # ------------------------------------------------------------------
+
+    def wire_multi_sector_l3(
+        self,
+        *,
+        topology_mirror: Any,
+        my_node_id: Any,
+        cp_meta_by_aid: dict[str, dict[str, Any]],
+        leader_addrs_by_sector: dict[Sector, dict[str, Any]],
+        leader_node_ids: dict[str, Any],
+    ) -> None:
+        """Inject the post-construction state the multi-sector L3 path
+        needs to elect a coordinator and drive a joint multi-sector
+        ADMM.  Called by ``scenario.restoration`` after the topology
+        mirror + every CP agent have been built; pre-call the role
+        behaves as legacy per-CP.
+
+        Parameters
+        ----------
+        topology_mirror
+            Shared :class:`TopologyMirror` instance.  Same instance the
+            community + holonic roles consult, so failures propagate
+            consistently across L2 and L3.
+        my_node_id
+            This CP agent's host node id in the monee graph.
+        cp_meta_by_aid
+            ``{cp_aid: {sectors, capacity_mw, coupling_ratios, addr,
+            node_id}}`` for every CP in the world.  L3 coord
+            broadcasts to other CPs via this map; non-coord CPs apply
+            allocations they receive.
+        leader_addrs_by_sector
+            ``{Sector: {leader_aid: addr}}`` for every group leader.
+            L3 coord filters this through the mirror to find leaders
+            in its multi-sector component.
+        leader_node_ids
+            ``{leader_aid: node_id}`` for reachability filtering.
+        """
+        self._topology_mirror = topology_mirror
+        self._my_node_id = my_node_id
+        self._cp_meta_by_aid = dict(cp_meta_by_aid)
+        self._leader_addrs_by_sector = dict(leader_addrs_by_sector)
+        self._leader_node_ids = dict(leader_node_ids)
+
+    def _multi_sector_l3_enabled(self) -> bool:
+        """True iff this CP has the runtime state needed to drive the
+        multi-sector L3 path.  Falls back to the legacy per-CP path
+        when False (e.g. tests that build the role directly without
+        wiring the mirror, or campaigns that disable enable_cp_admm).
+        """
+        return (
+            self._topology_mirror is not None
+            and self._my_node_id is not None
+            and bool(self._cp_meta_by_aid)
+        )
+
+    def _multi_sector_component_reachable(self) -> set:
+        """Return the set of node ids in this CP's multi-sector
+        connected component — i.e. nodes mutually reachable on the
+        active branch subgraph AND through active CP bridges.  Used
+        to scope both leader-flex collection and CP-allocation
+        dispatch to the right physical island.
+        """
+        try:
+            return self._topology_mirror.reachable_from(
+                self._my_node_id, sector=None, allow_cp_bridges=True,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] multi-sector reachable_from failed: %s",
+                self.context.aid, exc,
+            )
+            return {self._my_node_id}
+
+    def _cp_peers_in_component(self) -> dict[str, dict[str, Any]]:
+        """Return ``{cp_aid: meta}`` for every CP whose host node is
+        in this CP's multi-sector component.  Always includes self
+        (so the lex-smallest aid is well-defined even for a singleton
+        component).
+        """
+        reachable = self._multi_sector_component_reachable()
+        out: dict[str, dict[str, Any]] = {}
+        for aid, meta in self._cp_meta_by_aid.items():
+            node = meta.get("node_id")
+            if aid == self.context.aid or node is None or node in reachable:
+                out[aid] = meta
+        # Defensive: always self.
+        if self.context.aid not in out and self.context.aid in self._cp_meta_by_aid:
+            out[self.context.aid] = self._cp_meta_by_aid[self.context.aid]
+        return out
+
+    def _leader_addrs_in_component(self) -> dict[Sector, dict[str, Any]]:
+        """Return ``{Sector: {leader_aid: addr}}`` filtered to leaders
+        whose host node is reachable from this CP on the active
+        multi-sector subgraph.  This is what the L3 coord asks for
+        flex; identical to L2's per-component peer set logic but
+        widened to span every sector touched by the multi-sector
+        component.
+        """
+        reachable = self._multi_sector_component_reachable()
+        out: dict[Sector, dict[str, Any]] = {}
+        for sector, table in self._leader_addrs_by_sector.items():
+            sec_out: dict[str, Any] = {}
+            for aid, addr in table.items():
+                node = self._leader_node_ids.get(aid)
+                if node is not None and node in reachable:
+                    sec_out[aid] = addr
+            if sec_out:
+                out[sector] = sec_out
+        return out
+
+    def _schedule_trigger(self) -> None:
+        """Route the reactive trigger to the multi-sector L3 path when
+        wired, else to the legacy per-CP path.  Used by the predicate /
+        beacon / holon-allocation / coalition handlers that previously
+        always scheduled ``trigger_cp_negotiation``.
+        """
+        if self._multi_sector_l3_enabled():
+            self.context.schedule_instant_task(self.trigger_multi_sector_l3())
+        else:
+            self._schedule_trigger()
+
+    def _is_l3_coordinator(self) -> bool:
+        """True iff this CP has the lex-smallest aid among CPs in its
+        multi-sector component.  The L3 coord drives the joint ADMM;
+        other CPs in the same component wait for ``CPAllocation``.
+
+        Defensive: if this CP isn't in the cp_meta table (the wiring
+        was incomplete), defer to legacy per-CP and return True only
+        when this CP is the trivially-lex-smallest of {self}.
+        """
+        peers = self._cp_peers_in_component()
+        if not peers:
+            return True
+        return min(peers) == self.context.aid
+
     def setup(self) -> None:
         def _wrap(coro_fn):
             def _sync(msg, meta):
@@ -165,6 +348,19 @@ class EnergyConverterRole(Role):
             "[%s] EnergyConverterRole setup: sectors=%s",
             self.context.aid, [s.value for s in self.sectors],
         )
+        # CP triggering is purely event-driven.  The role wakes up only
+        # when an actual cross-sector decision input arrives:
+        #   - NegotiationFinishedEvent (L1 gossip converged on a new
+        #     group setpoint)
+        #   - HolonAllocation (L2 holon dispatched a fresh per-member plan)
+        #   - CPCommitment (L2.5 coalition issued a directional envelope)
+        #   - CPAllocation (multi-sector L3 coord assigned this CP)
+        # The previous design also ran a periodic ``_heartbeat_l3`` and
+        # subscribed to ``SectorImbalanceUpdate`` beacons; both were
+        # implicitly periodic (heartbeat by timer, beacon by publisher
+        # cadence) and could fire ADMM even when no upstream state had
+        # changed.  They have been removed — the CP only acts on new
+        # information now.
         self.context.subscribe_message(
             self,
             _wrap(self._handle_ask_energy),
@@ -179,15 +375,6 @@ class EnergyConverterRole(Role):
             self,
             _wrap(self._handle_flex_answer),
             lambda msg, meta: isinstance(msg, AvailableFlexAnswer),
-        )
-        # Predicate path: receive sector-imbalance beacons from group
-        # leaders.  This runs *alongside* the legacy NegotiationFinishedEvent
-        # path — both can trigger ADMM independently, and the existing
-        # ``self._active`` guard prevents concurrent runs.
-        self.context.subscribe_message(
-            self,
-            _wrap(self._handle_sector_imbalance),
-            lambda msg, meta: isinstance(msg, SectorImbalanceUpdate),
         )
         # Direct L2 -> L3 trigger.  When a holon commits a per-member
         # allocation that creates cross-sector flow, the CP can decide
@@ -206,6 +393,17 @@ class EnergyConverterRole(Role):
             self,
             _wrap(self._handle_cp_commitment),
             lambda msg, meta: isinstance(msg, CPCommitment),
+        )
+        # Multi-sector L3 dispatch: non-coord CPs receive their
+        # per-sector flow setpoint from the elected L3 coordinator
+        # and apply it via the existing regulation path.  The coord's
+        # local setpoint goes through the same handler so all CPs
+        # behave uniformly.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_cp_allocation),
+            lambda msg, meta: isinstance(msg, CPAllocation)
+            and msg.cp_aid == str(self.context.aid),
         )
 
     async def _handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
@@ -233,94 +431,6 @@ class EnergyConverterRole(Role):
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
-    async def _handle_sector_imbalance(
-        self, message: SectorImbalanceUpdate, meta: dict
-    ) -> None:
-        """Predicate-driven trigger path (channel/decision design).
-
-        Updates the per-publisher imbalance memory, then evaluates the
-        trigger predicate over the aggregated sector vector.  Fires
-        ``trigger_cp_negotiation`` independently of whether L1 gossip
-        has finished — the missing path that left L3 silent on
-        ``simbench_lv_cp_heavy`` with the holon layer disabled.
-        """
-        # Only the CP leader runs ADMM.  Non-leaders silently drop
-        # beacons; they exist for symmetry with the legacy path.
-        char = topology_characteristic(self, tid="cps")
-        logger.debug(
-            "[%s] CP received beacon: sector=%s imb=%.5f v=%d from %s char=%s",
-            self.context.aid, message.sector.value, message.local_imbalance_mw,
-            message.version, message.publisher, char,
-        )
-        if char != "leader":
-            return
-        # Echo / staleness guard.  ``caused_by[my_aid] == latest`` means
-        # the beacon is reporting on state we just published; skip it.
-        my_latest = self._seen_beacons.latest(self.context.aid)
-        if message.caused_by.get(self.context.aid, -1) == my_latest and my_latest >= 0:
-            return
-        if not self._seen_beacons.is_fresh(message.publisher, message.version):
-            return
-
-        self._beacon_imbalance[(message.publisher, message.sector)] = (
-            float(message.local_imbalance_mw)
-        )
-        self._seen_beacons.mark(message.publisher, message.version)
-
-        if self._active:
-            return
-
-        T = self._predicate_inputs()
-        if not self._predicate_should_run(T):
-            return
-
-        now = float(self.context.current_timestamp)
-        if now - self._last_predicate_fire_t < _PREDICATE_MIN_GAP_S:
-            return
-        self._last_predicate_fire_t = now
-
-        logger.info(
-            "[%s] CP predicate fired: T=%s (publisher=%s v=%d)",
-            self.context.aid,
-            {s.value: round(v, 4) for s, v in T.items()},
-            message.publisher,
-            message.version,
-        )
-        self.context.schedule_instant_task(self.trigger_cp_negotiation())
-
-    def _predicate_inputs(self) -> dict[Sector, float]:
-        """Aggregate the latest per-publisher imbalances by sector.
-
-        A publisher only contributes its most-recent value per sector
-        (the dict is keyed by ``(publisher, sector)``).  Sums across
-        publishers give the sector-level signal the predicate compares
-        across sectors.
-        """
-        by_sector: dict[Sector, float] = {}
-        for (_, sec), v in self._beacon_imbalance.items():
-            if sec in self.sectors:
-                by_sector[sec] = by_sector.get(sec, 0.0) + v
-        return by_sector
-
-    def _predicate_should_run(self, T: dict[Sector, float]) -> bool:
-        """Predicate is a *wake-up hint*, not an ADMM-feasibility test.
-
-        The historical same-sign-skip lives inside ``_run_admm`` (which
-        runs its own ``AskForAvailableFlex`` round after we trigger),
-        so the predicate doesn't need to duplicate it.  Beacons only
-        cover sectors whose group leaders had a CP connector
-        registered (and mango's per-agent single-conn_type rule means
-        multi-sector CPs only show up to one sector's leaders), which
-        would otherwise make the cross-sector check unreachable.
-
-        The predicate just asks: did any subscribed sector report
-        stress beyond the dead-band?  If yes, wake the CP up; its
-        collection round will gather the real cross-sector picture.
-        """
-        if not T:
-            return False
-        return any(abs(v) >= _PREDICATE_DEAD_BAND_MW for v in T.values())
-
     async def _handle_holon_allocation(
         self, message: HolonAllocation, meta: dict
     ) -> None:
@@ -343,7 +453,10 @@ class EnergyConverterRole(Role):
             self.context.aid, message.sector.value,
             len(message.targets_mw), message.version, message.publisher, char,
         )
-        if char != "leader":
+        # Cps-leader gate — only active in legacy single-sector mode.
+        # Multi-sector L3 path uses the ``_is_l3_coordinator`` election
+        # inside the dispatcher.
+        if char != "leader" and not self._multi_sector_l3_enabled():
             return
         # Echo guard: a holon allocation triggered by our own CP
         # setpoint isn't fresh news to us.
@@ -381,7 +494,7 @@ class EnergyConverterRole(Role):
             self.context.aid, message.sector.value, signal,
             message.publisher, message.version,
         )
-        self.context.schedule_instant_task(self.trigger_cp_negotiation())
+        self._schedule_trigger()
 
     async def _handle_cp_commitment(
         self, message: CPCommitment, meta: dict
@@ -428,8 +541,6 @@ class EnergyConverterRole(Role):
         # Diagnostic ledger entry — picked up by ``event_log()`` so the
         # post-run analysis can plot envelope-active intervals and the
         # cumulative cross-sector transfer the coalition committed to.
-        from scare.base.diagnostics import record_event
-
         record_event(
             t=now,
             kind="cp_envelope_set",
@@ -468,8 +579,6 @@ class EnergyConverterRole(Role):
             "[%s] CP ADMM result clamped to coalition envelope %s: %s",
             self.context.aid, self._envelope_coalition_id, result,
         )
-        from scare.base.diagnostics import record_event
-
         record_event(
             t=float(self.context.current_timestamp),
             kind="cp_envelope_clamp",
@@ -510,7 +619,7 @@ class EnergyConverterRole(Role):
             )
             return
         self._last_sector_setpoint[sector] = new
-        self.context.schedule_instant_task(self.trigger_cp_negotiation())
+        self._schedule_trigger()
 
     def _live_connectors(self, connectors: list) -> list:
         """Filter ``connectors`` through the sibling
@@ -561,12 +670,18 @@ class EnergyConverterRole(Role):
     async def _handle_flex_answer(
         self, message: AvailableFlexAnswer, meta: dict
     ) -> None:
-        if not self._active:
+        # Route to the right ADMM driver based on which flow opened the
+        # collection.  ``_l3_active`` is set by ``trigger_multi_sector_l3``;
+        # ``_active`` is set by the legacy ``trigger_cp_negotiation``.
+        # Mutually exclusive by design — both guards reject re-entry.
+        if not self._l3_active and not self._active:
             return
-
         self._flex_answers.append(message)
-
-        if len(self._flex_answers) >= self._flex_expected:
+        if len(self._flex_answers) < self._flex_expected:
+            return
+        if self._l3_active:
+            await self._run_multi_sector_admm()
+        else:
             await self._run_admm()
 
     def _aggregate_flex_answers(
@@ -580,8 +695,6 @@ class EnergyConverterRole(Role):
         critical (lowest-tier) unmet (sector, tier) pair so the ADMM
         weight is top-tier-dominant rather than magnitude-weighted.
         """
-        from scare.base.util import aggregate_priority_weight
-
         agg = _FlexAggregate({}, {}, {}, {}, {})
         for answer in answers:
             agg.imbalance_by_sector[answer.sector] = (
@@ -631,8 +744,6 @@ class EnergyConverterRole(Role):
         magnitude weight when ``demand_by_sector_priority`` is absent.
         Result normalised to ``[0.01, 1]``.
         """
-        from scare.base.util import tier_priority_weight
-
         def _sector_w(sec: Sector) -> float:
             top_tier = agg.top_unmet_tier_per_sector.get(sec)
             if top_tier is None:
@@ -649,14 +760,6 @@ class EnergyConverterRole(Role):
         return np.maximum(priorities, 0.01)
 
     async def _run_admm(self) -> None:
-        import numpy as np
-        from distributed_resource_optimization import (
-            create_admm_sharing_data,
-            create_admm_start,
-            create_sharing_target_distance_admm_coordinator,
-            start_coordinated_optimization,
-        )
-
         answers = self._flex_answers[:]
         self._flex_answers = []
         self._flex_expected = 0
@@ -709,8 +812,6 @@ class EnergyConverterRole(Role):
             # post-run analysis even when ADMM bails before publishing a
             # setpoint.  Without this the cp_setpoint counter undercounts
             # CP engagement on grids where T is structurally same-sign.
-            from scare.base.diagnostics import record_event
-
             record_event(
                 t=float(self.context.current_timestamp),
                 kind="cp_admm_skipped_same_sign",
@@ -764,8 +865,6 @@ class EnergyConverterRole(Role):
             )
             # Ledger entry — picked up by ``event_log()`` so the plots
             # can reconstruct each CP's per-sector flow timeline.
-            from scare.base.diagnostics import record_event
-
             record_event(
                 t=float(self.context.current_timestamp),
                 kind="cp_setpoint",
@@ -801,6 +900,369 @@ class EnergyConverterRole(Role):
 
         self._active = False
 
+    # ------------------------------------------------------------------
+    # Multi-sector L3 driver (Option B)
+    # ------------------------------------------------------------------
+
+    async def trigger_multi_sector_l3(self) -> None:
+        """L3-coord entrypoint for the joint multi-sector ADMM round.
+
+        Only the lex-smallest CP aid in the multi-sector component
+        actually runs.  Other CPs early-out and wait for the
+        :class:`CPAllocation` broadcast from the coord.
+
+        Flow:
+          1. Collect flex from every group leader in the multi-sector
+             component (one ``AskForAvailableFlex`` per leader).
+          2. Wait for replies via the existing ``_handle_flex_answer``
+             buffer; once the expected count lands, call
+             :meth:`_run_multi_sector_admm`.
+          3. The ADMM is the same supply-priority kernel L2 uses, but
+             scoped to the multi-sector component (spans every sector
+             touched by this component).
+          4. Dispatch :class:`ComponentAllocation` to each leader (per-
+             sector slice of the joint result), then compute per-sector
+             marginal values and broadcast :class:`CPAllocation` to
+             every CP in the component (including self) so each CP
+             can apply its setpoint via the existing
+             :meth:`_apply_result` path.
+
+        Falls back to the legacy per-CP path via
+        :meth:`trigger_cp_negotiation` when the multi-sector wiring is
+        unavailable (e.g. ``wire_multi_sector_l3`` wasn't called).
+        """
+        if not self._multi_sector_l3_enabled():
+            await self.trigger_cp_negotiation()
+            return
+        # Note: deliberately do NOT gate on cps-cluster-leader here.
+        # The L3 coordinator identity is determined by lex-smallest
+        # aid in the multi-sector component (see ``_is_l3_coordinator``)
+        # which is independent of cps-cluster topology leadership.  In
+        # grids with CPs scattered across multiple cps-clusters, the
+        # L3 coord often isn't the cps-cluster leader; gating here
+        # caused the "silent shed" pattern in the 2026-05-23 smoke
+        # where L2 deferred but L3 never fired.
+        if not self._is_l3_coordinator():
+            # Non-coord: wait for the coord's CPAllocation broadcast.
+            return
+        if self._l3_active or self._active:
+            return
+
+        component_leaders = self._leader_addrs_in_component()
+        # Flatten {sector: {aid: addr}} → list[addr], one per leader
+        # (some leaders may appear in multiple sectors if their group
+        # spans them, but ``leader_addrs_by_sector`` is per-sector so
+        # the same aid won't double-list under a single sector).
+        all_addrs: list[Any] = []
+        seen_aids: set[str] = set()
+        for sec_table in component_leaders.values():
+            for aid, addr in sec_table.items():
+                if aid in seen_aids:
+                    continue
+                seen_aids.add(aid)
+                all_addrs.append(addr)
+        if not all_addrs:
+            logger.info(
+                "[%s] L3 trigger skipped: no reachable leaders in component",
+                self.context.aid,
+            )
+            return
+
+        self._l3_active = True
+        self._flex_answers = []
+        self._flex_expected = len(all_addrs)
+
+        logger.info(
+            "[%s] L3 coord triggered: asking %d leaders in MS component for flex",
+            self.context.aid, len(all_addrs),
+        )
+        msg = AskForAvailableFlex(include_connectors=False)
+        for addr in all_addrs:
+            await self.context.send_message(msg, receiver_addr=addr)
+
+    async def _run_multi_sector_admm(self) -> None:
+        """Run the joint multi-sector supply-priority ADMM over the
+        collected leader flex answers and dispatch the result.
+
+        Called by :meth:`_handle_flex_answer` when the L3-coord path
+        has gathered the expected replies.  Distinct from
+        :meth:`_run_admm` (the legacy per-CP path).
+        """
+        try:
+            await self._run_multi_sector_admm_inner()
+        finally:
+            self._l3_active = False
+
+    async def _run_multi_sector_admm_inner(self) -> None:
+        answers = self._flex_answers[:]
+        self._flex_answers = []
+        self._flex_expected = 0
+        if not answers:
+            return
+
+        # Build (supply, demand) actor lists from the leader replies.
+        # One actor per leader.  The supply-priority ADMM is sector-
+        # agnostic about how many sectors live in a single round, so
+        # passing in every sector touched by any leader gives us the
+        # multi-sector joint solve.
+        actor_supplies: list[dict[str, float]] = []
+        actor_demands: list[dict[str, dict[int, float]]] = []
+        for a in answers:
+            actor_supplies.append(dict(a.supply_by_sector or {}))
+            actor_demands.append(
+                {
+                    sec: dict(tmap)
+                    for sec, tmap in (a.demand_by_sector_priority or {}).items()
+                }
+            )
+
+        sectors = sorted({
+            s for d in actor_demands for s in d
+        })
+        if not sectors:
+            return
+        tiers_present: set[int] = set()
+        for d in actor_demands:
+            for tmap in d.values():
+                tiers_present.update(tmap.keys())
+        tiers = sorted(t for t in tiers_present if t >= 1)
+        if not tiers:
+            return
+        total_demand = sum(
+            float(v) for d in actor_demands
+            for tmap in d.values()
+            for v in tmap.values()
+        )
+        if total_demand < 1e-6:
+            return
+
+        round_id = f"l3-r{self._l3_round_counter}"
+        self._l3_round_counter += 1
+
+        try:
+            service_fraction, _per_actor_x, meta = await allocate_supply_priority(
+                sectors=sectors,
+                tiers=tiers,
+                actor_supplies=actor_supplies,
+                actor_demands=actor_demands,
+                actor_ub_overrides=None,
+                priority_tiers=10,
+                max_iters=50,
+                abs_tol=1e-3,
+                enable_priority_weighting=True,
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] multi-sector L3 ADMM failed: %s", self.context.aid, exc,
+            )
+            record_event(
+                t=float(self.context.current_timestamp),
+                kind="l3_admm_failed",
+                aid=str(self.context.aid),
+                sector="cp",
+                detail=f"multi_sector: {exc}",
+            )
+            return
+
+        # Numeric noise scrub: the multi-sector supply-priority ADMM
+        # leaves ~1e-3-scale residuals on cells it can't serve.  The
+        # ADMM converges within its own tolerance, but the cross-cell
+        # ordering of those residuals isn't priority-monotone at that
+        # noise level — the per-sector L2 path produced ~1e-7-scale
+        # residuals that didn't trip PI; the multi-sector pool is
+        # noisier because more cells share one waterfall target.
+        # Below ``_FRACTION_NOISE`` (= PI claim tolerance) we clamp
+        # to exactly 0, restoring priority-monotone-by-construction
+        # at sub-tolerance without affecting cells with genuine
+        # partial service.
+        _FRACTION_NOISE = 1e-3
+        for sec_key in service_fraction:
+            for tier, frac in list(service_fraction[sec_key].items()):
+                if 0.0 < float(frac) < _FRACTION_NOISE:
+                    service_fraction[sec_key][tier] = 0.0
+
+        logger.info(
+            "[%s] L3 multi-sector ADMM result: round=%s sectors=%s tiers=%s "
+            "n_leaders=%d fractions=%s",
+            self.context.aid, round_id, sectors, tiers, len(answers),
+            service_fraction,
+        )
+        record_event(
+            t=float(self.context.current_timestamp),
+            kind="l3_admm_result",
+            aid=str(self.context.aid),
+            sector="cp",
+            detail=(
+                f"round={round_id} sectors={sectors} n_leaders={len(answers)} "
+                f"fractions={service_fraction}"
+            ),
+        )
+
+        # L3 *does not* dispatch ComponentAllocation to leaders any
+        # more.  The per-sector priority allocation is L2's job — L2
+        # runs in parallel with L3 and refines per-sector per-tier
+        # service fractions on the post-CP state.  L3's sole output
+        # is the CP setpoints; using the multi-sector ADMM result
+        # only to compute per-sector marginal values for the
+        # gradient-step setpoint decision.
+        #
+        # Earlier shipping had L3 broadcasting ComponentAllocation to
+        # every leader (which then conflicted with L2's own dispatch
+        # and made L1 gossip the de-facto arbiter — see the
+        # 2026-05-23 PI regression).  Removed.
+
+        # Compute per-sector marginal values from the service fractions
+        # and dispatch a per-CP setpoint to every CP in the multi-sector
+        # component.  Convention: marginal_value(sector) = 1 - min over
+        # tiers of the served fraction at tiers with positive demand.
+        # 0 = everything served, no scarcity.  Closer to 1 = stressed.
+        now = float(self.context.current_timestamp)
+        marginal_by_sector: dict[str, float] = {}
+        for sec in sectors:
+            tmap = service_fraction.get(sec, {})
+            if not tmap:
+                marginal_by_sector[sec] = 0.0
+                continue
+            lowest = min(tmap.values())
+            marginal_by_sector[sec] = max(0.0, 1.0 - float(lowest))
+
+        cp_peers = self._cp_peers_in_component()
+        for cp_aid, meta in cp_peers.items():
+            cp_setpoint = self._compute_cp_setpoint(meta, marginal_by_sector)
+            allocation_msg = CPAllocation(
+                publisher=str(self.context.aid),
+                version=self._cp_version.next(),
+                caused_by={},
+                timestamp_s=now,
+                cp_aid=cp_aid,
+                round_id=round_id,
+                sector_flows_mw=cp_setpoint,
+            )
+            cp_addr = meta.get("addr")
+            if cp_addr is None:
+                continue
+            await self.context.send_message(allocation_msg, receiver_addr=cp_addr)
+
+        # S2 — wake L2 in every sector the multi-sector ADMM touched.
+        # The CPs have just committed new setpoints; the post-CP-commit
+        # LP routing will change leader flex on the next gossip pass.
+        # Sending an ``L3RebalanceWakeup`` to every leader in the
+        # multi-sector component (per sector) flags ``_rebalance_dirty``
+        # so the leader's L2 short-circuit lifts and the next watchdog /
+        # reactive trigger re-evaluates with the new state.  No payload
+        # beyond the sector filter — this is purely a "kick" message,
+        # not a dispatch.
+        component_leaders = self._leader_addrs_in_component()
+        for sector, sec_table in component_leaders.items():
+            tier_map = service_fraction.get(sector.value, {})
+            if not tier_map:
+                continue
+            wakeup = L3RebalanceWakeup(
+                publisher=str(self.context.aid),
+                version=self._cp_version.next(),
+                caused_by={},
+                timestamp_s=now,
+                sector=sector,
+            )
+            for addr in sec_table.values():
+                await self.context.send_message(wakeup, receiver_addr=addr)
+
+    def _compute_cp_setpoint(
+        self,
+        cp_meta: dict[str, Any],
+        marginal_by_sector: dict[str, float],
+    ) -> dict[str, float]:
+        """Pick a setpoint for one CP given the per-sector marginal
+        values from the L3 ADMM.
+
+        Heuristic gradient step: for each ``(in_sector, out_sector)``
+        coupling pair, run the CP iff the destination's marginal value
+        × ratio exceeds the source's marginal value (i.e. conversion
+        relieves a more-stressed cell at a less-stressed cell's cost).
+        Setpoint magnitude is ``capacity × max(0, marginal_out × ratio
+        − marginal_in)`` — proportional to how lopsided the imbalance
+        is.  Conservative by construction: a balanced pair gives a
+        zero step, so no CP commitment in zero-deficit scenarios.
+
+        Returns ``{sector_value: signed_flow_mw}``.  Sign convention:
+        positive ⇒ flow into sector (CP consumes / load-like);
+        negative ⇒ flow out of sector (CP produces / generator-like).
+        Matches the existing :class:`CPSetpoint.sector_flows_mw`
+        convention so :meth:`_apply_result` consumes it unchanged.
+        """
+        capacity = float(cp_meta.get("capacity_mw") or 0.0)
+        if capacity <= 0:
+            return {}
+        ratios = cp_meta.get("coupling_ratios") or {}
+        if not ratios:
+            return {}
+
+        best_in: str | None = None
+        best_out: str | None = None
+        best_step: float = 0.0
+        best_ratio: float = 1.0
+        for (sec_in, sec_out), ratio in ratios.items():
+            try:
+                r = float(ratio)
+            except (TypeError, ValueError):
+                continue
+            m_in = float(marginal_by_sector.get(str(sec_in), 0.0))
+            m_out = float(marginal_by_sector.get(str(sec_out), 0.0))
+            step = m_out * r - m_in
+            if step > best_step:
+                best_step = step
+                best_in = str(sec_in)
+                best_out = str(sec_out)
+                best_ratio = r
+
+        if best_in is None or best_step <= 0.0:
+            return {}
+
+        # Magnitude of conversion to commit, clamped to capacity.  The
+        # step ∈ (0, 1] (marginal values are clipped to [0, 1] above)
+        # so capacity × step lands in (0, capacity].
+        magnitude = capacity * min(1.0, best_step)
+        return {
+            best_in: float(magnitude),                 # consume from source
+            best_out: -float(magnitude * best_ratio),  # produce into destination
+        }
+
+    async def _handle_cp_allocation(
+        self, message: CPAllocation, meta: dict
+    ) -> None:
+        """Apply a setpoint dispatched by the L3 coord.  Routes through
+        the existing :meth:`_apply_result` so the regulate ledger,
+        diagnostics and downstream LP all see the same path the legacy
+        per-CP ADMM would have produced.
+
+        Idempotent on repeated identical broadcasts: ``apply_regulate``
+        already dedups same-value writes within tolerance.
+        """
+        if topology_characteristic(self, tid="cps") != "leader":
+            return
+        flows_mw = dict(message.sector_flows_mw)
+        # Translate the dict to the flat [el, heat, gas] result vector
+        # _apply_result expects.  Missing sectors stay at 0.
+        result = [0.0, 0.0, 0.0]
+        for sec, idx in _RESULT_INDEX.items():
+            v = flows_mw.get(sec.value)
+            if v is not None:
+                result[idx] = float(v)
+        self._last_l3_setpoint_by_sector = {
+            sec.value: float(result[idx]) for sec, idx in _RESULT_INDEX.items()
+        }
+        applied_factor = self._apply_result(result)
+        record_event(
+            t=float(self.context.current_timestamp),
+            kind="cp_setpoint",
+            aid=str(self.context.aid),
+            sector="cp",
+            detail=(
+                f"source=l3 round={message.round_id} flows={flows_mw} "
+                f"reg={float(applied_factor or 1.0):.3f}"
+            ),
+        )
+
     def _apply_result(self, result: list[float]) -> float | None:
         obs = self.behavior.observe(self.context.aid) or {}
         # result layout: [0=EL, 1=HEAT, 2=GAS]
@@ -828,8 +1290,6 @@ class EnergyConverterRole(Role):
                 best_factor = factor
 
         if best_factor is not None:
-            from scare.base.util import apply_regulate
-
             apply_regulate(
                 self.behavior,
                 self.context.aid,
@@ -839,3 +1299,240 @@ class EnergyConverterRole(Role):
                 timestamp=self.context.current_timestamp,
             )
         return best_factor
+
+
+class MultiCommunityCPRole(Role):
+    """CP-side coordination role for the ``component_level`` baseline.
+
+    The baseline forms one community per connected component of each
+    per-sector subgraph (see :func:`scare.base.community.\
+connected_component_partition`) and exposes the CP as a connector to
+    each of the per-sector communities it bridges (via the same
+    ``cps``↔``groups`` cross-topology link the SCARe CP-ADMM path uses).
+    Group leaders therefore continue to dispatch
+    :class:`NegotiationFinishedEvent` to the CP after each local
+    rebalance, but with the holonic + cross-sector ADMM layers turned
+    off, the CP no longer has a single coordinator deciding its
+    setpoint; each community contributes an independent ask.
+
+    This role reconciles those asks under an EMA-blended target with a
+    deadband + cooldown so the CP, which is "in" two communities at
+    once, cannot ping-pong between contradictory commits.  It
+    deliberately replaces the legacy :class:`EnergyConverterRole`
+    pipeline (no ADMM, no flex-actor, no per-sector beacons) and only
+    keeps the minimal :class:`AskEnergyMessage` reply so co-located
+    gossip rounds don't stall waiting for the CP.
+
+    State machine
+    -------------
+    - ``_target_by_sector``  EMA-blended desired setpoint per sector.
+      Updated on each incoming :class:`NegotiationFinishedEvent`:
+      ``target ← α · new_setpoint + (1 − α) · target``.
+    - ``_committed_by_sector``  Last setpoint actually committed via
+      :func:`scare.base.util.apply_regulate`.  A commit fires only when
+      ``|target − committed| > deadband`` AND the per-CP cooldown has
+      elapsed, so noisy fluctuations and high-frequency oscillation are
+      suppressed.
+    - ``_last_commit_t``  Sim-time of the last commit; gates the
+      cooldown check above.
+    - EMA is reset on every observed :class:`BranchFailureEvent` (the
+      scenario builder wires it to :meth:`on_branch_failure` via
+      ``behavior_in``) so a failure that islands one of the
+      communities the CP bridges does not leave stale signal averaged
+      into the post-failure decision.  ``_committed_*`` is retained
+      because the physical setpoint at the CP does not move on the
+      event itself; only the EMA's belief about what each community
+      wants is dropped.
+    """
+
+    def __init__(
+        self,
+        behavior: "RestorationEnvironmentBehavior",
+        sectors: list[Sector],
+        *,
+        ema_alpha: float = 0.3,
+        deadband_mw: float = 0.05,
+        min_interval_s: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.behavior = behavior
+        self.sectors = list(sectors)
+        self._ema_alpha = float(ema_alpha)
+        self._deadband_mw = float(deadband_mw)
+        self._min_interval_s = float(min_interval_s)
+        # Per-sector smoothed target.  Initialised lazily to the first
+        # observed setpoint so the EMA doesn't start at 0 (which would
+        # bias every CP toward "off" until enough rounds accumulate).
+        self._target_by_sector: dict[Sector, float] = {}
+        # Last committed setpoint per sector — used by the deadband
+        # check, so a small drift between proposed targets and the
+        # active commit doesn't generate spurious regulate calls.
+        self._committed_by_sector: dict[Sector, float] = {}
+        # Sim-time of the last apply_regulate call; cooldown gate.
+        self._last_commit_t: float = -1e9
+
+    def setup(self) -> None:
+        def _wrap(coro_fn):
+            def _sync(msg, meta):
+                self.context.schedule_instant_task(coro_fn(msg, meta))
+            return _sync
+
+        # Reply minimally to community gossip's flex-query round so a
+        # leader treating this CP as a (cps-cross-link) connector does
+        # not stall waiting for a response.  ``available=0`` mirrors
+        # ``EnergyConverterRole._handle_ask_energy``: the CP brings no
+        # spare flex of its own, only the cross-sector conversion knob.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_ask_energy),
+            lambda msg, meta: isinstance(msg, AskEnergyMessage),
+        )
+        # Per-community signal: every time a community's gossip
+        # converges, its leader broadcasts NegotiationFinishedEvent to
+        # the CP connectors of the relevant sector.  Each event tells
+        # us what target setpoint the community has settled on; we
+        # treat that as the community's ask of the CP.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_negotiation_finished),
+            lambda msg, meta: isinstance(msg, NegotiationFinishedEvent),
+        )
+        # Dynamic re-partition handshake is wired by the scenario
+        # builder via ``behavior_in(... on_global_event=BranchFailureEvent,
+        # role_types=MultiCommunityCPRole)`` and dispatches to
+        # :meth:`on_branch_failure` below.  CPs themselves are not
+        # community members in the ``groups`` topology (they bridge
+        # via the ``cps``↔``groups`` cross-link), so the
+        # :class:`RepartitionHandlerRole` path that fires
+        # ``CommunityReassignedEvent`` on regular members never
+        # reaches a CP.  The branch-failure global event is the only
+        # signal that lands on every CP regardless of topology
+        # placement, which is exactly the property we need for a
+        # safety reset.
+
+    async def _handle_ask_energy(
+        self, message: AskEnergyMessage, meta: dict
+    ) -> None:
+        try:
+            obs = self.behavior.observe(self.context.aid) or {}
+        except (AttributeError, KeyError):
+            obs = {}
+        key = _ACCESS_KEYS.get(message.sector)
+        if key and key in obs:
+            raw = obs[key]
+            reg = obs.get("regulation", 1.0)
+            try:
+                value = float(raw) * float(reg)
+            except (TypeError, ValueError):
+                value = 0.0
+        else:
+            value = obs_setpoint(obs)
+        if not math.isfinite(value):
+            value = 0.0
+        reply = ResponseEnergyMessage(
+            negotiation_id=message.negotiation_id,
+            setpoint=value,
+            available=0.0,
+        )
+        await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
+
+    async def _handle_negotiation_finished(
+        self, message: NegotiationFinishedEvent, meta: dict
+    ) -> None:
+        sector = message.sector
+        if sector not in self.sectors:
+            return
+        proposed = float(message.new_setpoint)
+        if not math.isfinite(proposed):
+            return
+
+        # EMA blend.  First observation seeds the target — without
+        # seeding, the first commit would chase 0 → proposed across
+        # several rounds, behaviour the deadband then masks.
+        if sector not in self._target_by_sector:
+            self._target_by_sector[sector] = proposed
+        else:
+            alpha = self._ema_alpha
+            self._target_by_sector[sector] = (
+                alpha * proposed
+                + (1.0 - alpha) * self._target_by_sector[sector]
+            )
+
+        await self._maybe_commit(sector)
+
+    async def _maybe_commit(self, sector: Sector) -> None:
+        target = self._target_by_sector.get(sector)
+        if target is None:
+            return
+        now = float(self.context.current_timestamp)
+        if now - self._last_commit_t < self._min_interval_s:
+            return
+
+        committed = self._committed_by_sector.get(sector, 0.0)
+        if abs(target - committed) < self._deadband_mw:
+            return
+
+        try:
+            obs = self.behavior.observe(self.context.aid) or {}
+        except (AttributeError, KeyError):
+            obs = {}
+        clamped = clamp_to_constraints(target, obs, sector)
+        key = _ACCESS_KEYS.get(sector)
+        cap = float(obs.get(key, 0.0)) if key else 0.0
+        if cap == 0.0 or not math.isfinite(cap):
+            return
+        factor = max(0.0, min(1.0, abs(clamped / cap)))
+
+        apply_regulate(
+            self.behavior,
+            self.context.aid,
+            factor,
+            sector="cp",
+            reason="cp_multi_community",
+            timestamp=now,
+        )
+        self._committed_by_sector[sector] = float(clamped)
+        self._last_commit_t = now
+        record_event(
+            t=now,
+            kind="cp_setpoint",
+            aid=str(self.context.aid),
+            sector="cp",
+            detail=(
+                f"source=multi_community sector={sector.value} "
+                f"target={clamped:.4f} factor={factor:.3f} "
+                f"deadband={self._deadband_mw:.3f} cooldown={self._min_interval_s:.2f}"
+            ),
+        )
+
+    def on_branch_failure(self, branch_id: Any) -> None:
+        """Reset the per-sector EMA on every observed branch failure.
+
+        Dispatched from the scenario builder's ``behavior_in`` hook on
+        :class:`BranchFailureEvent`.  Conservative by design: we don't
+        try to decide whether *this* failure islands one of the
+        communities we bridge, because doing so would require the same
+        physical-graph mirror the SCARe variant keeps for L2/L3 — and
+        the EMA's α = 0.3 default re-seeds within a few rounds of
+        post-failure :class:`NegotiationFinishedEvent` deliveries
+        anyway, so a spurious reset is cheap.
+
+        ``_committed_by_sector`` is retained on purpose: the actual
+        regulation setpoint at the CP did not move on the failure, so
+        the deadband check still anchors against the live operating
+        point.  Cooldown is retained for the same reason.
+        """
+        if not self._target_by_sector:
+            return
+        self._target_by_sector.clear()
+        try:
+            t = float(self.context.current_timestamp)
+        except Exception:
+            t = 0.0
+        record_event(
+            t=t,
+            kind="cp_ema_reset",
+            aid=str(self.context.aid),
+            sector="cp",
+            detail=f"trigger=branch_failure branch={branch_id}",
+        )

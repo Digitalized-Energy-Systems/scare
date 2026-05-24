@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 from mango.express.topology import topology_characteristic, topology_connectors
 
-from scare.base.model import Sector
+from scare.base.model import NegotiationFinishedEvent, Sector
 from scare.base.util import obs_setpoint
 
 if TYPE_CHECKING:
@@ -70,14 +70,15 @@ class Decision:
 class SectorImbalanceUpdate(Decision):
     """A group leader's local imbalance estimate for one sector.
 
-    Published periodically by ``SectorImbalanceBeacon``; consumed by
-    ``EnergyConverterRole`` (L3) to drive the trigger predicate.
+    Published event-driven by ``SectorImbalanceBeacon`` (on the local
+    ``NegotiationFinishedEvent`` from gossip convergence, plus a long
+    watchdog).  No L3 subscriber exists in the current design — CP
+    triggering is purely message-driven on the four
+    ``EnergyConverterRole`` reactive paths — but the channel is kept
+    for future consumers, with version semantics intact.
 
     ``local_imbalance_mw`` is *signed*: positive = surplus available to
-    export, negative = local deficit needing import.  L3 aggregates by
-    sector across all publishers it sees and checks the resulting
-    vector for a same-sign-skip pattern (no beneficial cross-sector
-    trade exists) before invoking ADMM.
+    export, negative = local deficit needing import.
 
     The value reported is the leader's own contribution, not the full
     group sum — collecting the group sum already happens inside L3's
@@ -265,6 +266,153 @@ class CoalitionConstraint(Decision):
 
 
 @dataclass
+class ComponentAdmmReport(Decision):
+    """A group leader's flex report for the per-(sector, active-component) L2 ADMM.
+
+    Sent by every group leader to the component coordinator (the
+    lex-smallest aid among group leaders that are mutually reachable
+    on the active branch subgraph for this sector).  The coordinator
+    buffers reports by ``round_id`` + ``leader_aid`` (latest-wins per
+    leader), runs the supply-priority ADMM with all reports as
+    actors, then dispatches a component-uniform
+    :class:`ComponentAllocation` to every leader in the component.
+
+    With ``RestorationConfiguration.holon_admm_scope = "component"``
+    this replaces both the per-holon ``_run_supply_priority_admm``
+    path and the earlier sector-wide variant.  Each *community*
+    leader (one per group-topology leader) is one ADMM actor — the
+    holon abstraction is not used for optimisation.  Coverage:
+    every load whose leader sits on the same active subgraph is
+    represented in the ADMM and receives the dispatched per-tier
+    fraction.  After a failure splits a sector into disjoint sub-
+    components, each sub-component re-elects its own coordinator
+    and runs its own ADMM, independent of the others.
+
+    The fields mirror the subset of :class:`AvailableFlexAnswer` the
+    supply-priority ADMM actually consumes: per-sector supply pool and
+    per-(sector, tier) demand.  Keeping the dataclass narrow keeps the
+    wire size O(n_tiers · n_sectors) rather than the full per-load
+    flex dump the per-holon flex_answers carry.
+    """
+
+    round_id: str = ""
+    sector: Sector = Sector.ELECTRICITY
+    leader_aid: str = ""
+    supply_by_sector: dict[str, float] = field(default_factory=dict)
+    demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+
+
+@dataclass
+class ComponentAllocation(Decision):
+    """Per-(sector, active-component) ADMM result: the per-tier service
+    fraction every group leader in the component should apply to its
+    members.
+
+    Issued by the component coordinator after collecting
+    :class:`ComponentAdmmReport` from each group leader.  Recipients
+    rebroadcast as ``StartBalanceNegotiation(service_fraction_by_
+    sector_priority=…)`` to their own community members.
+
+    Component-uniform by construction: every leader in the component
+    receives the same ``service_fraction_by_tier`` map, so every load
+    at the same tier in the same (sector, active-component) is served
+    at the same fraction — eliminating the cross-community priority
+    inversion the per-holon and sector-wide paths produced.
+    """
+
+    round_id: str = ""
+    sector: Sector = Sector.ELECTRICITY
+    service_fraction_by_tier: dict[int, float] = field(default_factory=dict)
+
+
+@dataclass
+class CPFlexReport(Decision):
+    """A CP agent's self-description for the multi-sector L3 coordinator.
+
+    Sent by every CP to the L3 coordinator (the lex-smallest CP aid in
+    the multi-sector connected component as classified by the topology
+    mirror with ``allow_cp_bridges=True``) when the coordinator asks
+    for participants' state at the start of a joint ADMM round.  Same
+    role in the L3 protocol that :class:`ComponentAdmmReport` plays
+    for community leaders.
+
+    Carries the four things the joint multi-sector supply-priority
+    ADMM needs to build the CP's actor row:
+
+    * ``sectors`` — sector values this CP bridges (e.g.
+      ``["electricity", "heat"]`` for a P2H).  Used to size the actor's
+      per-cell vector.
+    * ``capacity_mw`` — rated conversion capacity, signed in load
+      convention on the *input* side (positive ⇒ load that consumes
+      from the source sector).  The coupling constraint scales this
+      via ``coupling_ratios`` to bound the output side.
+    * ``coupling_ratios`` — keyed by ``(input_sector_value,
+      output_sector_value)``.  Value ``r`` means: ``output ≤ r ·
+      input``.  For a P2H with 90 % efficiency this is ``{(electricity,
+      heat): 0.9}``.
+    * ``current_setpoint_by_sector`` — the CP's *realised* per-sector
+      flow under the previous round's regulation, so the coord's
+      ADMM has a warm-start starting point for the actor's primal
+      variables.
+    """
+
+    cp_aid: str = ""
+    sectors: list[str] = field(default_factory=list)
+    capacity_mw: float = 0.0
+    coupling_ratios: dict[str, float] = field(default_factory=dict)
+    current_setpoint_by_sector: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class CPAllocation(Decision):
+    """Per-CP allocation envelope dispatched by the L3 coordinator to
+    every CP in the multi-sector component.
+
+    Result of the joint multi-sector ADMM.  Carries the CP's per-sector
+    flow targets that the receiving CP applies via the existing
+    ``_apply_result`` / ``apply_regulate`` path — identical semantics
+    to the legacy ``CPSetpoint.sector_flows_mw`` payload, addressed by
+    ``cp_aid`` so a single broadcast can include multiple CPs without
+    each recipient acting on the others.
+
+    The coupling that produced these flows (``output = ratio × input``)
+    is enforced inside the ADMM itself, so the recipient need not
+    re-check the math; just apply the dispatched flow to its
+    regulation factor.
+    """
+
+    cp_aid: str = ""
+    round_id: str = ""
+    sector_flows_mw: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class L3RebalanceWakeup(Decision):
+    """Wake-up signal from the L3 multi-sector coordinator to every
+    group leader in the active multi-sector component, sent after
+    the L3 ADMM solve dispatches its CP allocations.
+
+    Carries no payload beyond the ``sector`` filter (and the
+    standard :class:`Decision` provenance fields).  Recipients call
+    :meth:`HolonicCommunityRole._maybe_schedule_rebalance`, which
+    marks ``_rebalance_dirty=True`` and schedules a fresh L2 round
+    on the post-CP-commit state.
+
+    Why a dedicated message: the L1 ``NegotiationFinishedEvent`` is
+    consumed by ``GenerationController`` to re-apply a regulation
+    factor from ``new_setpoint`` (S1 hit this — emitting NFE from
+    the dispatch path mis-triggered stability), and
+    ``CoalitionConstraint`` / ``HolonAllocation`` are overloaded
+    with payload other consumers act on.  This message exists for
+    the single purpose of nudging L2 awake; the dispatch payload
+    (CP setpoints) is carried by :class:`CPAllocation`.
+    """
+
+    sector: Sector = Sector.ELECTRICITY
+
+
+@dataclass
 class CPCommitment(Decision):
     """Cross-sector coalition commitment dispatched to a CP member.
 
@@ -348,7 +496,7 @@ class SeenVersions:
 
 
 class SectorImbalanceBeacon(Role):
-    """Periodic publisher of ``SectorImbalanceUpdate`` on group leaders.
+    """Event-driven publisher of ``SectorImbalanceUpdate`` on group leaders.
 
     Installed alongside ``EnergyBalanceNegotiator`` on the group leader
     of each ``groups`` topology cluster when ``enable_cp_admm`` is True.
@@ -356,15 +504,14 @@ class SectorImbalanceBeacon(Role):
     ``EnergyConverterRole`` uses for its own NegotiationFinishedEvent
     fan-out — no new topology required.
 
-    Every tick advances the version and publishes the current local
-    imbalance.  An earlier draft gated publishes on a change-vs-last-
-    publish dead-band, but that left the per-publisher version stuck
-    at 1 for a quiescent grid: when stress arrived later, the
-    subscriber's ``SeenVersions`` already had version 1 marked and
-    skipped the new (still-version-1) decision.  The dead-band
-    correctly belongs on the *subscriber* (``_PREDICATE_DEAD_BAND_MW``
-    in cp.py) — the publisher's job is to keep the version frontier
-    advancing so the subscriber can detect change at all.
+    Publishes only when the local imbalance has actually moved: the
+    natural trigger is the local ``NegotiationFinishedEvent`` emitted
+    by the co-located ``EnergyBalanceNegotiator`` when gossip
+    converges on a new setpoint.  A long watchdog (``watchdog_s``)
+    re-publishes the current state regardless of motion so a new
+    subscriber that joins after the last gossip convergence still
+    sees the version frontier.  The watchdog cadence is intentionally
+    slow because the dominant trigger is event-driven.
     """
 
     def __init__(
@@ -372,20 +519,38 @@ class SectorImbalanceBeacon(Role):
         behavior: RestorationEnvironmentBehavior,
         sector: Sector,
         *,
-        period_s: float = 0.5,
+        watchdog_s: float = 30.0,
     ) -> None:
         super().__init__()
         self.behavior = behavior
         self.sector = sector
-        self.period_s = period_s
+        self.watchdog_s = watchdog_s
         self._version = MonotonicVersion()
 
     def setup(self) -> None:
         logger.debug(
-            "[%s] SectorImbalanceBeacon setup: sector=%s period_s=%.2f",
-            self.context.aid, self.sector.value, self.period_s,
+            "[%s] SectorImbalanceBeacon setup: sector=%s watchdog_s=%.2f",
+            self.context.aid, self.sector.value, self.watchdog_s,
         )
-        self.context.schedule_periodic_task(self._tick, delay=self.period_s)
+        # Primary trigger: local gossip just converged on a new
+        # setpoint, so the imbalance reported by ``_publish`` may
+        # have shifted.  ``subscribe_event`` captures the same-agent
+        # emit from EnergyBalanceNegotiator._finish_negotiation.
+        self.context.subscribe_event(
+            self, NegotiationFinishedEvent, self._on_negotiation_finished
+        )
+        # Watchdog: ensures the version frontier eventually advances
+        # for subscribers that joined after the last gossip event.
+        self.context.schedule_periodic_task(
+            self._tick, delay=self.watchdog_s
+        )
+
+    def _on_negotiation_finished(
+        self, event: NegotiationFinishedEvent, _src: Any
+    ) -> None:
+        if event.sector != self.sector:
+            return
+        self.context.schedule_instant_task(self._tick())
 
     async def _tick(self) -> None:
         if topology_characteristic(self, tid="groups") != "leader":

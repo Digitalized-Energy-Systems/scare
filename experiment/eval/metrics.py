@@ -15,6 +15,11 @@ import logging
 import math
 from typing import Any
 
+import networkx as nx
+from mango.simulation.world import WorldRecording
+from monee.model.child import HeatLoad, PowerLoad
+from monee.solver.core import find_ignored_nodes
+
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.util import (
     constraint_utilization,
@@ -68,10 +73,6 @@ def _disconnected_node_ids(monee_net: Any) -> set[int]:
     physically disconnected nodes.  This helper closes both holes.
     """
     try:
-        from monee.solver.core import find_ignored_nodes
-    except Exception:  # pragma: no cover - monee always available in this project
-        return set()
-    try:
         return set(find_ignored_nodes(monee_net))
     except Exception:
         return set()
@@ -89,10 +90,6 @@ def _active_node_components(monee_net: Any) -> dict[Any, int]:
     indices are arbitrary but stable within a single call (assigned in
     discovery order via union-find).
     """
-    try:
-        import networkx as nx
-    except Exception:  # pragma: no cover - networkx is a hard dep
-        return {}
     graph = nx.Graph()
     for node in monee_net.nodes:
         graph.add_node(node.id)
@@ -139,16 +136,11 @@ def served_by_load(
     disconnected = _disconnected_node_ids(monee_net)
     components = _active_node_components(monee_net)
 
-    _LOAD_CLASSES: tuple[type, ...] | None = None
-    try:
-        from monee.model.child import HeatLoad, PowerLoad
-        _LOAD_CLASSES = (HeatLoad, PowerLoad)
-    except Exception:  # pragma: no cover
-        _LOAD_CLASSES = None
+    _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
 
     rows: list[dict[str, Any]] = []
     for child in monee_net.childs:
-        if _LOAD_CLASSES is not None and not isinstance(child.model, _LOAD_CLASSES):
+        if not isinstance(child.model, _LOAD_CLASSES):
             continue
         aid = f"child-{child.id}"
         obs = behavior.observe(aid) or {}
@@ -229,15 +221,10 @@ def served_breakdown(
     # Without this filter, scare's metric inflates ``served`` past
     # baseline (validation run: post=6.21 MW vs baseline=5.20 MW on
     # cp_heavy_dependent_45; the 1 MW excess was 170 Sinks + 2 ExtHydrGrids).
-    _LOAD_CLASSES: tuple[type, ...] | None = None
-    try:
-        from monee.model.child import HeatLoad, PowerLoad
-        _LOAD_CLASSES = (HeatLoad, PowerLoad)
-    except Exception:  # pragma: no cover
-        _LOAD_CLASSES = None
+    _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
 
     for child in monee_net.childs:
-        if _LOAD_CLASSES is not None and not isinstance(child.model, _LOAD_CLASSES):
+        if not isinstance(child.model, _LOAD_CLASSES):
             continue
         aid = f"child-{child.id}"
         obs = behavior.observe(aid) or {}
@@ -522,8 +509,6 @@ def constraint_violation_integral(world: Any) -> dict[str, float]:
     above 1.0.  The result is dimensionless and comparable across runs
     on the same grid.
     """
-    from mango.simulation.world import WorldRecording
-
     recordings = getattr(world, "data_collections", {}) or {}
 
     sector_var: dict[str, tuple[Sector, str]] = {
@@ -573,8 +558,6 @@ def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
     series is below 0.5 % of its maximum magnitude for a sustained
     window.  Returns None if no such window is found.
     """
-    from mango.simulation.world import WorldRecording
-
     recordings = getattr(world, "data_collections", {}) or {}
     sector_keys = ("electrical_balance", "gas_balance", "heat_balance")
 

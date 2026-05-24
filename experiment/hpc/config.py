@@ -28,7 +28,7 @@ class TaskSpec:
     seed: int
     n_failures: int
     # ---- Evaluation axes (all optional for backward compat) --------
-    variant: str = "scare"                 # "scare" | "single_level" | "oracle"
+    variant: str = "scare"                 # "scare" | "single_level" | "component_level" | "oracle"
     experiment: str = ""                    # campaign-internal label
     ablation: dict[str, Any] = field(default_factory=dict)
     sweep: dict[str, Any] = field(default_factory=dict)

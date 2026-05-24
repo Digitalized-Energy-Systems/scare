@@ -173,6 +173,31 @@ def modularity_partition(
     return label
 
 
+def connected_component_partition(
+    graph: nx.Graph,
+) -> dict[Hashable, Hashable]:
+    """Return a partition with one community per connected component.
+
+    Each node's label is the lex-smallest node id in its component
+    (using :func:`_label_key` for stable comparison across heterogeneous
+    id types).  Used by the ``component_level`` baseline so the gossip
+    negotiator sees a single per-sector community per connected
+    component — i.e. as wide a view as is physically reachable —
+    instead of the many ``max_radius``-bounded sub-communities the
+    label-propagation partition produces.
+
+    Returns ``{node_id: label}``, same shape as
+    :func:`label_propagation_partition`, so call sites are
+    interchangeable.
+    """
+    label: dict[Hashable, Hashable] = {}
+    for component in nx.connected_components(graph):
+        seed = min(component, key=_label_key)
+        for node in component:
+            label[node] = seed
+    return label
+
+
 def modularity_of_partition(
     graph: nx.Graph,
     label_by_node: dict[Hashable, Hashable],
@@ -213,46 +238,54 @@ def modularity_of_partition(
     return q
 
 
-def communities_from_topology(
+def partition_label_by_node(
     topology: Topology,
     *,
     max_radius: int = 2,
     method: str = "label_propagation",
     modularity_iterations: int = 10,
     modularity_resolution: float = 1.0,
-) -> list[list[Any]]:
-    """Partition a per-sector physical *topology* into sub-communities.
+) -> dict[Hashable, Hashable]:
+    """Return ``{node_id: label}`` for the given partition method.
 
-    Two methods are available:
-
-    - ``"label_propagation"`` (default, original behaviour): radius-
-      bounded min-label propagation — communities are ≤``max_radius``-
-      hop balls centred on the lex-smallest reachable seed.
-    - ``"modularity"``: distributed-Louvain Phase 1 — communities form
-      to maximise local modularity gain, respecting the graph's
-      natural cluster structure.  Sizes vary; not bounded by radius.
-
-    Returns a list of communities, each as a list of agents (the agents
-    co-located on the topology node assigned to that community).  Within
-    a community the agents are ordered by AID so the leader (first
-    element) is deterministic.
+    Same method semantics as :func:`communities_from_topology`; exposed
+    separately so callers that need the per-node label assignment (e.g.
+    the ``component_level`` baseline's CP injection step, which has to
+    answer "which community contains node X?") can avoid recomputing
+    it.
     """
     if method == "modularity":
-        label_by_node = modularity_partition(
+        return modularity_partition(
             topology.graph,
             max_iterations=modularity_iterations,
             resolution=modularity_resolution,
         )
-    elif method == "label_propagation":
-        label_by_node = label_propagation_partition(
+    if method == "label_propagation":
+        return label_propagation_partition(
             topology.graph, max_radius=max_radius
         )
-    else:
-        raise ValueError(
-            f"unknown community partition method: {method!r} "
-            "(expected 'label_propagation' or 'modularity')"
-        )
+    if method == "connected_component":
+        return connected_component_partition(topology.graph)
+    raise ValueError(
+        f"unknown community partition method: {method!r} "
+        "(expected 'label_propagation', 'modularity', or "
+        "'connected_component')"
+    )
 
+
+def agents_by_label_from_topology(
+    topology: Topology,
+    label_by_node: dict[Hashable, Hashable],
+) -> list[list[Any]]:
+    """Group ``topology``'s agents by the external ``label_by_node``
+    assignment.
+
+    Returns a list of communities, each as a list of agents (the agents
+    co-located on the topology node assigned to that community).
+    Within a community the agents are ordered by AID so the leader
+    (first element) is deterministic.  Communities are ordered by
+    lex-smallest label, mirroring :func:`communities_from_topology`.
+    """
     label_to_agents: dict[Hashable, list[Any]] = {}
     for tnode_id, label in label_by_node.items():
         agent_node = topology.graph.nodes[tnode_id][AGENT_NODE_KEY]
@@ -265,3 +298,39 @@ def communities_from_topology(
         members = sorted(label_to_agents[label], key=lambda a: a.aid)
         communities.append(members)
     return communities
+
+
+def communities_from_topology(
+    topology: Topology,
+    *,
+    max_radius: int = 2,
+    method: str = "label_propagation",
+    modularity_iterations: int = 10,
+    modularity_resolution: float = 1.0,
+) -> list[list[Any]]:
+    """Partition a per-sector physical *topology* into sub-communities.
+
+    Three methods are available:
+
+    - ``"label_propagation"`` (default, original behaviour): radius-
+      bounded min-label propagation — communities are ≤``max_radius``-
+      hop balls centred on the lex-smallest reachable seed.
+    - ``"modularity"``: distributed-Louvain Phase 1 — communities form
+      to maximise local modularity gain, respecting the graph's
+      natural cluster structure.  Sizes vary; not bounded by radius.
+    - ``"connected_component"``: one community per connected component
+      of the sector subgraph.  Drives the ``component_level`` baseline.
+
+    Returns a list of communities, each as a list of agents (the agents
+    co-located on the topology node assigned to that community).  Within
+    a community the agents are ordered by AID so the leader (first
+    element) is deterministic.
+    """
+    label_by_node = partition_label_by_node(
+        topology,
+        max_radius=max_radius,
+        method=method,
+        modularity_iterations=modularity_iterations,
+        modularity_resolution=modularity_resolution,
+    )
+    return agents_by_label_from_topology(topology, label_by_node)

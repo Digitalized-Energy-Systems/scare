@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -31,13 +32,43 @@ import random
 import signal
 import sys
 import time
+import time as _time
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
+from mango.simulation.world import WorldRecording
 
+from scare.base import diagnostics
+from scare.base import diagnostics as _diag
+from scare.base.config import RestorationConfiguration
+from scare.base.infeasibility_capture import (
+    arm_infeasibility_capture,
+    disarm_infeasibility_capture,
+)
+from scare.base.util import create_failures
+from scare.scenario.restoration import (
+    _flush_pending_negotiations,
+    create_restoration_scenario_world,
+    start_restoration_simulation,
+)
+
+from experiment.eval.claims import evaluate_task
+from experiment.eval.oracle import compose_oracle_result, compute_baseline_served
+from experiment.eval.results import (
+    compose_result,
+    write_diary_csv,
+    write_events_csv,
+    write_messages_csv,
+    write_result_json,
+    write_served_by_load_csv,
+    write_served_csv,
+    write_slack_meta,
+    write_trajectories_csv,
+)
 from experiment.hpc.config import (
     CAMPAIGN_LAYOUT,
     RuntimePlan,
@@ -45,6 +76,15 @@ from experiment.hpc.config import (
     task_dir,
 )
 from experiment.hpc.plan import read_manifest
+from experiment.restoration import (
+    GRIDS,
+    apply_cold_day,
+    apply_line_stress,
+    apply_microgrid_islanding,
+    apply_pv_peak,
+    apply_slack_budget,
+    assign_load_priorities,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -191,8 +231,6 @@ def _resolve_failures(monee_net: Any, plan: RuntimePlan, task: TaskSpec) -> list
     - ``generator_share`` — for ``mixed``, fraction of the draw that
                             is generators (default 0.5)
     """
-    from scare.base.util import create_failures
-
     scenario = task.scenario or {}
     failure_type = scenario.get("failure_type", "branch")
     kwargs = {}
@@ -232,8 +270,6 @@ def _serialize_failures(failures: list[Any]) -> list[dict[str, Any]]:
 
 
 def _extract_metrics(world: Any) -> dict[str, Any]:
-    from mango.simulation.world import WorldRecording
-
     metrics: dict[str, Any] = {}
     for name, rec in getattr(world, "data_collections", {}).items():
         if not isinstance(rec, WorldRecording):
@@ -258,10 +294,6 @@ def _extract_metrics(world: Any) -> dict[str, Any]:
 
 
 def _write_timeseries(world: Any, path: Path) -> None:
-    from mango.simulation.world import WorldRecording
-
-    import pandas as pd
-
     series_map: dict[str, pd.Series] = {}
     for name, rec in getattr(world, "data_collections", {}).items():
         if not isinstance(rec, WorldRecording):
@@ -276,8 +308,6 @@ def _write_timeseries(world: Any, path: Path) -> None:
 
 
 def _dump_diagnostics(path: Path) -> None:
-    from scare.base import diagnostics
-
     path.write_text(diagnostics.dump_recent() + "\n")
 
 
@@ -296,13 +326,6 @@ async def _run_simulation(
     root-cause infeasibility-capture writes its one-shot snapshot
     there as ``infeasibility_snapshot.json``.
     """
-    from experiment.restoration import GRIDS
-    from scare.base.config import RestorationConfiguration
-    from scare.scenario.restoration import (
-        create_restoration_scenario_world,
-        start_restoration_simulation,
-    )
-
     if task.grid not in GRIDS:
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
 
@@ -341,8 +364,6 @@ async def _run_simulation(
     # the other artefacts; the runner ``disarm``-s after the task
     # finishes so the next task gets its own capture window.
     if out_dir is not None:
-        from scare.base.infeasibility_capture import arm_infeasibility_capture
-
         snapshot_path = out_dir / "infeasibility_snapshot.json"
         arm_infeasibility_capture(
             world.environment.behavior, snapshot_path, clock=world.clock,
@@ -361,7 +382,6 @@ async def _run_simulation(
         # would be silently lost from the diary.  Drain them here so
         # the started == Σ terminals invariant holds even on timeouts.
         try:
-            from scare.scenario.restoration import _flush_pending_negotiations
             _flush_pending_negotiations(world)
         except Exception as flush_exc:  # noqa: BLE001
             logger.warning("flush_pending after timeout failed: %s", flush_exc)
@@ -381,12 +401,6 @@ def _run_oracle(
     would, and solve monee's minimal-load-shedding LP.  Returns
     (net, failures, result_payload) — no world, no agents.
     """
-    import time as _time
-
-    from experiment.restoration import GRIDS
-
-    from experiment.eval.oracle import compose_oracle_result
-
     if task.grid not in GRIDS:
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
     factory = GRIDS[task.grid]
@@ -433,8 +447,6 @@ def _resolve_priorities(
     """
     scenario = task.scenario or {}
     distribution = scenario.get("priority_assignment", "skewed")
-    from experiment.restoration import assign_load_priorities
-
     priorities = assign_load_priorities(
         net, seed=task.seed, distribution=distribution
     )
@@ -499,8 +511,6 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
             kind, sorted(_KNOWN_KINDS),
         )
     if kind == "cold_day":
-        from experiment.restoration import apply_cold_day
-
         kwargs = {
             k: scenario[k]
             for k in ("supply_t_k", "heat_load_scale")
@@ -509,8 +519,6 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         apply_cold_day(net, **kwargs)
         logger.info("Applied cold_day scenario: %s", kwargs or "<defaults>")
     elif kind == "pv_peak":
-        from experiment.restoration import apply_pv_peak
-
         kwargs = {
             k: scenario[k]
             for k in ("gen_scale", "load_scale")
@@ -519,8 +527,6 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         apply_pv_peak(net, **kwargs)
         logger.info("Applied pv_peak scenario: %s", kwargs or "<defaults>")
     elif kind == "line_stress":
-        from experiment.restoration import apply_line_stress
-
         kwargs = {
             k: scenario[k]
             for k in ("load_scale", "ampacity_scale", "affect_branch_fraction")
@@ -536,8 +542,6 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         # promotion, ``enable_islanding`` is a no-op on stock simbench
         # nets (no native GridFormingMixin children); promotion is
         # the practical way to make the extension exercise something.
-        from experiment.restoration import apply_microgrid_islanding
-
         carriers = scenario.get(
             "carriers", ("electricity", "water", "gas")
         )
@@ -565,8 +569,6 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
     # ``GRIDS`` dict comment for the design rationale.
     slack_budget_pct = scenario.get("slack_budget_pct")
     if slack_budget_pct is not None:
-        from experiment.restoration import apply_slack_budget
-
         apply_slack_budget(net, float(slack_budget_pct))
         logger.info(
             "Applied slack_budget_pct=%s (per-scenario operator policy)",
@@ -579,13 +581,35 @@ def _config_from_task(task: TaskSpec):
     ablation, and sweep dictionaries.  Variant maps to a base preset;
     ablation / sweep are field overrides applied on top.
     """
-    from dataclasses import replace
-    from scare.base.config import RestorationConfiguration
-
     if task.variant == "single_level":
         base = RestorationConfiguration(
             enable_holonic=False,
             enable_cp_admm=False,
+        )
+    elif task.variant == "component_level":
+        # One community per connected component of each per-sector
+        # subgraph (``community_partition_method="connected_component"``)
+        # — global decision making at L1 without a hierarchy on top.
+        # CPs join the communities they bridge as normal members; their
+        # legacy CP-ADMM is replaced by ``MultiCommunityCPRole``'s
+        # EMA + deadband + cooldown guard so a CP sitting in two
+        # communities reconciles conflicting asks instead of
+        # ping-ponging.
+        #
+        # ``enable_multihop_constraint=False`` is mandatory here: the
+        # connected_component partition collapses the whole sector into
+        # one ``tid="groups"`` group, so multi-hop ConstraintState
+        # forwarding fans out O(N²) per hop and OOM-kills the worker
+        # (observed: 8.5 M log lines in 9 min on simbench_lv with
+        # N≈300, task 11 of eval_full_smoke_20260524-170808).  Direct
+        # neighbour visibility plus per-agent caching still gives the
+        # global picture because the local group already is global.
+        base = RestorationConfiguration(
+            enable_holonic=False,
+            enable_cp_admm=False,
+            cps_join_communities=True,
+            community_partition_method="connected_component",
+            enable_multihop_constraint=False,
         )
     else:
         base = RestorationConfiguration()
@@ -633,8 +657,6 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     # default because the log can grow large.  Enabled by setting
     # ``write_trajectories: true`` in the campaign config; consumed by
     # the C.5 cluster-synchronisation analysis.
-    from scare.base import diagnostics as _diag
-
     # Reset every per-run diagnostics log so this task's result.json
     # event counts reflect only this task — workers reuse the same Py
     # process across tasks, so without an explicit arm() the
@@ -688,13 +710,14 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     # rather than the priority-weighted fraction alone.
     baseline_served = None
     try:
-        from experiment.eval.oracle import compute_baseline_served
-        from experiment.restoration import GRIDS
-
         if task.grid in GRIDS:
-            # We need priorities for the baseline metric to be
-            # comparable; resolve them from a fresh build.  Factory
-            # already applies MISOCP + McCormick.
+            # Priorities are deterministic in (grid, seed, scenario),
+            # so we build a throwaway net just to enumerate loads,
+            # then release it BEFORE the heavy simulation/oracle phase
+            # — otherwise base_net + its Pyomo model state stay alive
+            # alongside the simulation's own fresh net and double peak
+            # RAM (~1-3 GB on CP-heavy grids).  Factory already applies
+            # MISOCP + McCormick.
             base_net = GRIDS[task.grid]()
             _apply_scenario(base_net, task, logger)
             base_priorities = _resolve_priorities(base_net, task, logger)
@@ -709,6 +732,8 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 baseline_served.get("priority_weighted_demand", 0.0),
                 baseline_served.get("priority_weighted_fraction", 0.0),
             )
+            del base_net, base_priorities
+            gc.collect()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Baseline LP failed (continuing without it): %s", exc)
 
@@ -725,22 +750,13 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
             (out_dir / "result.json").write_text(
                 json.dumps(payload, indent=2, sort_keys=True, default=str)
             )
+            write_slack_meta(out_dir / "slack_meta.json", net)
         else:
             world, failures, net = asyncio.run(
                 _run_simulation(plan, task, logger, out_dir=out_dir)
             )
             (out_dir / "failures.json").write_text(
                 json.dumps(_serialize_failures(failures), indent=2)
-            )
-            from experiment.eval.results import (
-                compose_result,
-                write_diary_csv,
-                write_events_csv,
-                write_messages_csv,
-                write_result_json,
-                write_served_by_load_csv,
-                write_served_csv,
-                write_trajectories_csv,
             )
             behavior = world.environment.behavior
             # End-of-sim measurement boundary: force a fresh energy flow
@@ -772,6 +788,7 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
             )
             write_diary_csv(out_dir / "diary.csv")
             write_events_csv(out_dir / "events.csv")
+            write_slack_meta(out_dir / "slack_meta.json", net)
             cfg = _config_from_task(task)
             if cfg.record_messages:
                 write_messages_csv(out_dir / "messages.csv", world)
@@ -789,8 +806,6 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
             # fold pass/fail into result.json so the aggregator can roll
             # them up.
             try:
-                from experiment.eval.claims import evaluate_task
-
                 claims = evaluate_task(out_dir)
                 payload["claims"] = claims
                 write_result_json(out_dir / "result.json", payload)
@@ -857,7 +872,6 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         # task on this worker gets a fresh slate.  Best-effort: the
         # module is optional, so swallow ImportError if it's not on path.
         try:
-            from scare.base.infeasibility_capture import disarm_infeasibility_capture
             disarm_infeasibility_capture()
         except Exception:  # noqa: BLE001
             pass

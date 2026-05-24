@@ -36,6 +36,17 @@ import logging
 from typing import Any
 
 import numpy as np
+from distributed_resource_optimization import (
+    create_admm_sharing_data,
+    create_admm_start,
+    create_sharing_target_distance_admm_coordinator,
+    start_coordinated_optimization,
+)
+from distributed_resource_optimization.algorithm.admm.flex_actor import (
+    ADMMFlexActor,
+)
+
+from scare.base.util import tier_priority_weight
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +99,7 @@ async def allocate_supply_priority(
     max_iters: int = 50,
     abs_tol: float = 1e-3,
     enable_priority_weighting: bool = True,
+    cp_coupling: list[tuple[int, str, str, float]] | None = None,
 ) -> tuple[
     dict[str, dict[int, float]],
     list[list[float]],
@@ -126,6 +138,19 @@ async def allocate_supply_priority(
         ``base.util.obs_priority``'s tier range.
     max_iters, abs_tol
         Coordinator convergence knobs.
+    cp_coupling
+        Optional list of ``(actor_index, sector_in, sector_out, ratio)``
+        tuples expressing cross-sector coupling at coupling-point (CP)
+        actors.  For each entry the actor's per-cell vector gets two
+        extra inequality rows in its ``(C, d)`` constraint matrix:
+        ``Σ_t x[sector_out, t] − ratio · Σ_t x[sector_in, t] ≤ 0`` and
+        the reversed sign — together expressing the equality ``output
+        = ratio · input``.  Convention: ``sector_in`` is the CP's
+        input (consumes from this sector), ``sector_out`` is the
+        output (produces into this sector).  A P2H bridging
+        electricity → heat with η = 0.9 passes
+        ``(cp_idx, "electricity", "heat", 0.9)``.  None or empty
+        list ⇒ no coupling rows added (legacy behaviour).
 
     Returns
     -------
@@ -160,16 +185,6 @@ async def allocate_supply_priority(
         raise ValueError(
             "supply-priority ADMM: actor_ub_overrides length must match actor count"
         )
-
-    from distributed_resource_optimization import (
-        create_admm_sharing_data,
-        create_admm_start,
-        create_sharing_target_distance_admm_coordinator,
-        start_coordinated_optimization,
-    )
-    from distributed_resource_optimization.algorithm.admm.flex_actor import (
-        ADMMFlexActor,
-    )
 
     n_sec = len(sectors)
     n_tier = len(tiers)
@@ -219,8 +234,6 @@ async def allocate_supply_priority(
                 "degenerate": True,
             },
         )
-
-    from scare.base.util import tier_priority_weight
 
     priorities = np.zeros(n_dims)
     for tier in tiers:
@@ -282,6 +295,77 @@ async def allocate_supply_priority(
             total_demand_sum, holon_supply_total, float(total_T.sum()),
         )
 
+    # Waterfall short-circuit: when there are no per-actor reach
+    # restrictions and no CP coupling, the ``total_T`` vector IS the
+    # priority-optimal allocation per cell, regardless of how it
+    # distributes across actors.  The dispatch layer only reads
+    # ``service_fraction = T / demand``, never the per-actor ``x``.
+    # The ADMM would otherwise be solving "which actor commits how
+    # much to each cell" — a degree of freedom we don't actually
+    # need, and one its share-weighted S term solves badly (small
+    # actors with weak priority bias chronically under-commit, so
+    # ``Σ x`` converges well below ``T``; 2026-05-24 deficit audit
+    # showed waterfall T = 0.268 but ADMM committed only 0.115 on
+    # simbench_lv with 6 failures and slack 0.15).  Covers both
+    # supply ≥ demand (T = demand → frac = 1) and supply < demand
+    # (T = waterfall → frac matches the priority-correct schedule).
+    if (
+        actor_ub_overrides is None
+        and (cp_coupling is None or len(cp_coupling) == 0)
+        and holon_supply_total > 0
+    ):
+        service_fraction: dict[str, dict[int, float]] = {}
+        for sec in sectors:
+            service_fraction.setdefault(sec, {})
+            for tier in tiers:
+                j = _flat_idx(sec, tier)
+                demand_cell = float(total_demand_per_cell[j])
+                target_cell = float(total_T[j])
+                frac = (
+                    1.0 if demand_cell <= 1e-9
+                    else min(1.0, max(0.0, target_cell / demand_cell))
+                )
+                service_fraction[sec][tier] = frac
+        logger.debug(
+            "supply-priority ADMM waterfall short-circuit: "
+            "supply=%.4f, demand=%.4f, T_sum=%.4f",
+            holon_supply_total, total_demand_sum, float(total_T.sum()),
+        )
+        return (
+            service_fraction,
+            [[0.0] * n_dims for _ in actor_supplies],
+            {
+                "T_per_cell": total_T.tolist(),
+                "demand_per_cell": total_demand_per_cell.tolist(),
+                "sum_x_per_cell": total_T.tolist(),
+                "actor_supply_total": [
+                    sum(float(v) for v in s.values()) for s in actor_supplies
+                ],
+                "holon_supply_total": holon_supply_total,
+                "priorities": priorities.tolist(),
+                "sectors": list(sectors),
+                "tiers": list(tiers),
+                "degenerate": False,
+                "short_circuit": "waterfall",
+            },
+        )
+
+    # Index the cp_coupling entries by actor so we can extend that
+    # actor's (C, d) below.  Each entry is consumed once.
+    cp_couplings_by_actor: dict[int, list[tuple[str, str, float]]] = {}
+    for entry in (cp_coupling or []):
+        try:
+            g_idx, sec_in, sec_out, ratio = entry
+        except (TypeError, ValueError):
+            continue
+        if sec_in not in sec_idx or sec_out not in sec_idx:
+            # Skip couplings that reference sectors not in the current
+            # multi-sector ADMM scope (e.g. a P2G when gas is absent).
+            continue
+        cp_couplings_by_actor.setdefault(int(g_idx), []).append(
+            (str(sec_in), str(sec_out), float(ratio))
+        )
+
     actors: list[ADMMFlexActor] = []
     actor_supply_total: list[float] = []
     for g, supply_map in enumerate(actor_supplies):
@@ -299,14 +383,54 @@ async def allocate_supply_priority(
                     cap = overrides.get((sec, tier))
                     if cap is not None:
                         raw_cap = min(raw_cap, float(cap))
-                ub[j] = max(raw_cap, 1e-6)
+                # Waterfall-shed cells: when the priority waterfall set
+                # ``T[j] = 0`` (cell is below the supply cutoff in the
+                # priority order), force the per-actor ub to *exact* 0
+                # so the local QP cannot leak supply into a cell the
+                # waterfall decided to drop.  Without this, the
+                # sharing-ADMM's weak per-actor S preference + the local
+                # QP's quadratic round-off let small actors deposit
+                # tiny positive amounts on shed cells; ``x_avg[j] > 0``
+                # then anchors ``z[j] > 0`` via the z-update's
+                # quadratic term, and the convergence check passes on
+                # a leaked allocation.  Using exact 0 (bypassing the
+                # ``max(raw_cap, 1e-6)`` well-conditioning floor) is
+                # safe because the constraint ``0 ≤ x ≤ 0`` is feasible
+                # for OSQP and pins the variable exactly; the floor
+                # only matters when ``raw_cap > 0`` and the solver
+                # needs slack to handle near-degenerate cells.
+                if total_T[j] <= 1e-12:
+                    ub[j] = 0.0
+                else:
+                    ub[j] = max(raw_cap, 1e-6)
 
         # Per-actor coupling: Σ commitments ≤ total supply.  Binding
         # constraint that creates scarcity when supply < demand.
         total_supply = sum(float(v) for v in supply_map.values())
         actor_supply_total.append(total_supply)
-        C = np.ones((1, n_dims))
-        d = np.array([max(total_supply, 0.0)])
+        C_rows = [np.ones(n_dims)]
+        d_rows = [max(total_supply, 0.0)]
+
+        # CP coupling: for each (sector_in, sector_out, ratio) attached
+        # to this actor, add the equality ``Σ_t x[out, t] = ratio · Σ_t
+        # x[in, t]`` as a pair of inequalities.  Together they pin the
+        # CP actor's per-sector flow ratio so its output supply commit
+        # stays consistent with its input draw under the conversion
+        # efficiency.  No-op for non-CP actors (the list is empty).
+        for sec_in, sec_out, ratio in cp_couplings_by_actor.get(g, []):
+            row_out_minus_r_in = np.zeros(n_dims)
+            for tier in tiers:
+                row_out_minus_r_in[_flat_idx(sec_out, tier)] += 1.0
+                row_out_minus_r_in[_flat_idx(sec_in, tier)] -= ratio
+            # out − ratio · in ≤ 0
+            C_rows.append(row_out_minus_r_in.copy())
+            d_rows.append(0.0)
+            # ratio · in − out ≤ 0  (same row, negated)
+            C_rows.append(-row_out_minus_r_in)
+            d_rows.append(0.0)
+
+        C = np.vstack(C_rows)
+        d = np.array(d_rows, dtype=float)
 
         # S biases each actor toward high-priority cells.  Magnitude
         # scaled by share of pool supply so larger pools have a

@@ -99,6 +99,7 @@
       "variants": [
         "scare",
         "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -358,7 +359,7 @@
       "$comment": [
         "Cross-sector coalition pillar (L2.5).  Mirrors cp_coalition_eval's headline",
         "ablation on simbench_lv_cp_heavy_dependent \u00e2\u20ac\u201d CPs replace primary generation, so",
-        "losing a CP is unrecoverable by intra-sector gossip + islanding alone.  Tight",
+        "losing a CP is unrecoverable by intra-sector gossip + local-gen fallback alone.  Tight",
         "slack budget (15%) + generator-class failures make the cross-sector layer the",
         "only path to recovery.  Three rows: full stack vs xs-off vs all-coalitions-off",
         "so the smoke exercises every L2.5 code path."

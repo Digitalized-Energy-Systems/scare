@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 
 from scare.base.model import NegotiationFinishedEvent, SECTOR_TIMESCALE, Sector
-from scare.base.util import apply_regulate, obs_capacity
+from scare.base.util import apply_regulate, lookup_priority, obs_capacity
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -134,8 +134,6 @@ class GenerationController(Role):
             factor = self._floor
         if cap > 0:
             self._floor = max(self._floor, factor)
-
-        from scare.base.util import lookup_priority
 
         applied = apply_regulate(
             self.behavior,

@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from scare.base.model import Sector
+from scare.base.util import sector_color
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,8 +84,6 @@ def visualize_network(
 ) -> Any:
     import networkx as nx
     import plotly.graph_objects as go
-
-    from scare.base.model import Sector
 
     g: nx.Graph = monee_net.graph
 
@@ -221,9 +222,6 @@ def plot_sector_timeseries(
 ) -> Any:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
-
-    from scare.base.model import Sector
-    from scare.base.util import sector_color
 
     if sectors is None:
         sectors = [s.value for s in Sector]

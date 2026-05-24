@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink
 
-from scare.base.model import Sector
+from scare.base.diagnostics import record_event, record_regulate
+from scare.base.model import SECTOR_CONSTRAINTS, Sector
 
 HHV: float = 15.3  # MW / (kg/s) for natural gas
 
@@ -209,7 +212,6 @@ def register_slack(
         # which downstream ``obs_capacity`` / ``obs_priority`` falls
         # back on the LP's current operating value — i.e. the slack
         # gets reclassified as a load.  Surface the bad input instead.
-        import logging
         logging.getLogger(__name__).warning(
             "register_slack(%s, rating_mw=%s): non-positive rating; "
             "slack will fall back to LP-value capacity, which is "
@@ -348,8 +350,6 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
         child = net.child_by_id(cid)
     except Exception:  # noqa: BLE001
         return False
-    from monee.model.child import ExtHydrGrid, ExtPowerGrid
-
     return isinstance(child.model, (ExtPowerGrid, ExtHydrGrid))
 
 
@@ -383,8 +383,6 @@ def _is_heat_side_mass_flow_sink(behavior: Any, aid: str) -> bool:
         child = net.child_by_id(cid)
     except Exception:  # noqa: BLE001
         return False
-    from monee.model.child import Sink
-
     if not isinstance(child.model, Sink):
         return False
     try:
@@ -430,8 +428,6 @@ def apply_regulate(
     """
     factor = max(0.0, min(1.0, factor))
     if factor < 1.0 - tolerance and _is_heat_side_mass_flow_sink(behavior, aid):
-        from scare.base.diagnostics import record_event
-
         record_event(
             t=float(timestamp),
             kind="regulate_blocked_heat_sink",
@@ -441,8 +437,6 @@ def apply_regulate(
         )
         return False
     if factor < 1.0 - tolerance and _is_slack_class_child(behavior, aid):
-        from scare.base.diagnostics import record_event
-
         record_event(
             t=float(timestamp),
             kind="regulate_blocked_slack",
@@ -465,8 +459,6 @@ def apply_regulate(
                 and 0 < int(priority_tier) <= _COOLDOWN_BYPASS_TIER_THRESHOLD
             )
             if not critical:
-                from scare.base.diagnostics import record_event
-
                 record_event(
                     t=float(timestamp),
                     kind="regulate_suppressed_by_cooldown",
@@ -491,8 +483,6 @@ def apply_regulate(
     if state["last_id"] == current_id and state["applies_on_current_id"] > 0:
         state["stale_landed"] += 1
         if state["warned_for_id"] != current_id:
-            from scare.base.diagnostics import record_event
-
             record_event(
                 t=float(timestamp),
                 kind="regulate_on_stale_obs",
@@ -513,8 +503,6 @@ def apply_regulate(
     _last_regulate_store(behavior)[aid] = factor
     if cooldown_s > 0:
         _last_regulate_t_store(behavior)[aid] = timestamp
-
-    from scare.base.diagnostics import record_regulate
 
     record_regulate(
         t=timestamp,
@@ -723,8 +711,6 @@ def obs_priority(
             behavior._scare_prio_fallback_seen = seen
         if aid not in seen:
             seen.add(aid)
-            from scare.base.diagnostics import record_event
-
             record_event(
                 t=float(record_default_fallback_t),
                 kind="priority_default_fallback",
@@ -898,8 +884,6 @@ def clamp_to_constraints(
     is used — preserves byte-compatible behaviour for callers that
     do not (yet) propagate tier information.
     """
-    from scare.base.model import SECTOR_CONSTRAINTS
-
     bounds = SECTOR_CONSTRAINTS.get(sector, {})
     cap = obs_capacity(obs)
     if cap == 0.0:

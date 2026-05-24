@@ -22,6 +22,7 @@ from pathlib import Path
 import pandas as pd
 
 from experiment.eval import plots
+from experiment.eval.aliases import alias_experiment, alias_variant
 from experiment.eval.loader import CampaignData, TaskArtefacts, load_campaign
 from experiment.eval.overview import write_overview
 
@@ -95,11 +96,6 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
             sub, out_dir / "served_by_variant.png",
             title="Priority-weighted served by variant",
         )),
-        # "How fast does each variant settle?" — restoration-time view
-        # that mirrors the served-fraction headline metric.
-        str(plots.time_to_stabilise_box(
-            sub, out_dir / "time_to_stabilise.png",
-        )),
         # "Which control layer actually fires under each variant?" —
         # exposes the regulate trigger mix so ablations stand out.
         str(plots.regulates_by_reason_bar(
@@ -108,6 +104,26 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
         str(plots.diary_outcomes_bar(sub, out_dir / "diary_outcomes.png")),
         str(plots.claims_pass_rate(sub, out_dir / "claims_pass_rate.png")),
     ]
+
+
+def _restoration_time(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Campaign-wide time-to-stabilise box plot.
+
+    Pools every OK task across every experiment so the per-variant box
+    has enough samples to be meaningful — restricting it to the
+    ``variant_comparison`` slice (the natural home for the PWSF bar)
+    collapses the box to n=1 per variant in small campaigns and hides
+    the scare distribution entirely.
+    """
+    df = campaign.summary
+    if df.empty:
+        return []
+    ok = df[df["status"] == "ok"]
+    if ok.empty:
+        return []
+    return [str(plots.time_to_stabilise_box(
+        ok, out_dir / "time_to_stabilise.png",
+    ))]
 
 
 def _ablation(campaign: CampaignData, out_dir: Path) -> list[str]:
@@ -289,6 +305,7 @@ def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
             f"External-grid slack — task {rep.task_id} ({rep.grid})"
         ),
         failure_t=failure_t,
+        slack_meta=rep.slack_meta,
     )))
     return figs
 
@@ -331,7 +348,6 @@ def _per_experiment_trajectories(
         return []
 
     out: list[tuple[str, list[str]]] = []
-    from experiment.eval.aliases import alias_experiment, alias_variant
     seen_pairs: set[tuple[str, str]] = set()
     for exp_name in sorted(ok["experiment"].dropna().unique()):
         if exp_name == "functional_baseline" or not exp_name:
@@ -375,6 +391,61 @@ def _per_experiment_trajectories(
             if figs:
                 out.append((label, figs))
     return out
+
+
+def _per_task_overviews(
+    campaign: CampaignData, out_dir: Path,
+) -> list[tuple[str, list[str]]]:
+    """Render :func:`plots.system_state_overview` for every OK task.
+
+    One stacked-subplots figure per task at
+    ``plots/per_task_overview/<task_id>.html`` — slack injection,
+    control-variable envelopes, line-loading aggregates, and per-tier
+    demand fulfilment (fraction + MW) on shared simulation-time axes.
+    Grouped per (experiment, variant) so the report can hyperlink
+    section-by-section without a thousand inline images.
+    """
+    df = campaign.summary
+    if df.empty or "task_id" not in df.columns:
+        return []
+    ok = df[df["status"] == "ok"]
+    if ok.empty:
+        return []
+
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for _, row in ok.iterrows():
+        try:
+            tid = int(row["task_id"])
+        except (TypeError, ValueError):
+            continue
+        task = campaign.task(tid)
+        try:
+            fig_path = str(plots.system_state_overview(
+                task.timeseries, task.events,
+                out_dir / f"{tid:06d}.png",
+                title=(
+                    f"System-state overview — task {tid} "
+                    f"({task.grid}, {alias_variant(task.variant)})"
+                ),
+                failure_t=task.first_failure_time(),
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "system_state_overview task %d failed: %s — skipping",
+                tid, exc,
+            )
+            continue
+        key = (str(row.get("experiment", "")), str(row.get("variant", "")))
+        grouped.setdefault(key, []).append(fig_path)
+
+    sections: list[tuple[str, list[str]]] = []
+    for (exp_name, variant), figs in sorted(grouped.items()):
+        label = (
+            f"Per-task overview — {alias_experiment(exp_name)} / "
+            f"{alias_variant(variant)}"
+        )
+        sections.append((label, figs))
+    return sections
 
 
 def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
@@ -448,7 +519,6 @@ def _missing_experiment_sections(
         sub = ok[ok["experiment"] == exp_name]
         if sub.empty:
             continue
-        from experiment.eval.aliases import alias_experiment
         out_dir = plots_root / exp_name
         figs = [
             str(plots.variant_comparison_bar(
@@ -481,8 +551,6 @@ def _table_status(campaign: CampaignData) -> str:
 
 
 def _table_variant_means(campaign: CampaignData) -> str:
-    from experiment.eval.aliases import alias_variant
-
     df = campaign.summary
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns:
@@ -552,6 +620,7 @@ def generate_report(campaign_dir: Path) -> Path:
         ("Functional baseline", _functional_baseline, "functional_baseline"),
         ("Optimality gap", _optimality_gap, "optimality_gap"),
         ("Variant comparison", _variant_comparison, "variant_comparison"),
+        ("Time to stabilise", _restoration_time, "restoration_time"),
         ("Ablation impact", _ablation, "ablation"),
         ("Robustness", _robustness, "robustness"),
         ("Cascading", _cascading, "cascading"),
@@ -594,6 +663,17 @@ def generate_report(campaign_dir: Path) -> Path:
                 sections.append((label, figs))
     except Exception as exc:  # noqa: BLE001
         logger.warning("Per-experiment trajectories failed: %s — skipping", exc)
+
+    # One system-state overview HTML per OK task — slack + control vars
+    # + line loading + per-tier fulfilment on shared time axes.
+    try:
+        for label, figs in _per_task_overviews(
+            campaign, plots_root / "per_task_overview",
+        ):
+            if figs:
+                sections.append((label, figs))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Per-task overviews failed: %s — skipping", exc)
 
     md = _stitch(campaign, sections)
     report_path = campaign_dir / "REPORT.md"

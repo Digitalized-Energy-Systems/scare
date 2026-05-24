@@ -34,6 +34,7 @@ unreliable links via Proposition~7 of the chapter.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -177,8 +178,6 @@ def hash_weighted_choice(
     """
     if not addrs:
         return None
-    import hashlib
-
     total = sum(max(0.0, w) for w in weights)
     if total <= 0.0:
         h = hashlib.sha256(seed.encode()).digest()

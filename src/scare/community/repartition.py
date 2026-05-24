@@ -39,6 +39,7 @@ from uuid import UUID, uuid4
 from mango import Role
 from mango.express.topology import topology_characteristic
 
+from scare.base.diagnostics import record_event
 from scare.base.model import (
     CommunityAssignment,
     CommunityReassignedEvent,
@@ -181,8 +182,6 @@ class DynamicRepartitionRole(Role):
         new_community_id = uuid4()
         orphan_addrs = [self._member_addr[aid] for aid in orphaned_aids]
 
-        from scare.base.diagnostics import record_event
-
         record_event(
             t=self.context.current_timestamp,
             kind="community_repartitioned",
@@ -263,8 +262,6 @@ class RepartitionHandlerRole(Role):
         ]
         assignment.leader_addr = message.new_leader_addr
         self.context.update(assignment)
-
-        from scare.base.diagnostics import record_event
 
         record_event(
             t=self.context.current_timestamp,

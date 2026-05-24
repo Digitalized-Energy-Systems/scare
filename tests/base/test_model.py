@@ -6,7 +6,7 @@ from scare.base.model import (
     ConstraintViolation,
     EnergyData,
     EnergyNegotiationMessage,
-    IslandingRequest,
+    LocalGenerationRequest,
     NegotiationFinishedEvent,
     SECTOR_CONSTRAINTS,
     SECTOR_TIMESCALE,
@@ -110,8 +110,8 @@ class TestFrozenDataclasses:
             cv.value = 1.0
 
 
-class TestIslandingRequest:
+class TestLocalGenerationRequest:
     def test_construction(self):
-        req = IslandingRequest(sector=Sector.ELECTRICITY, residual_deficit=2.5)
+        req = LocalGenerationRequest(sector=Sector.ELECTRICITY, residual_deficit=2.5)
         assert req.sector == Sector.ELECTRICITY
         assert req.residual_deficit == 2.5

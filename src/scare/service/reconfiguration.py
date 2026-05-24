@@ -7,12 +7,16 @@ from uuid import uuid4
 from mango import Role, State
 from mango.express.topology import topology_neighbors
 
+from scare.base.diagnostics import record_event, record_switch
 from scare.base.model import (
     GridPathMessage,
     GridPathResult,
     LineFailure,
     ReconfigurationCompletedEvent,
+    Sector,
+    StartBalanceNegotiation,
 )
+from scare.base.util import obs_constraint_values
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -211,9 +215,6 @@ class GridReconfigurator(Role):
         neighbour, normalised to the percent convention used by
         SECTOR_CONSTRAINTS (see ``obs_constraint_values``).
         """
-        from scare.base.model import Sector
-        from scare.base.util import obs_constraint_values
-
         branch_aid = _branch_aid_from_addrs(self.context.addr, neighbour_addr)
         obs = self.behavior.observe(branch_aid)
         if not obs:
@@ -301,8 +302,6 @@ class GridReconfigurator(Role):
         )
         if message.uncertain_connections:
             await self._close_tie_switches(message.uncertain_connections)
-            from scare.base.diagnostics import record_event
-            from scare.base.model import StartBalanceNegotiation
 
             record_event(
                 t=self.context.current_timestamp,
@@ -370,8 +369,6 @@ class GridReconfigurator(Role):
         return False
 
     async def _close_tie_switches(self, uncertain: list[tuple[Any, Any]]) -> None:
-        from scare.base.diagnostics import record_switch
-
         for from_addr, to_addr in uncertain:
             branch_aid = _branch_aid_from_addrs(from_addr, to_addr)
             if self.behavior.has_action(branch_aid, "switch"):
@@ -418,8 +415,6 @@ class GridTieSwitchOperator(Role):
 
     def close_switch(self) -> None:
         if self.behavior.has_action(self.context.aid, "switch"):
-            from scare.base.diagnostics import record_switch
-
             self.behavior.act(self.context.aid, "switch")
             record_switch(
                 t=self.context.current_timestamp,

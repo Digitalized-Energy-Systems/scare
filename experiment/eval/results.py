@@ -22,10 +22,15 @@ from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from monee.model.child import ExtHydrGrid, ExtPowerGrid
+
 from scare.base import diagnostics
+from scare.base.model import Sector
+from scare.base.util import sector_from_grid
 
 from experiment.eval.metrics import (
     constraint_violation_integral,
+    restoration_breakdown,
     served_breakdown,
     served_by_load,
     time_to_stabilise_s,
@@ -50,7 +55,6 @@ def compose_result(
     baseline_served: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structured result.json payload for a scare-variant run."""
-    from experiment.eval.metrics import restoration_breakdown
 
     served = served_breakdown(monee_net, behavior, priorities=priorities)
     restoration = restoration_breakdown(served, baseline_served)
@@ -177,6 +181,69 @@ def write_served_by_load_csv(
                 f"{r['demand']:.6f}", f"{r['served']:.6f}", f"{r['fraction']:.6f}",
                 r["disconnected"],
             ])
+
+
+def write_slack_meta(path: Path, monee_net: Any) -> None:
+    """Persist per-slack-child metadata (budget + LP envelope) so the
+    post-run plot tooling can overlay the operator policy on the
+    measured trajectory.
+
+    Output schema (one entry per slack-class child):
+
+        {
+          "<aid>": {
+            "sector":       "electricity" | "gas" | "heat",
+            "obs_key":      "p_mw" | "mass_flow",
+            "budget":       <float | null>,   # |operator policy|, null = heat
+            "lp_envelope":  <float | null>,   # |LP Var bound|, null = unbounded
+            "node_id":      <child's parent node id>
+          },
+          ...
+        }
+
+    Budget is the value stamped on the model by ``apply_slack_budget``.
+    LP-envelope is the absolute Var bound after ``apply_slack_budget``
+    widened it (typically ``10 × budget``).  Both are ``null`` for
+    slack children left intentionally unbudgeted (heat-side
+    ``ExtHydrGrid``); the plot then skips the overlay for that sector.
+    """
+
+    meta: dict[str, dict[str, Any]] = {}
+    for child in monee_net.childs:
+        m = child.model
+        if isinstance(m, ExtPowerGrid):
+            obs_key = "p_mw"
+            budget = getattr(m, "_scare_slack_budget_mw", None)
+            var = getattr(m, "p_mw", None)
+        elif isinstance(m, ExtHydrGrid):
+            obs_key = "mass_flow"
+            budget = getattr(m, "_scare_slack_budget_kgs", None)
+            var = getattr(m, "mass_flow", None)
+        else:
+            continue
+        try:
+            node = monee_net.node_by_id(child.node_id)
+            sector = sector_from_grid(node.grid)
+        except Exception:  # noqa: BLE001
+            sector = None
+        if sector is None:
+            continue
+        envelope: float | None = None
+        if var is not None:
+            v_min = getattr(var, "min", None)
+            v_max = getattr(var, "max", None)
+            mags = [abs(float(b)) for b in (v_min, v_max) if b is not None]
+            if mags:
+                envelope = max(mags)
+        aid = f"child-{child.id}"
+        meta[aid] = {
+            "sector": sector.value if isinstance(sector, Sector) else str(sector),
+            "obs_key": obs_key,
+            "budget": float(budget) if budget is not None else None,
+            "lp_envelope": envelope,
+            "node_id": child.node_id,
+        }
+    path.write_text(json.dumps(meta, indent=2, sort_keys=True))
 
 
 def write_diary_csv(path: Path) -> None:

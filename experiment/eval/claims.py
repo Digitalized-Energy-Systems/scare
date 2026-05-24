@@ -46,6 +46,9 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
     out["monotonic_progress"] = _check_monotonic_progress(
         task_dir / "timeseries.csv", task_dir / "events.csv"
     )
+    out["slack_budget_compliance"] = _check_slack_budget(
+        task_dir / "events.csv"
+    )
     return out
 
 
@@ -368,6 +371,62 @@ def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
             continue
         windows.append((t, t + _POST_FAILURE_S))
     return windows
+
+
+# ---------------------------------------------------------------------------
+# Slack budget compliance
+# ---------------------------------------------------------------------------
+
+
+def _check_slack_budget(events_path: Path) -> dict[str, Any]:
+    """Operator slack-budget constraint must be honoured throughout
+    the run.  ``SlackBudgetMonitor`` (service/slack_budget.py) polls
+    each registered slack child every ``poll`` seconds and records a
+    ``slack_budget_violation`` event whenever
+    ``|p_mw| > budget · (1 + slack_budget_violation_tol)`` — i.e.
+    whenever the LP draws more from the external grid than the
+    operator policy allows.
+
+    Passed iff no such event fired during the run.  Vacuously True
+    on tasks where no slack child carries an explicit budget
+    (``slack_budget_pct`` absent from the scenario; monitor never
+    installed).
+
+    Mirrors the budget claim the oracle reports from the LP itself
+    via ``compose_oracle_result`` — passing both says SCARE and
+    oracle solved the *same* operator-constrained problem and the
+    PWSF gap is the real allocation gap, not a policy violation by
+    one side.
+    """
+    if not events_path.exists():
+        return {"passed": True, "detail": "no events.csv (claim vacuous)"}
+    rows = _read_csv(events_path)
+    if not rows:
+        return {"passed": True, "detail": "empty events.csv (claim vacuous)"}
+    violations = [r for r in rows if r.get("kind") == "slack_budget_violation"]
+    if not violations:
+        return {
+            "passed": True,
+            "detail": {"n_violations": 0, "enforced_at": "agent"},
+        }
+    # Surface the worst few for diagnostics, plus the peak excess.
+    peaks: list[dict[str, Any]] = []
+    for r in violations[:5]:
+        peaks.append({
+            "t": r.get("t"),
+            "aid": r.get("aid"),
+            "sector": r.get("sector"),
+            "detail": (r.get("detail") or "")[:120],
+        })
+    return {
+        "passed": False,
+        "detail": {
+            "n_violations": len(violations),
+            "first_t": violations[0].get("t"),
+            "last_t": violations[-1].get("t"),
+            "peaks_sample": peaks,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

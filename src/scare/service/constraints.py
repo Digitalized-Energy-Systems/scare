@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from mango import Role
 from mango import sender_addr as mango_sender_addr
 from mango.express.topology import topology_neighbors
 
+from scare.base.diagnostics import record_event
 from scare.base.model import (
     PROACTIVE_WARNING_FRACTION,
     SECTOR_CONSTRAINTS,
@@ -33,11 +35,14 @@ from scare.base.model import (
     Sector,
     StartBalanceNegotiation,
 )
-from scare.base.util import obs_priority
+from scare.base.trust import TrustLedger, TrustParams
 from scare.base.util import (
+    apply_regulate,
     constraint_utilization,
+    lookup_priority,
     obs_capacity,
     obs_constraint_values,
+    obs_priority,
     obs_setpoint,
     tier_priority_weight,
 )
@@ -60,6 +65,14 @@ _FORWARD_VALUE_TOL: float = 0.02
 # liveness ticks flowing through the trust ledger while preventing the
 # per-cycle flood that ``_state_forwarded.clear()`` used to enable.
 _FORWARD_FRESHNESS_S: float = 5.0
+
+# Cache-gate tolerance for ``_monitor``: when no constraint variable's
+# value has moved by more than this since the last poll AND no
+# violation is currently active, the entire monitor body skips.
+# Tighter than ``_FORWARD_VALUE_TOL`` because here we are gating
+# whether to even look at the values at all — the propagation guard
+# downstream uses the coarser tolerance.
+_VALUES_DELTA_TOL: float = 1e-4
 
 # EMA smoothing factor for the local sensitivity estimate (dV / dP).
 # 0 = never update, 1 = replace with latest sample.  A low value keeps
@@ -171,14 +184,20 @@ class GridConstraintMonitor(Role):
         # avoid flooding.
         self._violation_emitted: set[str] = set()
 
+        # Cache of last-observed constraint values per variable.  Used
+        # by the polling watchdog (``_monitor``) to short-circuit when
+        # nothing has moved beyond ``_VALUES_DELTA_TOL`` since the
+        # last tick — most ticks on a steady grid would otherwise
+        # repeat identical work (violation check, sensitivity update,
+        # propagation guard) for no signal change.
+        self._last_polled_values: dict[str, float] = {}
+
         # B.1: continuous coupling weights K_ij for the constraint
         # propagation overlay.  Independent of the balance negotiator's
         # ledger because the topology and message frequencies differ.
         # Used to (a) weight the worst-neighbour utilisation by trust,
         # (b) skip forwarding to neighbours whose K is below the
         # liveness threshold.
-        from scare.base.trust import TrustLedger, TrustParams
-
         poll_s = SECTOR_TIMESCALE.get(sector, {}).get("poll_period_s", 1.0)
         self._trust = TrustLedger(
             TrustParams(
@@ -315,8 +334,6 @@ class GridConstraintMonitor(Role):
             "[%s] CONSTRAINT VIOLATION %s=%.4f bounds=[%.4f,%.4f]",
             self.context.aid, var, val, lo, hi,
         )
-        from scare.base.diagnostics import record_event
-
         record_event(
             t=self.context.current_timestamp,
             kind="constraint_violation",
@@ -366,6 +383,26 @@ class GridConstraintMonitor(Role):
 
         bounds = SECTOR_CONSTRAINTS.get(self.sector, {})
         values = obs_constraint_values(obs, self.sector)
+
+        # Cache gate: skip the whole monitor pass when no value has
+        # moved beyond ``_VALUES_DELTA_TOL`` since the last poll AND
+        # there is no active violation that still needs re-evaluation
+        # (an active violation must keep firing until the value drops
+        # back inside bounds, otherwise downstream balance roles never
+        # see the "clear" transition).
+        if not self._violation_emitted and self._last_polled_values:
+            unchanged = all(
+                math.isfinite(v)
+                and var in self._last_polled_values
+                and abs(v - self._last_polled_values[var]) < _VALUES_DELTA_TOL
+                for var, v in values.items()
+            )
+            if unchanged and set(values) == set(self._last_polled_values):
+                return
+        # Update cache for the next tick's comparison.
+        self._last_polled_values = {
+            var: float(v) for var, v in values.items() if math.isfinite(v)
+        }
 
         # Deduplication state is now persistent across cycles — see
         # ``_propagate_state`` / ``_handle_constraint_state`` for the
@@ -469,6 +506,19 @@ class GridConstraintMonitor(Role):
         if message.hops_remaining <= 1:
             return  # TTL exhausted
 
+        # ``enable_multihop_constraint=False`` also disables incoming-
+        # message forwarding (not just the own-state broadcast in
+        # ``_propagate_state``).  Required for ``component_level``,
+        # whose ``connected_component`` partition collapses an entire
+        # sector into one ``tid="groups"`` group: ``topology_neighbors``
+        # then returns O(N) addresses per agent, and a single message
+        # fans out N · (N−1) on the first hop alone, OOM-killing the
+        # worker (8.5 M log lines / 9 min on simbench_lv with N≈300).
+        # Cache + trust-score updates above still fire so the local
+        # picture stays current; only the redistribution stops.
+        if not self.enable_multihop_constraint:
+            return
+
         fwd = ConstraintStateMessage(
             sector=message.sector,
             variable=message.variable,
@@ -567,7 +617,6 @@ class GridConstraintMonitor(Role):
         # willingness (priority × local sensitivity × reducible output).
         total_amount = max(0.02, min(1.0, self._CURTAILMENT_GAIN * overshoot))
 
-        import uuid
         auction_id = str(uuid.uuid4())
         self._open_auctions[auction_id] = {
             "bids": {},
@@ -703,8 +752,6 @@ class GridConstraintMonitor(Role):
         amount = max(0.0, min(1.0, message.amount))
         new_factor = max(0.0, current * (1.0 - amount))
 
-        from scare.base.util import apply_regulate, lookup_priority
-
         applied = apply_regulate(
             self.behavior,
             self.context.aid,
@@ -745,6 +792,20 @@ class GridConstraintMonitor(Role):
         if not obs:
             return
 
+        # Cheap pre-gate: skip every later check (constraint values,
+        # capacity lookup, ramp computation) when there is nothing to
+        # recover.  Only runs work when this agent's regulation is
+        # actually < 1.0 — the only state in which un-shedding makes
+        # sense.  Loads with cap <= 0 (generators) are also filtered
+        # so the recovery loop only does work for shedding-eligible
+        # loads.
+        current = float(obs.get("regulation", 1.0))
+        if current >= 1.0:
+            return
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
+        if cap <= 0:
+            return
+
         bounds = SECTOR_CONSTRAINTS.get(self.sector, {})
         worst_util = 0.0
         for var, val in obs_constraint_values(obs, self.sector).items():
@@ -753,13 +814,6 @@ class GridConstraintMonitor(Role):
             lo, hi = bounds.get(var, (float("-inf"), float("inf")))
             worst_util = max(worst_util, constraint_utilization(val, lo, hi))
         if worst_util > self._HEAT_RECOVERY_CLEAR_FRACTION:
-            return
-
-        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
-        if cap <= 0:  # generators are not subject to recovery (DGs ramp via their own role)
-            return
-        current = float(obs.get("regulation", 1.0))
-        if current >= 1.0:
             return
 
         # Ramp at the heat-sector convergence rate per recovery period.
@@ -774,8 +828,6 @@ class GridConstraintMonitor(Role):
         new_factor = min(1.0, current + rate_per_s * period_s * 0.2)
         if new_factor <= current + 1e-4:
             return
-
-        from scare.base.util import apply_regulate, lookup_priority
 
         applied = apply_regulate(
             self.behavior,

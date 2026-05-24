@@ -36,9 +36,11 @@ CLI examples
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import sys
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Iterable
@@ -167,8 +169,6 @@ def discover_axes(runs: Iterable[TaskRun], *, max_depth: int = 2) -> dict[str, s
     a ``{dotted_key: set_of_values}`` mapping; values are coerced to
     str for hashability.
     """
-    from collections import defaultdict
-
     seen: dict[str, set] = defaultdict(set)
 
     def walk(prefix: str, val, depth: int) -> None:
@@ -219,8 +219,6 @@ def filter_runs(
 
 
 def _read_csv_floats(path: Path) -> tuple[list[str], np.ndarray]:
-    import csv
-
     rows: list[list[float]] = []
     cols: list[str] = []
     with path.open(newline="") as f:
@@ -239,8 +237,6 @@ _NUMERIC_TOKENS = {"nan", "inf", "+inf", "-inf"}
 
 
 def _read_csv_dicts(path: Path) -> list[dict]:
-    import csv
-
     out: list[dict] = []
     with path.open(newline="") as f:
         reader = csv.reader(f)

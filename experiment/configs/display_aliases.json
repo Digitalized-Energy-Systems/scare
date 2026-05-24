@@ -37,8 +37,9 @@
     "reconfiguration":         "reconfig"
   },
   "variants": {
-    "scare":         "SCARE",
-    "single_level":  "single-level",
-    "oracle":        "oracle"
+    "scare":           "SCARE",
+    "single_level":    "single-level",
+    "component_level": "component-level",
+    "oracle":          "oracle"
   }
 }

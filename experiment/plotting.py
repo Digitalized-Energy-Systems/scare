@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
 
 from scare.base.visu import (
     plot_message_counts,
@@ -74,8 +75,6 @@ def plot_aggregated(df: pd.DataFrame) -> None:
     if df.empty or "performance" not in df.columns:
         return
     _ensure_plots_dir()
-    import plotly.graph_objects as go
-
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=df["performance"], nbinsx=20, name="performance"))
     fig.update_layout(

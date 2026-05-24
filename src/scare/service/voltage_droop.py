@@ -32,6 +32,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Cache-gate tolerance for ``_step``: if every observed input
+# (vm_pu, |p_mw|, regulation) is within this tolerance of the
+# previous tick's value, the Q(U) droop output is unchanged and
+# the whole step is skipped.  Tighter than the typical voltage
+# fluctuation so the droop still tracks meaningful movement.
+_OBS_DELTA_TOL: float = 1e-4
+
+
 # ---------------------------------------------------------------------------
 # VDE-AR-N 4105 (Erzeugungsanlagen am Niederspannungsnetz) — Q(U) curve
 # ---------------------------------------------------------------------------
@@ -148,6 +156,14 @@ class ReactivePowerDroopRole(Role):
         # Last commanded Q (monee convention).  Used by ``_step`` to
         # avoid recording trivial duplicates when V hasn't moved.
         self._last_q: float | None = None
+        # Cache of the last observed voltage / real-power magnitude.
+        # The Q(U) droop output is a function of (vm_pu, p_mw,
+        # regulation); when none of those have moved beyond
+        # ``_OBS_DELTA_TOL`` the new Q would match the previous one
+        # and the periodic ``_step`` can return immediately.
+        self._last_obs_v: float | None = None
+        self._last_obs_p: float | None = None
+        self._last_obs_reg: float | None = None
 
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(Sector.ELECTRICITY, {}).get(
@@ -187,6 +203,23 @@ class ReactivePowerDroopRole(Role):
         if not math.isfinite(regulation):
             regulation = 1.0
         regulation = max(0.0, min(2.0, regulation))
+        # Cache gate: when every droop input is within tolerance of
+        # the previous tick's, the computed Q would match the last
+        # one and the dispatch is a no-op.  Skip the whole pass
+        # rather than re-deriving the same value every poll.  First
+        # call goes through unconditionally (cached values are None).
+        if (
+            self._last_obs_v is not None
+            and self._last_obs_p is not None
+            and self._last_obs_reg is not None
+            and abs(v_f - self._last_obs_v) < _OBS_DELTA_TOL
+            and abs(p_mag - self._last_obs_p) < _OBS_DELTA_TOL
+            and abs(regulation - self._last_obs_reg) < _OBS_DELTA_TOL
+        ):
+            return
+        self._last_obs_v = v_f
+        self._last_obs_p = p_mag
+        self._last_obs_reg = regulation
         p_dispatched = p_mag * regulation
         s_sq = self.s_nom_mva * self.s_nom_mva
         # ``p_dispatched > s_nom_mva`` means the active power exceeds the

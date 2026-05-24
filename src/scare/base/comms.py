@@ -12,6 +12,8 @@ from __future__ import annotations
 import random
 from typing import Any
 
+from mango.simulation.communication import SimpleCommunicationSimulation
+
 
 def install_perturbation(
     world: Any,
@@ -29,8 +31,6 @@ def install_perturbation(
 
     # Pure packet loss with static delay.
     if latency_jitter_ms <= 0:
-        from mango.simulation.communication import SimpleCommunicationSimulation
-
         world.communication_sim = SimpleCommunicationSimulation(
             loss_percent=packet_loss_pct / 100.0,
             default_delay_s=base_delay_s,
@@ -43,8 +43,6 @@ def install_perturbation(
     # a Gaussian draw to inject jitter.  The earlier implementation
     # used ``DelayProviderCommunicationSimulation`` which had no loss
     # support and silently dropped ``packet_loss_pct`` (audit P1-3).
-    from mango.simulation.communication import SimpleCommunicationSimulation
-
     sigma_s = latency_jitter_ms / 1000.0
     loss_frac = max(0.0, packet_loss_pct / 100.0) if packet_loss_pct > 0 else 0.0
 

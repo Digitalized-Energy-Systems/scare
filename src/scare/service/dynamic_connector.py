@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 from mango.express.topology import topology_characteristic
 
+from scare.base.diagnostics import record_event
 from scare.base.topology_mirror import GridTopologyMirror
 
 if TYPE_CHECKING:
@@ -155,8 +156,6 @@ class DynamicConnectorRole(Role):
             return
 
         self._unreachable_aids.update(newly_unreachable)
-
-        from scare.base.diagnostics import record_event
 
         record_event(
             t=self.context.current_timestamp,

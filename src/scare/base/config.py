@@ -24,7 +24,7 @@ class RestorationConfiguration:
     # Level-2 holonic ADMM across same-sector group leaders.  When
     # False, no HolonicCommunityRole is installed and the ``holons``
     # topology is empty; group-level rebalancing falls back to local
-    # constraint-violation triggers and the islanding fallback.
+    # constraint-violation triggers and the local-generation fallback.
     enable_holonic: bool = True
 
     # Level-3 cross-sector ADMM at coupling-point agents.  When False,
@@ -72,10 +72,20 @@ class RestorationConfiguration:
     # role schedules ``_publish`` every ``holon_summary_period_s`` and
     # ``_check_invariants`` at the same cadence.  Faster picks up
     # cross-holon inversions sooner but costs O(N²) extra messages
-    # per sector per period.  Default 1 s — short enough that even
-    # the 5 s smoke sims fire the publisher 3–4 times before sim
-    # end, long enough that per-period communication cost stays low.
-    holon_summary_period_s: float = 1.0
+    # per sector per period.
+    #
+    # The L2 holon ADMM dispatches its initial allocation reactively
+    # at ~ t=0.08 s (right after holon formation).  That allocation
+    # is what *creates* the cross-holon inversions L2.5 then races to
+    # close.  Detection needs (a) one self-publish, (b) peer publishes
+    # to arrive, (c) a second tick where this leader sees ≥1 peer
+    # summary and can compute the cross-holon aggregate.  At 1 s
+    # period that was ≥ 2 s of inversion before the first coalition
+    # ever fired — the dominant cause of the per-component priority
+    # invariant lingering low even at 60 s sim runs.  0.25 s lets the
+    # first coalition open by ~0.6 s sim time so the post-L2 inversion
+    # gap is closed within the first second.
+    holon_summary_period_s: float = 0.25
 
     # Per-tier served-fraction tolerance for declaring a priority
     # inversion.  A pair (tier_high, tier_low) is flagged when
@@ -94,7 +104,13 @@ class RestorationConfiguration:
     # Constraints are re-asserted every L2.5 tick until ``ttl_s`` or
     # a ``BranchFailureEvent`` invalidates them.  Off ⇒ M1 behaviour
     # (detect + record event, no scoped allocation).
-    enable_holon_coalition: bool = True
+    #
+    # Default off as of 2026-05-23: with ``holon_admm_scope="sector"``
+    # the new sector-wide L2 already produces a sector-uniform per-tier
+    # service fraction across all holons in the same sector, so the
+    # intra-sector coalition has nothing to fix.  Set True to opt
+    # back in (e.g. when paired with ``holon_admm_scope="holon"``).
+    enable_holon_coalition: bool = False
 
     # Window the initiator waits after broadcasting
     # ``CoalitionInvitation`` before running the allocation pass.
@@ -122,11 +138,16 @@ class RestorationConfiguration:
     # ``CoalitionConstraintStore`` so L2 (per-sector) and L3 (CP
     # ADMM) honour the commitment for the TTL window.
     #
-    # Off ⇒ legacy behaviour (per-sector coalitions only).  Provided
-    # as an ablation knob so evaluation campaigns can quantify the
-    # cross-sector contribution in isolation from the rest of the
-    # stack.
-    enable_cross_sector_coalitions: bool = True
+    # Off ⇒ per-sector behaviour only.  Default off as of 2026-05-23:
+    # the smoke campaign showed L2.5 firing reactively after the bad
+    # initial L2 dispatch has already been made (electrical balance
+    # collapses ~22 % in the first 300 ms of sim time) and only
+    # marginally recovers — see the 2026-05-22 eval_full_smoke phase
+    # analysis.  The new sector-wide L2 (all holons as ADMM peers,
+    # intra-sector) is intended to subsume L2.5's role; cross-sector
+    # coupling will be re-introduced in a later milestone once the
+    # in-sector path is correct.  Set True to opt back in.
+    enable_cross_sector_coalitions: bool = False
 
     # Curtailment auction in GridConstraintMonitor on hard violations.
     # When False, violations only emit a BalanceProblem to re-trigger
@@ -148,17 +169,41 @@ class RestorationConfiguration:
     enable_priority_holon_allocation: bool = True
 
     # No-regret floor in EnergyBalanceNegotiator._apply_setpoint
-    # during restoration directions.  When False, loads can be
-    # un-restored across negotiation rounds without a violation.
-    enable_monotonic_floor: bool = True
+    # during restoration directions.  When True, a load that has
+    # once reached factor=X cannot drop below X in a subsequent
+    # gossip round.
+    #
+    # Default flipped to False as of 2026-05-23: the floor blocks
+    # the L3→L2→L1 cascade's re-shed semantics.  When L3 commits a
+    # P2H increase to serve a high-priority heat load, the
+    # source-sector L2 must shed lower-priority elec loads to free
+    # the supply; the floor preserved the old (now stale) factor
+    # and prevented the shed, leading to LP over-commitment or
+    # priority inversions.  Set True to opt back into the no-regret
+    # behaviour for ablations against the pre-Option-B path.
+    enable_monotonic_floor: bool = False
 
     # Cold-load pickup ramp limit on regulation increases.
     # When False, factor jumps are not throttled.
     enable_clpu_ramp: bool = True
 
     # Heat-only periodic un-shed recovery in GridConstraintMonitor.
-    # When False, heat regulations stay where the gossip put them.
-    enable_heat_recovery: bool = True
+    # When True, every ~5 s the monitor checks local heat constraints
+    # and if they're clear it bumps each load's regulation factor up
+    # by ~0.2 per cycle (independent of L2/L3 priority decisions).
+    #
+    # Default flipped to False as of 2026-05-23: same class of bug as
+    # ``enable_monotonic_floor``.  When L2 sheds heat tier 5 loads to
+    # factor=0 (priority decision: serve tier <5 first), heat_recovery
+    # then un-sheds them back to ~0.225 because heat constraints are
+    # locally clear — overriding the priority cascade.  The 2026-05-23
+    # smoke showed this driving uniform-0.225 inversions on heat
+    # tier 5 vs tier 6 across multiple scenarios (cooldown_sweep,
+    # cold_day_stress, ablation_thermal, etc).
+    #
+    # Set True to opt back into the no-regret heat un-shed behaviour
+    # for ablations against the pre-Option-B path.
+    enable_heat_recovery: bool = False
 
     # Local Q-V droop at every inverter-coupled PowerGenerator (PV).
     # Follows the VDE-AR-N 4105 Q(U) characteristic: piecewise-linear
@@ -177,16 +222,17 @@ class RestorationConfiguration:
     qv_droop_voltage_ref_pu: float = 1.0
 
     # F2: slack-infeed target as a fraction of the registered slack
-    # rating (which itself is ``_bound_external_slack``'s cap when the
-    # grid uses a constrained slack budget).  Each slack agent then
-    # reports ``setpoint = slack_target_fraction · rating`` as its
-    # contribution to the gossip's imbalance computation — driving the
-    # MAS to shed / restore until the residual matches what the slack
-    # is *expected* to provide, instead of treating "slack absorbs
-    # everything" as the equilibrium.  Default 0.0: slack provides
-    # nothing in the imbalance accounting and the MAS does all the
-    # balancing locally.  1.0: slack should provide up to its full
-    # rated infeed; MAS handles anything beyond that.
+    # rating.  Per-community gossip uses this to bias its imbalance
+    # accounting away from "balance ⇒ zero slack draw" toward
+    # "balance ⇒ slack draws its target fraction of rating".  In
+    # practice this only matches the operator's intent when the
+    # slack's community spans the full LP balance scope (i.e.
+    # ``community_partition_method="connected_component"``); for
+    # the holonic and label-propagation partitions the gossip target
+    # derived from this setpoint contradicts the global budget.  Left
+    # at 0.0 by default; budget enforcement instead routes through
+    # :class:`~scare.service.slack_budget.SlackBudgetMonitor`'s
+    # signed ``override_target`` path, which is partition-agnostic.
     slack_target_fraction: float = 0.0
 
     # P6 primal-dual QP gossip.  When True (default), the receiving
@@ -213,6 +259,26 @@ class RestorationConfiguration:
     # gossip agents throttle their participation.  When False the
     # branch agents are not registered and line overload is silent.
     enable_line_loading_constraint: bool = True
+
+    # External-grid slack budget monitor.  When True, every slack-class
+    # child (ExtPowerGrid / ExtHydrGrid with ``_scare_slack_budget_*``
+    # stamped by ``apply_slack_budget``) carries a ``SlackBudgetMonitor``
+    # role that polls the LP-chosen ``p_mw`` / ``mass_flow`` and, when
+    # the absolute draw exceeds ``budget · (1 + slack_budget_violation_tol)``,
+    # records a ``slack_budget_violation`` event and emits a
+    # ``BalanceProblem`` so the co-located ``EnergyBalanceNegotiator``
+    # triggers a rebalance round (and the optional curtailment auction
+    # / multihop propagation chained off it).  Goal: make the operator-
+    # policy ``slack_budget_pct`` a runtime-enforced constraint rather
+    # than a passive label, while leaving the LP envelope (10× budget)
+    # wide enough that the energy-flow solve stays feasible.
+    enable_slack_budget_monitor: bool = True
+
+    # Relative tolerance for the slack-budget monitor.  A draw is flagged
+    # only when ``|obs| > budget · (1 + slack_budget_violation_tol)``;
+    # the small margin avoids flagging the steady-state numerical wiggle
+    # of an LP that's already converged inside the envelope.
+    slack_budget_violation_tol: float = 0.05
 
     # GridReconfigurator path ranking by line loading.  When True the
     # reconfigurator carries a running max_loading_percent along each
@@ -283,6 +349,47 @@ class RestorationConfiguration:
     #   limited flex" problem.
     holon_admm_mode: str = "supply"
 
+    # Holon ADMM *scope* — which actors participate in a single ADMM
+    # round.  Decoupled from ``holon_admm_mode`` (which picks the LP
+    # formulation regardless of scope).
+    #
+    # - ``"component"`` (default as of 2026-05-23): every *group
+    #   leader* in the same active connected component of the sector
+    #   is an ADMM actor.  The elected coordinator (lex-smallest
+    #   leader aid among leaders mutually reachable on the active
+    #   branch subgraph) collects each leader's community flex
+    #   (supply + per-tier demand), runs the ADMM, and dispatches the
+    #   resulting per-tier ``service_fraction`` to every leader in
+    #   the component.  Each leader then applies the fractions to
+    #   its OWN community members directly (no holon hop).
+    #
+    #   Why per-component: priority is a global ordering whose
+    #   guarantee scope is exactly the connected component of the
+    #   active grid (the priority-invariant claim aggregates per
+    #   ``(sector, component)``).  Aligning the optimisation scope
+    #   with the claim scope means cross-leader inversions cannot
+    #   arise *and* a failure that splits a component re-elects two
+    #   coordinators that decide independently for their halves.
+    #
+    #   Why every group leader (not every holon): the previous
+    #   sector-scope path dispatched only via holon leaders, leaving
+    #   communities not in any holon at the LP-default factor=1.0 —
+    #   the actual root cause of the inversions surfaced by the
+    #   2026-05-22 smoke.  This default puts every community leader
+    #   in the dispatch loop.
+    #
+    # - ``"sector"`` (deprecated, 2026-05-22 default): all holon
+    #   leaders in the sector were ADMM actors.  Suffered the
+    #   coverage gap above — kept reachable as an ablation for the
+    #   campaign comparison; will be removed once the per-component
+    #   path is validated.
+    # - ``"holon"`` (legacy): each holon leader runs its own ADMM
+    #   over its member groups only.  Produces per-holon per-tier
+    #   service fractions that need not agree across holons — i.e.
+    #   the cross-holon inversions the original smoke surfaced.
+    #   Retained as an ablation knob.
+    holon_admm_scope: str = "component"
+
     # Hebbian-emergent holon membership refinement (Aoki & Aoyagi 2009).
     # Leaders broadcast their normalised sector imbalance δ_g as
     # HebbianFlexBeacon, accumulate a per-peer co-variance estimate
@@ -315,6 +422,12 @@ class RestorationConfiguration:
     # - ``"modularity"``: distributed-Louvain Phase 1 — communities
     #   form to maximise local modularity gain, respecting the graph's
     #   natural cluster structure.  Sizes vary; not bounded by radius.
+    # - ``"connected_component"``: one community per connected
+    #   component of the per-sector subgraph.  Used by the
+    #   ``component_level`` baseline — gives the gossip negotiator a
+    #   global per-component view rather than many small radius-bounded
+    #   sub-communities.  Combine with ``cps_join_communities=True`` so
+    #   the CPs that bridge two components actually participate.
     community_partition_method: str = "label_propagation"
 
     # Radius bound for ``label_propagation`` method (ignored by
@@ -331,6 +444,43 @@ class RestorationConfiguration:
     # Iteration cap for the modularity phase-1 sweep.  Convergence
     # typically in 3-5 rounds; 10 is a safe cap.
     community_modularity_iterations: int = 10
+
+    # ----------------------------------------------------------------
+    # ``component_level`` baseline tunables
+    # ----------------------------------------------------------------
+    #
+    # When True, every CP agent joins the per-sector community of each
+    # endpoint it bridges (a P2G bridges one electricity + one gas
+    # community).  CPs become normal members of those communities' L1
+    # gossip rounds and drop their separate CP-ADMM path —
+    # ``EnergyConverterRole`` is replaced by
+    # ``MultiCommunityCPRole``, which collects per-community signals,
+    # combines them with an EMA over per-sector setpoint targets, and
+    # commits via ``apply_regulate`` under a deadband + cooldown guard
+    # so a CP sitting in two communities can't ping-pong between
+    # contradictory asks.  Only meaningful with
+    # ``enable_cp_admm=False``; the variant builder in
+    # ``experiment/hpc/runner.py`` enforces the combination.
+    cps_join_communities: bool = False
+
+    # EMA blending factor for the multi-community CP guard.  Each tick
+    # the new per-sector target is ``α · proposed + (1 − α) · current``;
+    # higher means more reactive to incoming proposals, lower means
+    # heavier filtering.  0.3 mirrors the smoothing band used by the
+    # existing slack-budget cooldown plumbing.
+    cp_oscillation_ema_alpha: float = 0.3
+
+    # Minimum |target − current| (in the sector's natural units — MW
+    # for electricity, MW for heat, kg/s for gas) below which a new
+    # target is treated as noise and not committed.  Sits above the
+    # 0.01 MW fixed-point tolerance the legacy ``EnergyConverterRole``
+    # already uses on incoming setpoints.
+    cp_oscillation_deadband_mw: float = 0.05
+
+    # Minimum simulation-second gap between two regulation commits on
+    # the same CP.  Modelled on the 2.0 s ``SlackBudgetMonitor`` refire
+    # cooldown that successfully damps oscillation in the gossip layer.
+    cp_oscillation_min_interval_s: float = 1.0
 
     # ----------------------------------------------------------------
     # Sensitivity-sweep tunables

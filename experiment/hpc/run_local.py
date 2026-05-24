@@ -21,19 +21,23 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from experiment.hpc.plan import filter_task_ids, read_manifest
+from experiment.hpc.runner import run_task
 
 logger = logging.getLogger(__name__)
 
 
 def _worker(campaign_dir_str: str, task_id: int) -> tuple[int, int]:
-    # Imported lazily so child processes don't pay import cost up front.
-    from experiment.hpc.runner import run_task
-
     code = run_task(Path(campaign_dir_str), task_id)
     return task_id, code
 
 
-def run_campaign(campaign_dir: Path, task_ids: list[int], workers: int) -> int:
+def run_campaign(
+    campaign_dir: Path,
+    task_ids: list[int],
+    workers: int,
+    *,
+    max_tasks_per_child: int = 3,
+) -> int:
     failures = 0
     if workers <= 1:
         for tid in task_ids:
@@ -41,7 +45,14 @@ def run_campaign(campaign_dir: Path, task_ids: list[int], workers: int) -> int:
             failures += int(code != 0)
             logger.info("Task %d → exit=%d", tid, code)
     else:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
+        # Recycle workers periodically so Gurobi / Pyomo C-extension
+        # heap state can return to the OS between tasks.  Without this,
+        # peak memory grows unboundedly across the campaign and any
+        # heavy task (CP-heavy / scaling grids) hits OOM.
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            max_tasks_per_child=max_tasks_per_child,
+        ) as ex:
             futures = {ex.submit(_worker, str(campaign_dir), tid): tid for tid in task_ids}
             done = 0
             for fut in as_completed(futures):
@@ -61,6 +72,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--only", default="all",
                    choices=["all", "failed", "timeout", "missing", "incomplete", "ok"],
                    help="Filter task subset by on-disk status (default: all)")
+    p.add_argument("--max-tasks-per-child", type=int, default=3,
+                   help="Recycle each worker process after this many tasks "
+                        "(bounds peak memory; default 3)")
     return p.parse_args()
 
 
@@ -79,9 +93,16 @@ def main() -> None:
         logger.warning("Nothing to run (mode=%s).", args.only)
         sys.exit(0)
 
-    logger.info("Running %d/%d task(s) with %d worker(s)",
-                len(selected), len(tasks), args.workers)
-    failures = run_campaign(campaign_dir, selected, args.workers)
+    logger.info(
+        "Running %d/%d task(s) with %d worker(s) (max_tasks_per_child=%d)",
+        len(selected), len(tasks), args.workers, args.max_tasks_per_child,
+    )
+    failures = run_campaign(
+        campaign_dir,
+        selected,
+        args.workers,
+        max_tasks_per_child=args.max_tasks_per_child,
+    )
     if failures:
         logger.warning("%d task(s) exited non-zero", failures)
     sys.exit(1 if failures else 0)

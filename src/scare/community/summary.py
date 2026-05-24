@@ -122,8 +122,11 @@ from scare.base.channel import (
     HolonSummary,
     MonotonicVersion,
 )
+from scare.base.diagnostics import record_event
+from scare.base.model import NegotiationFinishedEvent, Sector, StartBalanceNegotiation
 from scare.community.coalition_store import CoalitionConstraintStore
-from scare.base.model import Sector, StartBalanceNegotiation
+from scare.community.deliverability import per_actor_deliverable_caps
+from scare.community.supply_priority_admm import allocate_supply_priority
 from scare.base.util import (
     obs_capacity,
     obs_priority,
@@ -245,6 +248,7 @@ class HolonSummaryRole(Role):
         sector: Sector,
         *,
         period_s: float = 1.0,
+        watchdog_s: float = 30.0,
         inversion_tol: float = 1e-3,
         enable_coalition: bool = True,
         coalition_accept_window_s: float = 1.0,
@@ -264,6 +268,19 @@ class HolonSummaryRole(Role):
         self.behavior = behavior
         self.sector = sector
         self.period_s = period_s
+        # Watchdog cadence: even when nothing has moved, re-run the
+        # publish + invariant check + coalition re-assert at this
+        # slow interval so a peer joining late still sees the current
+        # version frontier and an active coalition stays renewed
+        # while its TTL is alive.  All meaningful work is event-driven
+        # (see setup()); the watchdog is purely a safety net.
+        self.watchdog_s = watchdog_s
+        # Cached last-published vectors so the event-driven publisher
+        # can skip when nothing material has moved.  ``inversion_tol``
+        # defines "material" so detection and publication agree on
+        # what counts as change.
+        self._last_published_served: dict[int, float] = {}
+        self._last_published_demand: dict[int, float] = {}
         self.inversion_tol = inversion_tol
         self.enable_coalition = enable_coalition
         self.coalition_accept_window_s = coalition_accept_window_s
@@ -370,19 +387,98 @@ class HolonSummaryRole(Role):
             lambda msg, meta: isinstance(msg, CoalitionConstraint)
             and msg.sector == self.sector,
         )
-        # Periodic publish + invariant check + coalition re-assert.
-        self.context.schedule_periodic_task(self._tick, delay=self.period_s)
+        # Event-driven publish: a leader's per-tier served/demand
+        # vector only moves when L1 gossip converges on a fresh
+        # setpoint or L2 dispatches a new allocation.  Subscribing
+        # to NegotiationFinishedEvent (same-agent emit from L1 gossip
+        # finish) and StartBalanceNegotiation (incoming L2 dispatch
+        # message) covers both.  ``_publish`` itself short-circuits
+        # when the new vector matches the cached last-published one,
+        # so even bursts of events don't republish identical state.
+        self.context.subscribe_event(
+            self, NegotiationFinishedEvent, self._on_local_state_change
+        )
+        self.context.subscribe_message(
+            self,
+            _wrap(self._on_l2_dispatch),
+            lambda msg, meta: isinstance(msg, StartBalanceNegotiation),
+        )
+        # Schedule an immediate first publish so peer summaries are
+        # already in flight by the time the L2 holon ADMM lands its
+        # initial allocation (~ t=0.08 s reactive on holon formation).
+        self.context.schedule_instant_task(self._tick())
+        # Watchdog: low-cadence re-run of publish + invariant check +
+        # coalition re-assert.  The dominant trigger is event-driven
+        # above; the watchdog catches missed events (peer joining
+        # late, coalition TTL needing renewal during a silent window).
+        self.context.schedule_periodic_task(self._tick, delay=self.watchdog_s)
 
     async def _tick(self) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
             return
-        await self._publish()
+        # Watchdog path: bypass the delta gate so the version frontier
+        # advances even when nothing has moved.
+        await self._publish(force=True)
         self._check_invariants()
         if self.enable_cross_sector_coalitions:
             self._check_cross_sector_invariants()
         await self._reassert_active_coalitions()
 
-    async def _publish(self) -> None:
+    def _on_local_state_change(
+        self, event: NegotiationFinishedEvent, _src: Any
+    ) -> None:
+        """Local L1 gossip just converged — the leader's per-tier
+        served/demand vector may have moved, so attempt a delta-gated
+        publish and re-check invariants.
+        """
+        if event.sector != self.sector:
+            return
+        if topology_characteristic(self, tid="groups") != "leader":
+            return
+        self.context.schedule_instant_task(self._publish_and_check())
+
+    async def _on_l2_dispatch(
+        self, message: StartBalanceNegotiation, meta: dict
+    ) -> None:
+        """L2 just dispatched a fresh allocation to this leader's
+        community — the per-tier served/demand may shift once members
+        apply the override.  Trigger a delta-gated publish + check.
+        """
+        if topology_characteristic(self, tid="groups") != "leader":
+            return
+        await self._publish_and_check()
+
+    async def _publish_and_check(self) -> None:
+        await self._publish()
+        self._check_invariants()
+        if self.enable_cross_sector_coalitions:
+            self._check_cross_sector_invariants()
+
+    def _summary_changed(
+        self,
+        served: dict[int, float],
+        demand: dict[int, float],
+    ) -> bool:
+        """True iff the new per-tier vectors differ from the cached
+        last-published ones on any tier by more than ``inversion_tol``.
+
+        Comparison is over the union of tiers so a tier that drops
+        out (becomes 0) is detected as change.
+        """
+        if not self._last_published_served and not self._last_published_demand:
+            return True  # first publish
+        tiers = set(served) | set(demand) | set(
+            self._last_published_served
+        ) | set(self._last_published_demand)
+        tol = self.inversion_tol
+        for t in tiers:
+            if abs(served.get(t, 0.0) - self._last_published_served.get(t, 0.0)) > tol:
+                return True
+            if abs(demand.get(t, 0.0) - self._last_published_demand.get(t, 0.0)) > tol:
+                return True
+        return False
+
+    async def _publish(self, *, force: bool = False) -> None:
         """Aggregate this leader's community state per priority tier,
         then broadcast the summary to all same-sector peers via the
         ``holon_summary_<sector>`` topology.
@@ -418,6 +514,21 @@ class HolonSummaryRole(Role):
             tier = obs_priority(obs, behavior=self.behavior, aid=aid)
             per_tier_demand[tier] = per_tier_demand.get(tier, 0.0) + abs(cap)
             per_tier_served[tier] = per_tier_served.get(tier, 0.0) + abs(sp)
+
+        # Delta gate: skip the publish + version bump when the per-tier
+        # vectors haven't moved by more than ``inversion_tol`` on any
+        # tier.  The watchdog tick passes ``force=True`` to keep the
+        # version frontier advancing for peers that joined late.
+        if not force and not self._summary_changed(
+            per_tier_served, per_tier_demand
+        ):
+            return
+
+        # Cache for the next delta comparison — must run before
+        # ``send_message`` so a re-entrant publish triggered by a
+        # downstream event sees the most recent baseline.
+        self._last_published_served = dict(per_tier_served)
+        self._last_published_demand = dict(per_tier_demand)
 
         summary = HolonSummary(
             publisher=str(self.context.aid),
@@ -467,6 +578,14 @@ class HolonSummaryRole(Role):
         # Mirror into the shared cross-sector registry so cross-sector
         # detection sees this peer too (same rationale as _publish).
         _xs_registry(self.behavior).setdefault(message.sector, {})[key] = message
+        # Now that the peer view has shifted, re-run inversion
+        # detection immediately — the watchdog runs only every
+        # ``watchdog_s`` so without this trigger M1 detection would
+        # lag a fresh peer summary by the full watchdog interval.
+        if topology_characteristic(self, tid="groups") == "leader":
+            self._check_invariants()
+            if self.enable_cross_sector_coalitions:
+                self._check_cross_sector_invariants()
 
     # ------------------------------------------------------------------
     # Detection + initiator election
@@ -538,8 +657,6 @@ class HolonSummaryRole(Role):
         now = float(self.context.current_timestamp)
         if now - self._last_inversion_emit_t < self._inversion_cooldown_s:
             return
-
-        from scare.base.diagnostics import record_event
 
         emitted = False
         # Open a coalition for the *worst* inversion (largest fraction
@@ -646,8 +763,6 @@ class HolonSummaryRole(Role):
                 if not union_aids or union_aids[0] != own_aid:
                     continue
                 self._last_xs_inversion_emit_t = now
-                from scare.base.diagnostics import record_event
-
                 record_event(
                     t=now,
                     kind="cross_sector_inversion_detected",
@@ -866,8 +981,6 @@ class HolonSummaryRole(Role):
                 issued_at=now,
                 ttl_s=float(self.coalition_constraint_ttl_s),
             )
-
-        from scare.base.diagnostics import record_event
 
         record_event(
             t=now,
@@ -1326,12 +1439,6 @@ class HolonSummaryRole(Role):
                         float(supply_map[sector_str]) * budget_scale
                     )
 
-        from scare.base.diagnostics import record_event
-        from scare.community.deliverability import per_actor_deliverable_caps
-        from scare.community.supply_priority_admm import (
-            allocate_supply_priority,
-        )
-
         # Deliverability caps: each actor's per-(sector, tier) ub is
         # narrowed to the reachable-demand sum at that tier, so supply
         # at a stranded actor cannot be committed to demand it cannot
@@ -1489,6 +1596,16 @@ class HolonSummaryRole(Role):
             if aid == str(self.context.aid):
                 continue
             broadcast_targets.add(addr)
+        # Self-loop the constraint so the initiator's own
+        # ``HolonicCommunityRole`` reacts the same way as peers: the
+        # subscribe_message handler triggers an L2 rebalance, merging
+        # the new coalition fractions with the holon's own ADMM
+        # result.  Without this loop the initiator's L2 only re-runs
+        # on its slow heartbeat (default 60 s) while every peer
+        # rebalances within ms of receiving the message.
+        own_addr = getattr(self.context, "addr", None)
+        if own_addr is not None:
+            broadcast_targets.add(own_addr)
         for addr in broadcast_targets:
             await self.context.send_message(constraint_msg, receiver_addr=addr)
 
