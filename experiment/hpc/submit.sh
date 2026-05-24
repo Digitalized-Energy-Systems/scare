@@ -17,7 +17,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/venv/bin/python}"
+PYTHON_BIN=~/.conda/envs/cmres_env/bin/python
 
 if [ ! -x "$PYTHON_BIN" ]; then
     echo "ERROR: python interpreter not found: $PYTHON_BIN" >&2
