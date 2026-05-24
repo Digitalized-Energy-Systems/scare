@@ -21,6 +21,9 @@
 #
 # Dry-run (print sbatch command without submitting):
 #   bash scripts/submit_campaign.sh experiment/configs/eval_smoke.json --dry-run
+module load hpc-env/13.1
+module load Miniforge3/26.1.0-0
+conda activate cmres_env
 
 set -euo pipefail
 
