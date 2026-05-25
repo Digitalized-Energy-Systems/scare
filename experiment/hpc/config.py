@@ -138,6 +138,13 @@ class CampaignConfig:
     notes: str = ""
     defaults: GridDefaults = field(default_factory=GridDefaults)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
+    # Overrides applied on top of ``slurm`` for the post-array eval /
+    # plotting job (see experiment.hpc.submit_plot). Any SlurmConfig
+    # field is overridable — partition, nodelist, account, qos, cpus,
+    # extra_sbatch_args, etc. Unset keys inherit from ``slurm``; set a
+    # key to ``null`` to drop it (e.g. ``"nodelist": null`` to release
+    # a per-task node pin for the eval job).
+    slurm_eval: dict[str, Any] | None = None
 
     # ---- I/O -----------------------------------------------------------
 
@@ -161,16 +168,26 @@ class CampaignConfig:
             )
         defaults_raw = data.pop("defaults", {})
         slurm_raw = data.pop("slurm", {})
+        slurm_eval_raw = data.pop("slurm_eval", None)
         try:
-            return cls(
+            cfg = cls(
                 grids=[GridSpec.parse(g) for g in grids_raw],
                 experiments=[ExperimentSpec.parse(e) for e in experiments_raw],
                 defaults=GridDefaults(**defaults_raw),
                 slurm=SlurmConfig(**slurm_raw),
+                slurm_eval=slurm_eval_raw,
                 **data,
             )
         except TypeError as exc:
             raise ValueError(f"invalid config: {exc}") from exc
+        # Validate slurm_eval keys early so a typo surfaces at plan time,
+        # not when submit_plot constructs the merged SlurmConfig.
+        if slurm_eval_raw:
+            try:
+                cfg.effective_eval_slurm()
+            except TypeError as exc:
+                raise ValueError(f"invalid slurm_eval override: {exc}") from exc
+        return cfg
 
     def to_json(self, path: Path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2, sort_keys=True))
@@ -184,6 +201,18 @@ class CampaignConfig:
             g.failure_lambda if g.failure_lambda is not None else self.defaults.failure_lambda,
             g.max_failures if g.max_failures is not None else self.defaults.max_failures,
         )
+
+    def effective_eval_slurm(self) -> SlurmConfig:
+        """Slurm config for the post-array eval / plotting job.
+
+        Returns ``self.slurm`` with any ``slurm_eval`` keys overlaid.
+        Every SlurmConfig field is overridable; keys not present in
+        ``slurm_eval`` inherit from ``slurm``.
+        """
+        if not self.slurm_eval:
+            return self.slurm
+        merged = {**asdict(self.slurm), **self.slurm_eval}
+        return SlurmConfig(**merged)
 
 
 @dataclass

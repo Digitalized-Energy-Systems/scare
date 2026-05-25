@@ -1,26 +1,28 @@
 """Submit a plotting / report job for a finished campaign to Slurm.
 
-Wraps ``scripts/plot.sh`` in an sbatch call that inherits partition /
-nodelist / account from the campaign's ``config.json``. The job runs
-aggregation + report rendering, producing ``summary.csv``, ``REPORT.md``,
-and ``plots/`` inside the campaign dir.
+Wraps ``scripts/plot.sh`` in an sbatch call that inherits its Slurm
+settings from the campaign's ``config.json``. The job runs aggregation
++ report rendering, producing ``summary.csv``, ``REPORT.md``, and
+``plots/`` inside the campaign dir.
+
+Sizing precedence (highest first):
+    1. ``slurm_eval`` block in config.json (partial overrides on top
+       of ``slurm``) — typical use: bump mem / time for large campaigns
+       without affecting per-task array sizing.
+    2. ``slurm`` block in config.json.
 
 Usage:
     python -m experiment.hpc.submit_plot <campaign_dir> [--skip-aggregate] [--dry-run]
 
-Notes:
-    - ``submit.py`` already auto-fires an aggregator after the array
-      (when ``slurm.aggregate=true``); pass ``--skip-aggregate`` to
-      avoid redoing that step.
-    - Defaults to 4G / 30 min — override via ``MEM`` / ``TIME`` env vars
-      or extend the ``SlurmConfig`` if you need a permanent change.
+Note: ``submit.py`` already auto-fires an aggregator after the array
+(when ``slurm.aggregate=true``); pass ``--skip-aggregate`` to avoid
+redoing that step.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import os
 import shlex
 import subprocess
 import sys
@@ -49,16 +51,16 @@ def _plot_command(campaign_dir: Path, slurm: SlurmConfig, skip_aggregate: bool, 
         f"{env_prefix}PYTHON_BIN={shlex.quote(_python_bin(slurm))} "
         f"exec bash {shlex.quote(str(plot_sh))} {shlex.quote(str(campaign_dir))}"
     )
-    # Plotting is single-task: bypass heavy slurm flags but keep
-    # partition / account / nodelist so it lands on the same slice the
-    # user is allowed to use.
-    mem = os.environ.get("MEM", "4G")
-    time = os.environ.get("TIME", "00:30:00")
-    flags = [f"--cpus-per-task=1", f"--mem={mem}", f"--time={time}"]
+    flags = [
+        f"--cpus-per-task={slurm.cpus}",
+        f"--mem={slurm.mem}",
+        f"--time={slurm.time}",
+    ]
     for k in ("partition", "account", "qos", "nodelist", "exclude"):
         v = getattr(slurm, k)
         if v:
             flags.append(f"--{k}={v}")
+    flags.extend(slurm.extra_sbatch_args)
     return [
         "sbatch", "--parsable",
         f"--job-name={job_name}",
@@ -84,16 +86,19 @@ def _run_sbatch(cmd: list[str], dry_run: bool) -> str:
 
 def submit_plot(campaign_dir: Path, skip_aggregate: bool, dry_run: bool) -> int:
     cfg = CampaignConfig.from_json(campaign_dir / CAMPAIGN_LAYOUT["config"])
+    slurm = cfg.effective_eval_slurm()
     log_dir = campaign_dir / CAMPAIGN_LAYOUT["slurm_logs"]
     log_dir.mkdir(exist_ok=True)
 
     logger.info("Submitting plot job")
     logger.info("  campaign:    %s", campaign_dir)
-    logger.info("  partition:   %s", cfg.slurm.partition or "<default>")
-    logger.info("  nodelist:    %s", cfg.slurm.nodelist or "<any>")
+    logger.info("  partition:   %s", slurm.partition or "<default>")
+    logger.info("  nodelist:    %s", slurm.nodelist or "<any>")
+    logger.info("  time/mem:    %s / %s (cpus=%d)", slurm.time, slurm.mem, slurm.cpus)
+    logger.info("  overrides:   %s", cfg.slurm_eval or "<none — using slurm block>")
     logger.info("  aggregate:   %s", "skip" if skip_aggregate else "run")
 
-    job = _run_sbatch(_plot_command(campaign_dir, cfg.slurm, skip_aggregate, log_dir), dry_run)
+    job = _run_sbatch(_plot_command(campaign_dir, slurm, skip_aggregate, log_dir), dry_run)
     logger.info("  plot job:    %s", job)
     return 0
 

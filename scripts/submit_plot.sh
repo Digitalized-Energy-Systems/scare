@@ -15,8 +15,13 @@
 #   bash scripts/submit_plot.sh experiment/_runs/foo --skip-aggregate
 #   bash scripts/submit_plot.sh experiment/_runs/foo --dry-run
 #
-# Override Slurm sizing without touching config.json:
-#   MEM=8G TIME=01:00:00 bash scripts/submit_plot.sh <campaign_dir>
+# Slurm sizing for the plot job comes from the campaign's config.json:
+#   * "slurm"      — defaults inherited from the per-task array config
+#   * "slurm_eval" — optional overrides applied on top of "slurm"; any
+#                    SlurmConfig field is overridable (partition,
+#                    nodelist, account, qos, cpus, extra_sbatch_args,
+#                    ...). Set a key to null to drop it.
+# Edit the JSON and resubmit to change sizing.
 #
 # Note: scripts/submit_campaign.sh already chains an aggregator after
 # the array (when slurm.aggregate=true), so plotting an already-aggregated

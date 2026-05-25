@@ -869,5 +869,14 @@
     "max_concurrent": 64,
     "aggregate": true,
     "nodelist": "mpcs046,mpcs047"
+  },
+  "slurm_eval": {
+    "partition": "rosa.p",
+    "time": "24:00:00",
+    "mem": "32G",
+    "cpus": 1,
+    "max_concurrent": 64,
+    "aggregate": true,
+    "nodelist": "mpcs032,mpcs003"
   }
 }
