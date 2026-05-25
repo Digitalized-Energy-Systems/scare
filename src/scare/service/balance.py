@@ -46,6 +46,7 @@ from scare.base.util import (
     obs_priority,
     obs_sector,
     obs_setpoint,
+    tier_priority_weight,
 )
 from scare.community.holonic import HolonicCommunityRole
 
@@ -98,7 +99,12 @@ _GOSSIP_TIMEOUT_PER_AGENT_S = 0.5
 _HEARTBEAT_MAX_AGE_MULTIPLE: float = 8.0
 
 # Intra-sector priority tiers (lower = higher urgency, gossips earlier).
-_PRIORITY_TIERS = 10
+# 4-tier model: tier 1 = critical (hard-locked at the leader pre-step
+# before the QP runs), tiers 2–4 = QP-weighted with steep exponents
+# (1e8 / 1e4 / 1.0) so the proportional equilibrium is effectively
+# strict.  See ``scare.base.util.tier_priority_weight`` for the
+# canonical schedule shared across L1 / L2 / L3.
+_PRIORITY_TIERS = 4
 
 # Byzantine cap: a single participant's delta is clipped to this
 # multiple of the negotiation target magnitude.
@@ -699,28 +705,19 @@ class EnergyBalanceNegotiator(Role):
     def _qp_priority_weight(self, target_sign: int) -> float:
         """Priority cost weight for the QP responsiveness ``a_i``.
 
-        With a positive target (lost-load restoration regime), higher-
-        priority loads receive higher ``w`` so they saturate first as
-        ``λ`` rises (waterfall: tier 1 hits ``δ_max`` before tier 2).
-        Generators receive the lowest weight so they are last to shed
-        when loads can't absorb the imbalance.  Sign is symmetrical
-        for the lost-gen regime (``target < 0``).
-
-        Returns 1.0 as the trivial floor when no priority is set.
+        Delegates to ``tier_priority_weight`` (the single source of
+        truth for the 4-tier schedule).  Tier 1 is hard-locked at the
+        leader pre-step, so this returns the defensive weight 1.0 for
+        tier-1 entries that might still reach the QP.  Tiers 2–4 get
+        the 1e8 / 1e4 / 1.0 schedule.  Generators always return 1.0 in
+        either direction — the existing primal-clamp sign handles
+        their participation symmetrically.
         """
-        p = self.priority
-        P = _PRIORITY_TIERS
-        if target_sign > 0:  # restoration: lost load, want to bring loads up
-            if p > 0:  # load: higher priority → higher w → saturates first
-                return 2.0 ** (P - min(p, P) + 1)
-            # generator: lowest weight → only adjusts after loads
-            return 1.0
-        if target_sign < 0:  # curtailment: lost gen, want to shed low-prio loads / ramp gen
-            if p > 0:  # load: REVERSE priority — low-priority sheds first
-                return 2.0 ** min(p, P)
-            # generator: highest weight → ramps up first
-            return 2.0 ** (P + 1)
-        return 1.0
+        return tier_priority_weight(
+            self.priority,
+            regime=int(target_sign),
+            priority_tiers=_PRIORITY_TIERS,
+        )
 
     def _qp_responsiveness(self, _cap: float, target_sign: int) -> float:
         """Per-agent QP coefficient ``a_i = w_i`` (priority weight).
@@ -775,18 +772,16 @@ class EnergyBalanceNegotiator(Role):
     def _entry_responsiveness(self, prio: int, target_sign: int) -> float:
         """``a_i`` from a ledger entry's stored priority — used by the
         receiver to estimate ``Σ a_j`` for dual-step normalisation.
+
+        Mirrors ``_qp_priority_weight`` exactly (same schedule, same
+        source of truth) so the dual update agrees with each agent's
+        own primal step.
         """
-        # Replicates ``_qp_priority_weight`` but for an arbitrary prio.
-        P = _PRIORITY_TIERS
-        if target_sign > 0:
-            if prio > 0:
-                return 2.0 ** (P - min(prio, P) + 1)
-            return 1.0
-        if target_sign < 0:
-            if prio > 0:
-                return 2.0 ** min(prio, P)
-            return 2.0 ** (P + 1)
-        return 1.0
+        return tier_priority_weight(
+            int(prio),
+            regime=int(target_sign),
+            priority_tiers=_PRIORITY_TIERS,
+        )
 
     def _step_size(self, counter: int) -> float:
         """Robbins-Monro diminishing step (P3).
@@ -995,7 +990,149 @@ class EnergyBalanceNegotiator(Role):
             )
             self._trigger_nid = None
             self._trigger_responses = {}
-            await self._start_gossip(-total_sp)
+
+            # Tier-1 hard-constraint pre-step.  Apply ``regulation = 1`` to
+            # every tier-1 load if the community's generator pool can
+            # cover the total tier-1 demand; otherwise distribute the
+            # pool pro-rata across tier-1 and force tiers 2/3/4 to 0
+            # (no QP needed — the trivial allocation is exact).
+            residual_target, skip_gossip = self._pre_apply_tier1_hard(
+                total_sp
+            )
+            if skip_gossip:
+                # Tier-1 infeasible case OR nothing left to negotiate
+                # after pre-step (residual below threshold).
+                self._active = False
+                return
+            await self._start_gossip(residual_target)
+
+    def _pre_apply_tier1_hard(self, total_sp: float) -> tuple[float, bool]:
+        """Tier-1 hard-constraint pre-step.
+
+        Walks the leader's group members, separates tier-1 loads from
+        tier-2/3/4 loads and generators, and decides between two paths:
+
+        **Feasible** (``pool >= tier1_unmet``): lift every tier-1 load
+        to ``regulation = 1`` directly via ``apply_regulate``, then
+        return the residual imbalance ``T_residual = (-total_sp) -
+        tier1_unmet`` so the gossip QP only needs to clear what's left
+        after tier-1 is fully served.  The QP runs over tiers 2/3/4 +
+        generators; tier-1 loads have ``a_i = 0`` (see
+        ``tier_priority_weight``) so they sit out the QP.
+
+        **Infeasible** (``pool < tier1_unmet``): distribute the
+        available pool across tier-1 loads pro-rata by per-load unmet
+        demand, force tier-2/3/4 loads to ``regulation = 0``, and
+        return ``(0.0, skip_gossip=True)``.  The trivial allocation is
+        priority-correct by construction; running the QP would only
+        introduce noise.
+
+        ``total_sp`` is the leader's current snapshot of the group's
+        net setpoint (load convention); the legacy gossip target is
+        ``-total_sp``.  The first return value is the residual target
+        for ``_start_gossip``; the second is True iff the gossip
+        should be skipped entirely (infeasible OR residual ≤
+        threshold).
+        """
+        original_target = -float(total_sp)
+        threshold = self._per_group_threshold()
+
+        members = [self.context.aid]
+        for neigh in self._live_neighbours():
+            members.append(neigh.aid)
+
+        tier1_records: list[tuple[str, float, float, str]] = []  # (aid, cap, sp, sector)
+        non_tier1_loads: list[tuple[str, float, str]] = []       # (aid, cap, sector)
+        pool = 0.0
+        for aid in members:
+            obs = self.behavior.observe(aid) or {}
+            cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
+            sec_enum = obs_sector(obs, behavior=self.behavior, aid=aid)
+            if sec_enum is None:
+                continue
+            sec = sec_enum.value
+            if cap > 0:
+                prio = obs_priority(obs, behavior=self.behavior, aid=aid)
+                if int(prio) == 1:
+                    sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
+                    tier1_records.append((aid, float(cap), float(sp), sec))
+                else:
+                    non_tier1_loads.append((aid, float(cap), sec))
+            elif cap < 0:
+                pool += abs(float(cap))
+
+        tier1_unmet_per_load = [
+            max(0.0, cap - sp) for (_aid, cap, sp, _sec) in tier1_records
+        ]
+        tier1_unmet = sum(tier1_unmet_per_load)
+
+        # No tier-1 loads OR no tier-1 deficit → nothing to pre-apply;
+        # the QP runs unchanged over the original imbalance.
+        if tier1_unmet <= threshold:
+            return original_target, abs(original_target) <= threshold
+
+        if pool + threshold >= tier1_unmet:
+            # Feasible: lift every tier-1 load to regulation = 1.
+            now = float(self.context.current_timestamp)
+            applied_tier1 = 0
+            for (aid, _cap, _sp, sec) in tier1_records:
+                apply_regulate(
+                    self.behavior,
+                    aid,
+                    1.0,
+                    sector=sec,
+                    reason="tier1_hard",
+                    timestamp=now,
+                    priority_tier=1,
+                )
+                applied_tier1 += 1
+            residual = original_target - tier1_unmet
+            logger.info(
+                "[%s] tier-1 hard pre-step (feasible): pool=%.4f "
+                "tier1_unmet=%.4f applied=%d residual_target=%.4f",
+                self.context.aid, pool, tier1_unmet, applied_tier1, residual,
+            )
+            return residual, abs(residual) <= threshold
+
+        # Infeasible: pro-rata pool across tier-1 by unmet; tiers 2-4 → 0.
+        now = float(self.context.current_timestamp)
+        applied_tier1 = 0
+        applied_shed = 0
+        for (aid, cap, sp, sec), unmet in zip(tier1_records, tier1_unmet_per_load):
+            if unmet <= 0.0 or cap <= 0.0:
+                continue
+            share = pool * (unmet / tier1_unmet)
+            new_sp = sp + share
+            factor = max(0.0, min(1.0, new_sp / cap))
+            apply_regulate(
+                self.behavior,
+                aid,
+                factor,
+                sector=sec,
+                reason="tier1_infeasible",
+                timestamp=now,
+                priority_tier=1,
+            )
+            applied_tier1 += 1
+        for (aid, cap, sec) in non_tier1_loads:
+            if cap <= 0.0:
+                continue
+            apply_regulate(
+                self.behavior,
+                aid,
+                0.0,
+                sector=sec,
+                reason="tier1_starvation",
+                timestamp=now,
+                priority_tier=None,
+            )
+            applied_shed += 1
+        logger.info(
+            "[%s] tier-1 hard pre-step (INFEASIBLE): pool=%.4f "
+            "tier1_unmet=%.4f tier1_loads=%d non_tier1_shed=%d",
+            self.context.aid, pool, tier1_unmet, applied_tier1, applied_shed,
+        )
+        return 0.0, True
 
     # ------------------------------------------------------------------
     # Gossip phase
@@ -2004,6 +2141,18 @@ class EnergyBalanceNegotiator(Role):
         obs = self.behavior.observe(self.context.aid) or {}
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         if cap == 0.0:
+            return
+        # Tier-1 hard-lock guard: the leader's pre-step has already
+        # applied ``regulation = 1`` (feasible branch) or a pro-rata
+        # share (infeasible branch) to every tier-1 load.  The QP that
+        # follows assigns these agents ``a_i = 0`` so they don't
+        # contribute, but the existing apply-on-first-visit path would
+        # still drag their factor back to 0 because the QP-side
+        # ``starting_sp`` is read from a not-yet-refreshed obs.
+        # Skip every actuator write on tier-1 during the QP — the
+        # pre-step's write stands until the next negotiation cycle
+        # re-evaluates feasibility.
+        if int(self.priority) == 1:
             return
         # Slack agents (ExtPowerGrid / ExtHydrGrid) have a *free* p_mw /
         # mass_flow Var the LP picks within a wide physical envelope.

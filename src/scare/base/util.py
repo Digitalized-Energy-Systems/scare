@@ -698,7 +698,14 @@ def obs_priority(
     if "priority" in obs:
         return int(obs["priority"])
     cap = obs_capacity(obs)
-    fallback = 0 if cap < 0 else 1
+    # Default unannotated loads to tier 4 (sheddable).  Under the 4-tier
+    # model tier 1 is hard-locked at ``x = 1``, so falling back to tier
+    # 1 would catastrophically over-assign critical priority to loads
+    # whose actual priority was never registered — turning every smoke
+    # grid without explicit ``priority_assignment`` into a perpetually
+    # infeasible-trivial allocation.  Tier 4 is the conservative
+    # default: missing annotations → lowest priority → first to shed.
+    fallback = 0 if cap < 0 else 4
     if (
         record_default_fallback_t is not None
         and behavior is not None
@@ -773,17 +780,22 @@ def aggregate_priority_weight(
 ) -> float:
     """Compute a scalar urgency weight from priority-tier demand breakdown.
 
-    Higher-priority tiers contribute exponentially more weight per unit of
-    unserved demand.  This is used as the ADMM S parameter to pull
-    allocation toward groups with critical unserved loads.
+    Higher-priority tiers contribute more weight per unit of unserved
+    demand.  Used by the L3 CP S-coefficient to pull allocation toward
+    sectors with high-priority unmet demand.
+
+    Uses the strict-monotone tier schedule
+    (:func:`tier_priority_weight_strict`) rather than the L1 QP
+    schedule (:func:`tier_priority_weight`), because the L1 schedule
+    returns 0 for tier 1 (hard-locked off-QP) — which would mask
+    tier-1 unmet demand from this urgency aggregate.  The strict
+    schedule keeps tier 1 ranking first while staying well-conditioned.
     """
     weight = 0.0
     for tier, demand in demand_by_priority.items():
         served = served_by_priority.get(tier, 0.0)
         unserved = max(0.0, demand - served)
-        # Exponential weighting: tier 1 → 2^9=512, tier 10 → 2^0=1
-        tier_weight = 2.0 ** max(0, 10 - tier)
-        weight += unserved * tier_weight
+        weight += unserved * tier_priority_weight_strict(int(tier))
     return weight
 
 
@@ -797,10 +809,41 @@ def aggregate_priority_weight(
 # load served at 65 % while tier-6 loads at 100 %, because tier-1
 # happened to sit in a slightly higher-voltage neighbourhood).  The
 # deadband restores the intent of "near-violation, throttle".
-# Default number of priority tiers when callers don't override.  Mirrors
-# the schedule used by every priority-aware layer (L1 QP, L2 ADMM,
-# coalition allocator, CP role).
-DEFAULT_PRIORITY_TIERS: int = 10
+# 4-tier priority model with hard tier-1 enforcement.
+#
+# Tier 1 = critical: leader pre-applies ``regulation = 1`` before the
+# gossip QP runs (see ``EnergyBalanceNegotiator._pre_apply_tier1_hard``).
+# Tiers 2–4 = QP-weighted, with very steep exponents so the proportional
+# QP equilibrium is effectively strict for any realistic deficit.
+#
+# Tier 1 carries a defensive QP weight of 1.0 — after the pre-step its
+# δ-box collapses (``[-cap, 0]`` in restoration, ``[0, cap]`` in
+# curtailment), so the QP's clamp pins δ=0 regardless of weight.
+#
+# Generators (priority ≤ 0) keep the legacy unit weight.
+DEFAULT_PRIORITY_TIERS: int = 4
+
+# Restoration (target > 0): higher-priority tiers get higher weight.
+# Tier 1's weight is 0 — it's hard-locked at the leader pre-step, so it
+# must not participate in the QP (a_i = 0 ⇒ δ = clamp(0·λ, …) = 0 if
+# 0 ∈ box, which holds whenever the pre-step has already moved tier-1
+# loads to their cap).  Its ledger entry also contributes nothing to
+# the dual normaliser.
+_TIER_WEIGHT_RESTORATION: dict[int, float] = {
+    1: 0.0,
+    2: 1e8,
+    3: 1e4,
+    4: 1.0,
+}
+
+# Curtailment (target < 0): lowest-priority tier sheds first.  Tier 1 is
+# always pre-locked at full and never sheds via the QP.
+_TIER_WEIGHT_CURTAILMENT: dict[int, float] = {
+    1: 0.0,
+    2: 1.0,
+    3: 1e4,
+    4: 1e8,
+}
 
 
 def tier_priority_weight(
@@ -809,45 +852,84 @@ def tier_priority_weight(
     regime: int = 1,
     priority_tiers: int = DEFAULT_PRIORITY_TIERS,
 ) -> float:
-    """Single source of truth for the per-tier exponential weight.
+    """Single source of truth for the per-tier QP weight (L1 gossip).
 
-    ``regime > 0`` (restoration / lost-load): tier 1 is most urgent, so
-    it gets the highest weight (``2^P``).  Used by the L1 gossip QP's
-    ``_qp_priority_weight``, the L2 tier-stratified and supply-priority
-    ADMMs, and the L3 CP per-sector S-coefficient.
+    Implements the 4-tier schedule with hard tier-1 enforcement off-QP:
 
-    ``regime < 0`` (curtailment / lost-gen): tier P is most disposable,
-    so low-priority loads shed first.  Used by the curtailment auction
-    in the constraint monitor.
+    * ``regime > 0`` (restoration / lost-load): tier 2 → 1e8, tier 3 →
+      1e4, tier 4 → 1.  Tier 1 is hard-locked at ``x = 1`` by the
+      leader's pre-step and returns the defensive weight 1.0 here.
+    * ``regime < 0`` (curtailment / lost-gen): tier 4 → 1e8 (sheds
+      first), tier 3 → 1e4, tier 2 → 1.  Tier 1 returns 1.0 — it never
+      sheds via the QP.
+    * ``regime == 0``: 1.0 (no negotiation direction).
 
-    ``regime == 0``: returns 1.0 — used by ``_qp_priority_weight`` only
-    when a target is exactly zero (no negotiation direction defined).
+    The ``priority_tiers`` argument is preserved for API compatibility
+    but the schedule is fixed to 4 tiers; tiers outside ``[1, 4]`` are
+    clamped before lookup so legacy 10-tier callers degrade gracefully
+    via the remap helper.
     """
-    P = int(priority_tiers)
-    if P <= 0:
-        return 1.0
     p = max(0, int(tier))
+    if regime == 0 or p <= 0:
+        return 1.0
+    p = min(p, 4)
     if regime > 0:
-        return 2.0 ** max(0, P - min(p, P) + 1)
-    if regime < 0:
-        return 2.0 ** max(0, min(p, P))
-    return 1.0
+        return _TIER_WEIGHT_RESTORATION.get(p, 1.0)
+    return _TIER_WEIGHT_CURTAILMENT.get(p, 1.0)
 
 
-_CLAMP_UTILIZATION_DEADBAND: float = 0.85
+def tier_priority_weight_strict(
+    tier: int,
+    *,
+    priority_tiers: int = DEFAULT_PRIORITY_TIERS,
+) -> float:
+    """Strictly-monotone tier weight for waterfall-style sorts.
 
-# Tier-aware deadband override: critical tiers tolerate measurements
-# closer to a bound before the clamp throttles them.  Empirically the
-# 0.85 default still produces priority-blind cuts on tier 1/2 loads
-# whenever a shared upstream variable (e.g. ``loading_percent``) drifts
-# past 0.85 — the priority waterfall is overruled by the local clamp
-# because the clamp itself doesn't know tier.  Raising the deadband to
-# 0.99 for tier ≤ 2 means: never throttle critical loads until the
-# measurement is essentially at the hard bound; below tier 2 the
-# original conservative behaviour stands.  Lower tiers get the
-# standard 0.85 deadband (and shed first when the bound is approached).
-_CLAMP_CRITICAL_TIER_THRESHOLD: int = 2
-_CLAMP_CRITICAL_DEADBAND: float = 0.99
+    The QP schedule (``tier_priority_weight``) returns a low weight for
+    tier 1 because tier-1 is hard-locked at the L1 pre-step.  But L2's
+    supply-priority waterfall sorts cells by weight to decide allocation
+    order, and tier 1 must come first regardless.  This helper returns a
+    schedule strictly decreasing in tier number (tier 1 → P, tier P →
+    1), keeping the waterfall's sort-by-weight semantics intact while
+    avoiding the wild magnitudes that would destabilise the ADMM
+    sharing-distance objective.
+    """
+    P = max(1, int(priority_tiers))
+    p = max(1, min(P, int(tier)))
+    return float(P - p + 1)
+
+
+def remap_legacy_priority(tier: int) -> int:
+    """Map a legacy 10-tier value onto the new 4-tier schedule.
+
+    Bucketing: ``{1, 2, 3} → 1``, ``{4, 5} → 2``, ``{6, 7} → 3``,
+    ``{8, 9, 10} → 4``.  Out-of-range values are clamped.  Tier 0
+    (generator class) passes through unchanged.
+    """
+    t = int(tier)
+    if t <= 0:
+        return 0
+    if t <= 3:
+        return 1
+    if t <= 5:
+        return 2
+    if t <= 7:
+        return 3
+    return 4
+
+
+# Tier-aware deadbands for ``clamp_to_constraints``: the higher the
+# tier's deadband, the closer to a hard bound a measurement must drift
+# before the clamp throttles the load.  Tier 1 is fully immune (clamp
+# no-ops, see ``clamp_to_constraints``) because the pre-step has hard-
+# locked it at ``x = 1``; the clamp must not break that invariant.  The
+# remaining tiers shade more aggressively as priority drops.
+_CLAMP_TIER_DEADBAND: dict[int, float] = {
+    2: 0.95,
+    3: 0.90,
+    4: 0.85,
+}
+_CLAMP_DEFAULT_DEADBAND: float = 0.85  # untagged / out-of-range tiers
 
 
 def clamp_to_constraints(
@@ -880,19 +962,29 @@ def clamp_to_constraints(
     priority-invariant failure on task-0 simbench_lv.
 
     ``tier`` is the load's priority tier (1 = most critical, higher =
-    less critical).  When ``None``, the legacy uniform 0.85 deadband
-    is used — preserves byte-compatible behaviour for callers that
-    do not (yet) propagate tier information.
+    less critical).  Tier 1 is immune to clamping — its pre-step lock
+    at ``regulation = 1`` must not be overridden by a soft proximity
+    signal; if a true ConstraintViolation fires, the next negotiation
+    re-evaluates feasibility instead.  Tiers 2 / 3 / 4 get progressively
+    tighter deadbands (0.95 / 0.90 / 0.85).  When ``None``, the legacy
+    uniform 0.85 deadband is used — preserves byte-compatible behaviour
+    for callers that do not (yet) propagate tier information.
     """
     bounds = SECTOR_CONSTRAINTS.get(sector, {})
     cap = obs_capacity(obs)
     if cap == 0.0:
         return setpoint
 
-    if tier is not None and 0 < int(tier) <= _CLAMP_CRITICAL_TIER_THRESHOLD:
-        deadband = _CLAMP_CRITICAL_DEADBAND
+    if tier is not None and int(tier) == 1:
+        # Hard tier-1 lock: bypass the clamp entirely.  A real grid
+        # violation will surface via ``ConstraintViolation`` and the
+        # subsequent negotiation re-checks tier-1 feasibility.
+        return setpoint
+
+    if tier is not None and int(tier) >= 2:
+        deadband = _CLAMP_TIER_DEADBAND.get(int(tier), _CLAMP_DEFAULT_DEADBAND)
     else:
-        deadband = _CLAMP_UTILIZATION_DEADBAND
+        deadband = _CLAMP_DEFAULT_DEADBAND
     width = max(1e-9, 1.0 - deadband)
 
     # Determine the tightest constraint across all local variables.

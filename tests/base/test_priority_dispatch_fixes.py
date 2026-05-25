@@ -40,36 +40,43 @@ def _disarm():
 
 class TestTierAwareClamp:
     def test_critical_tier_skips_clamp_at_moderate_util(self):
-        # vm_pu=1.04 → util=0.8.  Default deadband 0.85 ⇒ no clamp.
-        # Critical-tier deadband 0.99 ⇒ also no clamp.  Both should
-        # leave the setpoint unchanged at the moderate-stress regime.
+        # vm_pu=1.04 → util=0.8.  Tier 1 is immune (clamp no-ops).
+        # Tier 4 deadband 0.85 ⇒ util 0.8 < 0.85 ⇒ no clamp.  Both
+        # should leave the setpoint unchanged at the moderate-stress
+        # regime.
         obs = {"p_mw": 10.0, "vm_pu": 1.04}
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1) == 5.0
-        assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=5) == 5.0
+        assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=4) == 5.0
 
     def test_critical_tier_resists_clamp_past_default_deadband(self):
-        # vm_pu=1.048 → util=0.96.  Default deadband 0.85 ⇒
+        # vm_pu=1.048 → util=0.96.  Tier 4 deadband 0.85 ⇒
         # allowed=(1-0.96)/0.15 ≈ 0.267, max_abs≈2.67, so a low-tier
-        # 5 MW setpoint is throttled to ~2.67 MW.  Critical-tier
-        # deadband 0.99 ⇒ util 0.96 < 0.99 ⇒ no clamp on tier 1.
+        # 5 MW setpoint is throttled to ~2.67 MW.  Tier 1 is immune
+        # ⇒ no clamp regardless of util.
         obs = {"p_mw": 10.0, "vm_pu": 1.048}
-        low_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=8)
+        low_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=4)
         high_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
         assert abs(low_tier_result) < 5.0  # was throttled
-        assert high_tier_result == 5.0      # was not throttled
+        assert high_tier_result == 5.0      # was not throttled (immune)
 
     def test_no_tier_preserves_legacy_behaviour(self):
         # No tier arg → legacy 0.85 deadband.  vm_pu=1.04 (util=0.8) ⇒ no clamp.
         obs = {"p_mw": 10.0, "vm_pu": 1.04}
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY) == 5.0
 
-    def test_extreme_stress_still_clamps_critical(self):
-        # vm_pu=1.0499 → util≈0.998.  Critical-tier deadband 0.99 ⇒
-        # allowed=(1-0.998)/(1-0.99)=0.2 ⇒ max_abs=2.0.  So even tier 1
-        # is throttled below the original 5.0 setpoint.
+    def test_tier1_immune_even_under_extreme_stress(self):
+        # Tier 1 hard-immunity dominates the soft clamp.  At
+        # vm_pu=1.0499 (util ≈ 0.998), a tier-2 load would clamp to
+        # near zero, but tier 1 still passes through unmodified — the
+        # leader's pre-step has hard-locked it at regulation=1 and the
+        # clamp must not break that invariant.  A real grid violation
+        # would surface via ``ConstraintViolation`` instead and the
+        # next negotiation re-evaluates feasibility.
         obs = {"p_mw": 10.0, "vm_pu": 1.0499}
-        result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
-        assert abs(result) < 5.0
+        tier1 = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
+        tier2 = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=2)
+        assert tier1 == 5.0           # immune
+        assert abs(tier2) < 5.0       # was throttled
 
 
 # ---------------------------------------------------------------------------
@@ -103,18 +110,18 @@ class TestCooldownBypass:
         b = _FakeBehavior(cooldown_s=1.0)
         # First write lands.
         assert apply_regulate(
-            b, "child-9", 0.5, sector="electricity",
-            reason="test", timestamp=10.0, priority_tier=9,
+            b, "child-4", 0.5, sector="electricity",
+            reason="test", timestamp=10.0, priority_tier=4,
         ) is True
         # Second write within cooldown is suppressed.
         assert apply_regulate(
-            b, "child-9", 0.6, sector="electricity",
-            reason="test", timestamp=10.5, priority_tier=9,
+            b, "child-4", 0.6, sector="electricity",
+            reason="test", timestamp=10.5, priority_tier=4,
         ) is False
         assert len(b.acts) == 1
         events = [e for e in _drain_events() if e.kind == "regulate_suppressed_by_cooldown"]
         assert len(events) == 1
-        assert "tier=9" in events[0].detail
+        assert "tier=4" in events[0].detail
 
     def test_critical_tier_bypasses_cooldown(self):
         b = _FakeBehavior(cooldown_s=1.0)
@@ -398,29 +405,27 @@ class TestSaturationFilteredDual:
 
     @staticmethod
     def _entry_responsiveness(prio: int, target_sign: int) -> float:
-        """Mirrors EnergyBalanceNegotiator._entry_responsiveness."""
-        P = 10
-        if target_sign > 0:
-            if prio > 0:
-                return 2.0 ** (P - min(prio, P) + 1)
-            return 1.0
-        if target_sign < 0:
-            if prio > 0:
-                return 2.0 ** min(prio, P)
-            return 2.0 ** (P + 1)
-        return 1.0
+        """Mirrors EnergyBalanceNegotiator._entry_responsiveness on the
+        4-tier schedule (delegates to ``tier_priority_weight``)."""
+        from scare.base.util import tier_priority_weight
+
+        return tier_priority_weight(prio, regime=target_sign, priority_tiers=4)
 
     def test_saturated_entries_excluded_from_normaliser(self):
-        # Synthetic ledger: five tier-1 saturated entries (huge weight)
-        # plus one tier-9 unsaturated entry (small weight).  Without the
-        # F2 fix Σ a_j ≈ 5 × 1024 + 4 = 5124; with the fix it is just 4.
+        # Synthetic ledger: five tier-2 saturated entries (huge weight
+        # 1e8) plus one tier-4 unsaturated entry (small weight 1).
+        # Without the F2 fix Σ a_j ≈ 5 × 1e8 + 1; with the fix it is
+        # just 1.  Tier 1 isn't used here because under the 4-tier
+        # model tier-1's QP weight is 0 (hard-locked off-QP) — using
+        # tier 1 would zero out the saturated contribution entirely
+        # and trivialise the test.
         memory = {
-            "a": (0.0, 10, 1, True),  # saturated tier-1
-            "b": (0.0, 10, 1, True),
-            "c": (0.0, 10, 1, True),
-            "d": (0.0, 10, 1, True),
-            "e": (0.0, 10, 1, True),
-            "f": (0.001, 10, 9, False),  # active tier-9
+            "a": (0.0, 10, 2, True),   # saturated tier-2 (weight 1e8)
+            "b": (0.0, 10, 2, True),
+            "c": (0.0, 10, 2, True),
+            "d": (0.0, 10, 2, True),
+            "e": (0.0, 10, 2, True),
+            "f": (0.001, 10, 4, False),  # active tier-4 (weight 1)
         }
         target_sign = 1
 
@@ -448,9 +453,9 @@ class TestSaturationFilteredDual:
         # If nobody is saturated the two formulas must coincide
         # exactly so the F2 fix is a no-op in the healthy regime.
         memory = {
-            "a": (0.0, 10, 3, False),
-            "b": (0.0, 10, 6, False),
-            "c": (0.0, 10, 9, False),
+            "a": (0.0, 10, 2, False),
+            "b": (0.0, 10, 3, False),
+            "c": (0.0, 10, 4, False),
         }
         sum_all = sum(
             self._entry_responsiveness(int(v[2]), 1)

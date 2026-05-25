@@ -41,7 +41,7 @@ class TestSectorConstraints:
 
     def test_heat_bounds(self):
         lo, hi = SECTOR_CONSTRAINTS[Sector.HEAT]["t_k"]
-        assert lo == 283.15 and hi == 403.15
+        assert lo == 313.15 and hi == 403.15
 
 
 class TestSectorTimescale:

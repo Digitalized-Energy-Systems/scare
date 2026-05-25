@@ -47,10 +47,10 @@ SECTOR_CONSTRAINTS: dict[Sector, dict[str, tuple[float, float]]] = {
         "pressure_pu": (0.90, 1.10),     # junction pressure [p.u.]
     },
     Sector.HEAT: {
-        # Heat networks carry both hot supply (~60–130 °C) and cold return
-        # (~20 °C); a single bound pair must admit both to avoid false
-        # violations at consumer-side junctions.
-        "t_k": (283.15, 403.15),         # junction temperature [K] (10–130 °C)
+        # DHS operating envelope: supply (~80–130 °C) and return
+        # (~40–70 °C); a single bound pair must admit both to avoid
+        # false violations at consumer-side junctions.
+        "t_k": (313.15, 403.15),         # junction temperature [K] (40–130 °C)
     },
 }
 

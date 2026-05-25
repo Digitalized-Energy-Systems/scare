@@ -33,6 +33,27 @@ class RestorationConfiguration:
     # the ``cps`` topology is empty.
     enable_cp_admm: bool = True
 
+    # Replicated priority-cascaded sharing ADMM at L3 (the decentralised
+    # replacement for the Option-B elected-coordinator path).  When
+    # True, every CP runs the same :func:`scare.service.cp_priority_admm.
+    # solve_cp_priority_admm` kernel locally on its replicated peer view
+    # and commits its own regulation factor as a single self-addressed
+    # ``apply_regulate`` write — no per-component coordinator, no
+    # cross-CP fan-out.  Each CP sources per-sector demand/supply from
+    # the extended L2 ``holon_summary_<sector>`` meshes (the CP joins
+    # those meshes at scenario build time) and CP-specific slices from
+    # peer ``CPSummary`` envelopes.
+    #
+    # Default flipped to True as of the L3 cutover: the new path
+    # shadows the legacy Option-B installation through the
+    # ``if priority_admm: new_path; elif cp_admm: legacy_path`` install
+    # chain in ``scenario.restoration``, so ``enable_cp_admm`` stays at
+    # its True default for ablation reachability without competing with
+    # the new role.  Set False to fall back to the legacy elected-
+    # coordinator path; both can be False to install no L3 role at all
+    # (the single-level / component-level variants do this).
+    enable_cp_priority_admm: bool = True
+
     # Distributed FailureNotice propagation through ProblemDetector.
     # When False, a centralised ``behavior_in(BranchFailureEvent)``
     # callback triggers all leaders directly (legacy behaviour, kept
@@ -318,10 +339,13 @@ class RestorationConfiguration:
     enable_tier_stratified_holon_admm: bool = True
 
     # Number of priority tiers the tier-stratified ADMM allocates over.
-    # Mirrors ``base.util.obs_priority``'s tier range (1..10 by
-    # default).  Larger means more ADMM dimensions per actor — solver
-    # cost grows linearly.
-    priority_tiers: int = 10
+    # Mirrors ``base.util.tier_priority_weight``'s 4-tier schedule
+    # (tier 1 = critical / hard-locked at the L1 leader pre-step;
+    # tiers 2-4 = QP-weighted with 1e8 / 1e4 / 1.0 exponents).  Larger
+    # would re-introduce the over-soft proportional split this redesign
+    # was meant to fix; smaller would collapse the QP into pure tier-1
+    # gating with no QP-side ordering.
+    priority_tiers: int = 4
 
     # Holon ADMM mode (Package C variants).  Only consulted when
     # ``enable_tier_stratified_holon_admm`` is True.

@@ -94,6 +94,7 @@ from scare.detection.role import ProblemDetector
 from scare.service.balance import EnergyBalanceNegotiator, create_energy_balance_role
 from scare.service.constraints import GridConstraintMonitor
 from scare.service.cp import EnergyConverterRole, MultiCommunityCPRole
+from scare.service.cp_priority_admm_role import CPPriorityAdmmRole
 from scare.service.dynamic_connector import DynamicConnectorRole
 from scare.service.local_generation import LocalGenerationFallbackRole
 from scare.service.reconfiguration import GridReconfigurator, GridTieSwitchOperator
@@ -652,7 +653,19 @@ def _populate_nodes(
         obs = dict(node.model.values)
         cp_type = _detect_cp_type_for_node(node, monee_net)
         if cp_type is not None:
-            if config.enable_cp_admm:
+            if config.enable_cp_priority_admm:
+                # Node-side install only when the CP is hosted on the
+                # node itself (CHP).  For branch-hosted CPs
+                # (P2G/G2P/P2H), :func:`_detect_cp_type_for_node`
+                # returns the incident-branch type but the actuator
+                # lives on the branch agent, which gets its own install
+                # below in :func:`_populate_branches`.  Installing the
+                # node-side role for those would attach to an agent
+                # with no ``regulate`` action — ``apply_regulate`` then
+                # silently no-ops every commit.
+                if "chp" in cp_type.lower():
+                    _attach_cp_priority_admm_role(roles, behavior, aid, cp_type, obs)
+            elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, cp_type, obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
                 _attach_multi_community_cp_role(roles, behavior, cp_type, config)
@@ -680,17 +693,23 @@ def _populate_branches(
             roles.append(GenerationController(behavior, Sector.HEAT))
 
         elif "powertogas" in branch_type:
-            if config.enable_cp_admm:
+            if config.enable_cp_priority_admm:
+                _attach_cp_priority_admm_role(roles, behavior, aid, "p2g", obs)
+            elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, "p2g", obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
                 _attach_multi_community_cp_role(roles, behavior, "p2g", config)
         elif "gastopower" in branch_type:
-            if config.enable_cp_admm:
+            if config.enable_cp_priority_admm:
+                _attach_cp_priority_admm_role(roles, behavior, aid, "g2p", obs)
+            elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, "g2p", obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
                 _attach_multi_community_cp_role(roles, behavior, "g2p", config)
         elif "powertoheat" in branch_type:
-            if config.enable_cp_admm:
+            if config.enable_cp_priority_admm:
+                _attach_cp_priority_admm_role(roles, behavior, aid, "p2h", obs)
+            elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, "p2h", obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
                 _attach_multi_community_cp_role(roles, behavior, "p2h", config)
@@ -818,6 +837,106 @@ def _attach_cp_roles(
     roles.append(DistributedOptimizationRole(flex_actor))
     roles.append(
         CoordinatorRole(create_sharing_target_distance_admm_coordinator())
+    )
+
+
+def _cp_signed_capacity_by_sector(
+    cp_type: str, obs: dict
+) -> dict[str, float]:
+    """Derive load-convention signed effective capacities per sector
+    for a CP from its branch / node obs, expressed in MW.
+
+    Mirrors the extraction logic in :mod:`scare.base.admm_factories`
+    (which the legacy ``EnergyConverterRole`` consumes through its
+    flex actor): each CP has one input sector and one or two output
+    sectors; the input capacity is read from the canonical obs key
+    (``el_mw`` for electric input, ``gas_kgps`` for gas input,
+    converted to MW); the output capacity is the input capacity
+    scaled by η (``eta_el`` / ``eta_heat`` / ``eta_gas`` falling back
+    to the generic ``efficiency`` field, then to the published
+    defaults in :func:`_cp_coupling_ratios`).
+
+    The signed convention is load-convention: positive = the CP
+    consumes from that sector, negative = the CP produces into it.
+    The kernel's single-knob substitution ``x_i = r_i · c_i`` then
+    honours each CP's input/output physics automatically.
+    """
+    ct = cp_type.lower()
+    el = Sector.ELECTRICITY.value
+    he = Sector.HEAT.value
+    ga = Sector.GAS.value
+
+    def _f(key: str, default: float = 0.0) -> float:
+        try:
+            return float(obs.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    out: dict[str, float] = {}
+    if "chp" in ct:
+        cap_in = kgps_to_mw(abs(_f("gas_kgps")))
+        if cap_in <= 0:
+            return {}
+        eta_el = _f("eta_el", 0.35)
+        eta_he = _f("eta_heat", 0.45)
+        out[ga] = cap_in
+        out[el] = -cap_in * eta_el
+        out[he] = -cap_in * eta_he
+    elif "p2g" in ct or "powertogas" in ct:
+        cap_in = abs(_f("el_mw"))
+        if cap_in <= 0:
+            return {}
+        eta = _f("eta_gas", _f("efficiency", 0.6))
+        out[el] = cap_in
+        out[ga] = -cap_in * eta
+    elif "g2p" in ct or "gastopower" in ct:
+        cap_in = kgps_to_mw(abs(_f("gas_kgps")))
+        if cap_in <= 0:
+            return {}
+        eta = _f("eta_el", _f("efficiency", 0.45))
+        out[ga] = cap_in
+        out[el] = -cap_in * eta
+    elif "p2h" in ct or "powertoheat" in ct:
+        cap_in = abs(_f("el_mw"))
+        if cap_in <= 0:
+            return {}
+        eta = _f("eta_heat", _f("efficiency", 0.95))
+        out[el] = cap_in
+        out[he] = -cap_in * eta
+    return out
+
+
+def _attach_cp_priority_admm_role(
+    roles: list,
+    behavior: Any,
+    aid: str,
+    cp_type: str,
+    obs: dict,
+) -> None:
+    """Install :class:`CPPriorityAdmmRole` in place of the legacy
+    ``EnergyConverterRole`` / ``DistributedOptimizationRole`` /
+    ``CoordinatorRole`` triple.  No-op when the CP's signed capacity
+    cannot be derived (unknown *cp_type* or empty capacity dict).
+
+    Replaces the legacy bundle entirely — the replicated kernel is
+    the only L3 path under ``enable_cp_priority_admm=True``.  The
+    role's cross-sector reachability filter, peer-CP address book,
+    and node-id table are injected post-construction by the wire pass
+    in ``create_restoration_scenario_world``.
+    """
+    sectors = _sectors_for_cp_type(cp_type)
+    if not sectors:
+        return
+    capacity_by_sector = _cp_signed_capacity_by_sector(cp_type, obs)
+    if not capacity_by_sector:
+        return
+    roles.append(
+        CPPriorityAdmmRole(
+            behavior,
+            cp_id=aid,
+            capacity_by_sector=capacity_by_sector,
+            bridged_sectors=sectors,
+        )
     )
 
 
@@ -1223,7 +1342,7 @@ def _build_topologies(
     # decision (``rated_capacity_mw``, ``coupling_ratios``), (c)
     # actually dispatch the allocation (``addr``).
     cp_meta_by_aid: dict[str, dict[str, Any]] = {}
-    if config.enable_cp_admm:
+    if config.enable_cp_admm or config.enable_cp_priority_admm:
         # Node-hosted CPs (e.g. CHP at a coupling node).
         for node in monee_net.nodes:
             cp_type = _detect_cp_type_for_node(node, monee_net)
@@ -1269,7 +1388,7 @@ def _build_topologies(
     # branch CPs we register both endpoints so a leader reachable
     # from either side sees "CP in my multi-sector component".
     cp_node_ids: set[Any] = set()
-    if config.enable_cp_admm:
+    if config.enable_cp_admm or config.enable_cp_priority_admm:
         for node in monee_net.nodes:
             if _detect_cp_type_for_node(node, monee_net) is not None:
                 cp_node_ids.add(node.id)
@@ -1487,11 +1606,30 @@ def _build_topologies(
     # edges per sector, but every message carries only ``2 × n_tiers``
     # floats and the period is in seconds, not milliseconds.
     if config.enable_holonic and config.enable_holon_summary:
+        # Collect the CP agents that bridge each sector — they need
+        # to be on the per-sector summary mesh to receive HolonSummary
+        # under the L3 priority-ADMM cutover (CPPriorityAdmmRole reads
+        # leader supply/demand slices from these summaries).  Empty
+        # when the cutover flag is off; in that case the topology is
+        # leader-only as before.
+        cp_agents_by_sector: dict[Sector, list[Any]] = {
+            sec: [] for sec in _SECTORS
+        }
+        if config.enable_cp_priority_admm:
+            for aid_, meta in cp_meta_by_aid.items():
+                agent = world._agents.get(aid_)
+                if agent is None:
+                    continue
+                for sec in meta.get("sectors", []):
+                    if sec in cp_agents_by_sector:
+                        cp_agents_by_sector[sec].append(agent)
         for sector, leaders in group_leaders_by_sector.items():
-            if len(leaders) < 2:
+            cps_on_mesh = cp_agents_by_sector.get(sector, [])
+            participants = list(leaders) + list(cps_on_mesh)
+            if len(participants) < 2:
                 continue
             with create_topology(tid=f"holon_summary_{sector.value}") as t:
-                nids = [t.add_node(leader) for leader in leaders]
+                nids = [t.add_node(a) for a in participants]
                 for i, nid_a in enumerate(nids):
                     for nid_b in nids[i + 1:]:
                         t.add_edge(nid_a, nid_b)
@@ -1504,7 +1642,11 @@ def _build_topologies(
     # NegotiationFinishedEvent deliveries from each leader to the
     # CP-side :class:`MultiCommunityCPRole`).  Skipped only when the
     # CPs are dead weight (no CP role installed on either path).
-    if config.enable_cp_admm or config.cps_join_communities:
+    if (
+        config.enable_cp_admm
+        or config.cps_join_communities
+        or config.enable_cp_priority_admm
+    ):
         # Mark CP branch agents as connectors for the sectors they bridge.
         for branch in monee_net.branches:
             if not _is_cp_branch(branch):
@@ -1595,6 +1737,46 @@ def _build_topologies(
                 leader_node_ids=all_leader_node_ids,
             )
 
+    # L3 priority-ADMM cutover — wire each :class:`CPPriorityAdmmRole`
+    # with the cross-sector topology mirror and the address books it
+    # needs to gossip ``CPSummary`` and to filter peer CPs by
+    # reachability.  Mirror-driven filtering replaces the legacy
+    # ``DynamicConnectorRole`` for the new path; failures invalidate
+    # peer reachability through the same shared mirror update that
+    # drives L2 dynamic membership.
+    if config.enable_cp_priority_admm:
+        peer_cp_addrs = {
+            aid_: meta["addr"] for aid_, meta in cp_meta_by_aid.items()
+        }
+        peer_cp_node_ids = {
+            aid_: meta["node_id"] for aid_, meta in cp_meta_by_aid.items()
+        }
+        for agent in world._agents.values():
+            cp_role = None
+            for role in getattr(agent, "roles", []):
+                if isinstance(role, CPPriorityAdmmRole):
+                    cp_role = role
+                    break
+            if cp_role is None:
+                continue
+            meta = cp_meta_by_aid.get(agent.aid)
+            if meta is None:
+                continue
+            # Inject home_node_id (set on the role at wire time, not
+            # at construction, so the same role object can be tested
+            # in isolation).
+            cp_role.home_node_id = meta["node_id"]
+            # Exclude self from the peer book.
+            peers_excl_self = {
+                aid_: addr for aid_, addr in peer_cp_addrs.items()
+                if aid_ != agent.aid
+            }
+            cp_role.wire(
+                topology_mirror=mirror,
+                peer_cp_addrs=peers_excl_self,
+                peer_cp_node_ids=peer_cp_node_ids,
+            )
+
     # Keep the grid topology current AND update the mirror: every
     # ``BranchFailureEvent`` marks the edge broken so GridReconfigurator
     # only routes through live edges, and the mirror's reachability
@@ -1654,12 +1836,17 @@ def _add_system_behaviors(
     config: RestorationConfiguration,
 ) -> None:
     def _trigger_balance(role: EnergyBalanceNegotiator, event: Any) -> None:
-        # Heat sector negotiation is constraint-driven only.  Setpoint
-        # imbalance does not capture the temperature-deficit problem
-        # that arises from a severed thermal corridor (see
-        # docs/chapter_method.tex §3.1, heat caveat).  Heat groups
-        # negotiate via BalanceProblem ← ConstraintViolation instead.
-        if role.sector == Sector.HEAT:
+        # Heat sector negotiation is constraint-driven only for setpoint-
+        # imbalance triggers: a severed thermal corridor does not show
+        # up as a setpoint mismatch (see docs/chapter_method.tex §3.1,
+        # heat caveat), so ``CustomFailureEvent`` and ``BranchFailureEvent``
+        # are skipped on heat.  ``ConstraintViolation`` IS the canonical
+        # heat trigger (BalanceProblem path) and ``ReconfigurationCompletedEvent``
+        # needs to re-explore newly reachable corridors — both must fire
+        # on heat as well as electricity / gas.
+        if role.sector == Sector.HEAT and isinstance(
+            event, (CustomFailureEvent, BranchFailureEvent)
+        ):
             return
         role.context.schedule_instant_task(
             role.trigger_balance_negotiation()

@@ -32,23 +32,23 @@ def _write_served_by_load(tmp_path: Path, rows: list[dict]) -> Path:
 
 
 def test_stranded_load_excluded_from_per_tier_aggregation(tmp_path):
-    # tier-6 has one stranded load (frac would be 0) and two served
-    # loads (frac=1.0).  tier-7 has two served loads.  Without the
-    # fix the stranded load drags tier-6's aggregate fraction below
-    # tier-7's, producing a spurious inversion.
+    # tier-3 has one stranded load (frac would be 0) and two served
+    # loads (frac=1.0).  tier-4 has two served loads.  Without the
+    # fix the stranded load drags tier-3's aggregate fraction below
+    # tier-4's, producing a spurious inversion.
     rows = [
-        # tier-6, served
-        {"aid": "a", "sector": "heat", "tier": 6, "node_id": 1, "component": 0,
+        # tier-3, served
+        {"aid": "a", "sector": "heat", "tier": 3, "node_id": 1, "component": 0,
          "demand": 5.0, "served": 5.0, "fraction": 1.0, "disconnected": 0},
-        {"aid": "b", "sector": "heat", "tier": 6, "node_id": 2, "component": 0,
+        {"aid": "b", "sector": "heat", "tier": 3, "node_id": 2, "component": 0,
          "demand": 5.0, "served": 5.0, "fraction": 1.0, "disconnected": 0},
-        # tier-6, STRANDED (no source path)
-        {"aid": "c", "sector": "heat", "tier": 6, "node_id": 3, "component": 0,
+        # tier-3, STRANDED (no source path)
+        {"aid": "c", "sector": "heat", "tier": 3, "node_id": 3, "component": 0,
          "demand": 6.0, "served": 0.0, "fraction": 0.0, "disconnected": 1},
-        # tier-7, served
-        {"aid": "d", "sector": "heat", "tier": 7, "node_id": 4, "component": 0,
+        # tier-4, served
+        {"aid": "d", "sector": "heat", "tier": 4, "node_id": 4, "component": 0,
          "demand": 5.0, "served": 5.0, "fraction": 1.0, "disconnected": 0},
-        {"aid": "e", "sector": "heat", "tier": 7, "node_id": 5, "component": 0,
+        {"aid": "e", "sector": "heat", "tier": 4, "node_id": 5, "component": 0,
          "demand": 5.0, "served": 5.0, "fraction": 1.0, "disconnected": 0},
     ]
     res = _check_priority_invariant(_write_served_by_load(tmp_path, rows))
@@ -59,13 +59,13 @@ def test_stranded_load_excluded_from_per_tier_aggregation(tmp_path):
 
 
 def test_genuine_inversion_still_detected(tmp_path):
-    # Same shape but no stranded load — instead tier-6 is shed (by a
-    # SCARE decision) and tier-7 is fully served.  This is a *real*
+    # Same shape but no stranded load — instead tier-3 is shed (by a
+    # SCARE decision) and tier-4 is fully served.  This is a *real*
     # inversion the check must still flag.
     rows = [
-        {"aid": "a", "sector": "heat", "tier": 6, "node_id": 1, "component": 0,
+        {"aid": "a", "sector": "heat", "tier": 3, "node_id": 1, "component": 0,
          "demand": 10.0, "served": 3.0, "fraction": 0.3, "disconnected": 0},
-        {"aid": "d", "sector": "heat", "tier": 7, "node_id": 4, "component": 0,
+        {"aid": "d", "sector": "heat", "tier": 4, "node_id": 4, "component": 0,
          "demand": 10.0, "served": 10.0, "fraction": 1.0, "disconnected": 0},
     ]
     res = _check_priority_invariant(_write_served_by_load(tmp_path, rows))
@@ -81,9 +81,9 @@ def test_all_loads_stranded_in_a_component_skips_silently(tmp_path):
     # stranded" — no false-positive inversion, no false-positive pass
     # that hides system loss.
     rows = [
-        {"aid": "a", "sector": "heat", "tier": 6, "node_id": 1, "component": 0,
+        {"aid": "a", "sector": "heat", "tier": 3, "node_id": 1, "component": 0,
          "demand": 5.0, "served": 0.0, "fraction": 0.0, "disconnected": 1},
-        {"aid": "b", "sector": "heat", "tier": 7, "node_id": 2, "component": 0,
+        {"aid": "b", "sector": "heat", "tier": 4, "node_id": 2, "component": 0,
          "demand": 5.0, "served": 0.0, "fraction": 0.0, "disconnected": 1},
     ]
     res = _check_priority_invariant(_write_served_by_load(tmp_path, rows))
@@ -97,9 +97,9 @@ def test_disconnected_field_missing_treated_as_not_stranded(tmp_path):
     # Older artefacts may lack the ``disconnected`` column; the check
     # must not crash and must fall back to "not stranded".
     rows = [
-        {"aid": "a", "sector": "heat", "tier": 6, "node_id": 1, "component": 0,
+        {"aid": "a", "sector": "heat", "tier": 3, "node_id": 1, "component": 0,
          "demand": 10.0, "served": 3.0, "fraction": 0.3},
-        {"aid": "d", "sector": "heat", "tier": 7, "node_id": 4, "component": 0,
+        {"aid": "d", "sector": "heat", "tier": 4, "node_id": 4, "component": 0,
          "demand": 10.0, "served": 10.0, "fraction": 1.0},
     ]
     res = _check_priority_invariant(_write_served_by_load(tmp_path, rows))

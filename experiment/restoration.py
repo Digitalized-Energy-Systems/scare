@@ -583,7 +583,10 @@ def assign_load_priorities(
     seed: int = 0,
     distribution: str = "skewed",
 ) -> dict[str, int]:
-    """Assign per-load priority tiers (1 = most critical, 10 = least).
+    """Assign per-load priority tiers under the 4-tier model.
+
+    Tier 1 = critical (hard-locked at the L1 leader pre-step);
+    tier 2 = high, tier 3 = medium, tier 4 = sheddable (QP-weighted).
 
     Returns a ``priorities`` dict keyed by ``child-{id}`` suitable for
     ``create_restoration_scenario_world(priorities=...)``.  Generators
@@ -592,24 +595,27 @@ def assign_load_priorities(
 
     ``distribution`` knobs:
 
-    - ``"uniform"``  — uniform over [1, P].  Maximally diverse;
-      stress-tests the priority-aware waterfall.
-    - ``"skewed"``    — realistic: ~10 % critical (tier 1-2),
-      ~70 % residential (tier 4-6), ~20 % curtailable (tier 8-10).
-      The default; matches the empirical mix on the simbench LV
-      grids and is the regime most likely to make Level-2 ADMM's
-      priority-weighted allocation discriminable.
+    - ``"uniform"``  — uniform over [1, 4].  Maximally diverse;
+      stress-tests the tier-1 hard-constraint pre-step and the
+      QP weighting on tiers 2-4.
+    - ``"skewed"``    — realistic: 10 % critical (tier 1), 30 % high
+      (tier 2), 40 % medium (tier 3), 20 % curtailable (tier 4).
+      Default; the 10 % tier-1 share keeps the per-community supply
+      pool able to cover hard-locked demand on the smoke grids
+      (avoiding the infeasible-trivial branch in most scenarios)
+      while leaving enough QP-weighted demand to discriminate L2
+      allocation.
     - ``"by_capacity"`` — large loads get higher priority (tier 1)
-      and small loads lower (tier 10).  Models the "feed the big
+      and small loads lower (tier 4).  Models the "feed the big
       hospitals first" heuristic.
-    - ``"all_one"``  — everyone tier 1 (legacy behaviour, preserved
-      so ablation comparisons against the no-diversity case remain
-      possible).
+    - ``"all_one"``  — everyone tier 1.  Under the new model this
+      will hard-lock every load — typically infeasible, triggering
+      the trivial pro-rata branch.  Preserved as an ablation knob.
 
     ``seed`` makes the random assignments deterministic.
     """
     rng = random.Random(seed * 7919 + 31)
-    P = 10
+    P = 4
     out: dict[str, int] = {}
 
     for child in monee_net.childs:
@@ -626,11 +632,13 @@ def assign_load_priorities(
         elif distribution == "skewed":
             r = rng.random()
             if r < 0.10:
-                out[aid] = rng.randint(1, 2)
+                out[aid] = 1   # critical (hard-locked)
+            elif r < 0.40:
+                out[aid] = 2   # high
             elif r < 0.80:
-                out[aid] = rng.randint(4, 6)
+                out[aid] = 3   # medium
             else:
-                out[aid] = rng.randint(8, 10)
+                out[aid] = 4   # sheddable
         elif distribution == "by_capacity":
             # Computed below in a second pass since it needs the
             # global capacity distribution.
@@ -641,7 +649,8 @@ def assign_load_priorities(
             raise ValueError(f"unknown priority distribution: {distribution}")
 
     if distribution == "by_capacity":
-        # Bin by capacity quantiles — top decile to tier 1, bottom decile to tier 10.
+        # Bin by capacity quantiles — top quartile to tier 1, bottom
+        # quartile to tier 4.
         items = []
         for child in monee_net.childs:
             obs = dict(child.model.values)

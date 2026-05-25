@@ -253,7 +253,7 @@ class HolonSummaryRole(Role):
         enable_coalition: bool = True,
         coalition_accept_window_s: float = 1.0,
         coalition_constraint_ttl_s: float = 8.0,
-        priority_tiers: int = 10,
+        priority_tiers: int = 4,
         admm_max_iters: int = 50,
         admm_abs_tol: float = 1e-3,
         my_node_id: Any = None,
@@ -492,6 +492,7 @@ class HolonSummaryRole(Role):
 
         per_tier_served: dict[int, float] = {}
         per_tier_demand: dict[int, float] = {}
+        supply_total: float = 0.0
         try:
             member_aids = [self.context.aid] + [
                 addr.aid for addr in topology_neighbors(self, tid="groups")
@@ -508,7 +509,14 @@ class HolonSummaryRole(Role):
             if sector != self.sector:
                 continue
             cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
-            if cap <= 0:  # generators, slack — not load
+            if cap < 0:
+                # Generator / slack injector — contributes to the
+                # community's supply pool.  Phase-1: captured into the
+                # extended summary so the future replicated kernel can
+                # read this leader's supply slice directly off the mesh.
+                supply_total += abs(cap)
+                continue
+            if cap == 0:
                 continue
             sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
             tier = obs_priority(obs, behavior=self.behavior, aid=aid)
@@ -530,6 +538,17 @@ class HolonSummaryRole(Role):
         self._last_published_served = dict(per_tier_served)
         self._last_published_demand = dict(per_tier_demand)
 
+        sec_key = self.sector.value
+        supply_by_sector = (
+            {sec_key: supply_total} if supply_total > 0.0 else {}
+        )
+        demand_by_sector_priority = (
+            {sec_key: dict(per_tier_demand)} if per_tier_demand else {}
+        )
+        served_by_sector_priority = (
+            {sec_key: dict(per_tier_served)} if per_tier_served else {}
+        )
+
         summary = HolonSummary(
             publisher=str(self.context.aid),
             version=self._version.next(),
@@ -538,6 +557,10 @@ class HolonSummaryRole(Role):
             sector=self.sector,
             per_tier_served_mw=per_tier_served,
             per_tier_demand_mw=per_tier_demand,
+            supply_by_sector=supply_by_sector,
+            demand_by_sector_priority=demand_by_sector_priority,
+            served_by_sector_priority=served_by_sector_priority,
+            home_node_id=self._my_node_id,
         )
         # Record our own latest summary too — the invariant check
         # treats self as just another publisher.

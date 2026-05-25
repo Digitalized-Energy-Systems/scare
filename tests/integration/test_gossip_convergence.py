@@ -109,12 +109,18 @@ async def test_three_agent_gossip():
 
 @pytest.mark.asyncio
 async def test_priority_ordering():
-    """Higher priority load (lower number) should participate earlier."""
+    """Higher priority load (lower number) should participate earlier.
+
+    Under the 4-tier model the tier-1 load is regulated by the leader's
+    hard-constraint pre-step (regulation = 1) and the tier-4 load is
+    handled by the QP that follows.  Both should still receive at
+    least one regulate call.
+    """
     behavior = MockBehavior()
     world, agents, roles = _build_group(behavior, [
         {"aid": "gen-0", "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0), "priority": 0},
         {"aid": "high-prio", "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1), "priority": 1},
-        {"aid": "low-prio", "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=5), "priority": 5},
+        {"aid": "low-prio", "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=4), "priority": 4},
     ])
 
     async with world:

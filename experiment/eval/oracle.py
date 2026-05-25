@@ -87,22 +87,37 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
                 )
 
 
+_ORACLE_TIER_WEIGHT: dict[int, float] = {
+    # Dedicated 4-tier oracle schedule.  The L1 QP returns weight 0
+    # for tier 1 (because the leader pre-step hard-locks it off-QP),
+    # which would be catastrophic for an LP whose entire job is to
+    # decide which tier to shed first.  This schedule restores the
+    # original "tier 1 dominates everything else" intent with magnitude
+    # separation big enough that the LP cannot accidentally tie tier 1
+    # against any lower tier under bounded numerical noise.
+    1: 1e12,
+    2: 1e8,
+    3: 1e4,
+    4: 1.0,
+}
+
+
 def _weight_for_load_factory(
     monee_net: Any,
     priorities: dict[str, int] | None,
     *,
     base_demand_weight: float,
-    n_tiers: int = 10,
+    n_tiers: int = 4,
 ) -> Any | None:
     """Build a ``weight_for_load`` closure for monee's
     ``create_min_load_shedding_problem``.
 
-    Returns a callable ``model -> float | None`` where ``float`` is the
-    per-load weight ``base_demand_weight × 2^(P − tier + 1)`` and
-    ``None`` defers to monee's default ``demand_weight``.  The
-    exponential schedule matches L1's QP weighting and the tier-
-    stratified holon ADMM so the three layers agree on priority
-    ordering.
+    Returns a callable ``model -> float | None`` where ``float`` is
+    ``base_demand_weight × tier_weight`` and ``None`` defers to
+    monee's default ``demand_weight``.  The tier schedule is the
+    dedicated oracle ladder ``{1: 1e12, 2: 1e8, 3: 1e4, 4: 1}`` — see
+    ``_ORACLE_TIER_WEIGHT`` for why it diverges from the L1 QP
+    schedule.
 
     Returns ``None`` if no priorities are supplied — caller passes
     that through to ``weight_for_load=None`` so monee uses its
@@ -111,6 +126,9 @@ def _weight_for_load_factory(
     The closure resolves models by ``id(model)``, populated once
     from the network's child list.  Generators / slack / unmapped
     models return ``None`` so monee uses the default for them.
+
+    ``n_tiers`` is preserved for back-compat with legacy callers; out-
+    of-range tier values are clamped onto ``[1, 4]``.
     """
     if not priorities:
         return None
@@ -129,11 +147,8 @@ def _weight_for_load_factory(
         tier = model_to_tier.get(id(model))
         if tier is None:
             return None  # let monee use its default
-        # Schedule mirrors balance.py:_qp_priority_weight (restoration):
-        # tier-1 -> 2^P, tier-P -> 2.  Anchored at the demand-weight base
-        # so the auto-floor logic continues to see something close to the
-        # legacy magnitude as the minimum.
-        return float(base_demand_weight) * (2.0 ** max(0, n_tiers - tier + 1))
+        t = max(1, min(4, int(tier)))
+        return float(base_demand_weight) * _ORACLE_TIER_WEIGHT[t]
 
     return _w
 
@@ -317,8 +332,8 @@ def run_oracle(
     # ``SECTOR_CONSTRAINTS`` so the LP is solved on the *same*
     # voltage / pressure / temperature operating envelope SCARE
     # enforces via the clamp deadband.  Heat is converted from
-    # SCARE's t_k = (283.15, 403.15) using monee's water-grid
-    # reference ``t_ref = 356 K`` → t_pu ≈ (0.7954, 1.1325).
+    # SCARE's t_k = (313.15, 403.15) using monee's water-grid
+    # reference ``t_ref = 356 K`` → t_pu ≈ (0.8796, 1.1325).
     prob = create_min_load_shedding_problem(
         weight_for_load=weight_for_load,
         ext_grid_el_bounds=ext_grid_el_bounds,
@@ -326,7 +341,7 @@ def run_oracle(
         ext_grid_heat_bounds=ext_grid_heat_bounds,
         bounds_el=(0.95, 1.05),
         bounds_gas=(0.90, 1.10),
-        bounds_heat=(0.7954, 1.1325),
+        bounds_heat=(0.8796, 1.1325),
     )
     if weight_for_load is not None:
         logger.info(

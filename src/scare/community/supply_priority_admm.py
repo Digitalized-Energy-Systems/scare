@@ -46,7 +46,7 @@ from distributed_resource_optimization.algorithm.admm.flex_actor import (
     ADMMFlexActor,
 )
 
-from scare.base.util import tier_priority_weight
+from scare.base.util import tier_priority_weight_strict
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ async def allocate_supply_priority(
     actor_supplies: list[dict[str, float]],
     actor_demands: list[dict[str, dict[int, float]]],
     actor_ub_overrides: list[dict[tuple[str, int], float] | None] | None = None,
-    priority_tiers: int = 10,
+    priority_tiers: int = 4,
     max_iters: int = 50,
     abs_tol: float = 1e-3,
     enable_priority_weighting: bool = True,
@@ -134,8 +134,9 @@ async def allocate_supply_priority(
         failure, set the cap to 0 (modelled as 1e-6 to keep the
         solver well-conditioned).
     priority_tiers
-        ``P`` in the ``2^(P − tier + 1)`` priority weight, mirroring
-        ``base.util.obs_priority``'s tier range.
+        ``P`` in the strict-monotone schedule ``P − tier + 1`` (see
+        ``base.util.tier_priority_weight_strict``).  4 by default,
+        matching the new tier model.
     max_iters, abs_tol
         Coordinator convergence knobs.
     cp_coupling
@@ -237,17 +238,20 @@ async def allocate_supply_priority(
 
     priorities = np.zeros(n_dims)
     for tier in tiers:
-        # Restoration-regime weight (high-priority tier → high weight)
-        # via the shared helper — keeps the supply-priority ADMM, the
-        # tier-stratified ADMM, the L1 QP, and the coalition allocator
-        # on a single per-tier schedule.  When priority weighting is
-        # disabled (ablation knob), every tier gets weight 1.0 so the
-        # ADMM redistributes supply uniformly across cells; the
-        # waterfall feasibility cap below then becomes a flat
-        # demand-proportional shave.
+        # Strictly-monotone tier weight (tier 1 → P, tier P → 1) for the
+        # waterfall sort and ADMM S-coefficient.  We deliberately do NOT
+        # use the L1 QP schedule here: that schedule returns weight 0
+        # for tier 1 (because tier 1 is hard-locked off-QP at L1) and
+        # 1e8 for tier 2 (because L1 wants effectively-strict precedence
+        # on a single per-cell variable).  Bringing those magnitudes
+        # into the L2 ADMM would (a) sort tier-1 cells AFTER tier-2
+        # cells in the waterfall — wrong; (b) destabilise the sharing-
+        # distance objective whose dual scales with Σ a_j.  The strict-
+        # monotone schedule keeps the sort correct (tier 1 first) and
+        # the magnitudes well-conditioned (range ``[1, P]``).
         if enable_priority_weighting:
-            weight = tier_priority_weight(
-                tier, regime=1, priority_tiers=priority_tiers,
+            weight = tier_priority_weight_strict(
+                tier, priority_tiers=priority_tiers,
             )
         else:
             weight = 1.0

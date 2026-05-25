@@ -51,8 +51,10 @@ class TestComputeActualPriority:
     def test_restoration_load_priority_1(self):
         assert _compute_actual_priority(1, target=1.0) == 1
 
-    def test_restoration_load_priority_5(self):
-        assert _compute_actual_priority(5, target=1.0) == 5
+    def test_restoration_load_priority_3(self):
+        # Mid-tier load under the 4-tier model — priority 3 maps to
+        # round 3 in restoration (lower number = earlier round).
+        assert _compute_actual_priority(3, target=1.0) == 3
 
     def test_restoration_load_capped_at_tiers(self):
         assert _compute_actual_priority(100, target=1.0) == _PRIORITY_TIERS
@@ -73,8 +75,8 @@ class TestComputeActualPriority:
 
     def test_reduction_high_priority_load_shed_last(self):
         p1 = _compute_actual_priority(1, target=-1.0)
-        p5 = _compute_actual_priority(5, target=-1.0)
-        assert p1 > p5  # more important → later round → shed last
+        p4 = _compute_actual_priority(4, target=-1.0)
+        assert p1 > p4  # more important → later round → shed last
 
     # --- Zero target ---
 

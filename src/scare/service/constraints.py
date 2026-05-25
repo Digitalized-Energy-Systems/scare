@@ -651,10 +651,12 @@ class GridConstraintMonitor(Role):
 
         # Willingness: bigger = more happy / more effective at absorbing
         # curtailment.  Combines three purely local signals:
-        #   - priority tier weight (exponential schedule consistent with
-        #     the curtailment-regime w(π, -1) = 2^π used in the Layer-1
-        #     QP: tier 10 → 1024, tier 1 → 2; gives a 512× spread instead
-        #     of the 10× linear spread used historically)
+        #   - priority tier weight (4-tier curtailment schedule from
+        #     ``tier_priority_weight(regime=-1)``: tier 4 → 1e8, tier 3
+        #     → 1e4, tier 2 → 1, tier 1 → 0.  Tier 1 weight of 0 falls
+        #     through the ``willingness <= 0`` guard to a floor of 1e-9
+        #     — tier-1 loads effectively never win the auction, which
+        #     matches the hard-lock invariant at the L1 leader pre-step)
         #   - local |dV/dP| sensitivity (high = curtailment here cheaply
         #     moves the violated variable)
         #   - current reducible output magnitude (nothing to curtail → nothing

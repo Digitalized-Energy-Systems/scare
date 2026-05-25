@@ -37,7 +37,7 @@ from mango import Role
 from mango.express.topology import topology_characteristic, topology_connectors
 
 from scare.base.model import NegotiationFinishedEvent, Sector
-from scare.base.util import obs_setpoint
+from scare.base.util import obs_capacity, obs_setpoint
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -166,6 +166,21 @@ class HolonSummary(Decision):
     sector: Sector = Sector.ELECTRICITY
     per_tier_served_mw: dict[int, float] = field(default_factory=dict)
     per_tier_demand_mw: dict[int, float] = field(default_factory=dict)
+    # Phase-1 replicated-kernel preparation.  Mirrors the slice that
+    # ``CoalitionAcceptance`` already carries so an L2 leader can run
+    # ``allocate_supply_priority`` directly on the gossiped peer view
+    # without an additional flex-collection round-trip.  Single key
+    # when populated (one role per sector); the dict shape lets the
+    # kernel ingest summary and acceptance payloads through the same
+    # subscript path.
+    supply_by_sector: dict[str, float] = field(default_factory=dict)
+    demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    # Publisher's monee node id on the per-sector subgraph.  Used by
+    # the future replicated kernel for deliverability filtering via
+    # ``GridTopologyMirror.reachable_from`` — same primitive the
+    # coalition path already uses.
+    home_node_id: Any = None
 
 
 @dataclass
@@ -243,6 +258,40 @@ class CoalitionAcceptance(Decision):
     # Cross-sector coalition payload — non-empty only for CP members.
     coupling_ratios: dict[tuple[str, str], float] = field(default_factory=dict)
     is_cp: bool = False
+
+
+@dataclass
+class CPSummary(Decision):
+    """Per-CP self-description for the L3 priority-cascaded ADMM mesh.
+
+    Published on the CP-only summary overlay by every CP carrying the
+    :class:`~scare.service.cp_priority_admm_role.CPPriorityAdmmRole`.
+    Every CP in the same cross-sector connected component subscribes
+    and accumulates the latest summary per publisher, so each CP can
+    feed :func:`~scare.service.cp_priority_admm.solve_cp_priority_admm`
+    its full peer view without an elected coordinator or a
+    request/reply round.
+
+    The fields are exactly what the kernel's :class:`CPSpec` consumes:
+
+    * ``capacity_by_sector`` — per-sector signed effective capacity in
+      MW under load convention (positive = consumes from the sector,
+      negative = produces into it).  The coupling ratio η is baked in
+      at scenario build time, so the kernel's single-knob substitution
+      ``x_i = r_i · c_i`` automatically honours the CP's physics.
+    * ``home_node_id`` — monee node id of the CP's host node, used by
+      every subscriber to decide cross-sector reachability via the
+      shared :class:`~scare.base.topology_mirror.GridTopologyMirror`.
+
+    Event-driven publish: same delta gate + watchdog pattern as
+    :class:`HolonSummary`.  A CP republishes only when its
+    ``capacity_by_sector`` materially shifts (e.g. on a branch failure
+    that re-derives the CP's effective capacity through the live
+    topology) or when the watchdog window expires.
+    """
+
+    capacity_by_sector: dict[str, float] = field(default_factory=dict)
+    home_node_id: Any = None
 
 
 @dataclass
@@ -592,12 +641,16 @@ class SectorImbalanceBeacon(Role):
         # nominally-operating load — useless for stress signalling.  We
         # need the regulation gap so the predicate fires when the LP
         # has been forced to curtail.
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
-        try:
-            reg = float(obs.get("regulation", 1.0))
-        except (TypeError, ValueError):
-            reg = 1.0
-        imbalance = sp * (1.0 - reg)
+        # Regulation gap in load-convention MW: ``cap - sp`` is what the
+        # LP curtailment removed from this aid's served setpoint, with
+        # the same sign as ``cap`` (positive for loads, negative for
+        # generators).  An earlier ``sp * (1 - reg)`` formulation
+        # collapsed to a parabola that read zero both at reg=1 (no
+        # curtailment) AND at reg=0 (fully shed) — the opposite of the
+        # signal we want from the publisher.
+        imbalance = cap - sp
 
         # No publisher-side dead-band.  Initial attempt gated on a
         # ``|Δimbalance| < dead_band`` filter, but on a quiescent grid

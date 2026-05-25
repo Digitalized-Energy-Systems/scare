@@ -181,7 +181,12 @@ class TestObsPriority:
         assert obs_priority({"p_mw": -5.0, "regulation": 0.5}) == 0
 
     def test_load_implicit(self):
-        assert obs_priority({"p_mw": 3.0, "regulation": 0.0}) == 1
+        # Unannotated loads default to tier 4 (sheddable) under the
+        # 4-tier model — see ``obs_priority`` for the rationale: tier 1
+        # is hard-locked at L1, so falling back to tier 1 would
+        # catastrophically over-assign critical priority to loads
+        # whose actual priority was never registered.
+        assert obs_priority({"p_mw": 3.0, "regulation": 0.0}) == 4
 
 
 # ===================================================================
@@ -297,8 +302,8 @@ class TestComputePriorityWeightedShares:
         """Only 1 MW available, group A has 10 MW tier-1, group B has 10 MW tier-5.
         All goes to group A (tier-1 first)."""
         shares = compute_priority_weighted_shares(
-            [{1: 10.0}, {5: 10.0}],
-            [{1: 0.0}, {5: 0.0}],
+            [{1: 10.0}, {4: 10.0}],
+            [{1: 0.0}, {4: 0.0}],
             total_available=1.0,
         )
         assert shares[0] == pytest.approx(1.0)
@@ -321,7 +326,7 @@ class TestAggregatePriorityWeight:
 
     def test_high_priority_heavier(self):
         w_high = aggregate_priority_weight({1: 1.0}, {1: 0.0})
-        w_low = aggregate_priority_weight({10: 1.0}, {10: 0.0})
+        w_low = aggregate_priority_weight({4: 1.0}, {4: 0.0})
         assert w_high > w_low
 
     def test_empty_dicts(self):

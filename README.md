@@ -85,9 +85,9 @@ src/scare/
     └── restoration.py  # create_restoration_scenario_world()
 
 experiment/
-├── restoration.py      # 30 s demo run
-├── evaluation.py       # batch eval across scenarios
-└── plotting.py         # comparison plots from saved results
+├── restoration.py      # 30 s demo run + HPC scenario helpers
+├── eval/               # canonical evaluation pipeline (claims, metrics, plots, report)
+└── hpc/                # SLURM campaign driver (plan, submit, runner, aggregate)
 ```
 
 ## License

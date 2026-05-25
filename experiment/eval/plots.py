@@ -1645,7 +1645,7 @@ def _sector_envelope_bounds() -> dict[str, tuple[float, float]]:
         return {
             "avg_vm_pu":       (0.90, 1.10),
             "avg_pressure_pu": (0.90, 1.10),
-            "avg_t_k":         (283.15, 403.15),
+            "avg_t_k":         (313.15, 403.15),
         }
     return {
         "avg_vm_pu":       SECTOR_CONSTRAINTS[Sector.ELECTRICITY]["vm_pu"],

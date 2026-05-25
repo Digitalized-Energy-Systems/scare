@@ -48,7 +48,7 @@ from scare.base.util import (
     kgps_to_mw,
     mw_to_kgps,
     obs_setpoint,
-    tier_priority_weight,
+    tier_priority_weight_strict,
 )
 from scare.community.supply_priority_admm import allocate_supply_priority
 
@@ -322,7 +322,7 @@ class EnergyConverterRole(Role):
         if self._multi_sector_l3_enabled():
             self.context.schedule_instant_task(self.trigger_multi_sector_l3())
         else:
-            self._schedule_trigger()
+            self.context.schedule_instant_task(self.trigger_cp_negotiation())
 
     def _is_l3_coordinator(self) -> bool:
         """True iff this CP has the lex-smallest aid among CPs in its
@@ -748,7 +748,11 @@ class EnergyConverterRole(Role):
             top_tier = agg.top_unmet_tier_per_sector.get(sec)
             if top_tier is None:
                 return agg.sector_priority_weight.get(sec, 1.0) or 1.0
-            base = tier_priority_weight(top_tier, regime=1, priority_tiers=10)
+            # Strict-monotone schedule: tier 1 gets the highest weight
+            # so the L3 CP ADMM's S-coefficient pulls toward sectors
+            # with high-priority unmet demand.  Uses the L2/L3 helper,
+            # not the L1 QP schedule (which returns 0 for tier 1).
+            base = tier_priority_weight_strict(top_tier, priority_tiers=4)
             mag = agg.top_unmet_mag_per_sector.get(sec, 0.0)
             return base * (1.0 + 0.5 * math.log1p(mag))
 
@@ -1046,7 +1050,7 @@ class EnergyConverterRole(Role):
                 actor_supplies=actor_supplies,
                 actor_demands=actor_demands,
                 actor_ub_overrides=None,
-                priority_tiers=10,
+                priority_tiers=4,
                 max_iters=50,
                 abs_tol=1e-3,
                 enable_priority_weighting=True,

@@ -70,7 +70,7 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.topology_mirror import LivePeerFilter
-from scare.base.util import compute_priority_weighted_shares, tier_priority_weight
+from scare.base.util import compute_priority_weighted_shares, tier_priority_weight_strict
 from scare.community.deliverability import per_actor_deliverable_caps
 from scare.community.supply_priority_admm import allocate_supply_priority
 
@@ -143,7 +143,7 @@ class HolonicCommunityRole(Role):
         admm_max_iters: int = 50,
         admm_abs_tol: float = 1e-3,
         enable_tier_stratified_admm: bool = True,
-        priority_tiers: int = 10,
+        priority_tiers: int = 4,
         admm_mode: str = "demand",
         admm_scope: str = "sector",
         enable_priority_allocation: bool = True,
@@ -1699,16 +1699,18 @@ class HolonicCommunityRole(Role):
 
         # Per-dimension priority weight passed to the coordinator.
         # Larger weight = stronger pull toward target for that
-        # dimension.  Shared with the L1 QP gossip weight
-        # (``_qp_priority_weight``) and the supply-priority ADMM via
-        # :func:`scare.base.util.tier_priority_weight` so every layer
-        # agrees on tier ordering.
+        # dimension.  Uses the strictly-monotone schedule (tier 1 → P,
+        # tier P → 1) rather than the L1 QP schedule: the L2 ADMM's
+        # sharing-distance objective wants a well-conditioned tier
+        # ordering, and the L1 QP's tier-1 weight of 0 (hard-locked
+        # off-QP) would zero out tier-1 here too — wrong, because L2
+        # still needs to rank tier-1 cells first.
         P = self.priority_tiers
         priorities = np.zeros(n_dims)
         for sec in sectors:
             for tier in tiers:
-                weight = tier_priority_weight(
-                    tier, regime=1, priority_tiers=P,
+                weight = tier_priority_weight_strict(
+                    tier, priority_tiers=P,
                 )
                 priorities[_flat_idx(sec, tier)] = weight
 
