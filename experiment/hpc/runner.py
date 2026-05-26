@@ -190,18 +190,17 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
     stderr.setFormatter(logging.Formatter(LOG_FORMAT))
     root.addHandler(stderr)
 
-    # Suppress the verbose solver loggers — pyomo, gurobipy and
-    # mango.simulation emit one DEBUG line per constraint / per branch
-    # which dominates the per-task log (hundreds of MB) once the
-    # solver fires from multiple roles per simulation step.  Keep
-    # WARN+ so genuine solver failures still surface.
+    # Suppress third-party DEBUG/INFO chatter — mango.agent.core alone
+    # emits ~60k lines per 30 s sim (one per envelope ack), and pyomo /
+    # gurobipy / simbench grid loaders pile on hundreds more.  Suppress
+    # at the package root so new submodules don't reintroduce noise;
+    # WARN+ still surfaces genuine solver / framework failures.
     for noisy in (
-        "pyomo.core",
-        "pyomo.opt",
-        "pyomo.contrib",
+        "pyomo",
         "gurobipy",
-        "mango.simulation.world",
-        "mango.express",
+        "mango",
+        "mango_energy_environments",
+        "simbench",
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 

@@ -2268,8 +2268,25 @@ class HolonicCommunityRole(Role):
         sector peer set when topology mirror or my own node id are
         unavailable (defensive — keeps the path runnable in
         configurations that don't wire the mirror in).
+
+        Coordinator-election eligibility: the ``holon_summary_<sector>``
+        mesh also carries CP / branch agents (they subscribe as L3
+        readers — see ``CPPriorityAdmmRole``).  Those agents do NOT
+        host a ``HolonicCommunityRole`` for this sector, so a
+        ``ComponentAdmmReport`` routed to one of them as the
+        lex-smallest "peer" is silently dropped, and the per-component
+        L2 solve never runs.  Filter the sector-peer set down to known
+        leader aids (with self always included) to keep CPs out of
+        the election.  When ``_leader_node_ids`` is empty (degenerate /
+        not-wired configurations), fall back to the unfiltered set.
         """
         sector_peers = self._resolve_sector_peer_addrs()
+        leader_aids = set(self._leader_node_ids)
+        if leader_aids:
+            sector_peers = {
+                aid: addr for aid, addr in sector_peers.items()
+                if aid == self.context.aid or aid in leader_aids
+            }
         mirror = self._topology_mirror
         my_node = self._my_node_id
         if mirror is None or my_node is None:
