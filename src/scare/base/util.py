@@ -272,8 +272,69 @@ def lookup_priority(behavior: Any, aid: str) -> int | None:
 _REGULATE_DEDUP_TOL: float = 1e-3
 
 
+# Reasons whose regulate write carries the L2 holon's authoritative
+# per-tier allocation — these *set* the load's L2 floor.  Reasons that
+# shed reactively at L1 (gossip ``balance`` actuation, ``stability``
+# re-apply) are clamped *up* to that floor so a supply-poor local group
+# can't undo a served-tier decision the component ADMM just made.
+L2_ALLOCATION_REASONS: frozenset[str] = frozenset(
+    {"holon_supply_priority", "holon_tier_alloc"}
+)
+L1_REACTIVE_SHED_REASONS: frozenset[str] = frozenset({"balance", "stability"})
+
+
 def _last_regulate_store(behavior: Any) -> dict[str, float]:
     return _get_behavior_store(behavior, "_scare_last_regulate")
+
+
+def note_actuated_factor(behavior: Any, aid: str, factor: float) -> None:
+    """Sync the per-aid dedup cache with a regulate actuation that was
+    written *outside* :func:`apply_regulate`.
+
+    The gossip path (``EnergyBalanceNegotiator._apply_setpoint``) writes
+    ``behavior.act("regulate", …)`` directly so its micro-steps bypass
+    the no-op dedup.  But that also means the dedup cache
+    (``_scare_last_regulate``) keeps the value from the *last*
+    ``apply_regulate`` call, not the gossip's actual write.  When a later
+    L2 re-dispatch (``apply_regulate(reason="holon_supply_priority")``)
+    asks for the load's allocated factor, the dedup compares against the
+    stale cache and silently drops the write — so a load the gossip shed
+    to 0 is never restored even though L2 re-dispatched it (eval
+    task-105 child-260: shed at t=5.12, six re-dispatches at t≥5.44 all
+    deduped, stays 0 to end-of-sim).  Calling this after every direct
+    actuator write keeps the cache truthful so corrective writes land.
+    """
+    _last_regulate_store(behavior)[str(aid)] = float(factor)
+
+
+def _l2_floor_store(behavior: Any) -> dict[str, float]:
+    """Per-aid L2 priority allocation: the served fraction the
+    component-scope holon ADMM most recently assigned to this load."""
+    return _get_behavior_store(behavior, "_scare_l2_floor")
+
+
+def l2_effective_floor(
+    behavior: Any,
+    aid: str,
+    obs: dict,
+    sector: Sector,
+    tier: int | None,
+) -> float | None:
+    """The served fraction an L1 reactive shed must not push below:
+    ``min(L2 allocation, constraint-allowed fraction)``.
+
+    Returns ``None`` when the holon has not allocated to this load yet
+    (no floor to enforce).  Capping the L2 allocation by the
+    constraint-allowed fraction means the floor yields, per-load and
+    continuously, to exactly the physical shedding the local constraint
+    requires — so curtailment/clamp own the violation window while the
+    floor only blocks *balance-driven* shedding below the priority
+    decision.
+    """
+    alloc = _l2_floor_store(behavior).get(aid)
+    if alloc is None:
+        return None
+    return min(alloc, constraint_allowed_fraction(obs, sector, tier=tier))
 
 
 def _last_regulate_t_store(behavior: Any) -> dict[str, float]:
@@ -427,6 +488,37 @@ def apply_regulate(
     (no behavior.act call, no diagnostics record).
     """
     factor = max(0.0, min(1.0, factor))
+
+    # --- L2 priority-floor reconciliation -----------------------------
+    # The component-scope holon ADMM is authoritative on which tier gets
+    # served; L1 must not undo it.  Record the floor on L2 writes; clamp
+    # L1 reactive sheds (here: ``stability`` — gossip ``balance`` writes
+    # bypass ``apply_regulate`` and are floored in
+    # ``EnergyBalanceNegotiator._apply_setpoint``).  Tier 1 is left
+    # entirely to its hard-lock pre-step / the curtailment auction, so it
+    # is excluded here (floor only governs tiers 2/3/4).  Gated on the
+    # config flag so the behaviour is A/B-able.
+    _cfg = getattr(behavior, "_scare_config", None)
+    if getattr(_cfg, "enable_l2_priority_floor", False):
+        if reason in L2_ALLOCATION_REASONS:
+            _l2_floor_store(behavior)[aid] = factor
+        elif (
+            reason in L1_REACTIVE_SHED_REASONS
+            and priority_tier is not None
+            and int(priority_tier) >= 2
+        ):
+            try:
+                _sector = Sector(sector) if not isinstance(sector, Sector) else sector
+            except ValueError:
+                _sector = None
+            if _sector is not None:
+                _obs = behavior.observe(aid) or {}
+                _floor = l2_effective_floor(
+                    behavior, aid, _obs, _sector, int(priority_tier)
+                )
+                if _floor is not None and factor < _floor:
+                    factor = _floor
+
     if factor < 1.0 - tolerance and _is_heat_side_mass_flow_sink(behavior, aid):
         record_event(
             t=float(timestamp),
@@ -970,26 +1062,50 @@ def clamp_to_constraints(
     uniform 0.85 deadband is used — preserves byte-compatible behaviour
     for callers that do not (yet) propagate tier information.
     """
-    bounds = SECTOR_CONSTRAINTS.get(sector, {})
     cap = obs_capacity(obs)
     if cap == 0.0:
         return setpoint
 
-    if tier is not None and int(tier) == 1:
-        # Hard tier-1 lock: bypass the clamp entirely.  A real grid
-        # violation will surface via ``ConstraintViolation`` and the
-        # subsequent negotiation re-checks tier-1 feasibility.
-        return setpoint
+    tightest_fraction = constraint_allowed_fraction(obs, sector, tier=tier)
+    if tightest_fraction < 1.0:
+        max_abs = tightest_fraction * abs(cap)
+        setpoint = max(-max_abs, min(max_abs, setpoint))
 
+    return setpoint
+
+
+def constraint_allowed_fraction(
+    obs: dict,
+    sector: Sector,
+    *,
+    tier: int | None = None,
+) -> float:
+    """Tightest constraint-allowed served fraction ``∈ [0, 1]`` from the
+    local grid measurements, using the same tier-dependent deadband as
+    :func:`clamp_to_constraints` (tier 1 immune → 1.0; tiers 2/3/4 use
+    the ``_CLAMP_TIER_DEADBAND`` schedule).
+
+    Returns the fraction of rated capacity the load may be served at
+    *given local physics*, before the priority decision is considered.
+    Shared by ``clamp_to_constraints`` (which applies it to a setpoint)
+    and the L2 priority-floor (``l2_effective_floor``), so the floor
+    relaxes by *exactly* the amount the clamp sheds — they can never
+    fight over the same load (the eval task-72 cold-day regression,
+    where a coarse violation flag let them disagree).
+    """
+    # Tier-1 is immune to the soft proximity clamp — its pre-step lock at
+    # regulation=1 must not be overruled by a near-bound signal; a true
+    # ConstraintViolation re-checks tier-1 feasibility instead.
+    if tier is not None and int(tier) == 1:
+        return 1.0
     if tier is not None and int(tier) >= 2:
         deadband = _CLAMP_TIER_DEADBAND.get(int(tier), _CLAMP_DEFAULT_DEADBAND)
     else:
         deadband = _CLAMP_DEFAULT_DEADBAND
     width = max(1e-9, 1.0 - deadband)
 
-    # Determine the tightest constraint across all local variables.
     tightest_fraction = 1.0
-    for var, (lo, hi) in bounds.items():
+    for var, (lo, hi) in SECTOR_CONSTRAINTS.get(sector, {}).items():
         if var not in obs:
             continue
         val = float(obs[var])
@@ -1001,9 +1117,4 @@ def clamp_to_constraints(
         else:
             allowed = max(0.0, (1.0 - util) / width)
         tightest_fraction = min(tightest_fraction, allowed)
-
-    if tightest_fraction < 1.0:
-        max_abs = tightest_fraction * abs(cap)
-        setpoint = max(-max_abs, min(max_abs, setpoint))
-
-    return setpoint
+    return tightest_fraction

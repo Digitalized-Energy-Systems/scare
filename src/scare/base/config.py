@@ -204,6 +204,21 @@ class RestorationConfiguration:
     # behaviour for ablations against the pre-Option-B path.
     enable_monotonic_floor: bool = False
 
+    # L2 priority-floor: clamp L1 reactive sheds (gossip ``balance`` +
+    # ``stability`` re-apply) up to ``min(L2 allocation,
+    # constraint-allowed fraction)`` for tiers 2/3/4.  Stops a
+    # supply-poor *local* gossip group from shedding a load the
+    # *component*-scope holon ADMM decided to serve — the L2→L1 override
+    # that produced the tier-3 < tier-4 / tier-2 < tier-3 inversions
+    # (eval task-88, task-51).  The constraint-allowed cap (same util as
+    # ``clamp_to_constraints``) lets curtailment/physics still shed the
+    # load during a real violation, per-load and continuously, so the
+    # floor and the constraint clamp never fight (the coarse-flag version
+    # regressed the cold-day task-72).  Tier 1 is excluded — it stays on
+    # its hard-lock pre-step / the curtailment auction.  Set False to
+    # ablate against the pre-floor override behaviour.
+    enable_l2_priority_floor: bool = True
+
     # Cold-load pickup ramp limit on regulation increases.
     # When False, factor jumps are not throttled.
     enable_clpu_ramp: bool = True

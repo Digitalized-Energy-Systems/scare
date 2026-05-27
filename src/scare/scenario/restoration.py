@@ -796,6 +796,7 @@ def _make_balance_role(
         termination_tolerance=config.gossip_termination_tolerance,
         max_hops=config.gossip_max_hops,
         enable_qp_gossip=config.enable_qp_gossip,
+        enable_l2_priority_floor=config.enable_l2_priority_floor,
     )
 
 

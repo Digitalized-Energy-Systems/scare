@@ -15,13 +15,41 @@ without spinning up a full simulation.
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 from experiment.eval.claims import (
     _check_diary_invariant,
     _check_monotonic_progress,
+    _check_priority_invariant,
     _check_slack_budget,
 )
+
+
+_SBL_COLS = (
+    "aid", "sector", "tier", "node_id", "component",
+    "demand", "served", "fraction", "disconnected", "constraint_allowed",
+)
+
+
+def _write_served_by_load(path: Path, loads: list[dict]) -> Path:
+    rows = []
+    for ld in loads:
+        demand = ld["demand"]
+        served = ld["served"]
+        rows.append({
+            "aid": ld.get("aid", "x"),
+            "sector": ld.get("sector", "heat"),
+            "tier": ld["tier"],
+            "node_id": ld.get("node_id", 0),
+            "component": ld.get("component", "0"),
+            "demand": demand,
+            "served": served,
+            "fraction": served / demand if demand else 0.0,
+            "disconnected": ld.get("disconnected", 0),
+            "constraint_allowed": ld.get("constraint_allowed", 1.0),
+        })
+    return _write_csv(path, _SBL_COLS, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -261,3 +289,127 @@ class TestSlackBudgetCompliance:
         assert res["detail"]["last_t"] == "7"
         # Peaks sample is capped at 5 to keep the report small.
         assert len(res["detail"]["peaks_sample"]) == 5
+
+
+class TestSlackBudgetSteadyState:
+    """Steady-state path: judge the slack draw over the final settling
+    window from timeseries.csv against slack_meta.json budgets."""
+
+    def _slack_meta(self, tmp_path, budget=10.0, sector="electricity", aid="child-7"):
+        meta = {aid: {"sector": sector, "obs_key": "p_mw", "budget": budget,
+                      "lp_envelope": budget * 10, "node_id": 1}}
+        p = tmp_path / "slack_meta.json"
+        p.write_text(json.dumps(meta))
+        return p, f"slack__{sector}__{aid}"
+
+    def test_transient_spike_that_recovers_passes(self, tmp_path):
+        # Over budget early (cold start), recovers under budget by the
+        # settling window → should PASS (the A-type false-positive fix).
+        meta, col = self._slack_meta(tmp_path, budget=10.0)
+        ts = _write_timeseries(
+            tmp_path / "timeseries.csv", (col,),
+            [(0.5, -13.0), (1.0, -12.0), (2.0, -10.4),
+             (8.5, -9.8), (9.0, -9.7), (10.0, -9.6)],
+        )
+        # An event was recorded for the early spike, but it recovered.
+        ev = _write_events(tmp_path / "events.csv", [
+            {"t": 0.5, "kind": "slack_budget_violation", "aid": "child-7",
+             "sector": "electricity", "detail": "p_mw=-13.0 budget=10.0"},
+        ])
+        res = _check_slack_budget(ev, timeseries_path=ts, slack_meta_path=meta)
+        assert res["passed"] is True, res["detail"]
+        assert res["detail"]["mode"] == "steady_state"
+        assert res["detail"]["n_transient_events"] == 1
+
+    def test_sustained_over_budget_fails(self, tmp_path):
+        # Over threshold (budget*1.05=10.5) through the settling window.
+        meta, col = self._slack_meta(tmp_path, budget=10.0)
+        ts = _write_timeseries(
+            tmp_path / "timeseries.csv", (col,),
+            [(0.5, -11.0), (2.0, -10.8), (8.5, -10.8), (9.0, -10.9), (10.0, -10.85)],
+        )
+        ev = _write_events(tmp_path / "events.csv", [])
+        res = _check_slack_budget(ev, timeseries_path=ts, slack_meta_path=meta)
+        assert res["passed"] is False, res["detail"]
+        assert res["detail"]["n_steady_breaches"] == 1
+        assert res["detail"]["breaches"][0]["slack"] == col
+
+    def test_within_tolerance_passes(self, tmp_path):
+        # Draw at budget*1.04 < threshold budget*1.05 → within tol.
+        meta, col = self._slack_meta(tmp_path, budget=10.0)
+        ts = _write_timeseries(
+            tmp_path / "timeseries.csv", (col,),
+            [(8.5, -10.4), (9.0, -10.3), (10.0, -10.4)],
+        )
+        ev = _write_events(tmp_path / "events.csv", [])
+        res = _check_slack_budget(ev, timeseries_path=ts, slack_meta_path=meta)
+        assert res["passed"] is True, res["detail"]
+
+    def test_falls_back_to_legacy_without_timeseries(self, tmp_path):
+        # No timeseries/meta → legacy "any event fails" path.
+        ev = _write_events(tmp_path / "events.csv", [
+            {"t": 1.5, "kind": "slack_budget_violation", "aid": "child-7",
+             "sector": "electricity", "detail": "p_mw=-13"},
+        ])
+        res = _check_slack_budget(ev)
+        assert res["passed"] is False
+        assert res["detail"]["mode"] == "legacy"
+
+
+class TestPriorityInvariantConstraintThrottle:
+    """Physics-aware exclusion: a load capped by a local constraint (and
+    serving at/near that cap) is not a priority inversion; a load shed
+    *below* its physical cap still is."""
+
+    def test_throttled_high_tier_excluded_physics_aware(self, tmp_path):
+        # Heat: tier-2 cold node physically capped at 0.0 (constraint_
+        # allowed=0), tier-3 warm fully served.  Strict sees tier2<tier3
+        # inversion; physics-aware excludes the throttled tier-2 load.
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.0, "constraint_allowed": 0.0},
+            {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+            {"aid": "c", "tier": 3, "demand": 1.0, "served": 0.4, "constraint_allowed": 1.0},
+        ])
+        strict = _check_priority_invariant(p, exclude_constraint_throttled=False)
+        physical = _check_priority_invariant(p, exclude_constraint_throttled=True)
+        assert strict["passed"] is False           # raw inversion present
+        assert physical["passed"] is True           # throttled tier-2 dropped
+        assert physical["detail"]["n_loads_throttled"] == 1
+
+    def test_priority_shed_below_cap_still_counts(self, tmp_path):
+        # tier-2 served 0.2 while its physical cap is 0.9 → shed below
+        # what physics allows ⇒ a real priority/balance shed, kept even
+        # in physics-aware mode; tier-3 fully served ⇒ inversion stands.
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 0.9},
+            {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+        ])
+        physical = _check_priority_invariant(p, exclude_constraint_throttled=True)
+        assert physical["passed"] is False
+        assert physical["detail"]["n_loads_throttled"] == 0
+
+    def test_unconstrained_inversion_counts_both_modes(self, tmp_path):
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
+            {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+        ])
+        assert _check_priority_invariant(p, exclude_constraint_throttled=False)["passed"] is False
+        assert _check_priority_invariant(p, exclude_constraint_throttled=True)["passed"] is False
+
+    def test_legacy_csv_without_column_falls_back(self, tmp_path):
+        # No constraint_allowed column (old artefact) → physics-aware
+        # mode behaves like strict (no exclusion), never crashes.
+        cols = ("aid", "sector", "tier", "node_id", "component",
+                "demand", "served", "fraction", "disconnected")
+        rows = [
+            {"aid": "a", "sector": "heat", "tier": 2, "node_id": 0,
+             "component": "0", "demand": 1.0, "served": 0.5, "fraction": 0.5,
+             "disconnected": 0},
+            {"aid": "b", "sector": "heat", "tier": 3, "node_id": 0,
+             "component": "0", "demand": 1.0, "served": 1.0, "fraction": 1.0,
+             "disconnected": 0},
+        ]
+        p = _write_csv(tmp_path / "served_by_load.csv", cols, rows)
+        res = _check_priority_invariant(p, exclude_constraint_throttled=True)
+        assert res["passed"] is False
+        assert res["detail"]["n_loads_throttled"] == 0

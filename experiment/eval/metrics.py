@@ -22,6 +22,7 @@ from monee.solver.core import find_ignored_nodes
 
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.util import (
+    constraint_allowed_fraction,
     constraint_utilization,
     obs_capacity,
     obs_priority,
@@ -161,6 +162,15 @@ def served_by_load(
             tier = int(priorities[aid])
         else:
             tier = obs_priority(obs)
+        # Physical serve cap from the load's local constraints (same
+        # util→fraction the gossip clamp uses).  A load served at/near
+        # this cap is throttled by *physics*, not by a priority decision
+        # — the physics-aware priority-invariant check excludes it the
+        # way it already excludes disconnected loads.
+        allowed = (
+            1.0 if is_disconnected
+            else constraint_allowed_fraction(obs, sec, tier=tier)
+        )
         rows.append({
             "aid": aid,
             "sector": sec.value,
@@ -171,6 +181,7 @@ def served_by_load(
             "served": served,
             "fraction": served / cap if cap > 0 else 0.0,
             "disconnected": int(is_disconnected),
+            "constraint_allowed": allowed,
         })
     return rows
 

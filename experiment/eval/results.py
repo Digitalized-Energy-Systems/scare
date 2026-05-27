@@ -170,7 +170,7 @@ def write_served_by_load_csv(
     rows = served_by_load(monee_net, behavior, priorities=priorities)
     cols = (
         "aid", "sector", "tier", "node_id", "component",
-        "demand", "served", "fraction", "disconnected",
+        "demand", "served", "fraction", "disconnected", "constraint_allowed",
     )
     with Path(path).open("w", newline="") as f:
         w = csv.writer(f)
@@ -179,7 +179,7 @@ def write_served_by_load_csv(
             w.writerow([
                 r["aid"], r["sector"], r["tier"], r["node_id"], r["component"],
                 f"{r['demand']:.6f}", f"{r['served']:.6f}", f"{r['fraction']:.6f}",
-                r["disconnected"],
+                r["disconnected"], f"{r.get('constraint_allowed', 1.0):.6f}",
             ])
 
 

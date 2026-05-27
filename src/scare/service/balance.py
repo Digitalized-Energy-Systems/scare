@@ -40,7 +40,9 @@ from scare.base.util import (
     apply_regulate,
     clamp_to_constraints,
     constraint_utilization,
+    l2_effective_floor,
     lookup_slack,
+    note_actuated_factor,
     obs_capacity,
     obs_min_max,
     obs_priority,
@@ -296,6 +298,7 @@ class EnergyBalanceNegotiator(Role):
         max_hops: int = _MAX_HOPS,
         step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
         enable_qp_gossip: bool = True,
+        enable_l2_priority_floor: bool = True,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -306,6 +309,11 @@ class EnergyBalanceNegotiator(Role):
         self.constraint_aware = constraint_aware
         self.enable_monotonic_floor = enable_monotonic_floor
         self.enable_clpu_ramp = enable_clpu_ramp
+        # L2 priority-floor: clamp gossip ``balance`` sheds up to the
+        # component ADMM's per-load allocation (relaxed by local
+        # constraints).  Blocks the L2→L1 override that inverts tiers
+        # (eval task-88); see ``_apply_setpoint``.
+        self.enable_l2_priority_floor = enable_l2_priority_floor
         self.max_hops = max_hops
         self.step_decay_k0 = max(1, int(step_decay_k0))
         # P6: when True, run the primal-dual QP gossip; when False the
@@ -1158,6 +1166,16 @@ class EnergyBalanceNegotiator(Role):
             self._active = False
             return
 
+        # An overlapping trigger (e.g. a slack-budget override arriving
+        # while an AskEnergy round's response is still in flight) can
+        # reach ``_start_gossip`` with a previous originator gossip still
+        # live in ``self._gossip``.  Overwriting it below would drop its
+        # diary terminal — the task-7/22 ``started != Σ terminals`` leak.
+        # Retire it as ``abandoned`` first.
+        self._close_inflight_originator(
+            "abandoned", log_reason="superseded by new gossip"
+        )
+
         # Clear violation flag at the start of each new negotiation so
         # that the monotonic floor is only breached while a violation is
         # actively present.
@@ -1875,6 +1893,48 @@ class EnergyBalanceNegotiator(Role):
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
+    def _close_inflight_originator(self, event: str, log_reason: str | None = None) -> None:
+        """Record a terminal for the in-flight gossip if this agent is
+        its originator, preserving the ``started == Σ terminals`` diary
+        invariant whenever ``self._gossip`` is about to be overwritten
+        or torn down.
+
+        ``event`` is the terminal kind (``"abandoned"`` / ``"cancelled"``).
+        No-op when there is no in-flight gossip or this agent is only a
+        relay (non-originator gossips never recorded a ``started``).
+
+        This consolidates the four sites that retire an active gossip —
+        ``_handle_negotiation_message`` (nid change),
+        ``_on_constraint_violation`` (cancel), ``_yield_to_l2_authority``
+        (L2 pre-emption), and ``_start_gossip`` (overlapping trigger) —
+        so none of them can leak an unterminated ``started``.  The last
+        of these was the eval_full_small task-7/22 diary leak: two
+        negotiation triggers raced (slack-budget override + a balance
+        round) and the second ``_start_gossip`` overwrote the first
+        originator gossip with no terminal.
+        """
+        if self._gossip is None or not self._gossip.is_originator:
+            return
+        total_delta = self._gossip_total_delta()
+        record_negotiation(
+            t=self.context.current_timestamp,
+            aid=self.context.aid,
+            sector=self.sector.value,
+            nid=self._gossip.negotiation_id,
+            event=event,
+            target=self._gossip.target,
+            residual=self._gossip.target - total_delta,
+            group_size=len(self._gossip.memory),
+        )
+        if log_reason is not None:
+            logger.info(
+                "[%s] gossip %s %s — %s",
+                self.context.aid,
+                self._gossip.negotiation_id[:8],
+                event,
+                log_reason,
+            )
+
     def _yield_to_l2_authority(self, route: str) -> None:
         """Abandon any in-flight L1 gossip so an arriving L2 directive
         can land.
@@ -1890,27 +1950,9 @@ class EnergyBalanceNegotiator(Role):
         """
         if not self._active:
             return
-        if (
-            self._gossip is not None
-            and self._gossip.is_originator
-        ):
-            total_delta = self._gossip_total_delta()
-            record_negotiation(
-                t=self.context.current_timestamp,
-                aid=self.context.aid,
-                sector=self.sector.value,
-                nid=self._gossip.negotiation_id,
-                event="abandoned",
-                target=self._gossip.target,
-                residual=self._gossip.target - total_delta,
-                group_size=len(self._gossip.memory),
-            )
-            logger.info(
-                "[%s] gossip %s abandoned — yielding to L2 (%s)",
-                self.context.aid,
-                self._gossip.negotiation_id[:8],
-                route,
-            )
+        self._close_inflight_originator(
+            "abandoned", log_reason=f"yielding to L2 ({route})"
+        )
         self._gossip = None
         self._active = False
 
@@ -2248,6 +2290,23 @@ class EnergyBalanceNegotiator(Role):
             if self.enable_clpu_ramp:
                 factor = self._rate_limit_increase(factor)
 
+        # --- L2 priority-floor (gossip path) ---
+        # The component ADMM decided this load's served tier; a
+        # supply-poor local gossip group must not shed it below that
+        # decision purely to zero its own imbalance.  Clamp the gossip
+        # factor up to ``min(L2 allocation, constraint-allowed)`` — the
+        # constraint term (computed from the same util as the clamp
+        # above) lets curtailment/physics still shed it during a real
+        # violation, per-load and continuously, so the floor and the
+        # constraint clamp never fight.  Tier 1 already returned above;
+        # this governs tiers 2/3/4 only.
+        if self.enable_l2_priority_floor:
+            floor = l2_effective_floor(
+                self.behavior, self.context.aid, obs, self.sector, self.priority
+            )
+            if floor is not None and factor < floor:
+                factor = floor
+
         # NB: gossip-driven regulates intentionally bypass the
         # ``apply_regulate`` no-op dedup.  Each gossip round computes a
         # small per-step delta (order of convergence_rate × cap / n) and
@@ -2260,6 +2319,11 @@ class EnergyBalanceNegotiator(Role):
         # deltas efficiently, so they are not the bottleneck here.
         if self.behavior.has_action(self.context.aid, "regulate"):
             self.behavior.act(self.context.aid, "regulate", factor)
+            # Keep the ``apply_regulate`` dedup cache truthful — this
+            # direct write bypasses it, and a stale cache silently drops
+            # a later L2 re-dispatch that would restore this load (the
+            # gossip-shed-never-restored cause; see note_actuated_factor).
+            note_actuated_factor(self.behavior, self.context.aid, factor)
             record_regulate(
                 t=self.context.current_timestamp,
                 aid=self.context.aid,
@@ -2364,6 +2428,7 @@ def create_energy_balance_role(
     max_hops: int = _MAX_HOPS,
     step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
     enable_qp_gossip: bool = True,
+    enable_l2_priority_floor: bool = True,
 ) -> EnergyBalanceNegotiator:
     if priority is None:
         priority = obs_priority(obs)
@@ -2378,4 +2443,5 @@ def create_energy_balance_role(
         max_hops=max_hops,
         step_decay_k0=step_decay_k0,
         enable_qp_gossip=enable_qp_gossip,
+        enable_l2_priority_floor=enable_l2_priority_floor,
     )
