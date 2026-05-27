@@ -49,6 +49,7 @@ from scare.base.infeasibility_capture import (
     arm_infeasibility_capture,
     disarm_infeasibility_capture,
 )
+from scare.base.solver_guard import install_solver_time_limit
 from scare.base.util import create_failures
 from scare.scenario.restoration import (
     _flush_pending_negotiations,
@@ -327,6 +328,17 @@ async def _run_simulation(
     """
     if task.grid not in GRIDS:
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
+
+    # Cap any single energyflow MISOCP at a small fraction of the
+    # task wall-clock budget.  Without this guard, ``asyncio.wait_for``
+    # cannot preempt a synchronous solve that exceeds ``task_timeout_s``
+    # — the cancellation only fires at the next ``await`` — and the
+    # task drifts past the configured timeout until SLURM SIGTERMs it.
+    # Floored at 30s so even hard MISOCPs get a chance to finish; capped
+    # at 60s so a misconfigured solver (e.g. no time-limit option known)
+    # still yields to the asyncio scheduler frequently.
+    per_solve_cap = max(30.0, min(plan.task_timeout_s / 4.0, 60.0))
+    install_solver_time_limit(per_solve_cap)
 
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s", task.grid)
