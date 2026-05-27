@@ -214,9 +214,11 @@ class RestorationConfiguration:
     # ``clamp_to_constraints``) lets curtailment/physics still shed the
     # load during a real violation, per-load and continuously, so the
     # floor and the constraint clamp never fight (the coarse-flag version
-    # regressed the cold-day task-72).  Tier 1 is excluded — it stays on
-    # its hard-lock pre-step / the curtailment auction.  Set False to
-    # ablate against the pre-floor override behaviour.
+    # regressed the cold-day task-72).  Applies to all load tiers incl.
+    # tier 1 (whose constraint-allowed is always 1.0, so the floor just
+    # re-asserts its hard-lock against ``stability`` erosion); the
+    # curtailment auction can still shed any tier when physics demands.
+    # Set False to ablate against the pre-floor override behaviour.
     enable_l2_priority_floor: bool = True
 
     # Cold-load pickup ramp limit on regulation increases.

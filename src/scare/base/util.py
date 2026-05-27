@@ -494,9 +494,14 @@ def apply_regulate(
     # served; L1 must not undo it.  Record the floor on L2 writes; clamp
     # L1 reactive sheds (here: ``stability`` — gossip ``balance`` writes
     # bypass ``apply_regulate`` and are floored in
-    # ``EnergyBalanceNegotiator._apply_setpoint``).  Tier 1 is left
-    # entirely to its hard-lock pre-step / the curtailment auction, so it
-    # is excluded here (floor only governs tiers 2/3/4).  Gated on the
+    # ``EnergyBalanceNegotiator._apply_setpoint``).  Applies to *all*
+    # load tiers including tier 1: ``constraint_allowed_fraction`` is
+    # tier-1-immune (returns 1.0), so tier-1's floor is simply its L2
+    # allocation — this re-asserts the tier-1 hard-lock against
+    # ``stability`` erosion (eval task-18 child-90 settling at 0.984)
+    # while the curtailment auction (``reason="curtail"``, not clamped
+    # here) can still shed tier-1 when a constraint physically demands
+    # it.  Generators (priority_tier <= 0) are excluded.  Gated on the
     # config flag so the behaviour is A/B-able.
     _cfg = getattr(behavior, "_scare_config", None)
     if getattr(_cfg, "enable_l2_priority_floor", False):
@@ -505,7 +510,7 @@ def apply_regulate(
         elif (
             reason in L1_REACTIVE_SHED_REASONS
             and priority_tier is not None
-            and int(priority_tier) >= 2
+            and int(priority_tier) >= 1
         ):
             try:
                 _sector = Sector(sector) if not isinstance(sector, Sector) else sector

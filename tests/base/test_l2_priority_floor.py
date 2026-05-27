@@ -114,8 +114,12 @@ def test_floor_disabled_lets_stability_shed():
     assert b.acted[-1] == ("load-1", pytest.approx(0.0))
 
 
-def test_tier1_stability_not_floored():
-    # Tier 1 is excluded from the floor (hard-lock / auction own it).
+def test_tier1_stability_is_floored_hardlock():
+    # Tier 1 IS floored against reactive sheds (re-asserts the hard-lock
+    # against stability erosion — eval task-18 child-90).  Its
+    # constraint-allowed is always 1.0 (immune), so the floor is its L2
+    # allocation; the curtailment auction (reason="curtail") can still
+    # shed it, but stability/balance cannot.
     cfg = _Cfg(floor=True)
     obs = {"p_mw": 1.0, "vm_pu": 1.0}
     b = _Behavior(config=cfg, obs=obs)
@@ -123,6 +127,12 @@ def test_tier1_stability_not_floored():
                    reason="holon_supply_priority", timestamp=1.0, priority_tier=1)
     apply_regulate(b, "load-1", 0.0, sector="electricity",
                    reason="stability", timestamp=1.1, priority_tier=1)
+    assert b.acted[-1] == ("load-1", pytest.approx(1.0))
+
+    # ...but a constraint-driven curtail can still shed tier 1.
+    applied = apply_regulate(b, "load-1", 0.0, sector="electricity",
+                             reason="curtail", timestamp=1.2, priority_tier=1)
+    assert applied is True
     assert b.acted[-1] == ("load-1", pytest.approx(0.0))
 
 
