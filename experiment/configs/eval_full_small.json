@@ -372,6 +372,6 @@
     "cpus": 1,
     "max_concurrent": 64,
     "aggregate": true,
-    "nodelist": "mpcs046,mpcs047"
+    "nodelist": "mpcs042,mpcs041"
   }
 }
