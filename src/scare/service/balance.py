@@ -1832,13 +1832,43 @@ class EnergyBalanceNegotiator(Role):
             flex_by_sector[sec_key] = flex_by_sector.get(sec_key, 0.0) + available
             balance_by_sector[sec_key] = balance_by_sector.get(sec_key, 0.0) + sp
             # Route-A supply-priority: accumulate generator-class
-            # rated supply per sector.  Convention: cap < 0 for
-            # generators (load-sign convention), so |cap| is the
-            # rated output magnitude.  Slack agents register via
-            # ``register_slack`` with their rated capacity surfaced
-            # by ``obs_capacity`` — they too count as supply.
+            # *deliverable* supply per sector.  Convention: cap < 0 for
+            # generators (load-sign convention).
+            #
+            # For non-slack generators we count the **delivered** output
+            # ``|sp|`` (= ``|cap|·regulation``) rather than the rated
+            # ``|cap|``.  Two classes of generator report their full
+            # rated ``|cap|`` via ``obs_capacity`` yet cannot push it:
+            #   * failed generators (``net.deactivate`` → regulation 0);
+            #   * constraint-curtailed generators (line / voltage limits
+            #     hold regulation < 1) — these genuinely *cannot* be
+            #     "regulated up", the network won't accept the power.
+            # Counting their rated value inflates the supply pool with
+            # generation the LP physically can't deliver, so the
+            # supply-priority waterfall over-serves and the slack fills
+            # the undeliverable gap, blowing past the operator budget.
+            # Validated on eval task-25 (el slack 0.101 vs budget 0.056,
+            # +81%): rated 0.170 vs delivered 0.119, a 0.051 phantom gap
+            # = 0.022 failed (5 gens) + 0.029 constraint-curtailed (6
+            # gens); switching to ``|sp|`` cuts the breach to +15%.  A
+            # healthy generator sits at regulation 1 so ``|sp| == |cap|``
+            # — full rated is counted, which is what "the generator can
+            # be regulated up" means: it is already up.  ``|sp|`` thus
+            # self-adapts to failure and curtailment without the duals.
+            #
+            # Slack agents are the exception: their ``obs_capacity``
+            # returns the *registered budget* (``register_slack`` stamps
+            # ``cap = -budget``) while their ``obs_setpoint`` returns the
+            # LP's actual draw, which is precisely the over-budget value
+            # we must NOT bake into the pool.  Keep slacks at ``|cap|``
+            # (the budgeted rating) so the pool reflects the operator
+            # allowance, not the breach.
             if cap < 0:
-                supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + abs(cap)
+                if lookup_slack(self.behavior, aid) is not None:
+                    gen_supply = abs(cap)   # slack: its budgeted rating
+                else:
+                    gen_supply = abs(sp)    # generator: deliverable, not rated
+                supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + gen_supply
             # Priority-tier demand aggregation (loads only: cap > 0)
             if cap > 0:
                 prio = obs_priority(

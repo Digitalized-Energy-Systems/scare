@@ -54,6 +54,35 @@ class RestorationConfiguration:
     # (the single-level / component-level variants do this).
     enable_cp_priority_admm: bool = True
 
+    # L3 kernel selection.  ``"lexicographic"`` (default) runs the
+    # distributed lexicographic-cascade sharing ADMM from
+    # ``distributed_resource_optimization`` — a Π-round cascade (one
+    # round per priority tier, highest first) that *maximises* served
+    # demand per tier subject to the hard per-(sector, step) constraint
+    # ``σ + Σ_i r_i·c_{i,s} ≤ B_s − θ``.  Because the sector base supply
+    # ``B`` folds in the slack's operator budget (the slack is counted
+    # at ``|cap|`` = its budget in ``_handle_ask_flex``), this hard-caps
+    # the CPs' cross-sector draw at the budget — so a CP burning gas to
+    # make electricity cannot force the gas slack past its budget even
+    # when the gas sector carries no demand of its own.  ``"penalty"``
+    # selects the legacy ``solve_cp_priority_admm`` kernel
+    # (priority-weight marginal penalty); that kernel is *formally
+    # broken* for the budget case — a soft over-draw penalty either
+    # limit-cycles (flat) or settles with a steady-state offset
+    # (proportional), neither of which respects the hard budget — and is
+    # retained only for ablation.
+    cp_admm_algorithm: str = "lexicographic"
+
+    # Proximal step-damping coefficient ``α ≥ 0`` for the lexicographic
+    # cascade's per-CP closed-form projection.  Biases the *iterate
+    # step* (not the saddle): at any fixed point ``r = r_prev`` so the α
+    # term cancels and the asymptote is the bare sharing-ADMM optimum.
+    # 0.1 is the DRO empirical sweet spot; α = 0 is still correct but
+    # can oscillate on a degenerate optimal face and never trip the
+    # per-iter convergence test.  Ignored when
+    # ``cp_admm_algorithm == "penalty"``.
+    cp_admm_r_regularization: float = 0.1
+
     # Distributed FailureNotice propagation through ProblemDetector.
     # When False, a centralised ``behavior_in(BranchFailureEvent)``
     # callback triggers all leaders directly (legacy behaviour, kept

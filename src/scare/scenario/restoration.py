@@ -664,7 +664,7 @@ def _populate_nodes(
                 # with no ``regulate`` action — ``apply_regulate`` then
                 # silently no-ops every commit.
                 if "chp" in cp_type.lower():
-                    _attach_cp_priority_admm_role(roles, behavior, aid, cp_type, obs)
+                    _attach_cp_priority_admm_role(roles, behavior, aid, cp_type, obs, config)
             elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, cp_type, obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
@@ -694,21 +694,21 @@ def _populate_branches(
 
         elif "powertogas" in branch_type:
             if config.enable_cp_priority_admm:
-                _attach_cp_priority_admm_role(roles, behavior, aid, "p2g", obs)
+                _attach_cp_priority_admm_role(roles, behavior, aid, "p2g", obs, config)
             elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, "p2g", obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
                 _attach_multi_community_cp_role(roles, behavior, "p2g", config)
         elif "gastopower" in branch_type:
             if config.enable_cp_priority_admm:
-                _attach_cp_priority_admm_role(roles, behavior, aid, "g2p", obs)
+                _attach_cp_priority_admm_role(roles, behavior, aid, "g2p", obs, config)
             elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, "g2p", obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
                 _attach_multi_community_cp_role(roles, behavior, "g2p", config)
         elif "powertoheat" in branch_type:
             if config.enable_cp_priority_admm:
-                _attach_cp_priority_admm_role(roles, behavior, aid, "p2h", obs)
+                _attach_cp_priority_admm_role(roles, behavior, aid, "p2h", obs, config)
             elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, "p2h", obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
@@ -913,6 +913,7 @@ def _attach_cp_priority_admm_role(
     aid: str,
     cp_type: str,
     obs: dict,
+    config: RestorationConfiguration,
 ) -> None:
     """Install :class:`CPPriorityAdmmRole` in place of the legacy
     ``EnergyConverterRole`` / ``DistributedOptimizationRole`` /
@@ -937,6 +938,8 @@ def _attach_cp_priority_admm_role(
             cp_id=aid,
             capacity_by_sector=capacity_by_sector,
             bridged_sectors=sectors,
+            algorithm=config.cp_admm_algorithm,
+            r_regularization=config.cp_admm_r_regularization,
         )
     )
 

@@ -191,12 +191,25 @@ class SlackBudgetMonitor(Role):
                     bound_high=self.budget,
                     node_id=None,
                 ))
-                # Compute the signed over-budget magnitude.  Slack sign
-                # convention is generator-style: ``val < 0`` ⇒ slack
-                # injects into the network (network IMPORTS), so an
-                # over-import has ``imbalance < 0``; ``val > 0`` ⇒
-                # over-export with ``imbalance > 0``.
-                imbalance = val - self.budget if val > 0 else val + self.budget
+                # Over-budget magnitude in gossip-target convention
+                # (negative ⇒ shed net load, which reduces an importing
+                # slack's draw).  In the restoration setting an
+                # over-budget slack is always over-*importing* (the
+                # failure removed supply and the slack fills the
+                # deficit), so the correct response is always to shed
+                # toward the budget — independent of which raw sign the
+                # slack uses to encode import.  The previous form
+                # ``val - budget if val > 0 else val + budget`` is
+                # ``sign(val)·(|val|-budget)``: it assumed import is
+                # always the negative direction, which holds for
+                # ``ExtPowerGrid`` (p_mw<0 ⇒ import) but NOT for the
+                # ``ExtHydrGrid`` slacks that report import as a
+                # *positive* mass_flow.  Such a slack received a positive
+                # "add-load" target and was driven to the 10x LP envelope
+                # (eval task-84/85: +900% over-budget gas).  ``-(|val| -
+                # budget)`` is identical to the old form for negative-
+                # import slacks and fixes the positive-import ones.
+                imbalance = -(abs(val) - self.budget)
                 # Routing:
                 # * If we have a known community leader, send a
                 #   ``StartBalanceNegotiation`` with the real
@@ -233,15 +246,11 @@ class SlackBudgetMonitor(Role):
                 #
                 # Gossip-target sign (per line-overload relief and
                 # _start_gossip): NEGATIVE ⇒ reduce net load by that
-                # magnitude, POSITIVE ⇒ add net load.  Match that to
-                # the slack direction:
-                #   over-import  (val<0, imbalance<0) ⇒ shed load
-                #     ⇒ override_target = imbalance  (negative)
-                #   over-export  (val>0, imbalance>0) ⇒ add load
-                #     ⇒ override_target = imbalance  (positive)
-                # So the override_target equals imbalance directly
-                # (NOT -imbalance — that would push the QP the wrong
-                # way and was the bug in the first iteration).
+                # magnitude.  ``imbalance`` above is now always negative
+                # (shed toward budget), so ``override_target = imbalance``
+                # feeds the correct shed magnitude straight into the L1
+                # QP for an over-importing slack of either sign
+                # convention.
                 if self.home_leader_addr is not None:
                     try:
                         await self.context.send_message(

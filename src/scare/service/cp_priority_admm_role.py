@@ -59,6 +59,10 @@ from mango import sender_addr as mango_sender_addr
 from scare.base.channel import CPSummary, HolonSummary, MonotonicVersion
 from scare.base.model import Sector
 from scare.base.util import apply_regulate
+from distributed_resource_optimization.algorithm.distributed_lexicographic_cascade.core import (  # noqa: E501
+    solve_cp_distributed_lexicographic_cascade,
+)
+
 from scare.service.cp_priority_admm import (
     CPSpec,
     SectorDemand,
@@ -91,6 +95,8 @@ class CPPriorityAdmmRole(Role):
         r_damping: float = 0.3,
         admm_max_iters: int = 200,
         admm_abs_tol: float = 1e-3,
+        algorithm: str = "lexicographic",
+        r_regularization: float = 0.1,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -106,6 +112,8 @@ class CPPriorityAdmmRole(Role):
         self.r_damping = float(r_damping)
         self.admm_max_iters = int(admm_max_iters)
         self.admm_abs_tol = float(admm_abs_tol)
+        self.algorithm = str(algorithm)
+        self.r_regularization = float(r_regularization)
 
         self._version = MonotonicVersion()
         # Peer state caches keyed by publisher aid.
@@ -360,19 +368,43 @@ class CPPriorityAdmmRole(Role):
             cps.append(CPSpec(cp_id=aid, capacity_by_sector=dict(s.capacity_by_sector)))
 
         try:
-            result = solve_cp_priority_admm(
-                cps=cps,
-                demands=demands,
-                horizon=self.horizon,
-                rho=self.rho,
-                max_iters=self.admm_max_iters,
-                abs_tol=self.admm_abs_tol,
-                priority_weight_base=self.priority_weight_base,
-                r_damping=self.r_damping,
-            )
+            if self.algorithm == "lexicographic":
+                # Distributed lexicographic-cascade sharing ADMM: Π
+                # rounds (one per priority tier, highest first), each
+                # maximising served demand subject to the hard
+                # ``σ + Σ_i r_i·c_{i,s} ≤ B_s − θ`` constraint.  Since
+                # ``B`` folds in the slack budget, this hard-caps the
+                # CPs' cross-sector draw at the operator budget — the
+                # formally-correct replacement for the penalty kernel's
+                # soft over-draw marginal (which limit-cycles / offsets).
+                # SCARE's ``CPSpec`` / ``SectorDemand`` duck-type onto the
+                # DRO kernel (it reads only ``.cp_id`` /
+                # ``.capacity_by_sector`` and ``.sector`` /
+                # ``.demand_by_tier`` / ``.base_supply``).
+                result = solve_cp_distributed_lexicographic_cascade(
+                    cps=cps,
+                    demands=demands,
+                    horizon=self.horizon,
+                    rho=self.rho,
+                    inner_iters_max=self.admm_max_iters,
+                    inner_abs_tol=self.admm_abs_tol,
+                    r_regularization=self.r_regularization,
+                )
+            else:
+                result = solve_cp_priority_admm(
+                    cps=cps,
+                    demands=demands,
+                    horizon=self.horizon,
+                    rho=self.rho,
+                    max_iters=self.admm_max_iters,
+                    abs_tol=self.admm_abs_tol,
+                    priority_weight_base=self.priority_weight_base,
+                    r_damping=self.r_damping,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] cp_priority_admm kernel failed: %s", self.cp_id, exc,
+                "[%s] cp L3 kernel (%s) failed: %s",
+                self.cp_id, self.algorithm, exc,
             )
             return
 
