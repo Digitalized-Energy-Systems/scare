@@ -1875,6 +1875,45 @@ class EnergyBalanceNegotiator(Role):
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
+    def _yield_to_l2_authority(self, route: str) -> None:
+        """Abandon any in-flight L1 gossip so an arriving L2 directive
+        can land.
+
+        The supply-priority / tier-stratified / override-target paths
+        carry the holon's authoritative priority decision; without this
+        yield, ``_active=True`` from a curtailment gossip (e.g. one
+        triggered by a heat-temperature constraint violation) would
+        silently swallow the L2 message and leave high-priority loads
+        stuck at the gossip's saturating shed — the eval_full_small
+        task-89 heat inversion (child-146 tier-2 shed to 0, never
+        restored by the corrective L2 ``{tier 2: 1.0}`` allocation).
+        """
+        if not self._active:
+            return
+        if (
+            self._gossip is not None
+            and self._gossip.is_originator
+        ):
+            total_delta = self._gossip_total_delta()
+            record_negotiation(
+                t=self.context.current_timestamp,
+                aid=self.context.aid,
+                sector=self.sector.value,
+                nid=self._gossip.negotiation_id,
+                event="abandoned",
+                target=self._gossip.target,
+                residual=self._gossip.target - total_delta,
+                group_size=len(self._gossip.memory),
+            )
+            logger.info(
+                "[%s] gossip %s abandoned — yielding to L2 (%s)",
+                self.context.aid,
+                self._gossip.negotiation_id[:8],
+                route,
+            )
+        self._gossip = None
+        self._active = False
+
     async def _handle_start_balance(
         self, message: StartBalanceNegotiation, meta: dict
     ) -> None:
@@ -1887,8 +1926,7 @@ class EnergyBalanceNegotiator(Role):
             message, "service_fraction_by_sector_priority", None
         )
         if service_frac:
-            if self._active:
-                return
+            self._yield_to_l2_authority("service_fraction")
             self._active = True
             self.context.schedule_instant_task(
                 self._dispatch_service_fractions(service_frac)
@@ -1901,8 +1939,7 @@ class EnergyBalanceNegotiator(Role):
             message, "override_targets_by_sector_priority", None
         )
         if per_tier:
-            if self._active:
-                return
+            self._yield_to_l2_authority("per_tier")
             self._active = True
             self.context.schedule_instant_task(
                 self._dispatch_per_tier_targets(per_tier)
@@ -1915,8 +1952,7 @@ class EnergyBalanceNegotiator(Role):
             # use the ADMM result directly as the gossip target so the
             # cross-sector optimisation actually drives the per-group
             # contribution instead of being discarded.
-            if self._active:
-                return
+            self._yield_to_l2_authority("override_target")
             self._active = True
             self.context.schedule_instant_task(self._start_gossip(float(override)))
             return
