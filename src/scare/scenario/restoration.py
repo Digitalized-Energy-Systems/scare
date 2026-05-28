@@ -269,6 +269,27 @@ def _is_heat_side_mass_flow_sink(child: Any, monee_net: Any) -> bool:
     return "water" in grid_name or "heat" in grid_name
 
 
+def _is_cp_subordinate_child(child: Any) -> bool:
+    """True when ``child`` is a coupling-point's *subordinate output*
+    rather than an independent device.
+
+    monee's ``CHPHG`` injects its heat through a ``SubHG`` child whose
+    ``q_mw_heat`` is a Var pinned by the control-node equation
+    (``sub_hg.q_mw_heat == -efficiency_heat · gas_kgps · regulation ·
+    3.6·hhv``) — it *follows* the ``CHPHGControlNode`` and is never
+    independently controllable.  SCARE controls (and counts) the CHP at
+    its control node (the cascade CP, which carries the heat leg), so
+    rolling ``SubHG`` as a standalone heat generator would (a) let the
+    heat layer issue regulate writes that can't actually move the
+    device and (b) double-count the same CHP heat in
+    ``supply_by_sector[heat]`` — once via this child and again via the
+    control-node CP — inflating the cascade's ``base_supply[heat]``.
+    Skip it at agent-build time; the physical heat injection still
+    happens through the Var in the energy-flow solve.
+    """
+    return type(child.model).__name__ == "SubHG"
+
+
 def _inverter_s_nom_mva(child: Any) -> float | None:
     """Return the inverter's rated apparent power in MVA.
 
@@ -532,6 +553,13 @@ def _populate_children(
         # the sector topology / community partition / holon membership,
         # so the dispatcher never tries to curtail them.
         if _is_heat_side_mass_flow_sink(child, monee_net):
+            continue
+
+        # A CHP's SubHG heat output follows its control node (the CP);
+        # it is not an independent agent — skip so it is neither
+        # separately regulated nor double-counted as a heat generator
+        # (see ``_is_cp_subordinate_child``).
+        if _is_cp_subordinate_child(child):
             continue
 
         # Register the resolved priority on ``behavior`` so anyone
@@ -897,15 +925,26 @@ def _cp_signed_capacity_by_sector(
 
     out: dict[str, float] = {}
     if "chp" in ct:
-        # The CHP is actuated through its ``chphgcontrolnode`` agent,
-        # whose obs carries the *actual* gas input rate in ``gas_kgps``
-        # (kg/s) plus ``efficiency_power`` / ``efficiency_heat``.  The
-        # older extractor read ``gas_kgps`` (fine here) but ``eta_el`` /
-        # ``eta_heat`` (absent → defaults).  ``mass_flow_setpoint`` is
-        # the equivalent key on the *compound* obs (the control node
-        # instead carries a per-unit ``mass_flow`` = 1, which must NOT
-        # be used as a rate).  ``gas_kgps`` first, ``mass_flow_setpoint``
-        # as the compound-obs fallback; never ``mass_flow``.
+        # The CHP is actuated through its ``chphgcontrolnode`` agent —
+        # monee's single controllability point for a CHPHG (gas in →
+        # electricity + heat out all scale with the control node's
+        # ``regulation``).  Its obs carries the *actual* gas input rate
+        # in ``gas_kgps`` (kg/s) plus ``efficiency_power`` /
+        # ``efficiency_heat``.  ``mass_flow_setpoint`` is the equivalent
+        # key on the *compound* obs (the control node instead carries a
+        # per-unit ``mass_flow`` = 1, which must NOT be used as a rate),
+        # so: ``gas_kgps`` first, ``mass_flow_setpoint`` as the
+        # compound-obs fallback; never ``mass_flow``.
+        #
+        # Heat *is* on the CP because the control node is the device's
+        # controllability point.  The ``SubHG`` child that physically
+        # injects that heat at the heat node is slaved to this control
+        # node (``sub_hg.q_mw_heat`` is a Var fixed by the control-node
+        # equation) and is therefore *not* an independent agent — it is
+        # skipped at agent-build time (see ``_is_cp_subordinate_child``)
+        # so the same CHP heat isn't also counted as a standalone heat
+        # generator in ``supply_by_sector`` (which would double-count it
+        # in the cascade's ``base_supply[heat]``).
         cap_in = kgps_to_mw(abs(_first_nonzero("gas_kgps", "mass_flow_setpoint")))
         if cap_in <= 0:
             return {}
