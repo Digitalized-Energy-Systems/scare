@@ -234,6 +234,24 @@ def lookup_slack(behavior: Any, aid: str) -> "_SlackMeta | None":
     return _slack_store(behavior).get(aid)
 
 
+def _slack_eff_budget_store(behavior: Any) -> dict[str, float]:
+    return _get_behavior_store(behavior, "_scare_slack_eff_budget")
+
+
+def set_slack_eff_budget(behavior: Any, aid: str, value: float) -> None:
+    """Record a slack's *effective* budget — the loss-compensated cap the
+    supply pool should advertise, maintained by ``SlackBudgetMonitor``'s
+    integral feedback.  ``EnergyBalanceNegotiator._handle_ask_flex`` reads
+    it (via :func:`lookup_slack_eff_budget`) in place of the nominal
+    ``|cap|`` so the L1/L2/L3 control targets ``B - losses`` and the
+    slack's *actual* draw lands at the operator budget ``B``."""
+    _slack_eff_budget_store(behavior)[aid] = float(value)
+
+
+def lookup_slack_eff_budget(behavior: Any, aid: str) -> float | None:
+    return _slack_eff_budget_store(behavior).get(aid)
+
+
 def _priority_store(behavior: Any) -> dict[str, int]:
     return _get_behavior_store(behavior, "_scare_priorities")
 

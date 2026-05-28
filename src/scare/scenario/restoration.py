@@ -577,6 +577,7 @@ def _populate_children(
                             obs_key=obs_key,
                             budget=budget_value,
                             tol=config.slack_budget_violation_tol,
+                            enable_feedback=config.enable_slack_budget_feedback,
                         )
                     )
 
@@ -767,6 +768,14 @@ def _detect_cp_type_for_node(node: Any, monee_net: Any) -> str | None:
     naming and monee's current ``PowerToGas`` / ``PowerToHeatHG`` /
     ``GasToPower`` / ``Chp`` class names.
     """
+    # The node's *own* model type — a CHP is actuated through its
+    # ``chphgcontrolnode`` (a node, not a branch), so branch-only
+    # detection missed every CHP and left it without a CP role (the
+    # gas-consuming lever the cascade's ``Σ r·c[gas] ≤ B_gas`` needs
+    # to throttle).  Check the node itself first.
+    own = _model_type_name(node)
+    if any(s in own for s in ("chp", "powertogas", "gastopower", "powertoheat")):
+        return own
     for branch in monee_net.branches_connected_to(node.id):
         t = _model_type_name(branch)
         if any(s in t for s in ("chp", "powertogas", "gastopower", "powertoheat")):
@@ -873,35 +882,62 @@ def _cp_signed_capacity_by_sector(
         except (TypeError, ValueError):
             return default
 
+    def _first_nonzero(*keys: str, default: float = 0.0) -> float:
+        """First present, non-zero obs value across *keys*; fallback to
+        *default*.  Lets each CP class accept the actual monee model's
+        rated-input key (e.g. CHPHG carries ``mass_flow_setpoint``,
+        PowerToHeatHG carries ``load_p_mw``) without breaking older
+        models that used the canonical generic keys (``gas_kgps``,
+        ``el_mw``)."""
+        for k in keys:
+            v = _f(k, 0.0)
+            if v != 0.0:
+                return v
+        return default
+
     out: dict[str, float] = {}
     if "chp" in ct:
-        cap_in = kgps_to_mw(abs(_f("gas_kgps")))
+        # The CHP is actuated through its ``chphgcontrolnode`` agent,
+        # whose obs carries the *actual* gas input rate in ``gas_kgps``
+        # (kg/s) plus ``efficiency_power`` / ``efficiency_heat``.  The
+        # older extractor read ``gas_kgps`` (fine here) but ``eta_el`` /
+        # ``eta_heat`` (absent → defaults).  ``mass_flow_setpoint`` is
+        # the equivalent key on the *compound* obs (the control node
+        # instead carries a per-unit ``mass_flow`` = 1, which must NOT
+        # be used as a rate).  ``gas_kgps`` first, ``mass_flow_setpoint``
+        # as the compound-obs fallback; never ``mass_flow``.
+        cap_in = kgps_to_mw(abs(_first_nonzero("gas_kgps", "mass_flow_setpoint")))
         if cap_in <= 0:
             return {}
-        eta_el = _f("eta_el", 0.35)
-        eta_he = _f("eta_heat", 0.45)
+        eta_el = _first_nonzero("efficiency_power", "eta_el", default=0.35)
+        eta_he = _first_nonzero("efficiency_heat", "eta_heat", default=0.45)
         out[ga] = cap_in
         out[el] = -cap_in * eta_el
         out[he] = -cap_in * eta_he
     elif "p2g" in ct or "powertogas" in ct:
-        cap_in = abs(_f("el_mw"))
+        cap_in = abs(_first_nonzero("el_mw", "load_p_mw"))
         if cap_in <= 0:
             return {}
-        eta = _f("eta_gas", _f("efficiency", 0.6))
+        eta = _first_nonzero("eta_gas", "efficiency", default=0.6)
         out[el] = cap_in
         out[ga] = -cap_in * eta
     elif "g2p" in ct or "gastopower" in ct:
-        cap_in = kgps_to_mw(abs(_f("gas_kgps")))
+        cap_in = kgps_to_mw(abs(_first_nonzero("gas_kgps", "mass_flow_setpoint")))
         if cap_in <= 0:
             return {}
-        eta = _f("eta_el", _f("efficiency", 0.45))
+        eta = _first_nonzero("efficiency_power", "eta_el", "efficiency",
+                             default=0.45)
         out[ga] = cap_in
         out[el] = -cap_in * eta
     elif "p2h" in ct or "powertoheat" in ct:
-        cap_in = abs(_f("el_mw"))
+        # PowerToHeatHG exposes ``load_p_mw`` (rated el input) and the
+        # generic ``efficiency`` — *not* ``el_mw``/``eta_heat``.  Same
+        # mis-key story as CHP: the extractor returned ``{}`` and P2H
+        # was never wired into the cascade.
+        cap_in = abs(_first_nonzero("el_mw", "load_p_mw"))
         if cap_in <= 0:
             return {}
-        eta = _f("eta_heat", _f("efficiency", 0.95))
+        eta = _first_nonzero("eta_heat", "efficiency", default=0.95)
         out[el] = cap_in
         out[he] = -cap_in * eta
     return out

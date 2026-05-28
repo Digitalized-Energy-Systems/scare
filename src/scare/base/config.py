@@ -347,6 +347,18 @@ class RestorationConfiguration:
     # of an LP that's already converged inside the envelope.
     slack_budget_violation_tol: float = 0.05
 
+    # Loss-compensating effective-budget feedback in the slack monitor.
+    # The operator budget caps the slack's *actual* draw, but the
+    # L1/L2/L3 control only shapes the served setpoints — network losses
+    # (plus the per-leader-group vs global supply-pool mismatch) leave
+    # the realized draw above budget even when the controller believes
+    # it hit the target.  When True, ``SlackBudgetMonitor`` runs an
+    # integral correction on the observed overage and advertises a
+    # tightened *effective* budget (``B - losses``) into the supply pool
+    # so the actual draw converges to the operator budget.  When False,
+    # the pool advertises the nominal budget (legacy behaviour).
+    enable_slack_budget_feedback: bool = True
+
     # GridReconfigurator path ranking by line loading.  When True the
     # reconfigurator carries a running max_loading_percent along each
     # GridPathMessage, buffers all results within a short window, and

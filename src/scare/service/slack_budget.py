@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 
 from scare.base.diagnostics import record_event
+from scare.base.util import set_slack_eff_budget
 from scare.base.model import (
     SECTOR_TIMESCALE,
     BalanceProblem,
@@ -60,6 +61,23 @@ _REFIRE_COOLDOWN_S: float = 2.0
 # slack draw hasn't moved by more than this since the last poll and
 # no violation is currently active, the whole tick is a no-op.
 _MONITOR_DELTA_TOL: float = 1e-4
+
+# Effective-budget integral-feedback gain.  Each poll the effective
+# budget moves by ``-gain · (|draw| - B)``.  Because the realized draw
+# tracks the advertised budget roughly 1:1 (``draw ≈ B_eff + losses``)
+# *with a one-control-cycle lag*, an aggressive gain overshoots (the
+# draw keeps falling after the budget stops moving) — observed as the
+# slack settling well *under* budget and the extra shedding tripping
+# the monotonic-progress transient guard.  0.3 damps that lag.
+_FEEDBACK_GAIN: float = 0.3
+
+# Floor on the effective budget as a fraction of the nominal budget.
+# A slack with no controllable lever (e.g. an infeasible operator
+# budget below the network's physical floor) would otherwise wind the
+# effective budget to zero and over-shed everything reachable; the
+# floor caps that futile tightening at a level that still leaves the
+# pool meaningful.
+_FEEDBACK_FLOOR_FRAC: float = 0.25
 
 
 class SlackBudgetMonitor(Role):
@@ -99,6 +117,7 @@ class SlackBudgetMonitor(Role):
         budget: float,
         tol: float = 0.05,
         home_leader_addr: "AgentAddress | None" = None,
+        enable_feedback: bool = True,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -107,11 +126,16 @@ class SlackBudgetMonitor(Role):
         self.budget = float(budget)
         self.tol = float(tol)
         self.home_leader_addr = home_leader_addr
+        self.enable_feedback = bool(enable_feedback)
         self._violation_active: bool = False
         self._last_emit_t: float = float("-inf")
         # Cache of the last observed slack draw — the polling watchdog
         # skips when the value hasn't moved and no violation is active.
         self._last_obs_val: float | None = None
+        # Loss-compensated effective budget, maintained by the integral
+        # feedback in ``_monitor``.  Starts at the nominal budget and is
+        # tightened toward ``B - losses`` so the *actual* draw lands at B.
+        self._eff_budget: float = float(budget)
 
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
@@ -145,6 +169,29 @@ class SlackBudgetMonitor(Role):
             val = float(obs[self.obs_key])
         except (TypeError, ValueError):
             return
+        # Effective-budget feedback (runs every poll, ahead of the cache
+        # gate so it keeps converging even at a steady draw).  Integral
+        # correction on the observed overage drives the advertised
+        # effective budget to ``B - losses`` so the slack's *actual*
+        # draw settles at the operator budget ``B`` — closing the
+        # residual gap the per-setpoint L1/L2/L3 control can't see
+        # (network losses + per-group-vs-global supply-pool slack).
+        if self.enable_feedback:
+            err = abs(val) - self.budget
+            # Deadband: once the draw is inside the operator tolerance
+            # band ``[B(1-tol), B(1+tol)]`` the budget is satisfied —
+            # stop correcting so the loop settles there instead of
+            # hunting (and over-shedding) around exact ``B``.
+            if abs(err) > self.tol * self.budget:
+                self._eff_budget -= _FEEDBACK_GAIN * err
+                lo = _FEEDBACK_FLOOR_FRAC * self.budget
+                if self._eff_budget > self.budget:
+                    self._eff_budget = self.budget
+                elif self._eff_budget < lo:
+                    self._eff_budget = lo
+                set_slack_eff_budget(
+                    self.behavior, self.context.aid, self._eff_budget
+                )
         # Cache gate: skip the whole pass when the slack draw hasn't
         # moved and no violation is currently active.  An active
         # violation must keep evaluating so the re-fire cooldown and

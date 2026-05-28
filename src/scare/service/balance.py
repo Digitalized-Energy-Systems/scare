@@ -42,6 +42,7 @@ from scare.base.util import (
     constraint_utilization,
     l2_effective_floor,
     lookup_slack,
+    lookup_slack_eff_budget,
     note_actuated_factor,
     obs_capacity,
     obs_min_max,
@@ -1865,7 +1866,12 @@ class EnergyBalanceNegotiator(Role):
             # allowance, not the breach.
             if cap < 0:
                 if lookup_slack(self.behavior, aid) is not None:
-                    gen_supply = abs(cap)   # slack: its budgeted rating
+                    # Slack: advertise its *effective* budget when the
+                    # SlackBudgetMonitor's loss-compensation feedback has
+                    # set one (so the pool targets ``B - losses`` and the
+                    # actual draw lands at ``B``); else the nominal budget.
+                    eff = lookup_slack_eff_budget(self.behavior, aid)
+                    gen_supply = float(eff) if eff is not None else abs(cap)
                 else:
                     gen_supply = abs(sp)    # generator: deliverable, not rated
                 supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + gen_supply
