@@ -20,6 +20,7 @@ from pathlib import Path
 
 from experiment.eval.claims import (
     _check_diary_invariant,
+    _check_heat_priority,
     _check_monotonic_progress,
     _check_priority_invariant,
     _check_slack_budget,
@@ -39,7 +40,10 @@ def _write_served_by_load(path: Path, loads: list[dict]) -> Path:
         served = ld["served"]
         rows.append({
             "aid": ld.get("aid", "x"),
-            "sector": ld.get("sector", "heat"),
+            # Default to a checked sector: heat is excluded from the
+            # priority-ordering claim (locally temperature-governed), so
+            # the mechanics tests (throttle/strand) use electricity.
+            "sector": ld.get("sector", "electricity"),
             "tier": ld["tier"],
             "node_id": ld.get("node_id", 0),
             "component": ld.get("component", "0"),
@@ -362,9 +366,9 @@ class TestPriorityInvariantConstraintThrottle:
     *below* its physical cap still is."""
 
     def test_throttled_high_tier_excluded_physics_aware(self, tmp_path):
-        # Heat: tier-2 cold node physically capped at 0.0 (constraint_
-        # allowed=0), tier-3 warm fully served.  Strict sees tier2<tier3
-        # inversion; physics-aware excludes the throttled tier-2 load.
+        # tier-2 load physically capped at 0.0 (constraint_allowed=0),
+        # tier-3 fully served.  Strict sees tier2<tier3 inversion;
+        # physics-aware excludes the throttled tier-2 load.
         p = _write_served_by_load(tmp_path / "served_by_load.csv", [
             {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.0, "constraint_allowed": 0.0},
             {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
@@ -402,10 +406,10 @@ class TestPriorityInvariantConstraintThrottle:
         cols = ("aid", "sector", "tier", "node_id", "component",
                 "demand", "served", "fraction", "disconnected")
         rows = [
-            {"aid": "a", "sector": "heat", "tier": 2, "node_id": 0,
+            {"aid": "a", "sector": "electricity", "tier": 2, "node_id": 0,
              "component": "0", "demand": 1.0, "served": 0.5, "fraction": 0.5,
              "disconnected": 0},
-            {"aid": "b", "sector": "heat", "tier": 3, "node_id": 0,
+            {"aid": "b", "sector": "electricity", "tier": 3, "node_id": 0,
              "component": "0", "demand": 1.0, "served": 1.0, "fraction": 1.0,
              "disconnected": 0},
         ]
@@ -413,3 +417,78 @@ class TestPriorityInvariantConstraintThrottle:
         res = _check_priority_invariant(p, exclude_constraint_throttled=True)
         assert res["passed"] is False
         assert res["detail"]["n_loads_throttled"] == 0
+
+
+class TestPriorityInvariantHeatExcluded:
+    """Heat is locally temperature-governed, so it is dropped from the
+    gating priority-ordering claim (``_LOCAL_PHYSICS_SECTORS``)."""
+
+    def test_heat_inversion_does_not_fail_claim(self, tmp_path):
+        # A blatant heat inversion (tier-2 shed below tier-3) must NOT
+        # flip the gating claim — heat is skipped by default.
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "a", "sector": "heat", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 1.0},
+            {"aid": "b", "sector": "heat", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+        ])
+        res = _check_priority_invariant(p)
+        assert res["passed"] is True
+        assert res["detail"]["n_loads_sector_skipped"] == 2
+        assert "heat" in res["detail"]["skipped_sectors"]
+
+    def test_electricity_inversion_still_fails_with_heat_present(self, tmp_path):
+        # Heat skipped, but a genuine electricity inversion still fails.
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "h1", "sector": "heat", "tier": 2, "demand": 1.0, "served": 0.0, "constraint_allowed": 1.0},
+            {"aid": "h2", "sector": "heat", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+            {"aid": "e1", "sector": "electricity", "tier": 2, "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
+            {"aid": "e2", "sector": "electricity", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+        ])
+        res = _check_priority_invariant(p)
+        assert res["passed"] is False
+        assert all(inv["sector"] == "electricity" for inv in res["detail"]["inversions"])
+
+    def test_explicit_empty_skip_set_restores_heat_check(self, tmp_path):
+        # Passing skip_sectors=frozenset() opts back into checking heat
+        # (used by the diagnostic / strict-validation callers).
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "a", "sector": "heat", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 1.0},
+            {"aid": "b", "sector": "heat", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+        ])
+        res = _check_priority_invariant(p, skip_sectors=frozenset())
+        assert res["passed"] is False
+
+
+class TestHeatPriorityDiagnostic:
+    """The non-gating ``heat_priority`` metric: per-tier feasible-heat
+    served fraction, with controllable inversions flagged for the oracle
+    diff."""
+
+    def test_reports_per_tier_feasible_and_flags_inversion(self, tmp_path):
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            # tier-1 feasible but shed to 0.3 (controllable error)
+            {"aid": "a", "sector": "heat", "tier": 1, "demand": 1.0, "served": 0.3, "constraint_allowed": 1.0},
+            # tier-2 feasible fully served → inversion vs tier-1
+            {"aid": "b", "sector": "heat", "tier": 2, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+        ])
+        res = _check_heat_priority(p)
+        assert res["passed"] is False
+        assert res["detail"]["n_feasible_inversions"] == 1
+        assert res["detail"]["per_tier_served_feasible"]["1"] == 0.3
+
+    def test_temperature_infeasible_load_excluded_from_feasible(self, tmp_path):
+        # A tier-1 load capped by temperature (constraint_allowed<1) drops
+        # out of the feasible subset → no controllable inversion flagged.
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "a", "sector": "heat", "tier": 1, "demand": 1.0, "served": 0.0, "constraint_allowed": 0.0},
+            {"aid": "b", "sector": "heat", "tier": 2, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+        ])
+        res = _check_heat_priority(p)
+        assert res["passed"] is True
+        assert res["detail"]["n_heat_loads_feasible"] == 1
+
+    def test_no_heat_loads_passes_vacuously(self, tmp_path):
+        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "e", "sector": "electricity", "tier": 1, "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
+        ])
+        res = _check_heat_priority(p)
+        assert res["passed"] is True

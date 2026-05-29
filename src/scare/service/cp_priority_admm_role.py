@@ -97,12 +97,17 @@ class CPPriorityAdmmRole(Role):
         admm_abs_tol: float = 1e-3,
         algorithm: str = "lexicographic",
         r_regularization: float = 0.1,
+        heat_supply_from_deficit: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
         self.cp_id = cp_id
         self.capacity_by_sector = dict(capacity_by_sector)
         self.bridged_sectors = list(bridged_sectors)
+        # When set, the heat sector's L3 base supply is the *delivered*
+        # heat (Σ served) rather than the (unbounded) heat-slack budget,
+        # so the unmet heat demand drives heat-producing CPs to ramp.
+        self.heat_supply_from_deficit = bool(heat_supply_from_deficit)
         self.home_node_id = home_node_id
         self.watchdog_s = watchdog_s
         self.rebalance_min_gap_s = rebalance_min_gap_s
@@ -336,9 +341,22 @@ class CPPriorityAdmmRole(Role):
             bucket = self._leader_summaries.get(sec_v, {})
             agg_demand: dict[int, float] = {}
             agg_supply: float = 0.0
+            heat_deficit_mode = (
+                self.heat_supply_from_deficit and sec_v == Sector.HEAT.value
+            )
             for summary in bucket.values():
-                supply_dict = summary.supply_by_sector or {}
-                agg_supply += float(supply_dict.get(sec_v, 0.0))
+                if heat_deficit_mode:
+                    # Heat delivery is temperature-limited, not MW-limited:
+                    # the unbounded heat slack would otherwise report an
+                    # effectively-infinite pool and L3 would never ramp a
+                    # heat CP.  Use the *delivered* heat (Σ served) as the
+                    # base supply so the unmet demand (nominal − delivered)
+                    # becomes the gap the reachable CHP/P2H units fill.
+                    served_map = (summary.served_by_sector_priority or {}).get(sec_v, {})
+                    agg_supply += sum(float(v) for v in served_map.values())
+                else:
+                    supply_dict = summary.supply_by_sector or {}
+                    agg_supply += float(supply_dict.get(sec_v, 0.0))
                 d_map = (summary.demand_by_sector_priority or {}).get(sec_v, {})
                 for tier, val in d_map.items():
                     agg_demand[int(tier)] = agg_demand.get(int(tier), 0.0) + float(val)

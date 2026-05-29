@@ -61,6 +61,12 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
     out["monotonic_progress"] = _check_monotonic_progress(
         task_dir / "timeseries.csv", task_dir / "events.csv"
     )
+    # Diagnostic (non-gating): heat is excluded from the priority-ordering
+    # claims above because its shedding follows local temperature
+    # feasibility; this tracks the per-tier feasible-heat served fraction so
+    # the residual controllable heat-priority gap stays measurable (vs the
+    # oracle at aggregation time).
+    out["heat_priority"] = _check_heat_priority(task_dir / "served_by_load.csv")
     out["slack_budget_compliance"] = _check_slack_budget(
         task_dir / "events.csv",
         timeseries_path=task_dir / "timeseries.csv",
@@ -105,6 +111,19 @@ def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
 # *below* its physical cap has been shed by a decision and still counts.
 _THROTTLE_CAP_TOL: float = 0.02
 
+# Sectors excluded from the priority-ordering claims (``priority_invariant``,
+# its strict variant, and ``monotonic_progress``).  Heat load control is
+# governed by *local* junction-temperature feasibility, not a global
+# priority allocation: a heat load on a flow-starved node must be shed to
+# keep its return temperature feasible regardless of its tier, and the act
+# of shedding it can recover the node to a feasible temperature so the
+# end-of-sim ``constraint_allowed`` reads ~1.0 — making a temperature-forced
+# shed indistinguishable from a priority shed.  Checking aggregate per-tier
+# served fractions on heat therefore mis-flags physically-forced shedding as
+# a priority violation.  Heat priority is instead tracked by the (non-gating)
+# ``heat_priority`` diagnostic, which is honest only relative to the oracle.
+_LOCAL_PHYSICS_SECTORS: frozenset[str] = frozenset({"heat"})
+
 # Near-full exemption (physics-aware check only).  A higher-priority tier
 # served at or above this fraction is treated as *essentially fully
 # served*: a marginal shortfall below a fully-served lower-priority tier
@@ -127,11 +146,18 @@ def _check_priority_invariant(
     legacy_served_csv: Path | None = None,
     exclude_constraint_throttled: bool = True,
     near_full_exempt: bool = True,
+    skip_sectors: frozenset[str] = _LOCAL_PHYSICS_SECTORS,
 ) -> dict[str, Any]:
     """At end-of-sim, when total demand exceeds capacity *within a
     connected component*, the served fraction must be non-increasing in
     priority tier (per (sector, component)): tier 1 ≥ tier 2 ≥ … ≥ tier
     P.
+
+    ``skip_sectors`` (default ``{"heat"}``): sectors whose service is
+    governed by *local* physics rather than a global priority allocation
+    are dropped entirely — see ``_LOCAL_PHYSICS_SECTORS``.  The count of
+    skipped loads is reported via ``n_loads_sector_skipped`` so the loss
+    stays visible.
 
     ``exclude_constraint_throttled`` (physics-aware, default): also drop
     loads that are capped by a *local constraint* (``served`` at/near the
@@ -189,6 +215,8 @@ def _check_priority_invariant(
     stranded_demand_mw = 0.0
     n_loads_throttled = 0
     throttled_demand_mw = 0.0
+    n_loads_sector_skipped = 0
+    sector_skipped_demand_mw = 0.0
     for r in rows:
         try:
             sec = r["sector"]
@@ -197,6 +225,13 @@ def _check_priority_invariant(
             demand = float(r["demand"])
             served = float(r["served"])
         except (KeyError, ValueError):
+            continue
+        # Locally-governed sectors (heat): excluded from the priority
+        # ordering check — their shedding follows junction-temperature
+        # feasibility, not tier (see ``_LOCAL_PHYSICS_SECTORS``).
+        if sec in skip_sectors:
+            n_loads_sector_skipped += 1
+            sector_skipped_demand_mw += demand
             continue
         # Stranded loads (no source path) — separate bucket.
         disc_raw = (r.get("disconnected") or "0").strip()
@@ -278,6 +313,105 @@ def _check_priority_invariant(
             "excluded_constraint_throttled": exclude_constraint_throttled,
             "n_loads_throttled": n_loads_throttled,
             "throttled_demand_mw": throttled_demand_mw,
+            "skipped_sectors": sorted(skip_sectors),
+            "n_loads_sector_skipped": n_loads_sector_skipped,
+            "sector_skipped_demand_mw": sector_skipped_demand_mw,
+        },
+    }
+
+
+def _check_heat_priority(by_load_path: Path) -> dict[str, Any]:
+    """Diagnostic (non-gating) heat-priority metric.
+
+    Heat is excluded from the gating ``priority_invariant`` claim because
+    its shedding tracks local junction-temperature feasibility, not tier
+    (see ``_LOCAL_PHYSICS_SECTORS``).  But heat priority is still worth
+    *measuring*: this reports the per-tier heat served fraction restricted
+    to the **feasible** subset (loads whose ``constraint_allowed`` is at
+    full — i.e. those the controller could serve regardless of
+    temperature).  Among that subset, served fraction *should* be
+    non-increasing in tier; a residual inversion there is a controllable
+    priority error (e.g. a feasible high-priority heat load shed to zero
+    while a feasible lower-priority one is served).
+
+    This is honest only *relative to the oracle*: a node the failures
+    flow-starved is temperature-infeasible and drops out of the feasible
+    subset for SCARE and the oracle alike, so the aggregator compares
+    ``per_tier_served_feasible`` against the oracle's to read the true
+    controllable gap.  Reported, never gating.
+    """
+    if not by_load_path.exists():
+        return {"passed": True, "detail": "no served_by_load.csv"}
+    rows = _read_csv(by_load_path)
+    if not rows:
+        return {"passed": True, "detail": "empty served_by_load.csv"}
+
+    # Per-tier aggregation over feasible (non-throttled, connected) heat
+    # loads, and separately over all heat loads (for the oracle diff).
+    feasible: dict[int, dict[str, float]] = {}
+    all_heat: dict[int, dict[str, float]] = {}
+    n_feasible = 0
+    n_total = 0
+    for r in rows:
+        try:
+            if r["sector"] != "heat":
+                continue
+            tier = int(r["tier"])
+            demand = float(r["demand"])
+            served = float(r["served"])
+        except (KeyError, ValueError):
+            continue
+        disc_raw = (r.get("disconnected") or "0").strip()
+        if disc_raw in ("1", "true", "True"):
+            continue
+        n_total += 1
+        a = all_heat.setdefault(tier, {"demand": 0.0, "served": 0.0})
+        a["demand"] += demand
+        a["served"] += served
+        try:
+            allowed = float(r.get("constraint_allowed", 1.0))
+        except (TypeError, ValueError):
+            allowed = 1.0
+        if allowed >= 1.0 - _THROTTLE_CAP_TOL:
+            n_feasible += 1
+            f = feasible.setdefault(tier, {"demand": 0.0, "served": 0.0})
+            f["demand"] += demand
+            f["served"] += served
+
+    if not all_heat:
+        return {"passed": True, "detail": "no heat loads"}
+
+    def _fracs(agg: dict[int, dict[str, float]]) -> dict[int, float]:
+        return {
+            t: (e["served"] / e["demand"] if e["demand"] > 0 else 1.0)
+            for t, e in sorted(agg.items())
+        }
+
+    per_tier_feasible = _fracs(feasible)
+    per_tier_all = _fracs(all_heat)
+
+    # Inversions among the feasible subset (controllable priority errors).
+    inversions: list[dict[str, Any]] = []
+    tiers = sorted(per_tier_feasible)
+    for i in range(1, len(tiers)):
+        t_prev, t_cur = tiers[i - 1], tiers[i]
+        f_prev, f_cur = per_tier_feasible[t_prev], per_tier_feasible[t_cur]
+        if f_cur > f_prev + 1e-3:
+            inversions.append({
+                "tier_prev": t_prev, "frac_prev": round(f_prev, 4),
+                "tier_cur": t_cur, "frac_cur": round(f_cur, 4),
+            })
+
+    return {
+        "passed": not inversions,
+        "detail": {
+            "per_tier_served_feasible": {str(t): round(v, 4) for t, v in per_tier_feasible.items()},
+            "per_tier_served_all": {str(t): round(v, 4) for t, v in per_tier_all.items()},
+            "n_heat_loads_feasible": n_feasible,
+            "n_heat_loads_total": n_total,
+            "feasible_inversions": inversions,
+            "n_feasible_inversions": len(inversions),
+            "gating": False,
         },
     }
 
@@ -400,7 +534,14 @@ def _check_monotonic_progress(
 
     if by_sector_tier:
         violations: dict[str, dict[str, Any]] = {}
+        skipped_sectors: list[str] = []
         for sec, tier_series in by_sector_tier.items():
+            # Heat shedding follows local junction-temperature feasibility,
+            # not tier order (see ``_LOCAL_PHYSICS_SECTORS``), so a tier's
+            # regulation can correctly drop while a lower tier stays served.
+            if sec in _LOCAL_PHYSICS_SECTORS:
+                skipped_sectors.append(sec)
+                continue
             maxes = {
                 k: (max(abs(y) for y in ys) or 1.0)
                 for k, (_t, ys) in tier_series.items()
@@ -436,14 +577,16 @@ def _check_monotonic_progress(
                 "tol": _DROP_TOL,
                 "shed_eps": _SHED_EPS,
                 "warmup_s": _WARMUP_S,
+                "skipped_sectors": sorted(set(skipped_sectors)),
             },
         }
 
     # --- Fallback: legacy per-sector aggregate drop ---------------------
+    # Heat omitted: its shedding tracks local temperature feasibility, not
+    # tier order (see ``_LOCAL_PHYSICS_SECTORS``).
     sectors = {
         "electricity": "electrical_balance",
         "gas": "gas_balance",
-        "heat": "heat_balance",
     }
     drops: dict[str, float] = {}
     for sec, col in sectors.items():

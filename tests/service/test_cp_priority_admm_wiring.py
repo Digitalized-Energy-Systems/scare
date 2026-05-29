@@ -491,3 +491,61 @@ def test_build_demands_converts_gas_dimension_to_mw() -> None:
     el = demands[Sector.ELECTRICITY.value]
     assert float(el.base_supply[0]) == pytest.approx(10.0)
     assert float(el.demand_by_tier[1][0]) == pytest.approx(4.0)
+
+
+# ---------------------------------------------------------------------------
+# Heat -> L3 supply link (enable_heat_cp_supply)
+# ---------------------------------------------------------------------------
+
+
+def test_heat_base_supply_uses_delivered_heat_in_deficit_mode():
+    """With ``heat_supply_from_deficit`` set, the heat sector's L3 base
+    supply is the *delivered* heat (Σ served), not the (unbounded) heat-
+    slack budget — so the unmet demand becomes the gap CPs must fill."""
+    role, _, _ = _make_role("chp-A", capacity_by_sector={"heat": -0.05, "gas": 0.1})
+    role.heat_supply_from_deficit = True
+    _inject_holon_summary(
+        role,
+        leader_aid="heat-leader",
+        sector=Sector.HEAT,
+        supply_mw=10.0,                 # unbounded-ish slack pool
+        demand_by_tier={1: 0.8},        # nominal heat demand
+        served_by_tier={1: 0.3},        # only 0.3 delivered (temp-limited)
+    )
+    heat = {d.sector: d for d in role._build_demands()}[Sector.HEAT.value]
+    # base supply == delivered (0.3), NOT the 10.0 slack pool
+    assert float(heat.base_supply[0]) == pytest.approx(0.3)
+    assert float(heat.demand_by_tier[1][0]) == pytest.approx(0.8)
+
+
+def test_heat_base_supply_uses_slack_when_flag_off():
+    """Default (flag off): heat keeps the slack-budget base supply, so the
+    pre-existing behaviour is preserved for ablation."""
+    role, _, _ = _make_role("chp-A", capacity_by_sector={"heat": -0.05})
+    assert role.heat_supply_from_deficit is False
+    _inject_holon_summary(
+        role,
+        leader_aid="heat-leader",
+        sector=Sector.HEAT,
+        supply_mw=10.0,
+        demand_by_tier={1: 0.8},
+        served_by_tier={1: 0.3},
+    )
+    heat = {d.sector: d for d in role._build_demands()}[Sector.HEAT.value]
+    assert float(heat.base_supply[0]) == pytest.approx(10.0)
+
+
+def test_deficit_mode_does_not_touch_electricity_base_supply():
+    """The deficit reframe is heat-scoped: electricity keeps slack supply
+    even when the flag is on."""
+    role, _, _ = _make_role(
+        "chp-A", capacity_by_sector={"heat": -0.05, "electricity": -0.02},
+        bridged_sectors=[Sector.HEAT, Sector.ELECTRICITY],
+    )
+    role.heat_supply_from_deficit = True
+    _inject_holon_summary(
+        role, leader_aid="el-leader", sector=Sector.ELECTRICITY,
+        supply_mw=10.0, demand_by_tier={1: 4.0}, served_by_tier={1: 1.0},
+    )
+    el = {d.sector: d for d in role._build_demands()}[Sector.ELECTRICITY.value]
+    assert float(el.base_supply[0]) == pytest.approx(10.0)  # slack, not served

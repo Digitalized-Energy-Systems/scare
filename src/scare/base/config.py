@@ -42,6 +42,24 @@ class RestorationConfiguration:
     # Set True to re-enable holon+gossip on heat for ablations.
     enable_heat_mw_balance: bool = False
 
+    # Re-establish the heat sector's link to the Layer-3 CP coordination
+    # after the MW-balance deactivation above severed it.  The cold loads'
+    # leaders signal their *delivered* heat (served) — not the unbounded
+    # heat-slack budget — as the L3 base supply, so the unmet heat demand
+    # (nominal − delivered) drives the reachable heat-producing coupling
+    # points (CHP / P2H) to ramp their heat output.  Without this, L3 sees
+    # the heat slack's effectively-infinite pool, judges heat fully
+    # supplied, and leaves every heat CP idle even while flow-starved
+    # junctions sit below the temperature floor.  Heat-scoped; el/gas
+    # keep the slack-budget base supply.  Set False to ablate.
+    enable_heat_cp_supply: bool = True
+    # Refresh cadence (s) for a heat leader's HolonSummary so the
+    # post-failure delivered-heat vector reaches L3 within the episode.
+    # Needed because heat's normal summary triggers (L1 gossip finish /
+    # L2 dispatch) are off under ``enable_heat_mw_balance=False`` and the
+    # 30 s liveness watchdog never fires inside a short run.
+    heat_cp_supply_refresh_s: float = 2.0
+
     # Level-3 cross-sector ADMM at coupling-point agents.  When False,
     # ``EnergyConverterRole`` / ``DistributedOptimizationRole`` /
     # ``CoordinatorRole`` are not installed on CP nodes/branches and
@@ -298,6 +316,19 @@ class RestorationConfiguration:
     # / ``"heat_recovery"`` (restore) so the heat curtail-lock makes L2 defer.
     # Strictly heat-scoped.  Set False to ablate against the gate behaviour.
     enable_heat_frontier: bool = True
+
+    # Priority-waterfall gate for the heat frontier controller.  Heat
+    # shedding is otherwise tier-blind: each load drives its OWN junction
+    # temperature to the feasibility frontier independently, so the shed
+    # burden falls by geography, not priority (a critical tier-1 load on a
+    # flow-starved node sheds itself while a lower-priority load on a warm
+    # node keeps drawing).  With this on, a cold heat load broadcasts its
+    # (tier, reducible) and defers its own shed while a strictly
+    # lower-priority load in its hydraulic region still has reducible draw
+    # — so shedding follows the priority order (lowest priority first),
+    # matching the oracle.  Heat-scoped; set False to recover the
+    # tier-blind frontier behaviour.
+    enable_heat_priority_waterfall: bool = True
 
     # Local Q-V droop at every inverter-coupled PowerGenerator (PV).
     # Follows the VDE-AR-N 4105 Q(U) characteristic: piecewise-linear

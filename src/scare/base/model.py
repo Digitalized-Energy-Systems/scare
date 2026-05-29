@@ -467,6 +467,13 @@ class ConstraintStateMessage:
     utilization: float
     hops_remaining: int
     origin_addr: Any = None
+    # Priority-coordination fields (heat frontier controller).  Carried on
+    # the same broadcast so a cold heat load can see whether lower-priority
+    # reducible heat load exists in its hydraulic region and defer its own
+    # (tier-blind) shed to the priority waterfall.  ``None`` on non-heat /
+    # legacy messages.
+    priority_tier: int | None = None
+    reducible: float | None = None
 
 
 @dataclass

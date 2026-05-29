@@ -265,11 +265,21 @@ class HolonSummaryRole(Role):
         enable_cross_sector_coalitions: bool = False,
         cp_meta: dict[str, dict[str, Any]] | None = None,
         peer_leader_addrs: dict[Sector, dict[str, Any]] | None = None,
+        enable_heat_cp_supply: bool = False,
+        heat_refresh_s: float = 2.0,
     ) -> None:
         super().__init__()
         self.behavior = behavior
         self.sector = sector
         self.period_s = period_s
+        # Heat→L3 link: heat's normal summary triggers (L1 gossip finish /
+        # L2 dispatch) are off under ``enable_heat_mw_balance=False``, so a
+        # heat leader's served/demand vector would otherwise stay frozen at
+        # the pre-failure publish until the 30 s watchdog (never inside a
+        # short run).  Refresh it on this faster cadence so the delivered-
+        # heat deficit reaches the CP-ADMM.  Heat-scoped.
+        self.enable_heat_cp_supply = bool(enable_heat_cp_supply)
+        self.heat_refresh_s = float(heat_refresh_s)
         # Watchdog cadence: even when nothing has moved, re-run the
         # publish + invariant check + coalition re-assert at this
         # slow interval so a peer joining late still sees the current
@@ -414,6 +424,14 @@ class HolonSummaryRole(Role):
         # above; the watchdog catches missed events (peer joining
         # late, coalition TTL needing renewal during a silent window).
         self.context.schedule_periodic_task(self._tick, delay=self.watchdog_s)
+        # Heat→L3 refresh: heat has no event-driven publish trigger under
+        # ``enable_heat_mw_balance=False``, so drive a faster delta-gated
+        # republish for heat leaders.  Keeps the delivered-heat vector the
+        # CP-ADMM reads current within a short run.
+        if self.sector == Sector.HEAT and self.enable_heat_cp_supply:
+            self.context.schedule_periodic_task(
+                self._publish_and_check, delay=self.heat_refresh_s
+            )
 
     async def _tick(self) -> None:
         if topology_characteristic(self, tid="groups") != "leader":

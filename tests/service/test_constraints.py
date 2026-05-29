@@ -305,3 +305,146 @@ async def test_worst_neighbour_utilization_default():
         pass
 
     assert monitor.worst_neighbour_utilization() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Heat priority-waterfall gate
+# ---------------------------------------------------------------------------
+
+
+def _cold_heat_monitor(priority: int, waterfall: bool = True):
+    """A cold (t_k=300) heat load that the frontier controller would shed.
+
+    ``enable_heat_frontier=False`` only suppresses the *auto-scheduled*
+    periodic task (which would otherwise fire during world startup with an
+    empty peer cache); the tests invoke ``_heat_frontier_control`` directly
+    to exercise the gate in isolation.
+    """
+    behavior = MockBehavior()
+    behavior.set_obs(
+        "agent-0",
+        {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 300.0, "priority": priority},
+    )
+    behavior.add_action("agent-0", "regulate")
+    monitor = GridConstraintMonitor(
+        behavior, Sector.HEAT, node_id=0, max_hops=1,
+        # Disable the other auto-scheduled levers (SCADA-poll auction
+        # self-curtail, multi-hop propagation) so only the manually-invoked
+        # frontier gate writes a regulate.
+        enable_curtailment_auction=False,
+        enable_multihop_constraint=False,
+        enable_heat_frontier=False,
+        enable_heat_priority_waterfall=waterfall,
+    )
+    return behavior, monitor
+
+
+@pytest.mark.asyncio
+async def test_frontier_defers_shed_when_lower_priority_reducible_in_region():
+    """A cold high-priority (tier-1) heat load defers its own shed while a
+    strictly lower-priority (tier-4) peer still has reducible draw — so the
+    waterfall sheds the low-priority load first."""
+    behavior, monitor = _cold_heat_monitor(priority=1)
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+    async with world:
+        monitor._sensitivity = 660.0
+        now = monitor.context.current_timestamp
+        monitor._heat_peer_state["peer-4"] = (now, 4, 0.05)  # tier-4, reducible
+        await monitor._heat_frontier_control()
+    assert not [a for a in behavior.action_log if a[1] == "regulate"], \
+        "tier-1 load should defer to the lower-priority peer, not self-shed"
+
+
+@pytest.mark.asyncio
+async def test_frontier_sheds_when_only_higher_priority_peers():
+    """No strictly-lower-priority reducible peer ⇒ the cold load sheds
+    itself (it is the lowest-priority lever available)."""
+    behavior, monitor = _cold_heat_monitor(priority=2)
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+    async with world:
+        monitor._sensitivity = 660.0
+        now = monitor.context.current_timestamp
+        monitor._heat_peer_state["peer-1"] = (now, 1, 0.05)  # higher priority
+        await monitor._heat_frontier_control()
+    regs = [a for a in behavior.action_log if a[1] == "regulate"]
+    assert regs and regs[-1][2][0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_frontier_sheds_when_lower_priority_exhausted():
+    """Once the lower-priority peer has shed (reducible ≈ 0) the gate opens
+    and the high-priority load finally sheds itself (waterfall terminates)."""
+    behavior, monitor = _cold_heat_monitor(priority=1)
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+    async with world:
+        monitor._sensitivity = 660.0
+        now = monitor.context.current_timestamp
+        monitor._heat_peer_state["peer-4"] = (now, 4, 1e-9)  # essentially shed
+        await monitor._heat_frontier_control()
+    regs = [a for a in behavior.action_log if a[1] == "regulate"]
+    assert regs and regs[-1][2][0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_frontier_stale_peer_aged_out():
+    """A lower-priority peer whose state is older than the freshness window
+    is ignored, so the load is not pinned in a permanent defer."""
+    behavior, monitor = _cold_heat_monitor(priority=1)
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+    async with world:
+        monitor._sensitivity = 660.0
+        now = monitor.context.current_timestamp
+        stale = now - monitor._HEAT_PEER_FRESHNESS_S - 1.0
+        monitor._heat_peer_state["peer-4"] = (stale, 4, 0.05)
+        await monitor._heat_frontier_control()
+    regs = [a for a in behavior.action_log if a[1] == "regulate"]
+    assert regs and regs[-1][2][0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_frontier_waterfall_disabled_sheds_tier_blind():
+    """With the gate disabled the controller reverts to tier-blind shedding
+    even when a lower-priority peer exists."""
+    behavior, monitor = _cold_heat_monitor(priority=1, waterfall=False)
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+    async with world:
+        monitor._sensitivity = 660.0
+        now = monitor.context.current_timestamp
+        monitor._heat_peer_state["peer-4"] = (now, 4, 0.05)
+        await monitor._heat_frontier_control()
+    regs = [a for a in behavior.action_log if a[1] == "regulate"]
+    assert regs and regs[-1][2][0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_handle_constraint_state_populates_heat_peer_cache():
+    """A heat t_k ConstraintStateMessage carrying (tier, reducible) lands in
+    the priority-waterfall peer cache."""
+    from scare.base.model import ConstraintStateMessage
+
+    behavior, monitor = _cold_heat_monitor(priority=1)
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+    async with world:
+        msg = ConstraintStateMessage(
+            sector=Sector.HEAT, variable="t_k", value=300.0, utilization=1.2,
+            hops_remaining=1, origin_addr="peer-9", priority_tier=4,
+            reducible=0.03,
+        )
+        await monitor._handle_constraint_state(
+            msg, {"sender_addr": "peer-sender", "sender_id": "s0"}
+        )
+    assert "peer-9" in monitor._heat_peer_state
+    _t, tier, reducible = monitor._heat_peer_state["peer-9"]
+    assert tier == 4 and abs(reducible - 0.03) < 1e-9

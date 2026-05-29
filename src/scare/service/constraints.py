@@ -161,6 +161,7 @@ class GridConstraintMonitor(Role):
         enable_curtailment_auction: bool = True,
         enable_multihop_constraint: bool = True,
         enable_heat_frontier: bool = True,
+        enable_heat_priority_waterfall: bool = True,
         branch_id: Any = None,
         home_leader_addr: Any = None,
     ) -> None:
@@ -172,6 +173,12 @@ class GridConstraintMonitor(Role):
         self.enable_curtailment_auction = enable_curtailment_auction
         self.enable_multihop_constraint = enable_multihop_constraint
         self.enable_heat_frontier = enable_heat_frontier
+        # Priority-waterfall gate for the heat frontier controller: a cold
+        # heat load defers its own (tier-blind) shed while lower-priority
+        # reducible heat load remains in its hydraulic region, so shedding
+        # follows the priority order (lowest-priority first).  See
+        # ``_heat_frontier_control``.
+        self.enable_heat_priority_waterfall = enable_heat_priority_waterfall
         # Branch mode: when ``branch_id`` is set the monitor is running
         # on a PowerLine branch agent.  Local ``emit_event(BalanceProblem)``
         # is a no-op on a branch (no co-located EnergyBalanceNegotiator),
@@ -185,6 +192,14 @@ class GridConstraintMonitor(Role):
         # Neighbour constraint state cache:
         # (origin_addr_str, variable) -> ConstraintStateMessage
         self._neighbour_state: dict[tuple[str, str], ConstraintStateMessage] = {}
+
+        # Heat priority-waterfall peer cache: origin_addr_str ->
+        # (t_received, priority_tier, reducible).  Populated from heat
+        # ``t_k`` ConstraintStateMessages that carry the priority-coordination
+        # fields; read by the frontier controller's deferral gate with a
+        # freshness window so a peer that has since shed (and stopped
+        # re-broadcasting) ages out instead of pinning a stale defer.
+        self._heat_peer_state: dict[str, tuple[float, int, float]] = {}
 
         # Deduplication: track which (origin, variable) we have already
         # forwarded with the (best_hops_remaining, t_received, value)
@@ -482,14 +497,15 @@ class GridConstraintMonitor(Role):
                 self._handle_warning(var, val, lo, hi, util)
 
             if self.enable_multihop_constraint:
-                await self._propagate_state(var, val, util)
+                await self._propagate_state(var, val, util, obs=obs)
 
     # ------------------------------------------------------------------
     # Multi-hop state propagation with deduplication
     # ------------------------------------------------------------------
 
     async def _propagate_state(
-        self, variable: str, value: float, utilization: float
+        self, variable: str, value: float, utilization: float,
+        obs: dict | None = None,
     ) -> None:
         # Suppress re-broadcasts of an unchanged value unless the
         # freshness window has elapsed (keeps trust-ledger liveness alive)
@@ -506,6 +522,25 @@ class GridConstraintMonitor(Role):
             if not (stale or changed):
                 return
 
+        # Heat t_k broadcasts carry this load's (tier, reducible) so cold
+        # neighbours can run the priority-waterfall gate in
+        # ``_heat_frontier_control``.  Only meaningful for a curtailable
+        # heat load; left ``None`` otherwise.
+        prio_tier: int | None = None
+        reducible: float | None = None
+        if (
+            self.sector == Sector.HEAT
+            and variable == "t_k"
+            and obs is not None
+            and self.behavior.has_action(self.context.aid, "regulate")
+        ):
+            prio_tier = max(
+                1, obs_priority(obs, behavior=self.behavior, aid=self.context.aid)
+            )
+            reducible = abs(
+                obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
+            )
+
         origin = self.context.addr
         msg = ConstraintStateMessage(
             sector=self.sector,
@@ -514,6 +549,8 @@ class GridConstraintMonitor(Role):
             utilization=utilization,
             hops_remaining=self.max_hops,
             origin_addr=origin,
+            priority_tier=prio_tier,
+            reducible=reducible,
         )
         origin_key = (str(origin), variable)
         self._state_forwarded[origin_key] = (self.max_hops, now, utilization)
@@ -535,6 +572,13 @@ class GridConstraintMonitor(Role):
 
         # Cache the latest state from this origin
         self._neighbour_state[origin_key] = message
+
+        # Heat priority-waterfall: cache the origin's (tier, reducible) when
+        # the message carries them, stamped with arrival time for freshness.
+        if message.priority_tier is not None and message.reducible is not None:
+            self._heat_peer_state[str(message.origin_addr)] = (
+                now, message.priority_tier, message.reducible,
+            )
 
         # --- Deduplication ---
         # Forward only if the incoming copy improves on what we've
@@ -578,6 +622,8 @@ class GridConstraintMonitor(Role):
             utilization=message.utilization,
             hops_remaining=message.hops_remaining - 1,
             origin_addr=message.origin_addr,
+            priority_tier=message.priority_tier,
+            reducible=message.reducible,
         )
         for addr in topology_neighbors(self, tid="groups"):
             # Don't send back to the origin or the immediate sender
@@ -908,6 +954,34 @@ class GridConstraintMonitor(Role):
     # rate-limited controller can take enough steps to converge a deeply
     # cold node to its frontier within the run.
     _HEAT_FRONTIER_PERIOD_S: float = 1.0
+    # Priority-waterfall gate.  A heat load broadcasts its (tier, reducible)
+    # on its t_k state message; a cold load defers its own shed while a
+    # peer in its hydraulic region with strictly lower priority (higher
+    # tier number) still has reducible heat draw above this epsilon (MW).
+    # Freshness window ages out peers that have since shed and stopped
+    # re-broadcasting (re-broadcast fires on a t_k move or every
+    # ``_FORWARD_FRESHNESS_S``), so a stale "still reducible" can't pin a
+    # permanent defer.
+    _WATERFALL_REDUCIBLE_EPS: float = 1e-4
+    _HEAT_PEER_FRESHNESS_S: float = 2.0 * _FORWARD_FRESHNESS_S
+
+    def _region_has_lower_priority_reducible(self, my_tier: int) -> float:
+        """Total reducible heat draw of fresh same-region peers at a
+        strictly lower priority (higher tier number) than ``my_tier``.
+
+        Drives the frontier controller's deferral gate: while this is
+        non-trivial, a cold load lets the lower-priority loads (and the
+        priority-weighted curtailment auction) absorb the shed first
+        instead of shedding itself tier-blind.
+        """
+        now = self.context.current_timestamp
+        total = 0.0
+        for _origin, (t_rx, tier, reducible) in self._heat_peer_state.items():
+            if now - t_rx > self._HEAT_PEER_FRESHNESS_S:
+                continue
+            if tier > my_tier and reducible > self._WATERFALL_REDUCIBLE_EPS:
+                total += reducible
+        return total
 
     async def _heat_frontier_control(self) -> None:
         """Drive this heat load's regulation toward the point where its
@@ -956,6 +1030,26 @@ class GridConstraintMonitor(Role):
         )
         if not (too_cold or can_restore):
             return  # inside the hold band
+
+        # Priority-waterfall gate (shed direction only): if a strictly
+        # lower-priority heat load in our hydraulic region still has
+        # reducible draw, defer — let it (and the priority-weighted
+        # curtailment auction) absorb the shed first rather than shedding
+        # this higher-priority load tier-blind.  The gate opens once the
+        # lower tiers have shed (their reducible decays toward 0), so a
+        # genuinely needed shed of this load still happens, just last in
+        # priority order.  Restores are never gated here.
+        if too_cold and self.enable_heat_priority_waterfall:
+            my_tier = max(
+                1, obs_priority(obs, behavior=self.behavior, aid=self.context.aid)
+            )
+            if self._region_has_lower_priority_reducible(my_tier) > 0.0:
+                logger.debug(
+                    "[%s] heat frontier: defer shed (t_k=%.1f, tier=%s) — "
+                    "lower-priority reducible load remains in region",
+                    self.context.aid, t, my_tier,
+                )
+                return
 
         # d(t_k)/d(reg) for heat is NEGATIVE (more extraction -> colder); the
         # EMA stores the magnitude |dt_k/dP|, dP/dreg = cap.  Floor the

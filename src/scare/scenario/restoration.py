@@ -586,6 +586,7 @@ def _populate_children(
                     enable_curtailment_auction=config.enable_curtailment_auction,
                     enable_multihop_constraint=config.enable_multihop_constraint,
                     enable_heat_frontier=config.enable_heat_frontier,
+                    enable_heat_priority_waterfall=config.enable_heat_priority_waterfall,
                 )
             )
             # Slack-budget enforcement.  Only slack-class children carry
@@ -1016,6 +1017,7 @@ def _attach_cp_priority_admm_role(
             bridged_sectors=sectors,
             algorithm=config.cp_admm_algorithm,
             r_regularization=config.cp_admm_r_regularization,
+            heat_supply_from_deficit=config.enable_heat_cp_supply,
         )
     )
 
@@ -1630,6 +1632,8 @@ def _build_topologies(
                         ),
                         cp_meta=cp_meta_by_aid,
                         peer_leader_addrs=peer_leader_addrs,
+                        enable_heat_cp_supply=config.enable_heat_cp_supply,
+                        heat_refresh_s=config.heat_cp_supply_refresh_s,
                     )
                 )
 
