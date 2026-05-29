@@ -116,6 +116,39 @@ def _branch_is_active(branch: Any) -> bool:
     return bool(getattr(branch, "active", True))
 
 
+# Heat "served" at a node whose temperature is outside the hard heat
+# bounds the oracle LP enforces (``SECTOR_CONSTRAINTS[HEAT]["t_k"]``) is
+# not physically valid service — the centralised baseline refuses to
+# serve it.  The live sim only enforces ``t_k`` softly (reactive
+# GridConstraintMonitor), so without this gate it counts heat served at
+# infeasible node temperatures and "beats" the temperature-constrained
+# oracle (the CP-heavy ``post > baseline`` ratios).  A small tolerance
+# keeps marginal numerical wiggle at the bound from over-firing while
+# still catching gross violations (cold-day nodes solve to ~240 K).
+_HEAT_T_TOL_K: float = 1.0
+
+
+def _heat_served_feasible(obs: dict, sec: Any) -> bool:
+    """False iff this is a heat load whose node temperature is outside the
+    hard ``t_k`` bounds the oracle enforces (within ``_HEAT_T_TOL_K``).
+    Non-heat loads, missing / non-finite readings, and configs without a
+    heat ``t_k`` bound all pass (never gate on absent data)."""
+    if sec is not Sector.HEAT:
+        return True
+    bounds = SECTOR_CONSTRAINTS.get(Sector.HEAT, {}).get("t_k")
+    if bounds is None:
+        return True
+    t = obs.get("t_k")
+    try:
+        t = float(t)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(t):
+        return True
+    lo, hi = bounds
+    return (lo - _HEAT_T_TOL_K) <= t <= (hi + _HEAT_T_TOL_K)
+
+
 def served_by_load(
     monee_net: Any,
     behavior: Any,
@@ -158,6 +191,11 @@ def served_by_load(
         sec = sector_from_grid(node.grid)
         if sec is None:
             continue
+        # Don't credit heat served at an out-of-bounds node temperature
+        # (the oracle won't either) — see ``_heat_served_feasible``.
+        temp_infeasible = not _heat_served_feasible(obs, sec)
+        if temp_infeasible:
+            served = 0.0
         if priorities is not None and aid in priorities:
             tier = int(priorities[aid])
         else:
@@ -166,11 +204,17 @@ def served_by_load(
         # util→fraction the gossip clamp uses).  A load served at/near
         # this cap is throttled by *physics*, not by a priority decision
         # — the physics-aware priority-invariant check excludes it the
-        # way it already excludes disconnected loads.
-        allowed = (
-            1.0 if is_disconnected
-            else constraint_allowed_fraction(obs, sec, tier=tier)
-        )
+        # way it already excludes disconnected loads.  A temperature-
+        # infeasible heat load is hard-capped at 0 here (overriding the
+        # tier-dependent deadband, incl. tier-1's immunity) so the
+        # priority-invariant check excludes it as constraint-throttled
+        # rather than reading its barrier-zeroed served as a priority shed.
+        if temp_infeasible:
+            allowed = 0.0
+        elif is_disconnected:
+            allowed = 1.0
+        else:
+            allowed = constraint_allowed_fraction(obs, sec, tier=tier)
         rows.append({
             "aid": aid,
             "sector": sec.value,
@@ -283,6 +327,10 @@ def served_breakdown(
         sec = sector_from_grid(node.grid)
         if sec is None:
             continue
+        # Don't credit heat served at an out-of-bounds node temperature
+        # (matches the oracle's hard t_k bound) — see ``_heat_served_feasible``.
+        if served > 0.0 and not _heat_served_feasible(obs, sec):
+            served = 0.0
         if priorities is not None and aid in priorities:
             tier = int(priorities[aid])
         else:
