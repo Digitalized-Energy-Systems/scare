@@ -28,6 +28,7 @@ from scare.base.model import (
     ConstraintWarning,
     EnergyNegotiationMessage,
     FailureNotice,
+    L2RecycleEscalation,
     LocalGenerationApproval,
     LocalGenerationRequest,
     NegotiationFinishedEvent,
@@ -2233,9 +2234,31 @@ class EnergyBalanceNegotiator(Role):
         # matches: cross-sector coupling effects propagate physically
         # but the agent-side response goes through ConstraintViolation,
         # not this notice.
-        if self.sector == Sector.HEAT:
-            return
         if message.sector != self.sector:
+            return
+        # L2 escalation (all sectors, incl. heat; members too): relay the
+        # topology change to our community leader so it can re-waterfall
+        # the whole component.  The per-component coordinator may be many
+        # physical hops away — beyond this notice's TTL — so a member that
+        # locally detected the failure tells its leader, which fans the
+        # escalation across the component-peer mesh.  This re-cycles the L2
+        # *allocation / component membership* (a topology concern); it is
+        # distinct from the heat L1 *setpoint* trigger below, which stays
+        # constraint-driven.  Route over the ``groups`` topology (the L1
+        # gossip topology, where the leader is reachable) rather than
+        # ``CommunityAssignment.leader_addr`` (not reliably populated for
+        # members): send to every group neighbour, and only the leader
+        # acts (``_handle_l2_recycle`` gates on group-leadership), so
+        # non-leader neighbours harmlessly ignore the relay.
+        try:
+            group_neighbours = list(topology_neighbors(self, tid="groups"))
+        except Exception:  # noqa: BLE001
+            group_neighbours = []
+        escalation = L2RecycleEscalation(sector=self.sector, from_member=True)
+        for addr in group_neighbours:
+            await self.context.send_message(escalation, receiver_addr=addr)
+        # --- L1 setpoint trigger: sector-specific, leader-only ---------
+        if self.sector == Sector.HEAT:
             return
         if topology_characteristic(self, tid="groups") != "leader":
             return

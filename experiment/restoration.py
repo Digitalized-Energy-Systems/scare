@@ -239,11 +239,23 @@ def apply_slack_budget(mes, fraction: float) -> None:
 
     1. Compute the operator's budget per sector from the sum of
        nominal load magnitudes (same formula as before).
-    2. Set the slack Var bounds to a generous *physical* envelope
-       ``± _SLACK_LP_HEADROOM_FACTOR · budget`` so the LP can always
-       balance the network (with a high slack draw paying a "natural"
-       price via the load-shedding objective if one is set, or simply
-       being absorbed if no objective constrains it).
+    2. Set the slack Var bounds to a generous *physical* envelope so the
+       LP can always balance the network (with a high slack draw paying a
+       "natural" price via the load-shedding objective if one is set, or
+       simply being absorbed if no objective constrains it).  The
+       envelope is ``± _SLACK_LP_HEADROOM_FACTOR · max(budget, sector
+       throughput)`` — the throughput term (total load *plus* total
+       generation / source magnitude in the sector) is what keeps the LP
+       feasible on grids where CP / generation flow dwarfs native load.
+       Sizing the envelope off the operator budget alone (the old
+       behaviour) under-sized it on such grids: on ``simbench_lv_small``
+       native gas load is 3e-4 kg/s but the gas sources / CHP push
+       ~1e-2 kg/s through the slack, so the old ``10·budget`` bound
+       (1.35e-3) made the energy-flow LP infeasible on the *intact*
+       network (eval tasks 84/85).  The envelope is purely an LP
+       feasibility guard; the operator policy is the *soft* budget in
+       step 3, which is left unchanged so the MAS target and the
+       ``slack_budget_compliance`` claim are unaffected.
     3. Stash the budget as the underscore-prefixed attribute
        ``_scare_slack_budget_mw`` / ``_scare_slack_budget_kgs`` on
        the slack model so F1's scenario-build hook can register that
@@ -267,13 +279,24 @@ def apply_slack_budget(mes, fraction: float) -> None:
     # convention, so route them by parent-node grid name — counting
     # heat-side Sinks toward the gas budget would inflate the cap by
     # roughly 4× and make the constraint inert in practice.
+    #
+    # We also track per-sector *injection* magnitude (PowerGenerator for
+    # electricity, gas-side Source for gas).  The operator budget is sized
+    # off load only, but the LP slack may have to absorb the full local
+    # injection (e.g. a grid whose generators / gas sources far exceed its
+    # native load), so the feasibility envelope is sized off load + the
+    # injection it might need to backstop.
     total_p_mw = 0.0
     total_gas_mass_kgs = 0.0
+    total_p_gen_mw = 0.0
+    total_gas_source_kgs = 0.0
     for child in mes.childs:
         m = child.model
         if isinstance(m, PowerLoad):
             total_p_mw += abs(getattr(m, "p_mw", 0.0))
-        elif isinstance(m, Sink):
+        elif isinstance(m, PowerGenerator):
+            total_p_gen_mw += abs(getattr(m, "p_mw", 0.0))
+        elif isinstance(m, (Sink, Source)):
             try:
                 grid_name = str(
                     getattr(mes.node_by_id(child.node_id).grid, "name", "")
@@ -281,13 +304,23 @@ def apply_slack_budget(mes, fraction: float) -> None:
             except Exception:
                 grid_name = ""
             if "gas" in grid_name:
-                total_gas_mass_kgs += abs(getattr(m, "mass_flow", 0.0))
+                if isinstance(m, Sink):
+                    total_gas_mass_kgs += abs(getattr(m, "mass_flow", 0.0))
+                else:
+                    total_gas_source_kgs += abs(getattr(m, "mass_flow", 0.0))
 
     cap_p_mw = max(1e-3, fraction * total_p_mw)
     cap_gas_mass_kgs = max(1e-4, fraction * total_gas_mass_kgs)
 
-    lp_p_mw = _SLACK_LP_HEADROOM_FACTOR * cap_p_mw
-    lp_gas_mass_kgs = _SLACK_LP_HEADROOM_FACTOR * cap_gas_mass_kgs
+    # Feasibility envelope: never below the sector's physical throughput
+    # (load + injection it may have to absorb), so the LP can always
+    # balance regardless of how small the operator budget is relative to
+    # CP / generation flow.  ``max(...)`` makes this a no-op on grids where
+    # the old ``HEADROOM · budget`` envelope already exceeded throughput.
+    lp_p_mw = _SLACK_LP_HEADROOM_FACTOR * max(cap_p_mw, total_p_mw + total_p_gen_mw)
+    lp_gas_mass_kgs = _SLACK_LP_HEADROOM_FACTOR * max(
+        cap_gas_mass_kgs, total_gas_mass_kgs + total_gas_source_kgs
+    )
 
     for child in mes.childs:
         m = child.model

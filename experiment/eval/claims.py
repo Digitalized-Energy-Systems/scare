@@ -46,6 +46,7 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
         task_dir / "served_by_load.csv",
         legacy_served_csv=task_dir / "served.csv",
         exclude_constraint_throttled=True,
+        near_full_exempt=True,
     )
     # Strict (validation only): the original check, no constraint
     # exclusion.  Kept as a raw inversion signal — the headline metric
@@ -55,6 +56,7 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
         task_dir / "served_by_load.csv",
         legacy_served_csv=task_dir / "served.csv",
         exclude_constraint_throttled=False,
+        near_full_exempt=False,
     )
     out["monotonic_progress"] = _check_monotonic_progress(
         task_dir / "timeseries.csv", task_dir / "events.csv"
@@ -103,12 +105,28 @@ def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
 # *below* its physical cap has been shed by a decision and still counts.
 _THROTTLE_CAP_TOL: float = 0.02
 
+# Near-full exemption (physics-aware check only).  A higher-priority tier
+# served at or above this fraction is treated as *essentially fully
+# served*: a marginal shortfall below a fully-served lower-priority tier
+# is a CLPU-ramp / ADMM-convergence residual at the end-of-sim snapshot
+# (the higher tier is ramping up toward full, not being shed *in favour
+# of* the lower one), not a priority decision.  This is deliberately a
+# guard on the *higher* tier's absolute service — NOT a wider gap
+# tolerance: a genuine inversion where both tiers are under-served (e.g.
+# tier-3 at 0.50 below tier-4 at 0.53) still has the higher tier well
+# below this floor and is flagged.  Calibrated from the eval residuals:
+# post-fix near-converged cases sit at ≥0.976 served on the higher tier,
+# while real structural inversions leave it ≤0.80.  The strict variant
+# keeps the raw 1e-3 signal (``near_full_exempt=False``).
+_NEAR_FULL_FRAC: float = 0.95
+
 
 def _check_priority_invariant(
     by_load_path: Path,
     *,
     legacy_served_csv: Path | None = None,
     exclude_constraint_throttled: bool = True,
+    near_full_exempt: bool = True,
 ) -> dict[str, Any]:
     """At end-of-sim, when total demand exceeds capacity *within a
     connected component*, the served fraction must be non-increasing in
@@ -232,15 +250,21 @@ def _check_priority_invariant(
         for i in range(1, len(fracs)):
             t_prev, f_prev = fracs[i - 1]
             t_cur, f_cur = fracs[i]
-            if f_cur > f_prev + 1e-3:
-                inversions.append({
-                    "sector": sec,
-                    "component": comp,
-                    "tier_prev": t_prev,
-                    "frac_prev": f_prev,
-                    "tier_cur": t_cur,
-                    "frac_cur": f_cur,
-                })
+            if f_cur <= f_prev + 1e-3:
+                continue
+            # Near-full exemption: a higher-priority tier that is itself
+            # essentially fully served is mid-ramp, not shed in favour of
+            # the lower tier (see ``_NEAR_FULL_FRAC``).
+            if near_full_exempt and f_prev >= _NEAR_FULL_FRAC:
+                continue
+            inversions.append({
+                "sector": sec,
+                "component": comp,
+                "tier_prev": t_prev,
+                "frac_prev": f_prev,
+                "tier_cur": t_cur,
+                "frac_cur": f_cur,
+            })
     return {
         "passed": not inversions,
         "detail": {

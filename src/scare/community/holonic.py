@@ -59,10 +59,12 @@ from scare.base.model import (
     AvailableFlexAnswer,
     CommunityAssignment,
     CommunityReassignedEvent,
+    FailureNotice,
     HebbianFlexBeacon,
     HolonicAssignment,
     HolonicJoinAnswer,
     HolonicJoinRequest,
+    L2RecycleEscalation,
     LocalGenerationApproval,
     LocalGenerationRequest,
     NegotiationFinishedEvent,
@@ -297,6 +299,16 @@ class HolonicCommunityRole(Role):
         # ``True`` initially so the first watchdog tick still runs
         # (covers the no-events-since-boot edge case).
         self._rebalance_dirty: bool = True
+        # A reactive trigger that arrives inside ``rebalance_min_gap_s``
+        # is throttled; without recovery it would sit dirty until the
+        # *slow* ``watchdog_s`` tick (30 s) — which never fires inside a
+        # short eval sim, stranding the work for seconds (eval task-62:
+        # the post-failure component re-cycle was throttled at t=0.10 and
+        # not recovered until an unrelated trigger at t≈5.3).  This flag
+        # guards a single deferred retry scheduled at gap-expiry so the
+        # throttled work runs as soon as the fuse clears, without adding a
+        # periodic heartbeat that would fire on stable inputs.
+        self._rebalance_retry_pending: bool = False
 
         # Resolved holon membership on the leader side.  Populated when
         # ``_handle_join_answer`` confirms acceptances; consulted by
@@ -470,6 +482,28 @@ class HolonicCommunityRole(Role):
         self.context.subscribe_event(
             self, NegotiationFinishedEvent, self._on_member_finished_local
         )
+        # Locality-respecting prompt L2 re-cycle: react to the propagated,
+        # TTL-bounded ``FailureNotice`` (same signal the ProblemDetector
+        # gossips from the failed branch's endpoints) so a topology change
+        # re-allocates the affected component promptly under the
+        # re-elected coordinator — instead of waiting for a downstream L1
+        # negotiation to finish.  Sector-filtered: only a same-sector
+        # branch failure changes this sector's component connectivity.
+        self.context.subscribe_message(
+            self,
+            _wrap(self._on_failure_notice),
+            lambda msg, meta: isinstance(msg, FailureNotice)
+            and msg.sector == self.sector,
+        )
+        # L2 recycle escalation: a member relays a locally-detected
+        # failure to its leader (from_member=True), or a peer leader
+        # fans the escalation across the component (from_member=False).
+        self.context.subscribe_message(
+            self,
+            _wrap(self._handle_l2_recycle),
+            lambda msg, meta: isinstance(msg, L2RecycleEscalation)
+            and msg.sector == self.sector,
+        )
         if self.enable_hebbian_formation:
             self.context.subscribe_message(
                 self,
@@ -576,8 +610,105 @@ class HolonicCommunityRole(Role):
         """Repartition just changed our community membership — our
         holon-eligibility set may have moved too.  Kick a formation
         attempt without waiting for the watchdog.
+
+        Also kick a full L2 rebalance.  A failure that islands a leader
+        re-elects a fresh component coordinator (the lex-smallest leader
+        still reachable); previously the reassignment only re-formed
+        holons, so the new coordinator's per-component ADMM did not re-run
+        until some *unrelated* L1 negotiation later happened to finish and
+        fire ``_on_member_finished`` — leaving the post-failure component
+        on the predecessor's stale per-tier allocation for seconds (eval
+        task-62: the heat component sat un-reallocated from the t=1.0
+        repartition until t≈5.3, and the successor then shed tier-3 while
+        the predecessor's stale tier-4 = 1.0 lingered → priority
+        inversion).  Re-running the cycle on the topology-change event
+        itself makes the re-allocation prompt: every reassigned leader
+        re-collects and re-reports to the (re-elected) coordinator, so the
+        new component is allocated consistently instead of opportunistically.
         """
         self.context.schedule_instant_task(self._try_form_holon())
+        self.context.schedule_instant_task(self._broadcast_recycle())
+
+    async def _on_failure_notice(self, message: FailureNotice, _meta: dict) -> None:
+        """A ``FailureNotice`` reached this node — kick a prompt L2
+        rebalance so the post-failure component re-allocates immediately
+        under the (re-elected) coordinator.
+
+        This is the *locality-respecting* L2 re-cycle trigger.  The notice
+        is the same TTL-bounded, sector-tagged gossip that
+        ``ProblemDetector`` originates at the failed branch's endpoints
+        and forwards through surviving same-sector neighbours, so only
+        communities physically reached by the propagation react — no agent
+        responds to a failure it could not have detected.  (We do *not*
+        subscribe to the global ``BranchFailureEvent``: that would let a
+        spatially-distant leader observe a failure it is nowhere near.)
+
+        Without this, the per-component ADMM only re-runs *indirectly* —
+        when a downstream L1 negotiation finishes and fires
+        ``_on_member_finished`` — so after a failure islands a leader the
+        freshly re-elected coordinator can lag seconds behind and then
+        allocate over a partial actor set, leaving the new component on
+        the predecessor's stale per-tier allocation (eval task-62: the
+        heat component sat un-reallocated from the t=1.0 repartition until
+        t≈5.3, then the successor shed tier-3 while the predecessor's
+        stale tier-4=1.0 lingered → a priority inversion).
+
+        Fires for heat too, even though the heat L1 negotiator
+        deliberately ignores the notice (heat *setpoints* are
+        constraint/temperature-driven): the L2 *component membership and
+        coordinator* are a topology concern, so they must react to a
+        topology-change signal regardless of sector.  ``_maybe_schedule_
+        rebalance``'s group-leader gate + min-gap throttle keep it cheap
+        for non-leaders and collapse failure bursts.
+        """
+        await self._broadcast_recycle()
+
+    async def _broadcast_recycle(self) -> None:
+        """L2 escalation: a topology change reached this leader, so tell
+        *every* peer in the current active component to run a fresh
+        waterfall, then kick our own.
+
+        This is the "all leaders communicate + re-waterfall" step.  The
+        ``FailureNotice`` propagation is TTL-bounded and may reach only a
+        few agents near the failure (a single comp leader, or only
+        members — eval task-62); fanning the escalation out across the
+        component-peer mesh ensures the *re-elected* coordinator — which
+        can be many physical hops away — and every leader that owns part
+        of the component re-collect and re-report, so the post-failure
+        allocation is computed over a complete actor set rather than
+        whatever partial reports happened to trickle in.
+
+        Single-hop: peers receive ``from_member=False`` and only rebalance
+        (they do not re-broadcast), bounding fan-out.  Only group leaders
+        broadcast; non-leaders no-op via the membership gate below.
+        """
+        if topology_characteristic(self, tid="groups") != "leader":
+            return
+        peers = self._resolve_component_peer_addrs()
+        msg = L2RecycleEscalation(sector=self.sector, from_member=False)
+        for aid, addr in peers.items():
+            if aid == self.context.aid:
+                continue
+            await self.context.send_message(msg, receiver_addr=addr)
+        self._maybe_schedule_rebalance()
+
+    async def _handle_l2_recycle(
+        self, message: L2RecycleEscalation, _meta: dict
+    ) -> None:
+        """Inbound L2 recycle escalation.
+
+        From a *member* (``from_member=True``): this leader owns that
+        member's community — re-broadcast to the whole component so all
+        peers re-waterfall.  From a *peer leader* (``from_member=False``):
+        just re-collect and re-report; do not re-broadcast (single-hop
+        fan-out, no flooding).
+        """
+        if topology_characteristic(self, tid="groups") != "leader":
+            return
+        if message.from_member:
+            await self._broadcast_recycle()
+        else:
+            self._maybe_schedule_rebalance()
 
     async def _try_form_holon(self) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
@@ -1105,9 +1236,27 @@ class HolonicCommunityRole(Role):
         if self._rebalance_active:
             return
         now = self.context.current_timestamp
-        if now - self._last_rebalance_t < self.rebalance_min_gap_s:
+        gap_left = (self._last_rebalance_t + self.rebalance_min_gap_s) - now
+        if gap_left > 0:
+            # Throttled.  Don't strand the dirty work until the slow
+            # ``watchdog_s`` tick — schedule a single deferred retry at
+            # gap-expiry so it runs as soon as the fuse clears.
+            if not self._rebalance_retry_pending:
+                self._rebalance_retry_pending = True
+                self.context.schedule_timestamp_task(
+                    self._deferred_rebalance(), timestamp=now + gap_left
+                )
             return
         self.context.schedule_instant_task(self._try_rebalance())
+
+    async def _deferred_rebalance(self) -> None:
+        """Fire a throttled rebalance once its ``rebalance_min_gap_s``
+        fuse has cleared.  ``_try_rebalance`` re-checks the gap, the
+        ``_rebalance_active`` guard and the dirty flag, so this is a
+        no-op if the state was already resolved by an intervening round.
+        """
+        self._rebalance_retry_pending = False
+        await self._try_rebalance()
 
     async def _on_member_finished(
         self, message: NegotiationFinishedEvent, meta: dict
@@ -2642,6 +2791,39 @@ class HolonicCommunityRole(Role):
         # inside the cooldown window and got suppressed.  The PI
         # claim's 1e-3 tolerance already absorbs unscrubbed
         # per-sector noise; we don't gain anything by clamping.
+
+        # G1a — complete + monotone per-tier vector.  A component round
+        # may solve over only a subset of tiers (the actors that reported
+        # and are currently reachable).  Dispatching just those tiers lets
+        # a lower-priority tier keep a stale, higher fraction from an
+        # earlier round: the eval task-88 / task-51 inversions, where a
+        # later {1,2,3} round shed tier-3 without re-touching a tier-4 an
+        # earlier round had set to 1.0, leaving tier-4 served *above* the
+        # shed tier-3 in the same component.  Fold the previous dispatch's
+        # tiers in to fill the gaps (fresh values win), then clamp the
+        # whole vector non-increasing in tier number so the priority
+        # ordering (tier 1 ≥ tier 2 ≥ …) holds by construction over the
+        # tiers this coordinator has actually allocated.  The waterfall
+        # allocator is already monotone over the tiers it solves; this
+        # only corrects the cross-round carry-forward.
+        #
+        # NB: deliberately bounded to tiers present in this coordinator's
+        # own solve+history — NOT a force over all P tiers.  The
+        # coordinator-handoff inversion (task-62: a fresh successor
+        # coordinator that never inherits the predecessor's tier-4 state)
+        # is out of reach here and needs the sector-wide L2.5
+        # reconciliation; forcing unsolved/unknown tiers down at dispatch
+        # over-sheds and regressed the single-coordinator cases this fix
+        # targets (eval sweep 2026-05-28).
+        sec_val = self.sector.value
+        prev_own = (self._last_component_fraction or {}).get(sec_val, {})
+        merged_own = dict(prev_own)
+        merged_own.update(service_fraction.get(sec_val, {}))
+        cap = 1.0
+        for tier in sorted(t for t in merged_own if t >= 1):
+            merged_own[tier] = min(merged_own[tier], cap)
+            cap = merged_own[tier]
+        service_fraction = {**service_fraction, sec_val: merged_own}
 
         self._last_component_fraction = service_fraction
         logger.info(

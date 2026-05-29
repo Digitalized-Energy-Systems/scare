@@ -257,6 +257,30 @@ class GridPathResult:
 
 
 @dataclass
+class L2RecycleEscalation:
+    """Escalate a locally-detected topology change to the L2 component layer.
+
+    A community *member* that receives a ``FailureNotice`` cannot itself
+    re-run the per-component waterfall — but it can tell its leader.  It
+    sends this with ``from_member=True`` to its community leader; the
+    leader then re-broadcasts it (``from_member=False``) to every peer in
+    its active component and runs a fresh rebalance.  Peers receiving the
+    ``from_member=False`` form re-collect and re-report to the (possibly
+    re-elected) coordinator but do *not* re-broadcast, bounding the fan-out
+    to a single hop.
+
+    This rides the agent organisation (member → leader → component-peer
+    mesh), so the re-cycle reaches a coordinator that is many physical
+    hops from the failure — beyond the TTL-bounded ``FailureNotice``
+    propagation — while still being driven only by agents that locally
+    detected the failure (no global event subscription).
+    """
+
+    sector: Sector
+    from_member: bool = False
+
+
+@dataclass
 class AskForAvailableFlex:
     include_connectors: bool = False
 

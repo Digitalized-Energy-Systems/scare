@@ -220,6 +220,35 @@ def _seed_everything(seed: int) -> None:
     np.random.seed(seed % (2**32 - 1))
 
 
+def ensure_deterministic_hashing(seed: str = "0") -> None:
+    """Pin ``PYTHONHASHSEED`` so the campaign is reproducible.
+
+    ``random`` / ``np.random`` are seeded per task (``_seed_everything``),
+    but Python's *hash* randomisation is fixed at interpreter start and is
+    left random by default.  That makes ``set`` / ``frozenset`` iteration
+    order over agent-id strings vary per worker process, which perturbs
+    async message scheduling and the per-round ADMM actor sets — enough to
+    flip the priority-invariant pass/fail and swing the measured inversion
+    gap run-to-run for the *same* ``(grid, seed, scenario)`` task (eval
+    reproducibility audit, 2026-05-28: task-88 gave gap 0.0 / 0.20 / 0.27
+    on three identical runs; pinning the hash seed made it identical).
+
+    Hash randomisation can only be disabled before the interpreter starts,
+    so we set the env var and re-exec the process once.  Spawned / forked
+    workers then inherit the pinned value from this process's environment.
+    A user-supplied ``PYTHONHASHSEED`` (anything other than the disabled
+    sentinel ``"random"``) is respected and never overridden.  No-op once
+    pinned, so the re-exec happens at most once.
+    """
+    current = os.environ.get("PYTHONHASHSEED")
+    if current is not None and current != "random":
+        return
+    os.environ["PYTHONHASHSEED"] = seed
+    # ``sys.orig_argv`` (3.10+) preserves the exact invocation, including
+    # ``-m experiment.hpc.<launcher>`` so package imports keep working.
+    os.execv(sys.executable, sys.orig_argv)
+
+
 def _resolve_failures(monee_net: Any, plan: RuntimePlan, task: TaskSpec) -> list[Any]:
     """Draw the failure scenario for this task.
 
@@ -929,6 +958,7 @@ def _resolve_task_id(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    ensure_deterministic_hashing()
     args = _parse_args()
     sys.exit(run_task(args.campaign_dir.resolve(), _resolve_task_id(args), reraise=args.reraise))
 

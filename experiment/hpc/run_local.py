@@ -21,7 +21,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from experiment.hpc.plan import filter_task_ids, read_manifest
-from experiment.hpc.runner import run_task
+from experiment.hpc.runner import ensure_deterministic_hashing, run_task
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,10 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # Pin the hash seed (re-exec once) before the worker pool is created,
+    # so every worker — spawned or in-process — has reproducible
+    # set/frozenset ordering.  See ``ensure_deterministic_hashing``.
+    ensure_deterministic_hashing()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
     args = _parse_args()
     campaign_dir = args.campaign_dir.resolve()
