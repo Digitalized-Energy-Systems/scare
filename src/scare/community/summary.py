@@ -128,6 +128,8 @@ from scare.community.coalition_store import CoalitionConstraintStore
 from scare.community.deliverability import per_actor_deliverable_caps
 from scare.community.supply_priority_admm import allocate_supply_priority
 from scare.base.util import (
+    lookup_slack,
+    lookup_slack_eff_budget,
     obs_capacity,
     obs_priority,
     obs_sector,
@@ -511,10 +513,20 @@ class HolonSummaryRole(Role):
             cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
             if cap < 0:
                 # Generator / slack injector — contributes to the
-                # community's supply pool.  Phase-1: captured into the
-                # extended summary so the future replicated kernel can
-                # read this leader's supply slice directly off the mesh.
-                supply_total += abs(cap)
+                # community's supply pool, which L3's CP-ADMM reads off
+                # this mesh as its per-sector ``base_supply``.  For a
+                # *slack* advertise its operator budget (the SlackBudget
+                # Monitor's loss-compensated *effective* budget when set,
+                # else the nominal one) rather than the raw ``|cap|`` —
+                # mirrors ``EnergyBalanceNegotiator._handle_ask_flex`` so
+                # the L2→L3 supply matches the L1/L2 pool and the CP draw
+                # is actually capped at the budget (without this the
+                # tightened budget never reached L3 and gas over-drew).
+                if lookup_slack(self.behavior, aid) is not None:
+                    eff = lookup_slack_eff_budget(self.behavior, aid)
+                    supply_total += float(eff) if eff is not None else abs(cap)
+                else:
+                    supply_total += abs(cap)
                 continue
             if cap == 0:
                 continue
@@ -1240,9 +1252,14 @@ class HolonSummaryRole(Role):
             cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
             sec_v = sec.value
             if cap < 0:  # generator-class — register supply
-                supply_by_sector[sec_v] = (
-                    supply_by_sector.get(sec_v, 0.0) + abs(float(cap))
-                )
+                # Slack advertises its (effective) operator budget, not
+                # its raw |cap| — see the publish path above.
+                if lookup_slack(self.behavior, aid) is not None:
+                    eff = lookup_slack_eff_budget(self.behavior, aid)
+                    add = float(eff) if eff is not None else abs(float(cap))
+                else:
+                    add = abs(float(cap))
+                supply_by_sector[sec_v] = supply_by_sector.get(sec_v, 0.0) + add
                 continue
             if cap <= 0:  # slack / passive — skip
                 continue
