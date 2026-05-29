@@ -155,6 +155,144 @@ async def test_local_sensitivity_ema_update():
 
 
 @pytest.mark.asyncio
+async def test_heat_sensitivity_updates_for_mw_scale_dp():
+    """Heat sensitivity must update for MW-scale setpoint deltas.
+
+    Regression for the ``_SENSITIVITY_MIN_DP[HEAT]`` unit mismatch: it was
+    0.5 (as if P were in W), but heat ``obs_setpoint`` is ``q_mw_heat`` in
+    MW (~0.0075–0.05), so no regulation step could ever exceed it — the
+    estimate stayed pinned at the 1e-5 default and the curtailment-auction
+    willingness lost its sensitivity term entirely.
+    """
+    behavior = MockBehavior()
+    behavior.add_action("agent-0", "regulate")
+    monitor = GridConstraintMonitor(behavior, Sector.HEAT, node_id=0, max_hops=1)
+
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    initial = monitor.local_sensitivity()
+
+    async with world:
+        # setpoint = q_mw_heat * regulation; each step moves P by ~0.02 MW
+        # (≫ the 5e-4 MW floor) and t_k by a few K -> the EMA must move.
+        for reg, t in [(1.0, 360.0), (0.6, 366.0), (0.3, 372.0)]:
+            behavior.set_obs(
+                "agent-0", {"q_mw_heat": 0.05, "regulation": reg, "t_k": t}
+            )
+            await step_simulation(world, step_size_s=6.0)
+
+    assert monitor.local_sensitivity() != initial
+    assert monitor.local_sensitivity() > 0.0
+
+
+@pytest.mark.asyncio
+async def test_curtail_willingness_sensitivity_is_bounded():
+    """The sensitivity multiplier in the auction willingness is clamped to
+    ``[_SENS_MULT_MIN, _SENS_MULT_MAX]`` so it ranks within a tier but can
+    never overcome the 1e4 priority tier step (no waterfall inversion)."""
+    from scare.service.constraints import _SENS_MULT_MAX, _SENS_MULT_MIN
+
+    behavior = MockBehavior()
+    behavior.set_obs(
+        "agent-0",
+        {"q_mw_heat": 0.04, "regulation": 1.0, "t_k": 360.0, "priority": 4},
+    )
+    behavior.add_action("agent-0", "regulate")
+    monitor = GridConstraintMonitor(behavior, Sector.HEAT, node_id=0, max_hops=1)
+
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    async with world:
+        obs = behavior.observe("agent-0")
+        monitor._sensitivity = 1e9   # absurdly high
+        w_hi = monitor._own_curtail_willingness(obs)
+        monitor._sensitivity = 1e-9  # absurdly low
+        w_lo = monitor._own_curtail_willingness(obs)
+
+    # Same tier + reducible in both calls, so the ratio is purely the
+    # clamped sensitivity-multiplier span (16x), not the raw 1e18.
+    assert w_hi / w_lo == pytest.approx(_SENS_MULT_MAX / _SENS_MULT_MIN)
+
+
+@pytest.mark.asyncio
+async def test_heat_frontier_sheds_to_partial_not_zero():
+    """A cold heat node is curtailed to a PARTIAL feasible frontier, not
+    bang-bang to 0: with a learned dT/dreg sensitivity the frontier
+    controller takes a proportional step toward t_k = floor + margin."""
+    behavior = MockBehavior()
+    behavior.set_obs(
+        "agent-0",
+        {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 305.0, "priority": 3},
+    )
+    behavior.add_action("agent-0", "regulate")
+    monitor = GridConstraintMonitor(behavior, Sector.HEAT, node_id=0, max_hops=1)
+
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    async with world:
+        monitor._sensitivity = 660.0  # learned dT/dP (K per MW): frontier ~0.8
+        await monitor._heat_frontier_control()
+
+    regs = [a for a in behavior.action_log if a[1] == "regulate"]
+    assert regs, "frontier controller should have written a regulate"
+    factor = regs[-1][2][0]
+    assert 0.0 < factor < 1.0  # partial frontier, not bang-bang 0
+
+
+@pytest.mark.asyncio
+async def test_heat_frontier_applies_to_tier1():
+    """Tier-1 heat is NOT exempt from the frontier controller — a critical
+    heat load at an infeasible temperature is curtailed to its feasible
+    partial (serving >0 beats the barrier crediting 0 at full draw)."""
+    behavior = MockBehavior()
+    behavior.set_obs(
+        "agent-0",
+        {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 300.0, "priority": 1},
+    )
+    behavior.add_action("agent-0", "regulate")
+    monitor = GridConstraintMonitor(behavior, Sector.HEAT, node_id=0, max_hops=1)
+
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    async with world:
+        monitor._sensitivity = 660.0
+        await monitor._heat_frontier_control()
+
+    regs = [a for a in behavior.action_log if a[1] == "regulate"]
+    assert regs and regs[-1][2][0] < 1.0  # tier-1 heat was curtailed
+
+
+@pytest.mark.asyncio
+async def test_heat_frontier_holds_in_band():
+    """A feasible heat node comfortably inside the hold band is not touched."""
+    behavior = MockBehavior()
+    behavior.set_obs(
+        "agent-0",
+        {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 318.0, "priority": 3},
+    )
+    behavior.add_action("agent-0", "regulate")
+    monitor = GridConstraintMonitor(behavior, Sector.HEAT, node_id=0, max_hops=1)
+
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    async with world:
+        monitor._sensitivity = 660.0
+        await monitor._heat_frontier_control()
+
+    assert not [a for a in behavior.action_log if a[1] == "regulate"]
+
+
+@pytest.mark.asyncio
 async def test_worst_neighbour_utilization_default():
     behavior = MockBehavior()
     monitor = _make_monitor(behavior, vm_pu=1.0)

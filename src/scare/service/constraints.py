@@ -39,6 +39,7 @@ from scare.base.trust import TrustLedger, TrustParams
 from scare.base.util import (
     apply_regulate,
     constraint_utilization,
+    has_heat_curtail_lock,
     lookup_priority,
     obs_capacity,
     obs_constraint_values,
@@ -86,7 +87,15 @@ _SENSITIVITY_EMA_ALPHA: float = 0.2
 _SENSITIVITY_MIN_DP: dict[Sector, float] = {
     Sector.ELECTRICITY: 0.01,   # MW
     Sector.GAS: 1e-4,           # kg/s
-    Sector.HEAT: 0.5,           # W or kg/s scaled
+    # Heat ``obs_setpoint`` is ``q_mw_heat`` in MW and individual heat
+    # loads are ~0.0075–0.05 MW, so a full regulation swing moves P by at
+    # most ~0.05 MW.  The previous 0.5 (calibrated as if P were in W) was
+    # 10–60× above any achievable ΔP, so ``_update_sensitivity`` never
+    # fired and ``_sensitivity`` stayed pinned at the 1e-5 default —
+    # silently disabling the sensitivity term of the curtailment-auction
+    # willingness.  5e-4 MW (0.5 kW) registers the ~30 % regulation steps
+    # the auction applies while staying above measurement noise.
+    Sector.HEAT: 5e-4,          # MW
 }
 
 # Default sensitivity used before any samples have been collected.
@@ -96,12 +105,31 @@ _SENSITIVITY_DEFAULT: dict[Sector, float] = {
     Sector.HEAT: 1e-5,          # K per W
 }
 
+# Bounds on the sensitivity multiplier in the curtailment-auction
+# willingness.  Sensitivity ranks loads *within* a priority tier by how
+# effectively curtailing them moves the violated variable, but the raw
+# EMA can span many orders of magnitude — left unbounded and multiplied
+# in, it would overcome the (1e4-per-step) priority tier weights and
+# invert the waterfall (shed a higher-priority but more-sensitive load
+# before a lower-priority one).  Normalising by the sector default and
+# clamping to [0.25, 4] keeps sensitivity a ≤16× within-tier tiebreaker,
+# far below the 1e4 tier step, so priority stays lexicographic.
+_SENS_MULT_MIN: float = 0.25
+_SENS_MULT_MAX: float = 4.0
+
 # Primary constraint variable per sector for sensitivity tracking.
 _SECTOR_PRIMARY_VAR: dict[Sector, str] = {
     Sector.ELECTRICITY: "vm_pu",
     Sector.GAS: "pressure_pu",
     Sector.HEAT: "t_k",
 }
+
+# Sentinel bidder key for the auctioneer's OWN load in a curtailment
+# auction.  The violating agent's own setpoint is the most direct lever
+# on its own junction (L0 self-action), so it competes in its own auction
+# as a bidder rather than only ever curtailing neighbours.  Distinct from
+# any ``str(addr)`` neighbour key.
+_SELF_BID_KEY: str = "__self__"
 
 
 class GridConstraintMonitor(Role):
@@ -132,7 +160,7 @@ class GridConstraintMonitor(Role):
         max_hops: int = _DEFAULT_MAX_HOPS,
         enable_curtailment_auction: bool = True,
         enable_multihop_constraint: bool = True,
-        enable_heat_recovery: bool = True,
+        enable_heat_frontier: bool = True,
         branch_id: Any = None,
         home_leader_addr: Any = None,
     ) -> None:
@@ -143,7 +171,7 @@ class GridConstraintMonitor(Role):
         self.max_hops = max_hops
         self.enable_curtailment_auction = enable_curtailment_auction
         self.enable_multihop_constraint = enable_multihop_constraint
-        self.enable_heat_recovery = enable_heat_recovery
+        self.enable_heat_frontier = enable_heat_frontier
         # Branch mode: when ``branch_id`` is set the monitor is running
         # on a PowerLine branch agent.  Local ``emit_event(BalanceProblem)``
         # is a no-op on a branch (no co-located EnergyBalanceNegotiator),
@@ -192,6 +220,13 @@ class GridConstraintMonitor(Role):
         # propagation guard) for no signal change.
         self._last_polled_values: dict[str, float] = {}
 
+        # Heat frontier controller: sign of the last applied regulation step,
+        # used to damp limit cycles (a too-large step relative to the
+        # under-estimated dT/dreg can overshoot the feasibility band; halving
+        # on each direction reversal makes the load converge to its frontier
+        # instead of ping-ponging).
+        self._frontier_last_dir: float = 0.0
+
         # B.1: continuous coupling weights K_ij for the constraint
         # propagation overlay.  Independent of the balance negotiator's
         # ledger because the topology and message frequencies differ.
@@ -221,19 +256,29 @@ class GridConstraintMonitor(Role):
         # auction_id -> {"bids": {sender_key: willingness}, "total": float,
         #                "neighbours_contacted": int, "deadline": float}
         self._open_auctions: dict[str, dict[str, Any]] = {}
+        # Per-variable in-flight guard: variable -> auction deadline.  A
+        # persistent violation re-enters ``_request_curtailment`` every
+        # monitor poll; this prevents stacking overlapping auctions for the
+        # same variable while letting curtailment ITERATE round-by-round
+        # toward feasibility once the previous round has allocated.
+        self._curtail_inflight: dict[str, float] = {}
 
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
         self.context.schedule_periodic_task(self._monitor, delay=poll)
-        # Heat sector: gradually un-shed previously curtailed loads once
-        # the local thermal stress has cleared.  The Level-1 gossip
-        # produces shed-only deltas during a violation; without an
-        # explicit recovery loop the load stays at the reduced factor
-        # forever.  Run at the heat poll period, slightly slower than
-        # the monitor so the violation flag has time to drop.
-        if self.sector == Sector.HEAT and self.enable_heat_recovery:
+        # Heat frontier controller: drive each heat load to the regulation
+        # where its t_k sits at the feasibility floor (max feasible service),
+        # both shedding cold nodes to the partial frontier and restoring
+        # recovered ones.  Supersedes the bang-bang gate behaviour.  Runs as
+        # a local feedback loop at ``_HEAT_FRONTIER_PERIOD_S`` — faster than
+        # the 5 s SCADA heat-decision poll, because each rate-limited step
+        # only moves regulation a little and a deeply-cold node needs several
+        # steps to converge to its frontier (t_k updates every energy-flow
+        # recompute, well inside this period).  See ``_heat_frontier_control``.
+        if self.sector == Sector.HEAT and self.enable_heat_frontier:
             self.context.schedule_periodic_task(
-                self._heat_recovery, delay=poll * 1.5
+                self._heat_frontier_control,
+                delay=min(poll, self._HEAT_FRONTIER_PERIOD_S),
             )
 
         def _wrap(coro_fn):
@@ -324,39 +369,46 @@ class GridConstraintMonitor(Role):
     ) -> None:
         """Emit ``ConstraintViolation`` + ``BalanceProblem`` for a freshly
         breached variable; relief-route branch overloads to the home
-        leader; trigger curtailment when enabled.  Re-firing for the
-        same variable is suppressed via ``_violation_emitted``.
+        leader; (re-)arm curtailment while the violation persists.
+
+        Event emission is deduped (one ``ConstraintViolation`` /
+        ``BalanceProblem`` per episode, via ``_violation_emitted``) to avoid
+        flooding the bus.  Curtailment, by contrast, is (re-)armed on EVERY
+        poll the violation is still active so a single gain-limited auction
+        round does not have to clear the whole violation by itself — the
+        round-to-round iteration drives the variable back toward feasibility.
+        The in-flight guard in ``_request_curtailment`` keeps that from
+        stacking overlapping auctions for the same variable.
         """
-        if var in self._violation_emitted:
-            return
-        self._violation_emitted.add(var)
-        logger.warning(
-            "[%s] CONSTRAINT VIOLATION %s=%.4f bounds=[%.4f,%.4f]",
-            self.context.aid, var, val, lo, hi,
-        )
-        record_event(
-            t=self.context.current_timestamp,
-            kind="constraint_violation",
-            aid=self.context.aid,
-            sector=self.sector.value,
-            detail=f"{var}={val:.4f} bounds=[{lo:.4f},{hi:.4f}]",
-        )
-        self._try_emit_event(ConstraintViolation(
-            sector=self.sector, variable=var, value=val,
-            bound_low=lo, bound_high=hi, node_id=self.node_id,
-        ))
-        self._try_emit_event(BalanceProblem(
-            sector=self.sector,
-            imbalance=val - hi if val > hi else lo - val,
-        ))
-        if (
-            self.branch_id is not None
-            and var == "loading_percent"
-            and self.home_leader_addr is not None
-        ):
-            # Branch-mode BalanceProblem has no local listener — drive
-            # the home leader to rebalance via StartBalanceNegotiation.
-            await self._send_line_overload_relief(obs, val, lo, hi)
+        if var not in self._violation_emitted:
+            self._violation_emitted.add(var)
+            logger.warning(
+                "[%s] CONSTRAINT VIOLATION %s=%.4f bounds=[%.4f,%.4f]",
+                self.context.aid, var, val, lo, hi,
+            )
+            record_event(
+                t=self.context.current_timestamp,
+                kind="constraint_violation",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=f"{var}={val:.4f} bounds=[{lo:.4f},{hi:.4f}]",
+            )
+            self._try_emit_event(ConstraintViolation(
+                sector=self.sector, variable=var, value=val,
+                bound_low=lo, bound_high=hi, node_id=self.node_id,
+            ))
+            self._try_emit_event(BalanceProblem(
+                sector=self.sector,
+                imbalance=val - hi if val > hi else lo - val,
+            ))
+            if (
+                self.branch_id is not None
+                and var == "loading_percent"
+                and self.home_leader_addr is not None
+            ):
+                # Branch-mode BalanceProblem has no local listener — drive
+                # the home leader to rebalance via StartBalanceNegotiation.
+                await self._send_line_overload_relief(obs, val, lo, hi)
         if self.enable_curtailment_auction:
             await self._request_curtailment(var, val, lo, hi)
 
@@ -599,31 +651,103 @@ class GridConstraintMonitor(Role):
     # if the violation persists.
     _AUCTION_TIMEOUT_S: float = 2.0
 
+    def _own_curtail_willingness(self, obs: dict) -> float:
+        """Curtailment willingness for *this* agent's own load.
+
+        Bigger = more happy / more effective at absorbing curtailment.
+        Combines three purely local signals:
+          - priority tier weight (``tier_priority_weight(regime=-1)``:
+            tier 4 → 1e8, tier 3 → 1e4, tier 2 → 1, tier 1 → 0; tier-1's 0
+            falls through the guard to a 1e-9 floor so tier-1 loads
+            effectively never win, matching the hard-lock invariant) — the
+            dominant, lexicographic term;
+          - a bounded sensitivity multiplier (high = curtailment here
+            cheaply moves the violated variable) — normalised by the
+            sector default and clamped to ``[_SENS_MULT_MIN,
+            _SENS_MULT_MAX]`` so it ranks loads *within* a tier without
+            overcoming the 1e4 tier step (see those constants);
+          - current reducible output (nothing to curtail → nothing to give).
+        """
+        from scare.service.balance import _PRIORITY_TIERS
+
+        prio_tier = max(
+            1, obs_priority(obs, behavior=self.behavior, aid=self.context.aid)
+        )
+        prio_weight = tier_priority_weight(
+            prio_tier, regime=-1, priority_tiers=_PRIORITY_TIERS,
+        )
+        reducible = abs(
+            obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
+        )
+        sens_ref = _SENSITIVITY_DEFAULT.get(self.sector, 1e-3)
+        sens_mult = (
+            self._sensitivity / sens_ref if sens_ref > 0.0 else 1.0
+        )
+        if not math.isfinite(sens_mult) or sens_mult <= 0.0:
+            sens_mult = 1.0
+        sens_mult = max(_SENS_MULT_MIN, min(_SENS_MULT_MAX, sens_mult))
+        willingness = prio_weight * sens_mult * reducible
+        if not math.isfinite(willingness) or willingness <= 0.0:
+            willingness = 1e-9
+        return willingness
+
     async def _request_curtailment(
         self, variable: str, value: float, lo: float, hi: float
     ) -> None:
         span = hi - lo
         if span <= 0:
             return
-        overshoot = (value - hi) / span if value > hi else (lo - value) / span
 
-        neighbors = list(topology_neighbors(self, tid="groups"))
-        if not neighbors:
+        # In-flight guard: a persistent violation re-enters here every poll
+        # (``_handle_violation`` re-arms us unconditionally).  Skip while an
+        # auction for this variable is still open so rounds don't stack;
+        # once it allocates the guard clears and the next poll opens the
+        # next round — that round-by-round iteration is what lets a
+        # gain-limited auction actually reach feasibility.
+        now = self.context.current_timestamp
+        deadline_prev = self._curtail_inflight.get(variable)
+        if deadline_prev is not None and now < deadline_prev:
             return
 
-        # Total fractional reduction needed across the group.  Announced
-        # via a two-phase auction: broadcast the *need*, collect bids,
-        # then allocate proportional to each neighbour's self-reported
-        # willingness (priority × local sensitivity × reducible output).
+        overshoot = (value - hi) / span if value > hi else (lo - value) / span
+
+        # Total fractional reduction needed across the group + self.
+        # Announced via a two-phase auction: broadcast the *need*, collect
+        # bids, then allocate proportional to each candidate's willingness
+        # (priority × local sensitivity × reducible output).
         total_amount = max(0.02, min(1.0, self._CURTAILMENT_GAIN * overshoot))
 
+        # The violating agent's OWN load is the most direct lever on its own
+        # junction (an upstream neighbour relieves a downstream node, but a
+        # node's own extraction always drives its own return temperature),
+        # so seed it as a candidate.  Priority still decides who actually
+        # absorbs: a high-priority self competing against low-priority
+        # neighbours wins ~0 share until the neighbours' reducible is spent.
+        self_obs = self.behavior.observe(self.context.aid) or {}
+        self_w = (
+            self._own_curtail_willingness(self_obs)
+            if self.behavior.has_action(self.context.aid, "regulate")
+            else None
+        )
+
+        neighbors = list(topology_neighbors(self, tid="groups"))
         auction_id = str(uuid.uuid4())
         self._open_auctions[auction_id] = {
             "bids": {},
             "total": total_amount,
             "neighbours_contacted": len(neighbors),
             "bidders": {},  # sender_key -> addr
+            "var": variable,
+            "self_willingness": self_w,
+            "self_addr": self.context.addr,
         }
+        self._curtail_inflight[variable] = now + self._AUCTION_TIMEOUT_S
+
+        if not neighbors:
+            # Self-only auction (isolated node / singleton group): allocate
+            # immediately so the local lever still fires.
+            await self._allocate_auction(auction_id)
+            return
 
         need_msg = CurtailmentNeed(
             sector=self.sector,
@@ -633,9 +757,7 @@ class GridConstraintMonitor(Role):
         for addr in neighbors:
             await self.context.send_message(need_msg, receiver_addr=addr)
 
-        deadline = (
-            self.context.current_timestamp + self._AUCTION_TIMEOUT_S
-        )
+        deadline = now + self._AUCTION_TIMEOUT_S
         self.context.schedule_timestamp_task(
             self._close_auction(auction_id), timestamp=deadline
         )
@@ -649,35 +771,9 @@ class GridConstraintMonitor(Role):
         if not obs:
             return
 
-        # Willingness: bigger = more happy / more effective at absorbing
-        # curtailment.  Combines three purely local signals:
-        #   - priority tier weight (4-tier curtailment schedule from
-        #     ``tier_priority_weight(regime=-1)``: tier 4 → 1e8, tier 3
-        #     → 1e4, tier 2 → 1, tier 1 → 0.  Tier 1 weight of 0 falls
-        #     through the ``willingness <= 0`` guard to a floor of 1e-9
-        #     — tier-1 loads effectively never win the auction, which
-        #     matches the hard-lock invariant at the L1 leader pre-step)
-        #   - local |dV/dP| sensitivity (high = curtailment here cheaply
-        #     moves the violated variable)
-        #   - current reducible output magnitude (nothing to curtail → nothing
-        #     to contribute).
-        from scare.service.balance import _PRIORITY_TIERS
-
-        prio_tier = max(1, obs_priority(obs, behavior=self.behavior, aid=self.context.aid))
-        # Curtailment regime — low-priority loads bid more willingly
-        # (highest weight at the highest tier number).  Shared helper
-        # keeps this consistent with the L1 QP's curtailment schedule.
-        prio_weight = tier_priority_weight(
-            prio_tier, regime=-1, priority_tiers=_PRIORITY_TIERS,
-        )
-        reducible = abs(obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid))
-        willingness = prio_weight * self._sensitivity * reducible
-        if not math.isfinite(willingness) or willingness <= 0.0:
-            willingness = 1e-9
-
         reply = CurtailmentBid(
             auction_id=message.auction_id,
-            willingness=willingness,
+            willingness=self._own_curtail_willingness(obs),
             sector=self.sector,
         )
         await self.context.send_message(
@@ -706,12 +802,33 @@ class GridConstraintMonitor(Role):
         auction = self._open_auctions.pop(auction_id, None)
         if auction is None:
             return
-        bids: dict[str, float] = auction["bids"]
-        bidders: dict[str, Any] = auction["bidders"]
+        # Clear the in-flight guard so the next monitor poll can open the
+        # next round if the violation has not yet cleared.
+        self._curtail_inflight.pop(auction.get("var"), None)
+
+        bids: dict[str, float] = dict(auction["bids"])
+        bidders: dict[str, Any] = dict(auction["bidders"])
         total_amount: float = auction["total"]
+
+        # Fold in the auctioneer's own bid (the L0 self-curtail candidate).
+        self_w = auction.get("self_willingness")
+        if self_w is not None:
+            bids[_SELF_BID_KEY] = self_w
+            bidders[_SELF_BID_KEY] = auction.get("self_addr")
 
         if not bids:
             return
+
+        async def _dispatch(key: str, addr: Any, share: float) -> None:
+            if share <= 0.0:
+                return
+            if key == _SELF_BID_KEY:
+                await self._curtail_self(share)
+            elif addr is not None:
+                await self.context.send_message(
+                    CurtailmentRequest(sector=self.sector, amount=share),
+                    receiver_addr=addr,
+                )
 
         sum_w = sum(bids.values())
         if sum_w <= 0.0:
@@ -719,27 +836,23 @@ class GridConstraintMonitor(Role):
             # so at least something curtails and the violation can clear.
             share = total_amount / len(bids)
             for key, addr in bidders.items():
-                await self.context.send_message(
-                    CurtailmentRequest(sector=self.sector, amount=share),
-                    receiver_addr=addr,
-                )
+                await _dispatch(key, addr, share)
             return
 
         for key, w in bids.items():
-            addr = bidders.get(key)
-            if addr is None:
-                continue
-            share = total_amount * (w / sum_w)
-            if share <= 0.0:
-                continue
-            await self.context.send_message(
-                CurtailmentRequest(sector=self.sector, amount=share),
-                receiver_addr=addr,
-            )
+            await _dispatch(key, bidders.get(key), total_amount * (w / sum_w))
 
     async def _handle_curtailment_request(
         self, message: CurtailmentRequest, meta: dict
     ) -> None:
+        await self._apply_curtail(message.amount, label="curtailed")
+
+    async def _curtail_self(self, amount: float) -> None:
+        """Apply the auctioneer's own winning share — the L0 self-action
+        lever (the violating load curtailing its own setpoint)."""
+        await self._apply_curtail(amount, label="self-curtailed")
+
+    async def _apply_curtail(self, amount: float, *, label: str) -> None:
         if not self.behavior.has_action(self.context.aid, "regulate"):
             return
         obs = self.behavior.observe(self.context.aid)
@@ -751,7 +864,7 @@ class GridConstraintMonitor(Role):
         # jumping past it, so the control loop can't overshoot in a
         # single step.
         current = float(obs.get("regulation", 1.0))
-        amount = max(0.0, min(1.0, message.amount))
+        amount = max(0.0, min(1.0, amount))
         new_factor = max(0.0, current * (1.0 - amount))
 
         applied = apply_regulate(
@@ -765,88 +878,122 @@ class GridConstraintMonitor(Role):
         )
         if applied:
             logger.info(
-                "[%s] curtailed by %.1f%% (regulation %.3f -> %.3f)",
+                "[%s] %s by %.1f%% (regulation %.3f -> %.3f)",
                 self.context.aid,
+                label,
                 amount * 100,
                 current,
                 new_factor,
             )
 
     # ------------------------------------------------------------------
-    # Heat recovery (un-shed)
+    # Heat frontier controller (serve at the t_k feasibility frontier)
     # ------------------------------------------------------------------
 
-    # Fraction of the feasible band below which the agent is considered
-    # comfortably clear and may begin un-shedding.  Matched to
-    # ``_HEAT_CLEAR_FRACTION`` in service/balance.py: an agent only
-    # contributes to the deficit target above this point, so the same
-    # threshold defines "no longer stressed".
-    _HEAT_RECOVERY_CLEAR_FRACTION: float = 0.6
+    # Target junction temperature: hold t_k a small margin above the hard
+    # floor so the load is served at (just inside) the feasibility frontier.
+    _HEAT_FRONTIER_MARGIN_K: float = 3.0
+    # Below ``target - DEADBAND`` -> shed; above ``target + RESTORE_BAND`` ->
+    # restore.  The asymmetric, wide restore band is hysteresis: it stops the
+    # restore<->re-violate limit cycle for nodes that re-cool when served.
+    _HEAT_FRONTIER_DEADBAND_K: float = 2.0
+    _HEAT_FRONTIER_RESTORE_BAND_K: float = 6.0
+    # Proportional gain and per-poll step clamp.  The clamp bounds the move
+    # even when ``_sensitivity`` is still at its prior (so a mis-estimate
+    # can't slam the load to 0/1 in one step); as the dT/dP estimate is
+    # learned the proportional term settles the load at the frontier.
+    _HEAT_FRONTIER_GAIN: float = 0.5
+    _HEAT_FRONTIER_MAX_STEP: float = 0.15
+    # Feedback-loop period (s).  Faster than the heat SCADA poll so the
+    # rate-limited controller can take enough steps to converge a deeply
+    # cold node to its frontier within the run.
+    _HEAT_FRONTIER_PERIOD_S: float = 1.0
 
-    async def _heat_recovery(self) -> None:
+    async def _heat_frontier_control(self) -> None:
+        """Drive this heat load's regulation toward the point where its
+        junction temperature sits at the feasibility floor — the maximum
+        feasible service.  Sheds a cold node to its partial frontier (not
+        bang-bang to 0) and restores a comfortably-warm one, using the local
+        dT/dreg sensitivity as the gain.  Applies to ALL tiers, incl. tier-1
+        (holding a critical heat load at full draw collapses its temperature
+        and the served barrier then credits zero — a partial feasible serve
+        beats that).  Writes ``reason="curtail"`` (shed) / ``"heat_recovery"``
+        (restore) so the heat curtail-lock makes the MW holon defer.
+        """
         if self.sector != Sector.HEAT:
-            return
-        if not self.is_locally_feasible():
             return
         if not self.behavior.has_action(self.context.aid, "regulate"):
             return
         obs = self._safe_observe()
         if not obs:
             return
-
-        # Cheap pre-gate: skip every later check (constraint values,
-        # capacity lookup, ramp computation) when there is nothing to
-        # recover.  Only runs work when this agent's regulation is
-        # actually < 1.0 — the only state in which un-shedding makes
-        # sense.  Loads with cap <= 0 (generators) are also filtered
-        # so the recovery loop only does work for shedding-eligible
-        # loads.
-        current = float(obs.get("regulation", 1.0))
-        if current >= 1.0:
-            return
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
-        if cap <= 0:
+        if cap <= 0:  # generator-class — nothing to curtail
             return
-
-        bounds = SECTOR_CONSTRAINTS.get(self.sector, {})
-        worst_util = 0.0
-        for var, val in obs_constraint_values(obs, self.sector).items():
-            if not math.isfinite(val) or (var == "t_k" and val <= 0.0):
-                return  # solver hasn't populated this junction yet
-            lo, hi = bounds.get(var, (float("-inf"), float("inf")))
-            worst_util = max(worst_util, constraint_utilization(val, lo, hi))
-        if worst_util > self._HEAT_RECOVERY_CLEAR_FRACTION:
+        bounds = SECTOR_CONSTRAINTS.get(Sector.HEAT, {}).get("t_k")
+        if bounds is None:
             return
+        lo, _hi = bounds
+        try:
+            t = float(obs.get("t_k"))
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(t) or t <= 0.0:
+            return  # solver hasn't populated this junction yet
 
-        # Ramp at the heat-sector convergence rate per recovery period.
-        # 0.15 / s × 1.5×poll(=5 s) ≈ +1.125 per cycle if unbounded; the
-        # min(1.0, ...) clamp caps a single step at full restoration.
-        rate_per_s = SECTOR_TIMESCALE.get(self.sector, {}).get(
-            "convergence_rate", 0.15
+        cur = float(obs.get("regulation", 1.0))
+        target = lo + self._HEAT_FRONTIER_MARGIN_K
+        too_cold = t < target - self._HEAT_FRONTIER_DEADBAND_K
+        # Only restore loads WE (the auction/frontier controller) shed for
+        # temperature — i.e. that still hold a curtail-lock.  A load shed by
+        # an L2 *priority* decision sets no lock; restoring it on a warm
+        # reading alone would claw back the priority cascade (the inversion
+        # bug that retired the old blind heat-recovery loop).
+        can_restore = (
+            t > target + self._HEAT_FRONTIER_RESTORE_BAND_K
+            and cur < 1.0
+            and has_heat_curtail_lock(self.behavior, self.context.aid)
         )
-        period_s = SECTOR_TIMESCALE.get(self.sector, {}).get(
-            "poll_period_s", 5.0
-        ) * 1.5
-        new_factor = min(1.0, current + rate_per_s * period_s * 0.2)
-        if new_factor <= current + 1e-4:
-            return
+        if not (too_cold or can_restore):
+            return  # inside the hold band
 
+        # d(t_k)/d(reg) for heat is NEGATIVE (more extraction -> colder); the
+        # EMA stores the magnitude |dt_k/dP|, dP/dreg = cap.  Floor the
+        # magnitude away from 0 so the step is finite; the clamp below bounds
+        # it regardless of the estimate's quality.
+        dtk_dreg_mag = max(self._sensitivity * cap, 1e-6)
+        delta_t = target - t  # >0 want warmer (shed); <0 want cooler (restore)
+        delta_reg = -self._HEAT_FRONTIER_GAIN * delta_t / dtk_dreg_mag
+        delta_reg = max(
+            -self._HEAT_FRONTIER_MAX_STEP,
+            min(self._HEAT_FRONTIER_MAX_STEP, delta_reg),
+        )
+        # Anti-limit-cycle damping: if this step reverses the previous one
+        # (the load overshot its frontier last time), halve it so the
+        # amplitude decays toward the frontier instead of ping-ponging.
+        if self._frontier_last_dir != 0.0 and (
+            delta_reg * self._frontier_last_dir < 0.0
+        ):
+            delta_reg *= 0.5
+        new_reg = max(0.0, min(1.0, cur + delta_reg))
+        if abs(new_reg - cur) < 1e-3:
+            return
+        self._frontier_last_dir = 1.0 if delta_reg > 0.0 else -1.0
+
+        reason = "curtail" if new_reg < cur else "heat_recovery"
         applied = apply_regulate(
             self.behavior,
             self.context.aid,
-            new_factor,
+            new_reg,
             sector=self.sector.value,
-            reason="heat_recovery",
+            reason=reason,
             timestamp=self.context.current_timestamp,
             priority_tier=lookup_priority(self.behavior, self.context.aid),
         )
         if applied:
             logger.info(
-                "[%s] heat recovery: regulation %.3f -> %.3f (util=%.2f)",
-                self.context.aid,
-                current,
-                new_factor,
-                worst_util,
+                "[%s] heat frontier: t_k=%.1f target=%.1f regulation %.3f -> %.3f",
+                self.context.aid, t, target, cur, new_reg,
             )
 
     # ------------------------------------------------------------------

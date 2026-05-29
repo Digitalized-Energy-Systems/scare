@@ -11,7 +11,10 @@ from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink
 from scare.base.diagnostics import record_event, record_regulate
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 
-HHV: float = 15.3  # MW / (kg/s) for natural gas
+# Higher heating value of natural gas in kWh/kg.  The MW-per-(kg/s)
+# factor is 3.6·HHV ≈ 55 (1 kWh/s = 3.6 MW), applied in the converters
+# below — do NOT read 15.3 itself as MW/(kg/s).
+HHV: float = 15.3  # kWh/kg for natural gas
 
 _CAPACITY_KEYS = (
     "p_mw",
@@ -181,10 +184,17 @@ class _SlackMeta:
     ``cap < 0`` (generator-priority).  ``dmin_abs`` / ``dmax_abs`` are
     the absolute bounds on the slack Var; deltas relative to the
     current setpoint are derived in ``obs_min_max``.
+
+    Units are the slack's *native* sector units — MW for an
+    ExtPowerGrid (``p_mw`` Var), kg/s for an ExtHydrGrid gas slack
+    (``mass_flow`` Var).  These values are produced and consumed within
+    a single sector (the gas gossip reads a gas slack's ``cap`` as
+    kg/s), so the field is not MW-normalised; any consumer that pools a
+    gas slack with MW quantities must ``kgps_to_mw`` first.
     """
-    cap: float          # generator-convention rated output, < 0
-    dmin_abs: float     # min absolute p_mw the Var can take
-    dmax_abs: float     # max absolute p_mw the Var can take
+    cap: float          # generator-convention rated output, < 0 (native unit)
+    dmin_abs: float     # min absolute Var value (p_mw / mass_flow)
+    dmax_abs: float     # max absolute Var value (p_mw / mass_flow)
 
 
 def _slack_store(behavior: Any) -> dict[str, "_SlackMeta"]:
@@ -206,6 +216,13 @@ def register_slack(
     actual ``p_mw`` Var bounds (load convention: negative = export,
     positive = import).  If both are None, the slack is assumed
     bidirectional at ``rating_mw``: ``[-rating_mw, +rating_mw]``.
+
+    NB: despite the ``rating_mw`` name, the value is stored in the
+    slack's *native* sector unit — for an ExtHydrGrid gas slack callers
+    pass kg/s (the ``mass_flow`` budget), not MW.  This is consistent
+    because every gas-sector consumer treats the stored ``cap`` as
+    kg/s; only code that crosses gas into a shared-MW space (e.g. the
+    L3 CP-priority kernel) must ``kgps_to_mw`` it.
     """
     if rating_mw <= 0.0:
         # Silent no-op here would leave the slack child unregistered,
@@ -300,6 +317,16 @@ L2_ALLOCATION_REASONS: frozenset[str] = frozenset(
 )
 L1_REACTIVE_SHED_REASONS: frozenset[str] = frozenset({"balance", "stability"})
 
+# Reason written by the community curtailment auction (and its L0 self-bid)
+# — already surfaced as "curtailment auction" in the eval plots.  Used as
+# the heat-only L2 defer signal (see ``apply_regulate`` / the heat curtail
+# lock): while a heat load holds an auction curtailment for a live
+# violation, L2 allocation writes defer to it.
+CURTAIL_AUCTION_REASON: str = "curtail"
+# Reason written by the heat un-shed recovery loop; lifts the heat curtail
+# lock as it ramps a recovered load back toward full service.
+HEAT_RECOVERY_REASON: str = "heat_recovery"
+
 
 def _last_regulate_store(behavior: Any) -> dict[str, float]:
     return _get_behavior_store(behavior, "_scare_last_regulate")
@@ -329,6 +356,25 @@ def _l2_floor_store(behavior: Any) -> dict[str, float]:
     """Per-aid L2 priority allocation: the served fraction the
     component-scope holon ADMM most recently assigned to this load."""
     return _get_behavior_store(behavior, "_scare_l2_floor")
+
+
+def _heat_curtail_lock_store(behavior: Any) -> dict[str, float]:
+    """Per-aid heat curtailment-auction lock: the regulation level the
+    community auction is currently holding a heat load at, in response to a
+    live local temperature violation.  Presence of an entry means the
+    auction owns this load and L2 allocation writes must defer.  Set by
+    ``reason="curtail"`` writes, lifted by ``heat_recovery`` ramp-up — see
+    :func:`apply_regulate`."""
+    return _get_behavior_store(behavior, "_scare_heat_curtail_lock")
+
+
+def has_heat_curtail_lock(behavior: Any, aid: str) -> bool:
+    """True iff *aid* is currently held by a temperature-driven curtailment
+    lock — i.e. the curtailment auction or the heat frontier controller shed
+    it (``reason="curtail"``), as opposed to an L2 *priority* shed (which
+    sets no lock).  Used by the frontier controller to only restore loads it
+    shed for temperature, never to claw back a priority decision."""
+    return str(aid) in _heat_curtail_lock_store(behavior)
 
 
 def l2_effective_floor(
@@ -507,6 +553,53 @@ def apply_regulate(
     """
     factor = max(0.0, min(1.0, factor))
 
+    _cfg = getattr(behavior, "_scare_config", None)
+
+    # --- Heat curtailment-auction lock (heat sector only) -------------
+    # While the community curtailment auction holds a heat load down for a
+    # live temperature violation, it is the authoritative shedding lever:
+    # L2 allocation writes DEFER (skip) rather than claw the load back up.
+    # This breaks the cold-day limit cycle where the MW-based holon
+    # re-dispatch restores a just-curtailed cold node, re-cools it below the
+    # t_k floor, and the two layers oscillate.  The lock is set by auction
+    # ("curtail") writes and lifted as ``heat_recovery`` ramps the recovered
+    # load back to ~1.0; with recovery disabled it persists (shed-and-stay
+    # for a permanent failure).  Strictly heat-scoped: other sectors and
+    # unlocked heat loads fall through to the normal L2 path below.
+    try:
+        _sector_e = Sector(sector) if not isinstance(sector, Sector) else sector
+    except ValueError:
+        _sector_e = None
+    if _sector_e is Sector.HEAT and getattr(
+        _cfg, "enable_heat_curtail_lock", True
+    ):
+        _lock = _heat_curtail_lock_store(behavior)
+        if reason == CURTAIL_AUCTION_REASON:
+            # Only lock when the auction is actually holding the load BELOW
+            # full service.  A no-op / near-1.0 curtail (tiny winning share)
+            # carries no claim, and locking at ~1.0 would wrongly block the
+            # holon from legitimately shedding the load for MW reasons.
+            if factor < 1.0 - tolerance:
+                _lock[str(aid)] = factor
+            else:
+                _lock.pop(str(aid), None)
+        elif reason == HEAT_RECOVERY_REASON:
+            if factor >= 1.0 - tolerance:
+                _lock.pop(str(aid), None)
+            else:
+                _lock[str(aid)] = factor
+        elif reason in L2_ALLOCATION_REASONS and str(aid) in _lock:
+            # Auction owns this load — L2 must not correct it.
+            record_event(
+                t=float(timestamp),
+                kind="regulate_deferred_to_curtail_lock",
+                aid=str(aid),
+                sector=str(sector),
+                detail=f"reason={reason} lock={_lock[str(aid)]:.4f} "
+                       f"requested_factor={factor:.4f}",
+            )
+            return False
+
     # --- L2 priority-floor reconciliation -----------------------------
     # The component-scope holon ADMM is authoritative on which tier gets
     # served; L1 must not undo it.  Record the floor on L2 writes; clamp
@@ -521,9 +614,41 @@ def apply_regulate(
     # here) can still shed tier-1 when a constraint physically demands
     # it.  Generators (priority_tier <= 0) are excluded.  Gated on the
     # config flag so the behaviour is A/B-able.
-    _cfg = getattr(behavior, "_scare_config", None)
     if getattr(_cfg, "enable_l2_priority_floor", False):
         if reason in L2_ALLOCATION_REASONS:
+            # Cap the holon allocation — both the applied factor and the
+            # stored floor — by the load's local constraint-allowed
+            # fraction.  The L2 ADMM decides priority on MW grounds and is
+            # blind to per-node physics; without this cap a holon write
+            # restores an out-of-bounds node (cold-day heat junction below
+            # the t_k floor) to ~1.0 and the floor then clamps L1 reactive
+            # temperature sheds back up, pinning the node at an infeasible
+            # temperature.  ``constraint_allowed_fraction`` is tier-1-immune
+            # (returns 1.0), so tier-1's allocation is unaffected — matching
+            # ``l2_effective_floor``'s read-time cap, so the stored floor is
+            # never above feasibility regardless of caller.
+            try:
+                _sector = (
+                    Sector(sector) if not isinstance(sector, Sector) else sector
+                )
+            except ValueError:
+                _sector = None
+            # HEAT is exempt — the frontier controller owns its temperature
+            # (and locks managed loads so this write already defers); capping
+            # here would re-shed feasible heat loads on transient t_k dips
+            # (A2 over-shed).  El/gas keep the cap.
+            if (
+                _sector is not None
+                and _sector is not Sector.HEAT
+                and priority_tier is not None
+            ):
+                _obs = behavior.observe(aid) or {}
+                factor = min(
+                    factor,
+                    constraint_allowed_fraction(
+                        _obs, _sector, tier=int(priority_tier)
+                    ),
+                )
             _l2_floor_store(behavior)[aid] = factor
         elif (
             reason in L1_REACTIVE_SHED_REASONS

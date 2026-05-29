@@ -441,3 +441,53 @@ def test_rebalance_throttle_suppresses_back_to_back_triggers() -> None:
     assert n_after_second == 1, (
         f"throttle/dedup should keep regulate count at 1; got {n_after_second}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Contract 5: gas supply/demand are converted to MW before the kernel
+# ---------------------------------------------------------------------------
+
+
+def test_build_demands_converts_gas_dimension_to_mw() -> None:
+    """The kernel works in MW across every dimension — a CP's
+    ``capacity_by_sector`` is MW (gas converted via ``kgps_to_mw`` in
+    ``_cp_signed_capacity_by_sector``).  A ``HolonSummary`` carries gas
+    supply/demand in native kg/s, so ``_build_demands`` must scale the
+    gas dimension by ``kgps_to_mw`` to keep ``supply_net = base_supply −
+    Σ r·c`` unit-consistent.  The electricity dimension must pass
+    through untouched.
+    """
+    from scare.base.util import kgps_to_mw
+
+    role, _, _ = _make_role(
+        "g2p-A",
+        capacity_by_sector={"gas": 5.0, "electricity": -2.0},
+        bridged_sectors=[Sector.GAS, Sector.ELECTRICITY],
+    )
+
+    _inject_holon_summary(
+        role,
+        leader_aid="gas-leader",
+        sector=Sector.GAS,
+        supply_mw=1.0,            # 1.0 kg/s despite the generic param name
+        demand_by_tier={1: 2.0},  # 2.0 kg/s
+    )
+    _inject_holon_summary(
+        role,
+        leader_aid="el-leader",
+        sector=Sector.ELECTRICITY,
+        supply_mw=10.0,           # 10 MW
+        demand_by_tier={1: 4.0},  # 4 MW
+    )
+
+    demands = {d.sector: d for d in role._build_demands()}  # type: ignore[attr-defined]
+
+    gas = demands[Sector.GAS.value]
+    assert float(gas.base_supply[0]) == pytest.approx(kgps_to_mw(1.0))
+    assert float(gas.demand_by_tier[1][0]) == pytest.approx(kgps_to_mw(2.0))
+    # Sanity: the conversion is the ~55× HHV factor, not a no-op.
+    assert float(gas.base_supply[0]) > 50.0
+
+    el = demands[Sector.ELECTRICITY.value]
+    assert float(el.base_supply[0]) == pytest.approx(10.0)
+    assert float(el.demand_by_tier[1][0]) == pytest.approx(4.0)

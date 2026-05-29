@@ -40,6 +40,7 @@ from scare.base.trust import TrustLedger, TrustParams, hash_weighted_choice
 from scare.base.util import (
     apply_regulate,
     clamp_to_constraints,
+    constraint_allowed_fraction,
     constraint_utilization,
     l2_effective_floor,
     lookup_slack,
@@ -301,6 +302,7 @@ class EnergyBalanceNegotiator(Role):
         step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
         enable_qp_gossip: bool = True,
         enable_l2_priority_floor: bool = True,
+        enable_heat_mw_balance: bool = True,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -316,6 +318,13 @@ class EnergyBalanceNegotiator(Role):
         # constraints).  Blocks the L2→L1 override that inverts tiers
         # (eval task-88); see ``_apply_setpoint``.
         self.enable_l2_priority_floor = enable_l2_priority_floor
+        # When False (the default for heat), both MW-balance layers are
+        # suppressed for this sector: the holon supply-priority dispatch is
+        # ignored AND the L1 gossip negotiation does not run.  Heat is then
+        # coordinated solely by the frontier controller + curtailment auction.
+        # See config ``enable_heat_mw_balance`` (multi-seed: net difference is
+        # within noise; we keep heat MW off as the simpler, understood design).
+        self.enable_heat_mw_balance = enable_heat_mw_balance
         self.max_hops = max_hops
         self.step_decay_k0 = max(1, int(step_decay_k0))
         # P6: when True, run the primal-dual QP gossip; when False the
@@ -881,6 +890,10 @@ class EnergyBalanceNegotiator(Role):
     async def trigger_balance_negotiation(self) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
             return
+        # MW balance deactivated for heat (frontier controller + auction own
+        # it; unbounded slack ⇒ no MW imbalance to resolve).
+        if self.sector == Sector.HEAT and not self.enable_heat_mw_balance:
+            return
         if self._active:
             return
         self._active = True
@@ -1149,6 +1162,10 @@ class EnergyBalanceNegotiator(Role):
     # ------------------------------------------------------------------
 
     async def _start_gossip(self, target: float) -> None:
+        # MW balance deactivated for heat — also guards the holon
+        # ``override_target`` path that calls here directly.
+        if self.sector == Sector.HEAT and not self.enable_heat_mw_balance:
+            return
         threshold = self._per_group_threshold()
         if abs(target) < threshold:
             logger.info(
@@ -1998,6 +2015,10 @@ class EnergyBalanceNegotiator(Role):
     ) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
             return
+        # MW balance deactivated for heat: ignore L2/L3 holon supply-priority
+        # overrides (heat is owned by the frontier controller + auction).
+        if self.sector == Sector.HEAT and not self.enable_heat_mw_balance:
+            return
         # Route A (supply-priority) takes highest precedence: the
         # holon-global service fractions are applied directly per
         # local-load-tier.
@@ -2079,6 +2100,18 @@ class EnergyBalanceNegotiator(Role):
                     # load drifted into the tier since.
                     continue
                 factor = max(0.0, min(1.0, float(frac)))
+                # El/gas: local physical feasibility is a hard ceiling on the
+                # holon's MW+priority allocation (no other temperature-aware
+                # lever guards them).  HEAT is exempt: the frontier controller
+                # owns its temperature (serving each load at its t_k frontier
+                # and locking it so this dispatch defers).  Capping here too
+                # would let a transient t_k dip re-shed a feasible heat load
+                # to 0 (A2 over-shed) — and the heat slack is unbounded, so
+                # there is no MW reason to shed a feasible heat load.
+                if sec is not Sector.HEAT:
+                    factor = min(
+                        factor, constraint_allowed_fraction(obs, sec, tier=prio)
+                    )
                 if factor < 1.0:
                     shed_count += 1
                 apply_regulate(
@@ -2202,6 +2235,22 @@ class EnergyBalanceNegotiator(Role):
                         if cap == 0.0:
                             continue
                         factor = max(0.0, min(1.0, new_sp / cap))
+                        # Cap by local feasibility for el/gas — see the
+                        # matching clamp in _dispatch_service_fractions.
+                        # HEAT is exempt (frontier controller owns its
+                        # temperature; capping here would A2-over-shed
+                        # feasible heat loads on transient dips).
+                        try:
+                            _sec_enum = Sector(sec)
+                        except ValueError:
+                            _sec_enum = None
+                        if _sec_enum is not None and _sec_enum is not Sector.HEAT:
+                            factor = min(
+                                factor,
+                                constraint_allowed_fraction(
+                                    obs, _sec_enum, tier=int(tier)
+                                ),
+                            )
                         apply_regulate(
                             self.behavior,
                             aid,
@@ -2488,6 +2537,7 @@ def create_energy_balance_role(
     step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
     enable_qp_gossip: bool = True,
     enable_l2_priority_floor: bool = True,
+    enable_heat_mw_balance: bool = True,
 ) -> EnergyBalanceNegotiator:
     if priority is None:
         priority = obs_priority(obs)
@@ -2503,4 +2553,5 @@ def create_energy_balance_role(
         step_decay_k0=step_decay_k0,
         enable_qp_gossip=enable_qp_gossip,
         enable_l2_priority_floor=enable_l2_priority_floor,
+        enable_heat_mw_balance=enable_heat_mw_balance,
     )

@@ -27,6 +27,21 @@ class RestorationConfiguration:
     # constraint-violation triggers and the local-generation fallback.
     enable_holonic: bool = True
 
+    # Whether the MW-balance coordination layers (L2/L3 holon supply-priority
+    # dispatch AND the L1 gossip balance negotiation) run for the HEAT sector.
+    # Default False (deactivated).  Heat service is temperature-limited, not
+    # MW-limited (the heat ExtHydrGrid slack is intentionally unbounded), so
+    # these layers have no MW imbalance to resolve and instead read a cold
+    # node's thermal deficit / the islanded sub-network's unservable demand as
+    # an MW deficit and shed connected loads.  A multi-seed A/B (6 cold-day
+    # tasks, 3 seeds) found enabling them changes mean heat served by only
+    # ~+0.0025 — within the run-to-run noise floor and with no mechanism that
+    # explains why MW coordination should help a temperature-limited sector.
+    # So heat is coordinated solely by the frontier controller (temperature) +
+    # curtailment auction, which we DO understand.  El/gas are unaffected.
+    # Set True to re-enable holon+gossip on heat for ablations.
+    enable_heat_mw_balance: bool = False
+
     # Level-3 cross-sector ADMM at coupling-point agents.  When False,
     # ``EnergyConverterRole`` / ``DistributedOptimizationRole`` /
     # ``CoordinatorRole`` are not installed on CP nodes/branches and
@@ -254,23 +269,35 @@ class RestorationConfiguration:
     # When False, factor jumps are not throttled.
     enable_clpu_ramp: bool = True
 
-    # Heat-only periodic un-shed recovery in GridConstraintMonitor.
-    # When True, every ~5 s the monitor checks local heat constraints
-    # and if they're clear it bumps each load's regulation factor up
-    # by ~0.2 per cycle (independent of L2/L3 priority decisions).
-    #
-    # Default flipped to False as of 2026-05-23: same class of bug as
-    # ``enable_monotonic_floor``.  When L2 sheds heat tier 5 loads to
-    # factor=0 (priority decision: serve tier <5 first), heat_recovery
-    # then un-sheds them back to ~0.225 because heat constraints are
-    # locally clear — overriding the priority cascade.  The 2026-05-23
-    # smoke showed this driving uniform-0.225 inversions on heat
-    # tier 5 vs tier 6 across multiple scenarios (cooldown_sweep,
-    # cold_day_stress, ablation_thermal, etc).
-    #
-    # Set True to opt back into the no-regret heat un-shed behaviour
-    # for ablations against the pre-Option-B path.
-    enable_heat_recovery: bool = False
+    # Heat-only curtailment-auction lock.  When a heat load is curtailed for
+    # a live temperature violation (``reason="curtail"`` — by the community
+    # auction or the heat frontier controller), that lever becomes
+    # authoritative: the L2 holon supply-priority dispatch must DEFER (skip
+    # the load) rather than claw it back up — otherwise the MW-based L2
+    # re-dispatch restores a just-curtailed cold node, re-cools it below the
+    # t_k floor, and the two layers limit-cycle (the cold-day task-36
+    # oscillation).  The lock lifts when the frontier controller's
+    # ``heat_recovery`` ramp restores the load to ~1.0; otherwise it
+    # persists, so a load shed for a permanent failure stays shed.  Strictly
+    # heat-scoped — electricity/gas L2 dispatch is untouched.  Set False to
+    # ablate against the pre-lock (L2-dominant) behaviour.
+    enable_heat_curtail_lock: bool = True
+
+    # Heat-only frontier feedback controller.  Each poll, every heat load's
+    # GridConstraintMonitor drives its regulation toward the point where its
+    # junction temperature sits at the feasibility floor (~t_k = 313.15 K) —
+    # the maximum feasible service — using the local dT/dreg sensitivity as
+    # the gain, rate-limited and with a restore-hysteresis band.  This
+    # replaces SCARE's bang-bang heat behaviour (``constraint_allowed_fraction``
+    # is a feasibility GATE that returns 0 for any out-of-bounds node, so the
+    # holon/clamp can only serve-full -> temp-collapse -> 0, or shed-to-0)
+    # with the oracle-style partial-frontier serving (e.g. a critical load at
+    # 0.6 served feasibly beats 1.0 -> 0).  Applies to ALL tiers incl. tier-1
+    # (holding a critical heat load at full draw collapses its temperature and
+    # the barrier then credits zero).  Writes use ``reason="curtail"`` (shed)
+    # / ``"heat_recovery"`` (restore) so the heat curtail-lock makes L2 defer.
+    # Strictly heat-scoped.  Set False to ablate against the gate behaviour.
+    enable_heat_frontier: bool = True
 
     # Local Q-V droop at every inverter-coupled PowerGenerator (PV).
     # Follows the VDE-AR-N 4105 Q(U) characteristic: piecewise-linear

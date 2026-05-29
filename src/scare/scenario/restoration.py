@@ -585,7 +585,7 @@ def _populate_children(
                     node_id=child.node_id,
                     enable_curtailment_auction=config.enable_curtailment_auction,
                     enable_multihop_constraint=config.enable_multihop_constraint,
-                    enable_heat_recovery=config.enable_heat_recovery,
+                    enable_heat_frontier=config.enable_heat_frontier,
                 )
             )
             # Slack-budget enforcement.  Only slack-class children carry
@@ -834,6 +834,7 @@ def _make_balance_role(
         max_hops=config.gossip_max_hops,
         enable_qp_gossip=config.enable_qp_gossip,
         enable_l2_priority_floor=config.enable_l2_priority_floor,
+        enable_heat_mw_balance=config.enable_heat_mw_balance,
     )
 
 

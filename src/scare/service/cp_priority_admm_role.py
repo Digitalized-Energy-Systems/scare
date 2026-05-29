@@ -58,7 +58,7 @@ from mango import sender_addr as mango_sender_addr
 
 from scare.base.channel import CPSummary, HolonSummary, MonotonicVersion
 from scare.base.model import Sector
-from scare.base.util import apply_regulate
+from scare.base.util import apply_regulate, kgps_to_mw
 from distributed_resource_optimization.algorithm.distributed_lexicographic_cascade.core import (  # noqa: E501
     solve_cp_distributed_lexicographic_cascade,
 )
@@ -340,10 +340,23 @@ class CPPriorityAdmmRole(Role):
                 supply_dict = summary.supply_by_sector or {}
                 agg_supply += float(supply_dict.get(sec_v, 0.0))
                 d_map = (summary.demand_by_sector_priority or {}).get(sec_v, {})
-                for tier, mw in d_map.items():
-                    agg_demand[int(tier)] = agg_demand.get(int(tier), 0.0) + float(mw)
+                for tier, val in d_map.items():
+                    agg_demand[int(tier)] = agg_demand.get(int(tier), 0.0) + float(val)
             if not agg_demand and agg_supply == 0.0:
                 continue
+            # The kernel works in MW across every dimension: a CP's
+            # ``capacity_by_sector`` is MW (gas is converted via
+            # ``kgps_to_mw`` in ``_cp_signed_capacity_by_sector``).  The
+            # ``HolonSummary`` it consumes, however, carries gas supply
+            # and demand in the sector's native kg/s.  Convert the gas
+            # dimension here so ``base_supply``/``demand`` are unit-
+            # consistent with the CP capacity they are netted against
+            # (``supply_net = base_supply − Σ r·c``, hard budget cap
+            # ``≤ Bₛ``); without this the ~55× HHV factor makes the gas
+            # budget and served-demand waterfall wrong.
+            if sec_v == Sector.GAS.value:
+                agg_supply = kgps_to_mw(agg_supply)
+                agg_demand = {t: kgps_to_mw(v) for t, v in agg_demand.items()}
             demands.append(
                 SectorDemand(
                     sector=sec_v,
