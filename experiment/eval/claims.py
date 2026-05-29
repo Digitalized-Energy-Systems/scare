@@ -326,41 +326,43 @@ def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
 
 _WARMUP_S: float = 1.0
 _DROP_TOL: float = 0.05
+# A lower-priority tier counts as "still served" (so that shedding a
+# higher tier above it is a priority-order violation) when its regulation
+# sum exceeds this fraction of its own peak.  Below it the tier is treated
+# as already shed, so dropping a higher tier is legitimate bottom-up
+# shedding, not a regret switch.
+_SHED_EPS: float = 0.1
 
 
 def _check_monotonic_progress(
     timeseries_path: Path, events_path: Path
 ) -> dict[str, Any]:
-    """Per-sector average regulation should be non-decreasing during
-    periods with no active ``constraint_violation`` event in that
-    sector.  This is a coarse proxy for the per-load monotonic floor —
-    we don't have per-load timeseries in the recorded artefacts.
+    """No-regret-switching check.
 
-    Returns the largest mid-restoration drop in each sector's
-    ``electrical_balance`` / ``gas_balance`` / ``heat_balance`` series.
-    A drop below ``_DROP_TOL`` of the series' max counts as a
-    violation.
+    The restoration must not *regret-switch* — un-serve a load it had
+    already restored — except to free supply for a higher-priority tier
+    (the intended L3→L2→L1 re-shed; ``enable_monotonic_floor`` is off by
+    design).  The earlier proxy watched each sector's *aggregate*
+    regulation balance and flagged any >``_DROP_TOL`` drop, but that
+    cannot distinguish a *correct* priority-ordered low-tier shed (which
+    drops the aggregate) from a genuine regression — it false-positived
+    on every CP-coupled run that correctly sheds its least-critical
+    electricity tier.
 
-    The check excludes:
+    Primary check (when the per-(sector, tier) ``tier_balance__<sector>__
+    <tier>`` series are present): within a sector, a drop in a tier's
+    regulation sum is a violation *only* when a strictly lower-priority
+    tier in the **same** sector is still being served (above ``_SHED_EPS``
+    of its peak).  Bottom-up shedding (lower tiers already shed) passes;
+    shedding a higher tier while a lower one stays served fails.  Same-
+    sector comparison so cross-sector independence is never mis-flagged.
 
-    1. **Warm-up window** (``t < _WARMUP_S``): the simulation starts
-       with every child at ``regulation = 1.0`` (the LP default before
-       any MAS decision) and the first holon-ADMM / coalition
-       dispatch lands around ``t ≈ 0.1–0.5 s``.  The transition from
-       "everyone at 1.0" to "MAS-equilibrium" is *initial dispatch*,
-       not a restoration regression — counting it as a violation
-       conflated agent convergence with the no-regret-switching
-       property this claim is meant to test.  Drops inside the
-       window are skipped.
-    2. **Active constraint-violation windows** (per sector): drops
-       inside a ``constraint_violation`` window are part of the
-       defensive shed path and pre-existed before this claim's
-       formulation.
-    3. **Post-failure ringing** (``Δt ≤ _POST_FAILURE_S``): every
-       branch / node / custom ``*FailureEvent`` opens a short
-       quiescence window.  Disconnecting a node forces the LP to
-       drop served loads on disconnected components — a legitimate
-       physical drop, not an agent-level regression.
+    Falls back to the legacy per-sector aggregate drop check on older
+    artefacts that lack the per-tier series.
+
+    Both paths exclude (1) the warm-up window ``t < _WARMUP_S`` (initial
+    dispatch off the LP default), (2) active ``constraint_violation``
+    windows, and (3) post-failure ringing (``Δt ≤ _POST_FAILURE_S``).
     """
     if not timeseries_path.exists():
         return {"passed": True, "detail": "no timeseries"}
@@ -369,14 +371,75 @@ def _check_monotonic_progress(
     if not series:
         return {"passed": True, "detail": "empty timeseries"}
 
-    # Build sector-bracketed violation windows from events.csv.  When
-    # available these tighten the check; otherwise we treat the entire
-    # run as "no violation" — coarse but safe.
     violations_by_sec = _violation_windows(events_path) if events_path.exists() else {}
     failure_windows = (
         _failure_windows(events_path) if events_path.exists() else []
     )
 
+    def _excluded(sec: str, ti: float) -> bool:
+        if ti < _WARMUP_S:
+            return True
+        windows = violations_by_sec.get(sec, []) + violations_by_sec.get("*", [])
+        if any(lo <= ti <= hi for lo, hi in windows):
+            return True
+        if any(lo <= ti <= hi for lo, hi in failure_windows):
+            return True
+        return False
+
+    # --- Primary: per-(sector, tier) priority-order check ---------------
+    by_sector_tier: dict[str, dict[int, tuple[list[float], list[float]]]] = {}
+    for col, (t, ys) in series.items():
+        if not col.startswith("tier_balance__"):
+            continue
+        try:
+            _, sec, tier_s = col.split("__", 2)
+            tier = int(tier_s)
+        except (ValueError, IndexError):
+            continue
+        by_sector_tier.setdefault(sec, {})[tier] = (t, ys)
+
+    if by_sector_tier:
+        violations: dict[str, dict[str, Any]] = {}
+        for sec, tier_series in by_sector_tier.items():
+            maxes = {
+                k: (max(abs(y) for y in ys) or 1.0)
+                for k, (_t, ys) in tier_series.items()
+            }
+            tiers_sorted = sorted(tier_series)
+            for k in tiers_sorted:
+                t_k, ys_k = tier_series[k]
+                lower = [j for j in tiers_sorted if j > k]  # lower priority
+                for i in range(1, len(ys_k)):
+                    if _excluded(sec, t_k[i]):
+                        continue
+                    rel_drop = (ys_k[i - 1] - ys_k[i]) / maxes[k]
+                    if rel_drop <= _DROP_TOL:
+                        continue
+                    # A lower-priority tier still served at this instant?
+                    for j in lower:
+                        t_j, ys_j = tier_series[j]
+                        if i < len(ys_j) and ys_j[i] > _SHED_EPS * maxes[j]:
+                            prev = violations.get(sec, {}).get("rel_drop", 0.0)
+                            if rel_drop > prev:
+                                violations[sec] = {
+                                    "rel_drop": round(rel_drop, 4),
+                                    "tier": k,
+                                    "lower_tier_served": j,
+                                    "t": round(t_k[i], 3),
+                                }
+                            break
+        return {
+            "passed": not violations,
+            "detail": {
+                "mode": "per_tier",
+                "violations": violations,
+                "tol": _DROP_TOL,
+                "shed_eps": _SHED_EPS,
+                "warmup_s": _WARMUP_S,
+            },
+        }
+
+    # --- Fallback: legacy per-sector aggregate drop ---------------------
     sectors = {
         "electricity": "electrical_balance",
         "gas": "gas_balance",
@@ -391,17 +454,10 @@ def _check_monotonic_progress(
             continue
         max_y = max(abs(y) for y in ys) or 1.0
         worst = 0.0
-        windows = violations_by_sec.get(sec, []) + violations_by_sec.get("*", [])
         for i in range(1, len(ys)):
-            if t[i] < _WARMUP_S:
+            if _excluded(sec, t[i]):
                 continue
-            in_violation = any(lo <= t[i] <= hi for lo, hi in windows)
-            if in_violation:
-                continue
-            in_failure_ringdown = any(lo <= t[i] <= hi for lo, hi in failure_windows)
-            if in_failure_ringdown:
-                continue
-            drop = ys[i - 1] - ys[i]   # positive if value dropped
+            drop = ys[i - 1] - ys[i]
             if drop > worst:
                 worst = drop
         drops[sec] = worst / max_y
@@ -410,6 +466,7 @@ def _check_monotonic_progress(
     return {
         "passed": passed,
         "detail": {
+            "mode": "legacy_aggregate",
             "per_sector_relative_drop": drops,
             "tol": _DROP_TOL,
             "warmup_s": _WARMUP_S,

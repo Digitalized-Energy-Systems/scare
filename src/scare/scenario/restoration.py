@@ -2190,6 +2190,45 @@ def _register_recordings(
                 _make_sum(member_aids),
             )
 
+    # Per-(sector, tier) regulation sum — ``tier_balance__<sector>__<tier>``.
+    # The per-sector aggregate balance above cannot tell a *correct
+    # priority-ordered* low-tier shed (intended: the L3→L2→L1 cascade
+    # re-sheds the least-critical tier to free supply) from a genuine
+    # regret switch.  Recording the regulation sum per (sector, tier) lets
+    # ``_check_monotonic_progress`` flag only the latter: a drop in a
+    # higher-priority tier while a lower-priority tier in the SAME sector
+    # is still served.  Same-sector so cross-sector independence (e.g. an
+    # electricity shed while heat is fully served) is never mis-flagged.
+    # Restrict to actual consumer loads (PowerLoad / HeatLoad) — the same
+    # population ``served_by_load`` scores.  Summing regulation over *all*
+    # sector children would fold in generators / sources / converters /
+    # slack, which for the gas sector (no native consumer loads here) is
+    # pure noise and would mis-flag a meaningless "gas tier" drop.
+    load_aids = {
+        _child_aid(c.id) for c in monee_net.childs
+        if isinstance(c.model, (PowerLoad, HeatLoad))
+    }
+    sector_aids = {
+        Sector.ELECTRICITY.value: el_child_aids,
+        Sector.GAS.value: gas_child_aids,
+        Sector.HEAT.value: heat_child_aids,
+    }
+    by_sector_tier: dict[tuple[str, int], list[str]] = {}
+    for sec_value, aids in sector_aids.items():
+        for aid in aids:
+            if aid not in load_aids:
+                continue
+            tier = int(priorities.get(aid, 0))
+            if tier < 1:
+                continue
+            by_sector_tier.setdefault((sec_value, tier), []).append(aid)
+    for (sec_value, tier), member_aids in by_sector_tier.items():
+        record_world(
+            world,
+            f"tier_balance__{sec_value}__{tier}",
+            _make_sum(member_aids),
+        )
+
     record_agent_having(
         world,
         "regulation",
