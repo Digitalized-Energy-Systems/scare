@@ -37,12 +37,13 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from mango import Role
-from mango.express.topology import topology_characteristic
+from mango.express.topology import topology_characteristic, topology_neighbors
 
 from scare.base.diagnostics import record_event
 from scare.base.model import (
     CommunityAssignment,
     CommunityReassignedEvent,
+    LeaderEmerged,
     RepartitionAssignment,
     Sector,
 )
@@ -225,6 +226,51 @@ class DynamicRepartitionRole(Role):
         self.context.update(own)
         self._already_orphaned.update(orphaned_aids)
 
+        # Broadcast ``LeaderEmerged`` to the original leader's
+        # ``holon_summary_<sector>`` peers so every L2 role learns
+        # about the promoted orphan leader and adds it to its
+        # ``_leader_node_ids`` map.  Without this, the promoted leader
+        # is invisible to the elected component coordinator (its
+        # ``ComponentAdmmReport`` is dropped because the receiver's
+        # leader-aid filter excludes unknown senders), and the
+        # ``SlackBudgetMonitor`` override routed to the new home
+        # leader has no escalation path.
+        #
+        # We broadcast from THIS (original-leader) role because the
+        # original leader is already on the ``holon_summary_<sector>``
+        # mesh — the new orphan leader was a group-member at scenario
+        # time and was therefore not added to that mesh (mango exposes
+        # no API for dynamic topology mutation, see the design note at
+        # the top of this module).  Routing the broadcast through the
+        # original leader is the smallest plumbing change that closes
+        # the ``_leader_node_ids`` gap.
+        new_leader_node_id = self._member_node_id.get(new_leader_aid)
+        if new_leader_node_id is not None:
+            announcement = LeaderEmerged(
+                leader_aid=new_leader_aid,
+                leader_addr=new_leader_addr,
+                node_id=new_leader_node_id,
+                sector=self.sector,
+            )
+            try:
+                summary_peers = list(
+                    topology_neighbors(
+                        self, tid=f"holon_summary_{self.sector.value}",
+                    )
+                )
+            except Exception:
+                summary_peers = []
+            for peer_addr in summary_peers:
+                try:
+                    await self.context.send_message(
+                        announcement, receiver_addr=peer_addr,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "[%s] leader-emerged broadcast to %s failed: %s",
+                        self.context.aid, peer_addr, exc,
+                    )
+
 
 # ---------------------------------------------------------------------------
 # Member-side: accept a repartition assignment
@@ -291,6 +337,30 @@ class RepartitionHandlerRole(Role):
             # No local subscribers — fine, downstream code can read
             # the model directly.
             pass
+
+        # Latent-bug fix: any co-located ``SlackBudgetMonitor`` caches
+        # the *original* group leader in ``home_leader_addr`` (wired
+        # at scenario build time, see
+        # ``src/scare/scenario/restoration.py`` slack-budget patch
+        # site).  When the agent is reassigned to a new community
+        # after a failure, that cached address is now stale — the
+        # ``StartBalanceNegotiation(override_target=imbalance)`` the
+        # monitor sends on the next over-budget poll would land at
+        # the wrong leader.  For task 88 specifically this was
+        # benign (the original leader was still a valid leader), but
+        # in topologies where the original leader ends up isolated or
+        # downgraded the override silently dropped, leaving the slack
+        # over budget with no escalation path.  Rewrite the cached
+        # address here so the next monitor fire reaches the new
+        # leader directly.  Walks the agent's own roles only (no
+        # cross-agent reach) and tolerates a missing ``roles``
+        # attribute defensively.  Uses duck-typing on the class name
+        # rather than an isinstance check to avoid importing
+        # ``SlackBudgetMonitor`` and creating a community→service
+        # dependency.
+        for role in getattr(self.context, "roles", []):
+            if type(role).__name__ == "SlackBudgetMonitor":
+                role.home_leader_addr = message.new_leader_addr
 
 
 # ---------------------------------------------------------------------------

@@ -72,12 +72,16 @@ _MONITOR_DELTA_TOL: float = 1e-4
 _FEEDBACK_GAIN: float = 0.3
 
 # Floor on the effective budget as a fraction of the nominal budget.
-# A slack with no controllable lever (e.g. an infeasible operator
-# budget below the network's physical floor) would otherwise wind the
-# effective budget to zero and over-shed everything reachable; the
-# floor caps that futile tightening at a level that still leaves the
-# pool meaningful.
-_FEEDBACK_FLOOR_FRAC: float = 0.25
+# Every load class in \textsc{Scare} carries a ``regulate`` action
+# (PowerLoad, HeatLoad, gas Sink), so there is always a controllable
+# lever and the integral feedback can drive the eff_budget toward zero
+# without futile tightening — only as far as L1/L2 shedding needs to
+# bring the slack draw inside the operator policy.  A non-zero floor
+# would cap the wind-down before that point and leave the slack
+# structurally over-budget (gas child-237 over-draw trace, 2026-05-29).
+# Kept at 0.0 unless a sector is empirically shown to have no
+# sheddable demand.
+_FEEDBACK_FLOOR_FRAC: float = 0.0
 
 
 class SlackBudgetMonitor(Role):

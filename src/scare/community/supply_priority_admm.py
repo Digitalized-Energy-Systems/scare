@@ -258,10 +258,58 @@ async def allocate_supply_priority(
         for sec in sectors:
             priorities[_flat_idx(sec, tier)] = weight
 
-    holon_supply_total = (
-        sum(sum(float(v) for v in s.values()) for s in actor_supplies)
-        or 1.0
+    holon_supply_total = sum(
+        sum(float(v) for v in s.values()) for s in actor_supplies
     )
+
+    # Degenerate no-supply branch.  When every actor reports zero
+    # supply (the orphan-island case after a failure splits a sub-
+    # component off the grid-forming sources), the legacy code fell
+    # back to ``or 1.0`` — silently substituting a 1 MW phantom pool
+    # that produced ``service_fraction == 1.0`` across every tier
+    # via the waterfall short-circuit below.  In a real orphan island
+    # this means the L2 dispatches "serve everything" → no shed →
+    # the slack backstopping the island stays over-budget.
+    #
+    # Evidence (eval_full_small_20260529-181310/tasks/000088):
+    # child-12's orphan sub-coord reports ``supply=0.0000`` every
+    # round; the phantom pool produced ``T2=T3=T4=1.0``; child-12's
+    # 7 leaders held all 13 island electricity loads at fraction 1.0;
+    # the slack ``child-39`` (the LV ext-grid feeding the whole
+    # island) settled at +10.6% over budget — the breach the
+    # remainder of the eval picked up after Bug 1/2/3/4 closed the
+    # primary inversions.
+    #
+    # Correct behaviour: a truly no-supply sub-component sheds every
+    # load.  The ``SlackBudgetMonitor`` feedback path then sees the
+    # restored balance and re-opens the effective budget within
+    # ``_FEEDBACK_GAIN`` rounds, restoring whatever service the
+    # backstop budget allows.  We deliberately do NOT fall back to
+    # "include the slack budget as supply" here — that requires
+    # plumbing ``HolonSummary.slack_budget_by_sector`` into this
+    # allocator (a larger refactor) and is the architecturally
+    # cleaner follow-up.  Shedding-then-recovery is the safe minimum.
+    if holon_supply_total <= 0.0:
+        logger.debug(
+            "supply-priority ADMM degenerate no-supply: sheds everything "
+            "(n_actors=%d, demand_sum=%.4f)",
+            len(actor_supplies), float(total_demand_per_cell.sum()),
+        )
+        return (
+            {sec: {tier: 0.0 for tier in tiers} for sec in sectors},
+            [[0.0] * n_dims for _ in actor_supplies],
+            {
+                "T_per_cell": [0.0] * n_dims,
+                "demand_per_cell": total_demand_per_cell.tolist(),
+                "sum_x_per_cell": [0.0] * n_dims,
+                "actor_supply_total": [0.0] * len(actor_supplies),
+                "holon_supply_total": 0.0,
+                "priorities": [0.0] * n_dims,
+                "sectors": list(sectors),
+                "tiers": list(tiers),
+                "degenerate_no_supply": True,
+            },
+        )
 
     # --- Feasibility cap on the ADMM target ---
     # When demand exceeds available supply (the common case on a

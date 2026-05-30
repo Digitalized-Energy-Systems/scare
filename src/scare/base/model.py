@@ -139,6 +139,34 @@ class CommunityReassignedEvent:
 
 
 @dataclass
+class LeaderEmerged:
+    """Cross-agent broadcast: a previously-non-leader agent has been
+    promoted to lead an orphan sub-community after a failure-driven
+    re-partition (``DynamicRepartitionRole``).
+
+    Sent by the orphan that became the new leader to every same-sector
+    peer it knows about (via the existing ``holon_summary_<sector>``
+    mesh).  Receivers add ``(aid, node_id)`` to their local
+    ``_leader_node_ids`` map so the new leader appears in
+    ``_resolve_component_peer_addrs`` and can participate in component-
+    scope ADMM and the L3 escalation path.
+
+    Without this broadcast the new leader is invisible to the elected
+    component coordinator: ``ComponentAdmmReport`` from the orphan sub-
+    community is dropped because the coordinator's leader registry
+    doesn't include the sender, and ``SlackBudgetMonitor`` overrides
+    routed to the orphan leader cannot escalate beyond their own
+    island.  See ``eval_full_small_20260529-181310/tasks/000088``
+    (child-25 / slack__electricity__child-39 +10.6%).
+    """
+
+    leader_aid: str
+    leader_addr: Any
+    node_id: Any
+    sector: Sector
+
+
+@dataclass
 class ResultService:
     aid_to_result: dict[str, list[Any]] = field(default_factory=dict)
 

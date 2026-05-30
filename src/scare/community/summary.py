@@ -468,6 +468,7 @@ class HolonSummaryRole(Role):
             return
         await self._publish_and_check()
 
+
     async def _publish_and_check(self) -> None:
         await self._publish()
         self._check_invariants()
@@ -513,6 +514,7 @@ class HolonSummaryRole(Role):
         per_tier_served: dict[int, float] = {}
         per_tier_demand: dict[int, float] = {}
         supply_total: float = 0.0
+        slack_budget_total: float = 0.0  # slack-only, used to cap CP input draw
         try:
             member_aids = [self.context.aid] + [
                 addr.aid for addr in topology_neighbors(self, tid="groups")
@@ -542,7 +544,9 @@ class HolonSummaryRole(Role):
                 # tightened budget never reached L3 and gas over-drew).
                 if lookup_slack(self.behavior, aid) is not None:
                     eff = lookup_slack_eff_budget(self.behavior, aid)
-                    supply_total += float(eff) if eff is not None else abs(cap)
+                    v = float(eff) if eff is not None else abs(cap)
+                    supply_total += v
+                    slack_budget_total += v
                 else:
                     supply_total += abs(cap)
                 continue
@@ -572,6 +576,9 @@ class HolonSummaryRole(Role):
         supply_by_sector = (
             {sec_key: supply_total} if supply_total > 0.0 else {}
         )
+        slack_budget_by_sector = (
+            {sec_key: slack_budget_total} if slack_budget_total > 0.0 else {}
+        )
         demand_by_sector_priority = (
             {sec_key: dict(per_tier_demand)} if per_tier_demand else {}
         )
@@ -590,6 +597,7 @@ class HolonSummaryRole(Role):
             supply_by_sector=supply_by_sector,
             demand_by_sector_priority=demand_by_sector_priority,
             served_by_sector_priority=served_by_sector_priority,
+            slack_budget_by_sector=slack_budget_by_sector,
             home_node_id=self._my_node_id,
         )
         # Record our own latest summary too — the invariant check

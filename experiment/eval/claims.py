@@ -23,9 +23,48 @@ can surface specific failure cases without re-parsing the artefacts.
 from __future__ import annotations
 
 import csv
+import json
 import math
 from pathlib import Path
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Mode-gate for priority claims
+# ---------------------------------------------------------------------------
+#
+# The priority-ordering claims (``priority_invariant`` and
+# ``monotonic_progress``) presume the controller actually arbitrates by
+# priority.  ``holon_admm_mode="demand"`` is documented as an ablation-only
+# formulation (see ``src/scare/base/config.py``): in pure-load groups the
+# per-actor coupling ``Σ x_g ≤ flex_g`` never binds, so the priority weight
+# only modulates magnitudes — it does NOT order tiers.  Gating an ablation
+# against a claim its design pre-states it cannot satisfy is meaningless;
+# the eval should report a transparent skip, not a fatal failure.
+#
+# Read from ``<task_dir>/config.json["sweep"]["holon_admm_mode"]`` (default
+# ``"supply"``); when absent (older runs / non-sweep tasks) the gate
+# returns True so the claim runs as before.
+_PRIORITY_AWARE_MODE: str = "supply"
+
+
+def _holon_admm_mode(task_dir: Path) -> str:
+    """Return the active ``holon_admm_mode`` for this task, or
+    ``"supply"`` as the production default when unparseable.
+    """
+    cfg_path = task_dir / "config.json"
+    if not cfg_path.exists():
+        return _PRIORITY_AWARE_MODE
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return _PRIORITY_AWARE_MODE
+    sweep = cfg.get("sweep") or {}
+    return str(sweep.get("holon_admm_mode", _PRIORITY_AWARE_MODE))
+
+
+def _is_priority_aware(task_dir: Path) -> bool:
+    return _holon_admm_mode(task_dir) == _PRIORITY_AWARE_MODE
 
 
 # ---------------------------------------------------------------------------
@@ -39,28 +78,44 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     out["diary_invariant"] = _check_diary_invariant(task_dir / "diary.csv")
+    # Mode gate: when ``holon_admm_mode != "supply"`` the controller does
+    # not arbitrate by priority (see ``_PRIORITY_AWARE_MODE``); the
+    # gating priority claims are skipped with ``passed=True`` and a
+    # ``skipped`` detail so the run is reported as ablation-honest
+    # rather than spuriously failed.
+    priority_aware = _is_priority_aware(task_dir)
+    skip_detail = {"skipped": f"holon_admm_mode={_holon_admm_mode(task_dir)!r}"}
     # Physics-aware (primary): exclude loads throttled by a local
     # constraint — they are physically capped, not priority-shed, the
     # same rationale as the existing ``disconnected`` exclusion.
-    out["priority_invariant"] = _check_priority_invariant(
-        task_dir / "served_by_load.csv",
-        legacy_served_csv=task_dir / "served.csv",
-        exclude_constraint_throttled=True,
-        near_full_exempt=True,
-    )
+    if priority_aware:
+        out["priority_invariant"] = _check_priority_invariant(
+            task_dir / "served_by_load.csv",
+            legacy_served_csv=task_dir / "served.csv",
+            exclude_constraint_throttled=True,
+            near_full_exempt=True,
+        )
+    else:
+        out["priority_invariant"] = {"passed": True, "detail": skip_detail}
     # Strict (validation only): the original check, no constraint
     # exclusion.  Kept as a raw inversion signal — the headline metric
     # is priority-weighted served fraction, so this is diagnostic, not
     # gating (not in ``fatal_claims``).
-    out["priority_invariant_strict"] = _check_priority_invariant(
-        task_dir / "served_by_load.csv",
-        legacy_served_csv=task_dir / "served.csv",
-        exclude_constraint_throttled=False,
-        near_full_exempt=False,
-    )
-    out["monotonic_progress"] = _check_monotonic_progress(
-        task_dir / "timeseries.csv", task_dir / "events.csv"
-    )
+    if priority_aware:
+        out["priority_invariant_strict"] = _check_priority_invariant(
+            task_dir / "served_by_load.csv",
+            legacy_served_csv=task_dir / "served.csv",
+            exclude_constraint_throttled=False,
+            near_full_exempt=False,
+        )
+    else:
+        out["priority_invariant_strict"] = {"passed": True, "detail": skip_detail}
+    if priority_aware:
+        out["monotonic_progress"] = _check_monotonic_progress(
+            task_dir / "timeseries.csv", task_dir / "events.csv"
+        )
+    else:
+        out["monotonic_progress"] = {"passed": True, "detail": skip_detail}
     # Diagnostic (non-gating): heat is excluded from the priority-ordering
     # claims above because its shedding follows local temperature
     # feasibility; this tracks the per-tier feasible-heat served fraction so

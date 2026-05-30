@@ -24,6 +24,9 @@ from experiment.eval.claims import (
     _check_monotonic_progress,
     _check_priority_invariant,
     _check_slack_budget,
+    _holon_admm_mode,
+    _is_priority_aware,
+    evaluate_task,
 )
 
 
@@ -492,3 +495,110 @@ class TestHeatPriorityDiagnostic:
         ])
         res = _check_heat_priority(p)
         assert res["passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Mode gate for the priority claims (eval_full_small_20260529-181310 fix).
+#
+# ``holon_admm_mode="demand"`` is an ablation-only formulation (see
+# ``src/scare/base/config.py``).  In pure-load groups the per-actor coupling
+# never binds, so the priority weight only modulates magnitudes — it does
+# NOT order tiers.  Gating an ablation against a claim its design pre-states
+# it cannot satisfy is meaningless; the eval should report a transparent
+# skip instead of a fatal failure on tasks 132/133.
+# ---------------------------------------------------------------------------
+
+
+class TestPriorityModeGate:
+    """``evaluate_task`` must skip the priority-ordering claims when the
+    task's ``holon_admm_mode`` is not the priority-aware production
+    default (``"supply"``).
+    """
+
+    @staticmethod
+    def _write_minimal_task(
+        task_dir: Path,
+        *,
+        admm_mode: str | None,
+        inversion: bool = True,
+    ) -> None:
+        """Materialise the minimal artefact set ``evaluate_task`` reads:
+        ``config.json``, ``served_by_load.csv`` (with an inversion if
+        requested), and an empty events/timeseries.
+        """
+        task_dir.mkdir(parents=True, exist_ok=True)
+        cfg: dict = {
+            "task_id": 99,
+            "variant": "scare",
+            "sweep": {} if admm_mode is None else {"holon_admm_mode": admm_mode},
+        }
+        (task_dir / "config.json").write_text(json.dumps(cfg))
+        if inversion:
+            # Tier 3 served 0.5, tier 4 served 1.0 — classic priority inversion.
+            _write_served_by_load(task_dir / "served_by_load.csv", [
+                {"aid": "a", "sector": "electricity", "tier": 3,
+                 "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
+                {"aid": "b", "sector": "electricity", "tier": 4,
+                 "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+            ])
+        else:
+            _write_served_by_load(task_dir / "served_by_load.csv", [
+                {"aid": "a", "sector": "electricity", "tier": 1,
+                 "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+            ])
+        # Diary + events + timeseries must exist as files for the other
+        # checks ``evaluate_task`` invokes, but can be empty/minimal.
+        _write_diary(task_dir / "diary.csv", ["started", "finished"])
+        _write_events(task_dir / "events.csv", [])
+        _write_timeseries(task_dir / "timeseries.csv", ("dummy",), [(0.0, 0.0)])
+
+    def test_supply_mode_runs_check_and_flags_inversion(self, tmp_path):
+        self._write_minimal_task(tmp_path, admm_mode="supply", inversion=True)
+        out = evaluate_task(tmp_path)
+        assert out["priority_invariant"]["passed"] is False, (
+            "supply-mode tasks must continue to gate on tier inversions"
+        )
+        assert "skipped" not in (out["priority_invariant"]["detail"] or {})
+
+    def test_demand_mode_skips_priority_invariant(self, tmp_path):
+        # Same fixture, but ``holon_admm_mode=demand`` flips the gate.
+        self._write_minimal_task(tmp_path, admm_mode="demand", inversion=True)
+        out = evaluate_task(tmp_path)
+        assert out["priority_invariant"]["passed"] is True
+        assert out["priority_invariant"]["detail"] == {
+            "skipped": "holon_admm_mode='demand'"
+        }
+        assert out["priority_invariant_strict"]["passed"] is True
+        assert out["monotonic_progress"]["passed"] is True
+        # The non-priority claims (diary_invariant, slack_budget,
+        # heat_priority) stay live regardless of mode.
+        assert out["diary_invariant"]["passed"] is True
+
+    def test_default_when_sweep_missing_is_supply(self, tmp_path):
+        # Tasks that don't set ``holon_admm_mode`` (the common case)
+        # default to supply-mode and run the claim normally.
+        self._write_minimal_task(tmp_path, admm_mode=None, inversion=True)
+        out = evaluate_task(tmp_path)
+        assert out["priority_invariant"]["passed"] is False
+
+    def test_missing_config_falls_back_to_supply(self, tmp_path):
+        # No config.json at all → default to supply-mode (don't silently
+        # skip claims because of a missing file).
+        _write_served_by_load(tmp_path / "served_by_load.csv", [
+            {"aid": "a", "sector": "electricity", "tier": 3,
+             "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
+            {"aid": "b", "sector": "electricity", "tier": 4,
+             "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
+        ])
+        _write_diary(tmp_path / "diary.csv", ["started", "finished"])
+        _write_events(tmp_path / "events.csv", [])
+        _write_timeseries(tmp_path / "timeseries.csv", ("dummy",), [(0.0, 0.0)])
+        assert _is_priority_aware(tmp_path) is True
+        assert _holon_admm_mode(tmp_path) == "supply"
+
+    def test_malformed_config_falls_back_to_supply(self, tmp_path):
+        # An unreadable config shouldn't silently disable a gating claim
+        # — fall back to supply-mode (the conservative default).
+        (tmp_path / "config.json").write_text("not json")
+        assert _holon_admm_mode(tmp_path) == "supply"
+        assert _is_priority_aware(tmp_path) is True

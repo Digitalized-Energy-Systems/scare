@@ -79,13 +79,64 @@ def _disconnected_node_ids(monee_net: Any) -> set[int]:
         return set()
 
 
-def _active_node_components(monee_net: Any) -> dict[Any, int]:
+def _branch_carries_sector(branch: Any, monee_net: Any, sector: str | None) -> bool:
+    """Whether this branch should be admitted into the component
+    subgraph for ``sector``.
+
+    ``sector is None`` admits every branch (legacy "full-graph" view).
+    A named sector admits ONLY same-sector edges — CP couplings
+    (``branch.model.is_cp() == True``) are excluded.  This matches the
+    L2 component-scope ADMM coordinator-election scope at
+    ``src/scare/community/holonic.py:_resolve_component_peer_addrs``,
+    which calls ``mirror.reachable_from(my_node, sector=self.sector)``
+    and the topology-mirror explicitly rejects CP bridges when a
+    sector filter is set (``src/scare/base/topology_mirror.py``
+    ``reachable_from`` raises on ``allow_cp_bridges=True`` with a sector).
+
+    Aligning the metric here with the control's scope is the fix for
+    the priority-invariant inversions observed in
+    ``eval_full_small_20260529-181310/tasks/{52,88,132,133}``: when two
+    electricity sub-islands are bridged only by a CP → heat → CP chain,
+    the L2 splits into two coordinators (each making independent
+    per-tier shed decisions) while the legacy full-graph metric merged
+    them and spuriously read an inversion across the coordinator
+    boundary.  See ``tests/community/test_component_scope_cp_bridge.py``
+    for the minimal reproducer.
+    """
+    if sector is None:
+        return True
+    model = getattr(branch, "model", None)
+    if model is not None and getattr(model, "is_cp", lambda: False)():
+        return False
+    # Same-sector check: walk to one endpoint's grid → sector.  Reuse
+    # ``sector_from_grid`` (the same resolver the rest of the codebase
+    # uses) so a future sector enum addition lands in one place.
+    a = branch.id[0]
+    try:
+        node = monee_net.node_by_id(a)
+    except Exception:
+        return False
+    sec = sector_from_grid(getattr(node, "grid", None))
+    return sec is not None and sec.value == sector
+
+
+def _active_node_components(
+    monee_net: Any, *, sector: str | None = None,
+) -> dict[Any, int]:
     """Return a mapping ``node_id -> component_index`` over the
     *active*-branch subgraph.  Failed branches (``branch.active is
     False``) and the failed branches' contribution to graph connectivity
     are removed; the result captures the post-failure islands that the
     priority-invariant check needs in order to compare tiers fairly
     within each connected partition.
+
+    ``sector``: when set, restrict the subgraph to same-sector branches
+    only (CP couplings excluded).  Default ``None`` preserves the
+    legacy full-graph behaviour for callers that don't yet pass a
+    sector — but :func:`served_by_load` now stamps each row's
+    ``component`` from the **sector-specific** map so the
+    ``priority_invariant`` claim aggregates on the same scope L2's
+    coordinator election uses.
 
     Disconnected single nodes get their own component.  Component
     indices are arbitrary but stable within a single call (assigned in
@@ -97,6 +148,8 @@ def _active_node_components(monee_net: Any) -> dict[Any, int]:
     for branch in monee_net.branches:
         if not _branch_is_active(branch):
             continue
+        if not _branch_carries_sector(branch, monee_net, sector):
+            continue
         a, b = branch.id[0], branch.id[1]
         graph.add_edge(a, b)
     out: dict[Any, int] = {}
@@ -104,6 +157,20 @@ def _active_node_components(monee_net: Any) -> dict[Any, int]:
         for node_id in comp:
             out[node_id] = idx
     return out
+
+
+def _component_label(comp_idx: int, sector: str | None) -> str:
+    """Stringify a component label for the CSV ``component`` column.
+
+    Sector-aware labels are prefixed (``"electricity:0"``) so the
+    ``priority_invariant`` aggregator naturally groups per-sector even
+    if a future caller mixes legacy (un-prefixed) and per-sector rows.
+    The unprefixed form is preserved for ``sector is None`` so existing
+    artefacts (and the strict legacy fallback) round-trip unchanged.
+    """
+    if sector is None:
+        return str(comp_idx)
+    return f"{sector}:{comp_idx}"
 
 
 def _branch_is_active(branch: Any) -> bool:
@@ -168,7 +235,16 @@ def served_by_load(
     so the priority-invariant claim can group by it.
     """
     disconnected = _disconnected_node_ids(monee_net)
-    components = _active_node_components(monee_net)
+    # Per-sector component maps so each row's ``component`` label
+    # matches the L2 coordinator-election scope (sector subgraph), not
+    # the legacy full-graph view that merged electricity sub-islands
+    # via CP couplings.  See ``_branch_carries_sector`` for the
+    # rationale and the eval_full_small_20260529-181310 failing tasks
+    # (52/88/132/133) for the manifestation.
+    components_by_sector: dict[str, dict[Any, int]] = {
+        sec.value: _active_node_components(monee_net, sector=sec.value)
+        for sec in Sector
+    }
 
     _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
 
@@ -215,12 +291,18 @@ def served_by_load(
             allowed = 1.0
         else:
             allowed = constraint_allowed_fraction(obs, sec, tier=tier)
+        sec_components = components_by_sector.get(sec.value, {})
+        comp_idx = sec_components.get(child.node_id, -1)
         rows.append({
             "aid": aid,
             "sector": sec.value,
             "tier": tier,
             "node_id": child.node_id,
-            "component": components.get(child.node_id, -1),
+            # Sector-prefixed label.  ``priority_invariant`` groups by
+            # ``(sector, component)``, so the prefix is informational —
+            # the grouping is correct either way — but it makes the CSV
+            # self-describing under inspection.
+            "component": _component_label(comp_idx, sec.value),
             "demand": cap,
             "served": served,
             "fraction": served / cap if cap > 0 else 0.0,

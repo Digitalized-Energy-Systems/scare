@@ -118,6 +118,83 @@ class TestSupplyPriorityFeasibilityCap:
         # weighting concentrates supply on high tiers.
         assert sec_frac[1] > 0.5, sec_frac
 
+    def test_zero_supply_returns_all_zero_fractions(self) -> None:
+        """When every actor reports zero controllable supply (the
+        orphan-island case after a failure splits a sub-component off
+        every grid-forming source), the allocator must return
+        ``service_fraction == 0.0`` for every (sector, tier).
+
+        Pre-fix: ``holon_supply_total = sum(supplies) or 1.0`` quietly
+        substituted a 1 MW phantom pool; the waterfall short-circuit
+        then produced ``frac = demand/demand = 1.0`` across all tiers
+        — the L2 told every leader "serve everything", no shed
+        happened, and the slack backstopping the island stayed
+        over budget.
+
+        Real-world manifestation:
+        ``eval_full_small_20260529-181310/tasks/000088`` child-12's
+        orphan sub-coord (n_communities=7, supply=0) published
+        ``T2=T3=T4=1.0`` every round; result: ``slack__electricity__
+        child-39`` settled +10.6% over its 0.10948 MW budget.
+        """
+        sectors = ["electricity"]
+        tiers = [1, 2, 3, 4]
+        actor_supplies = [{"electricity": 0.0}, {"electricity": 0.0}]
+        actor_demands = [
+            {"electricity": {1: 0.02, 2: 0.03, 3: 0.04, 4: 0.02}},
+            {"electricity": {1: 0.01, 2: 0.02, 3: 0.01, 4: 0.01}},
+        ]
+        service_fraction, x_per_actor, meta = _drive(allocate_supply_priority(
+            sectors=sectors,
+            tiers=tiers,
+            actor_supplies=actor_supplies,
+            actor_demands=actor_demands,
+            max_iters=50,
+        ))
+        for tier in tiers:
+            assert service_fraction["electricity"][tier] == 0.0, (
+                f"zero-supply scenario must shed tier {tier}; "
+                f"got fraction={service_fraction['electricity'][tier]}"
+            )
+        # No per-actor commitment — every actor's allocation is zero.
+        for row in x_per_actor:
+            assert all(v == 0.0 for v in row), row
+        # Meta surfaces the degenerate branch for caller introspection.
+        assert meta.get("degenerate_no_supply") is True
+        assert meta["holon_supply_total"] == 0.0
+
+    def test_near_zero_supply_uses_waterfall_not_phantom_pool(self) -> None:
+        """A tiny-but-positive supply pool must still trigger the
+        waterfall cap (not the legacy phantom default) and serve only
+        what the actual supply covers.
+
+        Tier 1 gets the supply first; tiers 2-4 get zero.  This is the
+        scarcity ordering the supply-priority schedule guarantees, and
+        is the boundary check that the no-supply fix doesn't kick in
+        on a legitimately small (but positive) pool.
+        """
+        sectors = ["electricity"]
+        tiers = [1, 2, 3, 4]
+        actor_supplies = [{"electricity": 0.005}, {"electricity": 0.0}]
+        actor_demands = [
+            {"electricity": {1: 0.01, 2: 0.02, 3: 0.01, 4: 0.01}},
+            {"electricity": {1: 0.0,  2: 0.01, 3: 0.0,  4: 0.0}},
+        ]
+        service_fraction, _x, meta = _drive(allocate_supply_priority(
+            sectors=sectors, tiers=tiers,
+            actor_supplies=actor_supplies, actor_demands=actor_demands,
+            max_iters=50,
+        ))
+        # Tier 1 served at supply/tier_1_demand = 0.005/0.01 = 0.5.
+        sec = service_fraction["electricity"]
+        assert sec[1] == pytest.approx(0.5, abs=1e-3), sec
+        # Tier 2 onwards: pool exhausted on tier 1, so frac = 0.
+        for tier in (2, 3, 4):
+            assert sec[tier] == 0.0, sec
+        # Definitely not the degenerate-no-supply branch.
+        assert meta.get("degenerate_no_supply") is not True
+        assert meta["holon_supply_total"] == pytest.approx(0.005)
+
     def test_abundant_supply_unchanged(self) -> None:
         """When supply ≥ demand the feasibility cap is a no-op: every
         tier should be fully served and the meta target equals demand.

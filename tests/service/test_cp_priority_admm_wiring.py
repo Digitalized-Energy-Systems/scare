@@ -137,6 +137,7 @@ def _inject_holon_summary(
     supply_mw: float,
     demand_by_tier: dict[int, float],
     served_by_tier: dict[int, float] | None = None,
+    slack_budget_mw: float = 0.0,
     version: int = 1,
 ) -> None:
     """Populate the role's leader-summaries cache directly so the
@@ -155,6 +156,7 @@ def _inject_holon_summary(
         supply_by_sector={sv: supply_mw} if supply_mw > 0 else {},
         demand_by_sector_priority={sv: dict(demand_by_tier)},
         served_by_sector_priority={sv: dict(served_by_tier)},
+        slack_budget_by_sector={sv: slack_budget_mw} if slack_budget_mw > 0 else {},
     )
     role._leader_summaries.setdefault(sv, {})[leader_aid] = summary  # type: ignore[attr-defined]
 
@@ -535,17 +537,62 @@ def test_heat_base_supply_uses_slack_when_flag_off():
     assert float(heat.base_supply[0]) == pytest.approx(10.0)
 
 
-def test_deficit_mode_does_not_touch_electricity_base_supply():
-    """The deficit reframe is heat-scoped: electricity keeps slack supply
-    even when the flag is on."""
+def test_deficit_mode_caps_electricity_input_at_served_plus_slack_budget():
+    """Issue A fix: with ``heat_supply_from_deficit`` set, the CP-input
+    sectors (electricity, gas) use ``base_supply = Σ served + slack
+    eff_budget`` instead of the aggregate supply pool — so a CP
+    consuming from that sector is bounded by the binding slack's
+    operator budget, not the (uncapped) non-slack |cap| sum."""
     role, _, _ = _make_role(
-        "chp-A", capacity_by_sector={"heat": -0.05, "electricity": -0.02},
+        "p2h-A", capacity_by_sector={"heat": -0.05, "electricity": 0.05},
         bridged_sectors=[Sector.HEAT, Sector.ELECTRICITY],
     )
     role.heat_supply_from_deficit = True
     _inject_holon_summary(
         role, leader_aid="el-leader", sector=Sector.ELECTRICITY,
-        supply_mw=10.0, demand_by_tier={1: 4.0}, served_by_tier={1: 1.0},
+        supply_mw=10.0,            # aggregate pool (slack + non-slack |cap|)
+        slack_budget_mw=0.168,     # binding electricity slack's eff_budget
+        demand_by_tier={1: 0.4}, served_by_tier={1: 0.37},
     )
     el = {d.sector: d for d in role._build_demands()}[Sector.ELECTRICITY.value]
-    assert float(el.base_supply[0]) == pytest.approx(10.0)  # slack, not served
+    # served (0.37) + slack budget (0.168) = 0.538, NOT the 10.0 pool.
+    assert float(el.base_supply[0]) == pytest.approx(0.538)
+
+
+def test_deficit_mode_caps_gas_input_at_served_plus_slack_budget():
+    """Same input-sector cap applies to gas (kg/s converted via
+    kgps_to_mw on the way into the kernel)."""
+    from scare.base.util import kgps_to_mw
+
+    role, _, _ = _make_role(
+        "chp-A",
+        capacity_by_sector={"heat": -0.04, "gas": 0.05, "electricity": -0.02},
+        bridged_sectors=[Sector.HEAT, Sector.GAS, Sector.ELECTRICITY],
+    )
+    role.heat_supply_from_deficit = True
+    _inject_holon_summary(
+        role, leader_aid="gas-leader", sector=Sector.GAS,
+        supply_mw=5.0,                # aggregate (kg/s in the summary)
+        slack_budget_mw=0.01,         # binding gas slack budget (kg/s)
+        demand_by_tier={1: 0.04}, served_by_tier={1: 0.03},
+    )
+    gas = {d.sector: d for d in role._build_demands()}[Sector.GAS.value]
+    # served (0.03) + slack budget (0.01) = 0.04 kg/s, kgps_to_mw'd:
+    assert float(gas.base_supply[0]) == pytest.approx(kgps_to_mw(0.04))
+
+
+def test_input_cap_off_when_flag_off():
+    """Default (flag off): electricity keeps slack supply, preserving
+    the pre-existing behaviour for ablation."""
+    role, _, _ = _make_role(
+        "chp-A", capacity_by_sector={"heat": -0.05, "electricity": -0.02},
+        bridged_sectors=[Sector.HEAT, Sector.ELECTRICITY],
+    )
+    assert role.heat_supply_from_deficit is False
+    _inject_holon_summary(
+        role, leader_aid="el-leader", sector=Sector.ELECTRICITY,
+        supply_mw=10.0, slack_budget_mw=0.168,
+        demand_by_tier={1: 4.0}, served_by_tier={1: 1.0},
+    )
+    el = {d.sector: d for d in role._build_demands()}[Sector.ELECTRICITY.value]
+    assert float(el.base_supply[0]) == pytest.approx(10.0)

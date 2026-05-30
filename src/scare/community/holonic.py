@@ -65,6 +65,7 @@ from scare.base.model import (
     HolonicJoinAnswer,
     HolonicJoinRequest,
     L2RecycleEscalation,
+    LeaderEmerged,
     LocalGenerationApproval,
     LocalGenerationRequest,
     NegotiationFinishedEvent,
@@ -387,6 +388,25 @@ class HolonicCommunityRole(Role):
         # dispatch, skip" cases on the periodic heartbeat.
         self._last_component_fraction: dict[str, dict[int, float]] | None = None
 
+        # --- ComponentAllocation versioning (packet-loss recovery) ---
+        # Strictly-monotone counter the coordinator stamps onto each
+        # outgoing ``ComponentAllocation``.  Receivers echo the last
+        # version they applied on their next ``ComponentAdmmReport``
+        # (``last_applied_allocation_version``), so the coordinator
+        # detects message loss and re-sends the latest allocation just
+        # to the stale receiver — turning the fire-and-forget broadcast
+        # into a reliable dispatch under non-zero packet loss.  See the
+        # docstring on ``channel.ComponentAllocation.version`` for the
+        # eval evidence (task 52, 50% packet loss).
+        self._allocation_version_counter: int = 0
+        # The latest dispatched allocation, used to re-send to stale
+        # leaders on report-receipt.  None until the first dispatch.
+        self._last_dispatched_allocation: Any = None  # ComponentAllocation
+        # The latest ``version`` this leader has applied as an L2
+        # leaf.  Echoed back in every outgoing ``ComponentAdmmReport``.
+        # ``-1`` = no allocation applied yet.
+        self._last_applied_allocation_version: int = -1
+
     def setup(self) -> None:
         # Holon formation: event-driven via _on_member_finished /
         # _handle_join_request / repartition events (see below).  A
@@ -482,6 +502,13 @@ class HolonicCommunityRole(Role):
         self.context.subscribe_event(
             self, NegotiationFinishedEvent, self._on_member_finished_local
         )
+        # b1 (data-refresh only — direct ADMM trigger removed after the
+        # first attempt over-restored gas demand by running the holon
+        # kernel against still-stale peer summaries; the cascade's
+        # existing NegotiationFinishedEvent path picks up the next
+        # natural round once every leader's HolonSummaryRole has
+        # refreshed its slack_budget_by_sector).
+        # No subscription needed here.
         # Locality-respecting prompt L2 re-cycle: react to the propagated,
         # TTL-bounded ``FailureNotice`` (same signal the ProblemDetector
         # gossips from the failed branch's endpoints) so a topology change
@@ -591,6 +618,31 @@ class HolonicCommunityRole(Role):
                 and msg.sector == self.sector,
             )
 
+        # LeaderEmerged: a previously-non-leader agent was promoted to
+        # lead an orphan sub-community after a failure-driven
+        # re-partition (see ``DynamicRepartitionRole``).  Updating
+        # ``_leader_node_ids`` keeps ``_resolve_component_peer_addrs``
+        # from filtering the new leader out of the component peer set
+        # when its ``ComponentAdmmReport`` eventually arrives.  The
+        # subscription is synchronous (it just mutates a dict); no
+        # task wrap needed.  Filter by sector to keep cross-sector
+        # broadcasts out of this role's view.
+        def _on_leader_emerged_msg(msg: Any, meta: dict) -> None:
+            try:
+                self._on_leader_emerged(msg)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[%s] _on_leader_emerged failed for %r: %s",
+                    self.context.aid, msg, exc,
+                )
+
+        self.context.subscribe_message(
+            self,
+            _on_leader_emerged_msg,
+            lambda msg, meta: isinstance(msg, LeaderEmerged)
+            and msg.sector == self.sector,
+        )
+
         # Holon-formation event triggers: retry when the
         # eligible-neighbour set could have changed.  The watchdog
         # in setup() is the slow fallback; these triggers cover the
@@ -603,6 +655,34 @@ class HolonicCommunityRole(Role):
     # ------------------------------------------------------------------
     # Holon formation
     # ------------------------------------------------------------------
+
+    def _on_leader_emerged(self, message: LeaderEmerged) -> None:
+        """A previously-non-leader agent was promoted to lead an
+        orphan sub-community.  Add it to ``_leader_node_ids`` so
+        ``_resolve_component_peer_addrs`` admits its address into the
+        component peer set when the topology-mirror filter says it's
+        reachable.
+
+        Idempotent.  No-op if the aid is already known (e.g. a
+        delayed retransmit).  Records a diagnostic event so the
+        promotion shows up in ``events.csv``.
+        """
+        aid = str(message.leader_aid)
+        if not aid:
+            return
+        prior = self._leader_node_ids.get(aid)
+        self._leader_node_ids[aid] = message.node_id
+        if prior is None:
+            record_event(
+                t=float(self.context.current_timestamp),
+                kind="leader_emerged_registered",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=(
+                    f"new_leader={aid} node_id={message.node_id} "
+                    f"known_leaders={len(self._leader_node_ids)}"
+                ),
+            )
 
     def _on_community_reassigned(
         self, _event: CommunityReassignedEvent, _src: Any
@@ -1292,6 +1372,7 @@ class HolonicCommunityRole(Role):
         if event.sector != self.sector:
             return
         self._maybe_schedule_rebalance()
+
 
     async def _handle_flex_answer(
         self, message: AvailableFlexAnswer, meta: dict
@@ -2602,6 +2683,10 @@ class HolonicCommunityRole(Role):
             supply_by_sector=supply,
             demand_by_sector_priority=demand,
             served_by_sector_priority=served,
+            # Implicit-ACK: echo the latest ComponentAllocation version
+            # we have applied so the coordinator can detect this
+            # leader missed the previous dispatch and re-send.
+            last_applied_allocation_version=self._last_applied_allocation_version,
         )
 
         if coord_aid == leader_aid:
@@ -2683,7 +2768,70 @@ class HolonicCommunityRole(Role):
         self._component_report_buffer[message.leader_aid] = (
             message.round_id, message
         )
+        # Packet-loss recovery: if the sender's echoed
+        # ``last_applied_allocation_version`` is behind the latest
+        # version we dispatched, re-send the stashed allocation to
+        # JUST this peer.  Idempotent on the receiver (a stale or
+        # equal-version retransmit is ignored at apply time).  Wrapped
+        # in try/except because the legacy ComponentAdmmReport had no
+        # such field — getattr keeps the path safe.
+        try:
+            await self._resend_allocation_if_stale(
+                message.leader_aid,
+                component_peers.get(message.leader_aid),
+                int(getattr(message, "last_applied_allocation_version", -1)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[%s] resend-if-stale failed for leader=%s: %s",
+                self.context.aid, message.leader_aid, exc,
+            )
         await self._maybe_run_component_admm(reason="peer_report")
+
+    async def _resend_allocation_if_stale(
+        self,
+        leader_aid: str,
+        leader_addr: Any | None,
+        applied_version: int,
+    ) -> None:
+        """Re-send the latest ``ComponentAllocation`` to ``leader_addr``
+        when its echoed ``last_applied_allocation_version`` is behind
+        ``self._allocation_version_counter``.
+
+        Trigger: a peer's ``ComponentAdmmReport`` echoes the version
+        it last applied; if it is strictly less than our latest
+        dispatch, the original ComponentAllocation was lost in
+        transit (packet loss is the dominant cause — see
+        ``channel.ComponentAllocation`` docstring + task 52 evidence).
+
+        Idempotency: the leaf's apply path ignores a
+        ``ComponentAllocation`` whose ``version`` is ≤ the already-
+        applied version, so a benign duplicate after a real drop is
+        a no-op.
+
+        Self-skip: the coordinator's own seat doesn't send to itself
+        — the dispatch loop in ``_run_component_admm_now`` already
+        included it.
+
+        Records a ``component_alloc_resent`` diagnostic event so the
+        recovery is visible in the events ledger.
+        """
+        if leader_addr is None:
+            return
+        if leader_aid == self.context.aid:
+            return
+        if self._last_dispatched_allocation is None:
+            return
+        if applied_version >= self._allocation_version_counter:
+            return
+        await self.context.send_message(
+            self._last_dispatched_allocation, receiver_addr=leader_addr,
+        )
+        self._record_event(
+            "component_alloc_resent",
+            f"target={leader_aid} applied_version={applied_version} "
+            f"latest_version={self._allocation_version_counter}",
+        )
 
     async def _maybe_run_component_admm(self, *, reason: str) -> None:
         """Debounce + dispatch.  Collapses a burst of incoming reports
@@ -2847,14 +2995,20 @@ class HolonicCommunityRole(Role):
             default="",
         )
         now = float(self.context.current_timestamp)
+        # Bump the per-coordinator allocation version BEFORE building
+        # the message so leaf-side ACK echoes line up with the dispatch
+        # we're about to send.  Stash the message for re-sends to
+        # stale leaders (see ``_resend_allocation_if_stale``).
+        self._allocation_version_counter += 1
         allocation = ComponentAllocation(
             publisher=self.context.aid,
-            version=self._version.next(),
+            version=self._allocation_version_counter,
             timestamp_s=now,
             round_id=round_id,
             sector=self.sector,
             service_fraction_by_tier=service_fraction.get(self.sector.value, {}),
         )
+        self._last_dispatched_allocation = allocation
         for addr in component_peers.values():
             await self.context.send_message(allocation, receiver_addr=addr)
 
@@ -2907,9 +3061,23 @@ class HolonicCommunityRole(Role):
             ),
             receiver_addr=self.context.addr,
         )
+        # ACK channel: record the version we just applied so the next
+        # outgoing ``ComponentAdmmReport`` echoes it.  The coordinator
+        # uses the echo to detect ComponentAllocation drops under
+        # packet loss and re-sends to stale leaders.  A retransmit
+        # with a stale ``version`` (≤ already-applied) is ignored.
+        try:
+            if int(message.version) > self._last_applied_allocation_version:
+                self._last_applied_allocation_version = int(message.version)
+        except (TypeError, ValueError):
+            # Defensive — legacy ComponentAllocation (no version field)
+            # still applies normally; ack stays at -1 so the
+            # coordinator interprets the report as "stale or first".
+            pass
         self._record_event(
             "holon_priority_allocation",
             f"component_scope round={message.round_id} "
+            f"version={getattr(message, 'version', 0)} "
             f"fractions={service_fraction}",
         )
 

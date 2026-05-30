@@ -112,14 +112,16 @@
       ]
     },
     {
-      "$comment": "Pillar 4e — thermal stress.  Baseline + heat_recovery-off on cold_day.",
+      "$comment": "Pillar 4e — thermal stress.  Baseline + the three heat-control mechanisms toggled off (temperature-frontier controller, tier-aware priority-waterfall gate, heat->CP supply link) on cold_day.  Replaces the retired enable_heat_recovery flag.",
       "name": "ablation_thermal",
       "grids": ["simbench_lv_cp_heavy"],
       "n_seeds": 2,
       "variants": ["scare"],
       "ablations": [
         {},
-        {"enable_heat_recovery": false}
+        {"enable_heat_frontier": false},
+        {"enable_heat_priority_waterfall": false},
+        {"enable_heat_cp_supply": false}
       ],
       "scenarios": [
         {"kind": "cold_day", "supply_t_k": 343.15, "heat_load_scale": 1.5, "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}

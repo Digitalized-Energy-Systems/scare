@@ -281,15 +281,19 @@ def apply_slack_budget(mes, fraction: float) -> None:
     # roughly 4× and make the constraint inert in practice.
     #
     # We also track per-sector *injection* magnitude (PowerGenerator for
-    # electricity, gas-side Source for gas).  The operator budget is sized
-    # off load only, but the LP slack may have to absorb the full local
-    # injection (e.g. a grid whose generators / gas sources far exceed its
-    # native load), so the feasibility envelope is sized off load + the
-    # injection it might need to backstop.
+    # electricity, gas-side Source for gas).  All demand on the slack is
+    # equal regardless of which device produces it — the operator budget
+    # mirrors physical slack throughput, not just load-shaped demand — so
+    # the budget is sized off load + injection.  Without this, on grids
+    # with gas-fed converters the slack must move load + converter gas
+    # but the load-only budget under-shoots by construction (every
+    # feasible balance breaches; see Issue C trace 2026-05-29).  The
+    # feasibility envelope below uses the same throughput basis.
     total_p_mw = 0.0
     total_gas_mass_kgs = 0.0
     total_p_gen_mw = 0.0
     total_gas_source_kgs = 0.0
+    total_gas_conv_kgs = 0.0
     for child in mes.childs:
         m = child.model
         if isinstance(m, PowerLoad):
@@ -308,9 +312,20 @@ def apply_slack_budget(mes, fraction: float) -> None:
                     total_gas_mass_kgs += abs(getattr(m, "mass_flow", 0.0))
                 else:
                     total_gas_source_kgs += abs(getattr(m, "mass_flow", 0.0))
+    # Cross-sector converters that draw gas (CHP) — modeled at the node
+    # level (CHPHGControlNode), not as a Sink/Source child, so the loop
+    # above misses them.  Their gas input is normal demand on the slack:
+    # leaving it out under-sized the budget on cp_heavy grids.
+    for node in mes.nodes:
+        nm = node.model
+        if type(nm).__name__ == "CHPHGControlNode":
+            total_gas_conv_kgs += abs(getattr(nm, "gas_kgps", 0.0))
 
-    cap_p_mw = max(1e-3, fraction * total_p_mw)
-    cap_gas_mass_kgs = max(1e-4, fraction * total_gas_mass_kgs)
+    cap_p_mw = max(1e-3, fraction * (total_p_mw + total_p_gen_mw))
+    cap_gas_mass_kgs = max(
+        1e-4,
+        fraction * (total_gas_mass_kgs + total_gas_source_kgs + total_gas_conv_kgs),
+    )
 
     # Feasibility envelope: never below the sector's physical throughput
     # (load + injection it may have to absorb), so the LP can always
@@ -319,7 +334,8 @@ def apply_slack_budget(mes, fraction: float) -> None:
     # the old ``HEADROOM · budget`` envelope already exceeded throughput.
     lp_p_mw = _SLACK_LP_HEADROOM_FACTOR * max(cap_p_mw, total_p_mw + total_p_gen_mw)
     lp_gas_mass_kgs = _SLACK_LP_HEADROOM_FACTOR * max(
-        cap_gas_mass_kgs, total_gas_mass_kgs + total_gas_source_kgs
+        cap_gas_mass_kgs,
+        total_gas_mass_kgs + total_gas_source_kgs + total_gas_conv_kgs,
     )
 
     for child in mes.childs:

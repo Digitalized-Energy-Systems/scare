@@ -344,6 +344,18 @@ class CPPriorityAdmmRole(Role):
             heat_deficit_mode = (
                 self.heat_supply_from_deficit and sec_v == Sector.HEAT.value
             )
+            # Input-sector capping: when the heat→L3 mode is active, the
+            # CP-input sectors (electricity, gas) also use the delivered-
+            # supply reframe so a CP's draw is bounded by the binding per-
+            # slack operator budget (`slack_budget_by_sector`) rather than
+            # the aggregate generator pool.  Without this, B_el is a
+            # phantom sum of every electricity leader's |cap| (≈100× the
+            # child-118 budget on cp_heavy) and the kernel constraint
+            # never binds on the P2H electricity draw — see Issue A.
+            input_capped_mode = (
+                self.heat_supply_from_deficit
+                and sec_v in (Sector.ELECTRICITY.value, Sector.GAS.value)
+            )
             for summary in bucket.values():
                 if heat_deficit_mode:
                     # Heat delivery is temperature-limited, not MW-limited:
@@ -354,6 +366,17 @@ class CPPriorityAdmmRole(Role):
                     # becomes the gap the reachable CHP/P2H units fill.
                     served_map = (summary.served_by_sector_priority or {}).get(sec_v, {})
                     agg_supply += sum(float(v) for v in served_map.values())
+                elif input_capped_mode:
+                    # B_s = currently delivered + binding slack's eff_budget.
+                    # The first term keeps existing load service feasible
+                    # in the kernel; the second is the additional draw the
+                    # operator allows through the slack, so a CP consuming
+                    # from this sector is capped at the slack budget rather
+                    # than the unbounded non-slack |cap| pool.
+                    served_map = (summary.served_by_sector_priority or {}).get(sec_v, {})
+                    agg_supply += sum(float(v) for v in served_map.values())
+                    slack_map = summary.slack_budget_by_sector or {}
+                    agg_supply += float(slack_map.get(sec_v, 0.0))
                 else:
                     supply_dict = summary.supply_by_sector or {}
                     agg_supply += float(supply_dict.get(sec_v, 0.0))

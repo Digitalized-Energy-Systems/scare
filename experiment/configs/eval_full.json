@@ -271,7 +271,7 @@
       ]
     },
     {
-      "$comment_block": "Thermal stress.  cold_day on cp_heavy forces heat-sector deficit so heat_recovery (heat-only) and clpu_ramp (ramp-rate-gated) have signal.",
+      "$comment_block": "Thermal stress.  cold_day on cp_heavy forces a heat-sector deficit so the heat-control stack has signal: enable_heat_frontier (temperature-frontier controller vs bang-bang), enable_heat_priority_waterfall (tier-aware shedding vs tier-blind), enable_heat_cp_supply (heat->L3 coupling-point supply link vs idle CPs), plus clpu_ramp (ramp-rate-gated).  Replaces the retired enable_heat_recovery flag.",
       "name": "ablation_thermal",
       "grids": [
         "simbench_lv_cp_heavy"
@@ -283,7 +283,13 @@
       "ablations": [
         {},
         {
-          "enable_heat_recovery": false
+          "enable_heat_frontier": false
+        },
+        {
+          "enable_heat_priority_waterfall": false
+        },
+        {
+          "enable_heat_cp_supply": false
         },
         {
           "enable_clpu_ramp": false

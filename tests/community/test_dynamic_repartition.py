@@ -75,3 +75,129 @@ def test_new_leader_election_is_lex_smallest_orphan() -> None:
     orphans = ["agent-9", "agent-3", "agent-7", "agent-5"]
     new_leader = sorted(orphans)[0]
     assert new_leader == "agent-3"
+
+
+def test_repartition_handler_rewrites_slack_budget_home_leader() -> None:
+    """``RepartitionHandlerRole._on_repartition`` must rewrite
+    ``home_leader_addr`` on every co-located ``SlackBudgetMonitor``.
+
+    The monitor caches the original group leader at scenario build
+    time; after a failure-driven re-assignment the agent's home
+    leader can change and the cached address goes stale.  An
+    over-budget poll would then send
+    ``StartBalanceNegotiation(override_target=imbalance)`` to the
+    wrong (or now-isolated) leader and the budget excursion has no
+    escalation path.
+
+    Verified end-to-end mango wiring is exercised by integration
+    tests; here we drive the role's coroutine directly to assert the
+    rewrite contract.
+
+    Regression for the residual ``slack__electricity__child-39``
+    breach on ``eval_full_small_20260529-181310/tasks/000088``: the
+    repartition wired child-39 to a new community (``community_
+    reassigned ... new_leader=child-25``) but the SlackBudgetMonitor
+    kept addressing the original leader.
+    """
+    # pylint: disable=import-outside-toplevel
+    import asyncio
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from scare.base.model import RepartitionAssignment
+    from scare.community.repartition import RepartitionHandlerRole
+
+    class _StubMonitor:
+        """Minimal duck-typed SlackBudgetMonitor stand-in: the only
+        attribute the rewrite touches is ``home_leader_addr``.  The
+        class name is what the rewrite filters on (no isinstance
+        check) so we keep the test free of the heavy slack-budget
+        dependency tree.
+        """
+        def __init__(self) -> None:
+            self.home_leader_addr = "original-leader"
+    _StubMonitor.__name__ = "SlackBudgetMonitor"
+
+    class _OtherRole:
+        """An unrelated role that must NOT be touched."""
+        def __init__(self) -> None:
+            self.home_leader_addr = "untouched"
+
+    class _StubContext:
+        def __init__(self) -> None:
+            self.aid = "child-39"
+            self.addr = "child-39-addr"
+            self.current_timestamp = 1.1
+            self.monitor = _StubMonitor()
+            self.other = _OtherRole()
+            self.roles = [self.monitor, self.other]
+            self._models: dict = {}
+            self._events: list = []
+
+        def get_or_create_model(self, _cls):
+            return self._models.setdefault("ca", SimpleNamespace(
+                community_id=None, neighbors=[], leader_addr=None,
+            ))
+
+        def update(self, _model):
+            pass
+
+        def emit_event(self, ev):
+            self._events.append(ev)
+
+        async def send_message(self, *_args, **_kwargs):
+            return None
+
+    role = RepartitionHandlerRole()
+    role._context = _StubContext()  # type: ignore[attr-defined]
+    msg = RepartitionAssignment(
+        community_id=uuid4(),
+        new_leader_addr="child-25-addr",
+        orphan_addrs=["child-39-addr", "child-31-addr", "child-25-addr"],
+    )
+    asyncio.run(role._on_repartition(msg, meta={}))
+
+    assert role._context.monitor.home_leader_addr == "child-25-addr", (
+        "SlackBudgetMonitor.home_leader_addr must be rewritten to the "
+        "new leader; got "
+        f"{role._context.monitor.home_leader_addr!r}"
+    )
+    # Unrelated co-located roles must NOT be touched — the rewrite
+    # filters on the class name to avoid clobbering homonymous
+    # attributes elsewhere.
+    assert role._context.other.home_leader_addr == "untouched"
+
+
+def test_repartition_module_publishes_leader_emerged_message() -> None:
+    """End-to-end mango wiring is out of scope here (covered by the
+    integration test), but the module's contract — broadcasting a
+    ``LeaderEmerged`` message to the original leader's
+    ``holon_summary_<sector>`` peers — must be statically visible in
+    the source so a future refactor that drops it gets flagged.
+
+    Regression for the slack__electricity__child-39 +10.6% breach in
+    ``eval_full_small_20260529-181310/tasks/000088``: the promoted
+    orphan leader (child-25) was invisible to the elected component
+    coordinator because no leader registered its aid in their
+    ``_leader_node_ids`` map.  The fix routes the announcement
+    through the original leader who is already on the
+    holon_summary_<sector> mesh.
+    """
+    # pylint: disable=import-outside-toplevel
+    import inspect
+
+    from scare.community import repartition
+
+    src = inspect.getsource(repartition.DynamicRepartitionRole)
+    assert "LeaderEmerged" in src, (
+        "DynamicRepartitionRole must publish LeaderEmerged after the "
+        "orphan-leader is elected; the broadcast goes through the "
+        "original leader's holon_summary_<sector> peer mesh because "
+        "the promoted orphan was not a leader at scenario time and so "
+        "isn't on that mesh itself."
+    )
+    assert "topology_neighbors" in src and "holon_summary_" in src, (
+        "Broadcast target must be the holon_summary_<sector> mesh — "
+        "this is where the receiving HolonicCommunityRoles live and "
+        "update _leader_node_ids."
+    )

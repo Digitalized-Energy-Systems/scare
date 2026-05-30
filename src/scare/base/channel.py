@@ -176,6 +176,14 @@ class HolonSummary(Decision):
     supply_by_sector: dict[str, float] = field(default_factory=dict)
     demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
     served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    # Per-sector slack-only operator budget (Σ over slack members'
+    # eff_budget), split out from ``supply_by_sector`` so the L3
+    # CP-ADMM can cap a CP's INPUT-sector draw at the binding slack's
+    # operator budget rather than the aggregate generator pool.  Without
+    # this split, a CP consuming from a sector competes against a
+    # phantom B_s ≈ Σ |cap| over non-slack feeders and the kernel never
+    # binds on the slack budget — see Issue A trace 2026-05-29.
+    slack_budget_by_sector: dict[str, float] = field(default_factory=dict)
     # Publisher's monee node id on the per-sector subgraph.  Used by
     # the future replicated kernel for deliverability filtering via
     # ``GridTopologyMirror.reachable_from`` — same primitive the
@@ -350,6 +358,13 @@ class ComponentAdmmReport(Decision):
     supply_by_sector: dict[str, float] = field(default_factory=dict)
     demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
     served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    # Implicit-ACK channel.  When the sending leader has previously
+    # applied a ``ComponentAllocation`` from the coordinator it echoes
+    # the allocation's ``version`` here; the coordinator uses the
+    # echo to detect leaders that missed the last dispatch under
+    # packet loss and re-sends just to them.  ``-1`` = no allocation
+    # applied yet.  See ``ComponentAllocation.version``.
+    last_applied_allocation_version: int = -1
 
 
 @dataclass
@@ -368,11 +383,31 @@ class ComponentAllocation(Decision):
     at the same tier in the same (sector, active-component) is served
     at the same fraction — eliminating the cross-community priority
     inversion the per-holon and sector-wide paths produced.
+
+    ``version`` is a monotone-per-coordinator counter that the
+    coordinator increments on every fresh dispatch.  Receivers echo
+    it on their next ``ComponentAdmmReport`` via
+    ``last_applied_allocation_version`` so the coordinator can
+    detect message loss and re-send: under non-zero packet loss this
+    is the only thing that turns a fire-and-forget broadcast into a
+    reliable dispatch.  Empirical: at 50% packet loss
+    (``robustness_packet_loss`` sweep, eval_full_small_20260529-181310
+    task 52) a single fire-and-forget dispatch leaves 6/28 tier-3
+    loads stuck at served=0 and 13/15 tier-4 loads stuck at the LP
+    default 1.0 — a by-community shed pattern that surfaces as a
+    spurious tier-3-vs-tier-4 priority inversion.
     """
 
     round_id: str = ""
     sector: Sector = Sector.ELECTRICITY
     service_fraction_by_tier: dict[int, float] = field(default_factory=dict)
+    # Monotone-per-coordinator dispatch version.  ``0`` = first
+    # dispatch since coordinator startup; the coordinator increments
+    # once per ``_run_component_admm_round`` send.  Leaves the
+    # default at 0 so legacy senders (no version assigned) behave
+    # as a single repeating round — no stale-version retries fire
+    # spuriously.
+    version: int = 0
 
 
 @dataclass
