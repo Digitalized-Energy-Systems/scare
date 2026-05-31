@@ -168,13 +168,24 @@ class CampaignData:
     def representative_task(
         self, experiment: str, variant: str = "scare"
     ) -> TaskArtefacts | None:
-        """Pick one OK task in the given experiment for trajectory plots."""
+        """Pick one OK task in the given experiment for trajectory plots.
+
+        Prefers tasks with no solver infeasibilities — a task whose
+        ``_net_results`` froze on a held-over snapshot makes a bad
+        representative because every observation-based metric flatlines
+        after the freeze.  When the summary column is unavailable
+        (older runs), falls back to the lowest task_id for stability.
+        """
         df = self.by_experiment(experiment)
         df = df[df["variant"] == variant]
         df = df[df["status"] == "ok"]
         if df.empty:
             return None
-        # Pick the lowest task_id for stability.
+        fresh_col = "solver_failures"
+        if fresh_col in df.columns:
+            fresh = df[df[fresh_col].fillna(0).astype(int) == 0]
+            if not fresh.empty:
+                return self.task(int(fresh["task_id"].iloc[0]))
         return self.task(int(df["task_id"].iloc[0]))
 
 

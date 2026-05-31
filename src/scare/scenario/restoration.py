@@ -2242,29 +2242,37 @@ def _register_recordings(
     )
 
     # Record constraint-related metrics when the observations expose them.
-    def _avg_constraint(child_aids: list[str], key: str) -> float:
-        vals = []
+    # Average is the population mean across the sector's nodes; min/max
+    # surface the actual extremes, which are what trigger a violation if
+    # they fall outside the operating envelope (the average hides those).
+    def _constraint_values(child_aids: list[str], key: str) -> list[float]:
+        vals: list[float] = []
         for aid in child_aids:
             obs = behavior.observe(aid)
             if obs and key in obs:
                 vals.append(float(obs[key]))
+        return vals
+
+    def _avg_constraint(child_aids: list[str], key: str) -> float:
+        vals = _constraint_values(child_aids, key)
         return sum(vals) / len(vals) if vals else 0.0
 
-    record_world(
-        world,
-        "avg_vm_pu",
-        lambda: _avg_constraint(el_child_aids, "vm_pu"),
-    )
-    record_world(
-        world,
-        "avg_pressure_pu",
-        lambda: _avg_constraint(gas_child_aids, "pressure_pu"),
-    )
-    record_world(
-        world,
-        "avg_t_k",
-        lambda: _avg_constraint(heat_child_aids, "t_k"),
-    )
+    def _min_constraint(child_aids: list[str], key: str) -> float:
+        vals = _constraint_values(child_aids, key)
+        return min(vals) if vals else 0.0
+
+    def _max_constraint(child_aids: list[str], key: str) -> float:
+        vals = _constraint_values(child_aids, key)
+        return max(vals) if vals else 0.0
+
+    for prefix, aids, key in (
+        ("vm_pu",       el_child_aids,   "vm_pu"),
+        ("pressure_pu", gas_child_aids,  "pressure_pu"),
+        ("t_k",         heat_child_aids, "t_k"),
+    ):
+        record_world(world, f"avg_{prefix}", lambda a=aids, k=key: _avg_constraint(a, k))
+        record_world(world, f"min_{prefix}", lambda a=aids, k=key: _min_constraint(a, k))
+        record_world(world, f"max_{prefix}", lambda a=aids, k=key: _max_constraint(a, k))
 
     # --- Line-loading aggregates ---
     # Per-tick rollup of electricity branch loading_percent across every

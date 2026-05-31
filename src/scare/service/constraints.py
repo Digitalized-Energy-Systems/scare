@@ -713,12 +713,24 @@ class GridConstraintMonitor(Role):
             _SENS_MULT_MAX]`` so it ranks loads *within* a tier without
             overcoming the 1e4 tier step (see those constants);
           - current reducible output (nothing to curtail → nothing to give).
+
+        Tier-1 LOADS (cap > 0) return exactly 0.0 instead of the 1e-9
+        floor.  The floor leaked in self-only auctions: with tier-1 self
+        as the only bidder, ``sum_w = 1e-9 > 0`` and the allocator
+        dispatched the full violation amount to self, defeating the
+        hard-lock invariant at ``base/util.py:1080-1086`` (eval task
+        1556: child-21/89 ratcheted 0.90 → 0.05).  Generators (cap < 0)
+        still get the 1e-9 floor — they must remain shed-eligible under
+        overvoltage so PV self-curtail under qv_droop violations works.
         """
         from scare.service.balance import _PRIORITY_TIERS
 
         prio_tier = max(
             1, obs_priority(obs, behavior=self.behavior, aid=self.context.aid)
         )
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
+        if prio_tier <= 1 and cap > 0:
+            return 0.0
         prio_weight = tier_priority_weight(
             prio_tier, regime=-1, priority_tiers=_PRIORITY_TIERS,
         )
@@ -770,13 +782,32 @@ class GridConstraintMonitor(Role):
         # absorbs: a high-priority self competing against low-priority
         # neighbours wins ~0 share until the neighbours' reducible is spent.
         self_obs = self.behavior.observe(self.context.aid) or {}
-        self_w = (
+        self_w_raw = (
             self._own_curtail_willingness(self_obs)
             if self.behavior.has_action(self.context.aid, "regulate")
             else None
         )
+        # Tier-1 returns willingness 0.0 (see ``_own_curtail_willingness``);
+        # drop it from the auction so the all-zero fallback even-split
+        # in ``_allocate_auction`` can't shed self either.  A zero
+        # willingness contributes nothing to dispatch in any case
+        # (``_dispatch`` short-circuits on share <= 0), so this is safe
+        # for the non-tier-1 "nothing to curtail" path too.
+        self_w = (
+            self_w_raw if (self_w_raw is not None and self_w_raw > 0.0) else None
+        )
 
         neighbors = list(topology_neighbors(self, tid="groups"))
+
+        if not neighbors and self_w is None:
+            # Self is locked (tier-1 or nothing to curtail) and there are
+            # no neighbours to delegate to — no auction can be allocated
+            # without violating the hard-lock invariant.  Clear the
+            # in-flight guard so the next monitor poll can retry once
+            # repartition adds neighbours or self becomes shed-eligible.
+            self._curtail_inflight.pop(variable, None)
+            return
+
         auction_id = str(uuid.uuid4())
         self._open_auctions[auction_id] = {
             "bids": {},

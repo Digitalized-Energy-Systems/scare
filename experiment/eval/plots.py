@@ -57,76 +57,93 @@ _QUAL_PALETTE = [
 _FONT_FAMILY = "Inter, -apple-system, Segoe UI, Roboto, sans-serif"
 _TITLE_FONT_FAMILY = "Charter, Georgia, 'Times New Roman', serif"
 
-# Figure dimensions tuned for two-column LaTeX dissertation layout.
-# At \columnwidth ≈ 3.3 in, a 500×340 native PDF scales to ~0.63 in
-# \includegraphics, which keeps the font sizes below at ≥9 pt printed.
-_FIG_WIDTH = 500
-_FIG_HEIGHT = 340
+# Figure dimensions tuned to match the dissertation's resilience-chapter
+# bar/line style: full-width landscape figures with generous label
+# breathing room.  The reference page (``Figures/resilience/pooled_srs``)
+# uses ~1500×600 pixel renders at \linewidth; we mirror that aspect so
+# the SCARE chapter reads as one continuous style.
+_FIG_WIDTH = 1000
+_FIG_HEIGHT = 440
 
-# Font sizing — chosen so labels remain ≥9 pt after column-width scaling.
-_BASE_FONT_SIZE = 14
-_TITLE_FONT_SIZE = 19
-_AXIS_TITLE_FONT_SIZE = 15
-_TICK_FONT_SIZE = 14
-_LEGEND_FONT_SIZE = 13
-_ANNOTATION_FONT_SIZE = 13
+# Font sizing — bumped up to read at full-width PDF without further
+# scaling; the dissertation's bar plots inline at ~14–18 pt printed.
+_BASE_FONT_SIZE = 17
+_TITLE_FONT_SIZE = 22
+_AXIS_TITLE_FONT_SIZE = 18
+_TICK_FONT_SIZE = 16
+_LEGEND_FONT_SIZE = 16
+_ANNOTATION_FONT_SIZE = 14
 
 _GRID_COLOR = "#ECECEC"
 _AXIS_COLOR = "#1A1A1A"
 _MUTED_COLOR = "#666666"
 
+# Axis style — dissertation reference shows horizontal gridlines only
+# (no vertical grid, no enclosing box).  ``showline=False`` removes the
+# axis spine; the ticks and labels are enough.  X-axis is overridden
+# below to hide grid lines entirely.
 _AXIS_STYLE = dict(
     gridcolor=_GRID_COLOR,
     gridwidth=0.8,
     zeroline=False,
-    showline=True,
-    linecolor=_AXIS_COLOR,
-    linewidth=1.1,
+    showline=False,
     mirror=False,
     ticks="outside",
     tickcolor=_AXIS_COLOR,
     ticklen=4,
     tickwidth=0.9,
     tickfont=dict(size=_TICK_FONT_SIZE),
-    title=dict(font=dict(size=_AXIS_TITLE_FONT_SIZE), standoff=8),
+    title=dict(font=dict(size=_AXIS_TITLE_FONT_SIZE), standoff=10),
     automargin=True,
 )
+_X_AXIS_STYLE = {**_AXIS_STYLE, "showgrid": False}
+_Y_AXIS_STYLE = {**_AXIS_STYLE, "showgrid": True}
 
 _DEFAULT_LAYOUT = dict(
     template="plotly_white",
     width=_FIG_WIDTH,
     height=_FIG_HEIGHT,
     font=dict(family=_FONT_FAMILY, size=_BASE_FONT_SIZE, color=_AXIS_COLOR),
+    # Centered title — matches dissertation/pooled_srs reference where
+    # the title is the most prominent text on the page.
     title=dict(
         font=dict(family=_TITLE_FONT_FAMILY, size=_TITLE_FONT_SIZE, color=_AXIS_COLOR),
-        x=0.02,
-        xanchor="left",
-        y=0.97,
+        x=0.5,
+        xanchor="center",
+        y=0.96,
         yanchor="top",
-        pad=dict(t=4, b=4),
+        pad=dict(t=6, b=6),
     ),
     paper_bgcolor="white",
     plot_bgcolor="white",
-    margin=dict(l=66, r=20, t=58, b=80),
+    margin=dict(l=84, r=160, t=72, b=72),
+    # Legend on the right (vertical) — same as the dissertation
+    # reference; lets bar/line plots use the full plot area without
+    # the bottom-stacked horizontal legend stealing vertical room.
     legend=dict(
         bgcolor="rgba(255,255,255,0)",
         bordercolor="rgba(0,0,0,0)",
         borderwidth=0,
         font=dict(size=_LEGEND_FONT_SIZE),
-        orientation="h",
-        x=0.5,
-        xanchor="center",
-        y=-0.22,
+        orientation="v",
+        x=1.02,
+        xanchor="left",
+        y=1.0,
         yanchor="top",
         itemsizing="constant",
+        tracegroupgap=4,
     ),
-    xaxis=_AXIS_STYLE,
-    yaxis=_AXIS_STYLE,
+    xaxis=_X_AXIS_STYLE,
+    yaxis=_Y_AXIS_STYLE,
     hoverlabel=dict(
         bgcolor="white",
         bordercolor=_AXIS_COLOR,
-        font=dict(family=_FONT_FAMILY, size=12),
+        font=dict(family=_FONT_FAMILY, size=13),
     ),
+    # Solid bar fills without the white separator stroke — dissertation
+    # reference treats bars as continuous coloured blocks.
+    bargap=0.2,
+    bargroupgap=0.06,
 )
 
 
@@ -136,13 +153,51 @@ def _apply_theme(
     title: str,
     height: int = _FIG_HEIGHT,
     width: int = _FIG_WIDTH,
+    font_bump: int = 0,
 ) -> go.Figure:
+    """Apply the shared figure theme.  ``font_bump`` adds the same delta
+    (in pt) to every text element — used by figures that ship as large
+    panels in the dissertation and need larger labels than the default
+    column-width-sized defaults.
+    """
     fig.update_layout(_DEFAULT_LAYOUT)
     fig.update_layout(
         title=dict(text=title, **_DEFAULT_LAYOUT["title"]),
         height=height,
         width=width,
     )
+    if font_bump:
+        fig.update_layout(
+            font=dict(size=_BASE_FONT_SIZE + font_bump),
+            title=dict(
+                text=title,
+                **{
+                    **_DEFAULT_LAYOUT["title"],
+                    "font": dict(
+                        family=_TITLE_FONT_FAMILY,
+                        size=_TITLE_FONT_SIZE + font_bump,
+                        color=_AXIS_COLOR,
+                    ),
+                },
+            ),
+            legend=dict(
+                **{**_DEFAULT_LAYOUT["legend"],
+                   "font": dict(size=_LEGEND_FONT_SIZE + font_bump)},
+            ),
+        )
+        # Apply to every axis (covers subplots too).
+        fig.update_xaxes(
+            tickfont=dict(size=_TICK_FONT_SIZE + font_bump),
+            title=dict(font=dict(size=_AXIS_TITLE_FONT_SIZE + font_bump), standoff=8),
+        )
+        fig.update_yaxes(
+            tickfont=dict(size=_TICK_FONT_SIZE + font_bump),
+            title=dict(font=dict(size=_AXIS_TITLE_FONT_SIZE + font_bump), standoff=8),
+        )
+        # Subplot titles (annotations attached to the figure layout).
+        for ann in fig.layout.annotations or ():
+            new_size = (ann.font.size or _AXIS_TITLE_FONT_SIZE) + font_bump
+            ann.font.size = new_size
     return fig
 
 
@@ -333,7 +388,7 @@ def variant_comparison_bar(
             y=means,
             error_y=dict(type="data", array=cis, visible=True, thickness=1.2, width=4,
                          color=_MUTED_COLOR),
-            marker=dict(color=_variant_color(variant), line=dict(width=0.5, color="white")),
+            marker=dict(color=_variant_color(variant), line=dict(width=0)),
             hovertemplate="%{customdata}<extra></extra>",
             customdata=hover,
         ))
@@ -349,7 +404,7 @@ def variant_comparison_bar(
     fig.update_yaxes(range=[0, 1.05], title="priority-weighted served fraction",
                      tickformat=".2f")
     fig.update_xaxes(title="grid")
-    return _save(_apply_theme(fig, title=title), out_path)
+    return _save(_apply_theme(fig, title=title, font_bump=2), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +478,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
                      tickformat=".2f")
     fig.update_yaxes(title="scare priority-weighted served", range=[0, 1.05],
                      tickformat=".2f")
-    return _save(_apply_theme(fig, title=title), out_path)
+    return _save(_apply_theme(fig, title=title, font_bump=4), out_path)
 
 
 def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
@@ -464,7 +519,7 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
                      tickformat=".2f", zeroline=False)
     fig.update_xaxes(title="grid")
     fig.update_layout(showlegend=False)
-    return _save(_apply_theme(fig, title=title), out_path)
+    return _save(_apply_theme(fig, title=title, font_bump=4), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -507,7 +562,7 @@ def ablation_impact_bar(df: pd.DataFrame, out_path: Path) -> Path:
         x=grouped["mean"],
         y=grouped.index,
         orientation="h",
-        marker=dict(color=colors, line=dict(width=0.5, color="white")),
+        marker=dict(color=colors, line=dict(width=0)),
         error_x=dict(type="data", array=grouped["ci"], thickness=1.2, width=4,
                      color=_MUTED_COLOR),
         customdata=hover,
@@ -777,7 +832,7 @@ def served_by_tier(
             y=pivot[sec].values,
             name=sec,
             marker=dict(color=_SECTOR_COLOR.get(sec, "#888888"),
-                        line=dict(width=0.5, color="white")),
+                        line=dict(width=0)),
             hovertemplate=f"<b>{sec}</b><br>tier: %{{x}}<br>served: %{{y:.4f}}<extra></extra>",
         ))
     fig.update_layout(barmode="group", bargap=0.24, bargroupgap=0.06)
@@ -889,7 +944,7 @@ def claims_pass_rate(df: pd.DataFrame, out_path: Path) -> Path:
             x=pivot[variant].values,
             name=alias_variant(variant),
             orientation="h",
-            marker=dict(color=_variant_color(variant), line=dict(width=0.5, color="white")),
+            marker=dict(color=_variant_color(variant), line=dict(width=0)),
             customdata=[
                 f"<b>{c}</b><br>variant: {alias_variant(variant)}<br>pass rate: {p:.1%}<br>n: {int(n_pivot.loc[c, variant])}"
                 for c, p in zip(pivot.index, pivot[variant].values)
@@ -900,7 +955,7 @@ def claims_pass_rate(df: pd.DataFrame, out_path: Path) -> Path:
     fig.update_xaxes(title="pass rate", range=[0, 1.05], tickformat=".0%")
     fig.update_yaxes(title="")
     height = max(_FIG_HEIGHT, 36 * len(pivot) + 130)
-    return _save(_apply_theme(fig, title=title, height=height), out_path)
+    return _save(_apply_theme(fig, title=title, height=height, font_bump=2), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -964,7 +1019,7 @@ def restoration_vs_baseline_bar(
         x=grids_lbl,
         y=grouped["post_mw"].values,
         name="post-restoration",
-        marker=dict(color=_VARIANT_COLOR["scare"], line=dict(width=0.5, color="white")),
+        marker=dict(color=_VARIANT_COLOR["scare"], line=dict(width=0)),
         hovertemplate="<b>%{x}</b><br>post: %{y:.3f} MW<extra></extra>",
     ), secondary_y=False)
     if raw_col in sub.columns:
@@ -1048,7 +1103,7 @@ def restoration_by_tier_bar(
             name=f"tier {tier}",
             x=grids_lbl,
             y=grouped[col].values,
-            marker=dict(color=color, line=dict(width=0.5, color="white")),
+            marker=dict(color=color, line=dict(width=0)),
             hovertemplate=f"<b>tier {tier}</b><br>grid: %{{x}}<br>ratio: %{{y:.3f}}<extra></extra>",
         ))
     fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
@@ -1120,7 +1175,7 @@ def restoration_loss_split_by_tier_bar(
         name="physical disconnect (priority-blind)",
         x=x,
         y=disc_means,
-        marker=dict(color="#999999", line=dict(width=0.5, color="white")),
+        marker=dict(color="#999999", line=dict(width=0)),
         hovertemplate=(
             "<b>%{x}</b><br>"
             "disconnect lost (mean per task): %{y:.3f} MW<extra></extra>"
@@ -1131,7 +1186,7 @@ def restoration_loss_split_by_tier_bar(
         x=x,
         y=agt_means,
         marker=dict(color=_VARIANT_COLOR.get("scare", "#1F4E96"),
-                    line=dict(width=0.5, color="white")),
+                    line=dict(width=0)),
         hovertemplate=(
             "<b>%{x}</b><br>"
             "agent shed (mean per task): %{y:.3f} MW<extra></extra>"
@@ -1191,7 +1246,7 @@ def agent_only_ratio_by_tier_bar(
             name=f"tier {tier}",
             x=grids_lbl,
             y=grouped[col].values,
-            marker=dict(color=color, line=dict(width=0.5, color="white")),
+            marker=dict(color=color, line=dict(width=0)),
             hovertemplate=f"<b>tier {tier}</b><br>grid: %{{x}}<br>agent-only ratio: %{{y:.3f}}<extra></extra>",
         ))
     fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
@@ -1239,7 +1294,7 @@ def restoration_ratio_by_variant_bar(
             x=grids_lbl,
             y=ys,
             name=alias_variant(variant),
-            marker=dict(color=_variant_color(variant), line=dict(width=0.5, color="white")),
+            marker=dict(color=_variant_color(variant), line=dict(width=0)),
             hovertemplate=(
                 f"<b>{alias_variant(variant)}</b>"
                 "<br>grid: %{x}<br>raw ratio: %{y:.3f}<extra></extra>"
@@ -1287,7 +1342,7 @@ def absolute_load_lost_bar(
     fig = go.Figure(go.Bar(
         x=_grids_display(list(grouped.index)),
         y=grouped["dropped_mw"].values,
-        marker=dict(color="#D62728", line=dict(width=0.5, color="white")),
+        marker=dict(color="#D62728", line=dict(width=0)),
         text=[f"{p*100:.1f}%" for p in pct],
         textposition="outside",
         textfont=dict(size=_ANNOTATION_FONT_SIZE),
@@ -1328,6 +1383,14 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
     if df.empty or not cols:
         return _save(_empty_fig("no diary data", title), out_path)
 
+    # Oracle is a snapshot LP solve — it does not run the negotiation
+    # protocol, so every diary counter is zero by construction.  Showing
+    # it would draw an empty stack that just crowds the x-axis.
+    if "variant" in df.columns:
+        df = df[df["variant"] != "oracle"]
+    if df.empty:
+        return _save(_empty_fig("no non-oracle diary data", title), out_path)
+
     by_variant = df.groupby("variant")[[c[0] for c in cols]].sum()
     if by_variant.empty:
         return _save(_empty_fig("no diary data", title), out_path)
@@ -1339,13 +1402,13 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
             x=variants_lbl,
             y=by_variant[col].values,
             name=label,
-            marker=dict(color=color, line=dict(width=0.5, color="white")),
+            marker=dict(color=color, line=dict(width=0)),
             hovertemplate=f"<b>{label}</b><br>variant: %{{x}}<br>count: %{{y}}<extra></extra>",
         ))
     fig.update_layout(barmode="stack", bargap=0.28)
     fig.update_xaxes(title="variant")
     fig.update_yaxes(title="count")
-    return _save(_apply_theme(fig, title=title), out_path)
+    return _save(_apply_theme(fig, title=title, font_bump=2), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1456,7 +1519,7 @@ def solver_health_bar(
         name="infeasibilities",
         x=variants_lbl,
         y=grouped["inf_mean"].values,
-        marker=dict(color="#D62728", line=dict(width=0.5, color="white")),
+        marker=dict(color="#D62728", line=dict(width=0)),
         hovertemplate=(
             "<b>%{x}</b><br>mean infeasibilities/task: %{y:.2f}<extra></extra>"
         ),
@@ -1465,7 +1528,7 @@ def solver_health_bar(
         name="other warnings",
         x=variants_lbl,
         y=grouped["warn_mean"].values,
-        marker=dict(color="#E07A1F", line=dict(width=0.5, color="white")),
+        marker=dict(color="#E07A1F", line=dict(width=0)),
         hovertemplate=(
             "<b>%{x}</b><br>mean warnings/task: %{y:.2f}<extra></extra>"
         ),
@@ -1527,8 +1590,12 @@ def regulates_by_reason_bar(
     if df.empty or not reason_keys:
         return _save(_empty_fig("no regulates_by_reason columns", title), out_path)
     sub = df.dropna(subset=["variant"]).copy()
+    # Oracle is a snapshot LP solve — it never fires the regulate path,
+    # so its bar is empty by construction.  Drop it so the remaining
+    # variants get full horizontal real estate.
+    sub = sub[sub["variant"] != "oracle"]
     if sub.empty:
-        return _save(_empty_fig("no rows with a variant", title), out_path)
+        return _save(_empty_fig("no non-oracle rows with a variant", title), out_path)
 
     cols: list[tuple[str, str, str]] = []
     for i, key in enumerate(reason_keys):
@@ -1551,7 +1618,7 @@ def regulates_by_reason_bar(
             name=label,
             x=variants_lbl,
             y=grouped[col].values,
-            marker=dict(color=color, line=dict(width=0.5, color="white")),
+            marker=dict(color=color, line=dict(width=0)),
             hovertemplate=(
                 f"<b>{label}</b><br>variant: %{{x}}<br>"
                 "mean count/task: %{y:.2f}<extra></extra>"
@@ -1561,7 +1628,7 @@ def regulates_by_reason_bar(
     fig.update_xaxes(title="variant")
     fig.update_yaxes(title="mean regulation actions per task",
                      rangemode="tozero", tickformat=".1f")
-    return _save(_apply_theme(fig, title=title), out_path)
+    return _save(_apply_theme(fig, title=title, font_bump=2), out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1611,7 +1678,7 @@ def restoration_by_sector_bar(
             name=sec,
             x=grids_lbl,
             y=grouped[col].values,
-            marker=dict(color=color, line=dict(width=0.5, color="white")),
+            marker=dict(color=color, line=dict(width=0)),
             hovertemplate=(
                 f"<b>{sec}</b><br>grid: %{{x}}<br>"
                 "ratio: %{y:.3f}<extra></extra>"
@@ -1652,6 +1719,24 @@ def _sector_envelope_bounds() -> dict[str, tuple[float, float]]:
         "avg_pressure_pu": SECTOR_CONSTRAINTS[Sector.GAS]["pressure_pu"],
         "avg_t_k":         SECTOR_CONSTRAINTS[Sector.HEAT]["t_k"],
     }
+
+
+# Operating-envelope visuals.  The envelope band is drawn per row in
+# the sector colour at a low alpha so the data series stay legible on
+# top.  The unified legend entry is neutral grey (one entry covers all
+# three sectors) — visualised via a square marker swatch tinted with
+# the same low-alpha grey.
+_ENVELOPE_GRAY = "#7F7F7F"
+_ENVELOPE_FILL_ALPHA = 0.10
+_ENVELOPE_FILL_RGBA = "rgba(127, 127, 127, 0.18)"
+_SPREAD_FILL_ALPHA = 0.20
+
+# Dash styles for avg / min / max — chosen so they remain distinguishable
+# in greyscale and to colour-blind readers (different stroke patterns
+# beat colour for binary discrimination).
+_AVG_DASH = "solid"
+_MIN_DASH = "longdash"
+_MAX_DASH = "dashdot"
 
 
 def _stale_data_segment(
@@ -1696,26 +1781,58 @@ def constraint_envelope_trajectory(
     failure_t: float | None = None,
     solver_failures: int | None = None,
 ) -> Path:
-    """Trajectory of ``avg_vm_pu`` / ``avg_pressure_pu`` / ``avg_t_k``
-    with the operating envelopes shaded.  Three stacked sub-plots, one
-    per sector; missing sectors are skipped (so a single-sector grid
-    just shows one row).  Failure / reconfiguration events are marked
-    as vertical guides on every row so the reader can read causality
-    against the failure.
+    """Trajectory of voltage / pressure / temperature with the operating
+    envelopes shaded.  Three stacked sub-plots, one per sector; missing
+    sectors are skipped (so a single-sector grid just shows one row).
 
-    When the timeseries carries a ``last_feasible_solve_t`` column,
-    the region past the last successful energyflow recompute is shaded
-    as STALE.  Reason: the underlying behavior keeps the previous
-    ``_net_results`` when a solve goes infeasible, so observations
-    freeze at the last-feasible state and the lines beyond that point
-    are not new measurements but echoes of an old snapshot.
-    ``solver_failures`` (read from ``result.json`` upstream) drives an
-    explicit banner on the figure title when non-zero, so the reader
-    sees the cause without having to dig through ``run.log``.
+    Each sector panel draws four data series:
+
+    * **average** (solid sector colour) — population mean across the
+      sector's nodes.
+    * **minimum** (long-dash sector colour) — the node that's closest
+      to (or below) the lower envelope.
+    * **maximum** (dash-dot sector colour) — the node that's closest
+      to (or above) the upper envelope.
+    * **min–max spread** (translucent sector-colour fill) — the
+      population band between min and max; a glance tells you whether
+      the average hides a tail.
+
+    The operating envelope is drawn as a sector-tinted shaded band
+    bounded by dotted lines in the sector colour.  Because the same
+    envelope concept repeats per sector with a different colour, the
+    legend folds all three into a single neutral-grey "constraint
+    envelope" entry — colour identity already lives in the subplot
+    title and the line palette.  ``min`` / ``max`` / ``avg`` / spread
+    are likewise legended once each.  Distinct dash patterns keep
+    avg / min / max distinguishable in greyscale and for colour-blind
+    readers.
+
+    Failure / reconfiguration events are marked as vertical guides on
+    every row so the reader can read causality against the failure.
+
+    **Stale-data handling.**  When the energyflow recompute returns
+    infeasible the underlying mango-energy-environments behavior keeps
+    the previous ``_net_results`` so every observation-based metric
+    (avg/min/max) silently freezes at the last-feasible state.
+    Recording ``last_feasible_solve_t`` lets us mark the post-failure
+    region.  Crucially: lfs lagging behind ``time_s`` alone is NOT
+    proof of staleness — the recording tick can simply be finer than
+    the solve schedule, in which case the unchanged observations are
+    legitimately current.  We therefore mark a stretch as stale ONLY
+    when ``solver_failures > 0`` (real infeasibilities reported by the
+    runner).  Old runs that pre-date ``solver_failures`` get a
+    fall-back lfs-based detection.
     """
     if timeseries.empty or "time_s" not in timeseries.columns:
         return _save(_empty_fig("no timeseries", title), out_path)
-    stale_from_t, stale_sample_count = _stale_data_segment(timeseries)
+    # Stale segmentation: only believed when the runner reported real
+    # infeasibilities; lfs-vs-time lag without failures is just normal
+    # sampling between scheduled solves (false positive otherwise).
+    lfs_from_t, lfs_sample_count = _stale_data_segment(timeseries)
+    if solver_failures is not None and solver_failures > 0:
+        stale_from_t = lfs_from_t
+    else:
+        stale_from_t = None
     if solver_failures and solver_failures > 0:
         banner = (
             f" — ⚠ {solver_failures} solver infeasibility(ies); data past "
@@ -1724,20 +1841,16 @@ def constraint_envelope_trajectory(
             else f" — ⚠ {solver_failures} solver infeasibility(ies)"
         )
         title = title + banner
-    elif stale_from_t is not None:
-        title = (
-            f"{title} — ⚠ data past t≈{stale_from_t:.2f}s is a held-over "
-            f"snapshot ({stale_sample_count} stale samples)"
-        )
 
     envelopes = _sector_envelope_bounds()
+    # (avg_col, min_col, max_col, panel title, envelope bounds, sector colour)
     rows = [
-        ("avg_vm_pu",       "voltage (p.u.)",  envelopes["avg_vm_pu"],
-         _SECTOR_COLOR["electricity"]),
-        ("avg_pressure_pu", "pressure (p.u.)", envelopes["avg_pressure_pu"],
-         _SECTOR_COLOR["gas"]),
-        ("avg_t_k",         "temperature (K)", envelopes["avg_t_k"],
-         _SECTOR_COLOR["heat"]),
+        ("avg_vm_pu",       "min_vm_pu",       "max_vm_pu",
+         "voltage (p.u.)",  envelopes["avg_vm_pu"],       _SECTOR_COLOR["electricity"]),
+        ("avg_pressure_pu", "min_pressure_pu", "max_pressure_pu",
+         "pressure (p.u.)", envelopes["avg_pressure_pu"], _SECTOR_COLOR["gas"]),
+        ("avg_t_k",         "min_t_k",         "max_t_k",
+         "temperature (K)", envelopes["avg_t_k"],         _SECTOR_COLOR["heat"]),
     ]
     present = [r for r in rows if r[0] in timeseries.columns]
     if not present:
@@ -1747,7 +1860,7 @@ def constraint_envelope_trajectory(
         rows=len(present), cols=1,
         shared_xaxes=True,
         vertical_spacing=0.08,
-        subplot_titles=[r[1] for r in present],
+        subplot_titles=[r[3] for r in present],
     )
 
     # Determine event markers once — applied as vlines on every row.
@@ -1765,22 +1878,58 @@ def constraint_envelope_trajectory(
             if str(k) in event_styles
         }
 
+    # Single-entry legend groups — each is shown once across all rows.
+    LG_ENVELOPE = "constraint_envelope"
+    LG_SPREAD   = "node_spread"
+    LG_AVG      = "node_avg"
+    LG_MIN      = "node_min"
+    LG_MAX      = "node_max"
+    legend_emitted: set[str] = set()
+
+    def _once(group: str) -> bool:
+        if group in legend_emitted:
+            return False
+        legend_emitted.add(group)
+        return True
+
+    # Neutral-grey sentinel legend entry for "constraint envelope":
+    # the per-row fills are sector-tinted but the legend entry stays
+    # gray to say "this is context, not a specific sector".
+    fig.add_trace(
+        go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(symbol="square", size=14, color=_ENVELOPE_FILL_RGBA,
+                        line=dict(color=_ENVELOPE_GRAY, width=1)),
+            name="constraint envelope",
+            legendgroup=LG_ENVELOPE,
+            showlegend=_once(LG_ENVELOPE),
+            hoverinfo="skip",
+        ),
+        row=1, col=1,
+    )
+
     x = timeseries["time_s"].values
-    for row_idx, (col, y_label, bounds, line_color) in enumerate(present, start=1):
+    x_list = list(x)
+    x_band = x_list + x_list[::-1]
+
+    for row_idx, (avg_col, min_col, max_col, y_label, bounds, line_color) in enumerate(present, start=1):
         lo, hi = bounds
-        # Envelope band — drawn as two scatter-fills so it shows up as
-        # a translucent rectangle behind the data series.
-        x_band = list(x) + list(x[::-1])
-        y_band = [hi] * len(x) + [lo] * len(x)
+
+        # --- Operating envelope (sector-tinted band + dotted boundaries) ---
+        # Fill is sector-coloured so the panel reads "this is voltage's
+        # safe band" without consulting the legend; the legend keeps a
+        # single neutral entry (above) since the encoding repeats.
         fig.add_trace(
             go.Scatter(
                 x=x_band,
-                y=y_band,
+                y=[hi] * len(x_list) + [lo] * len(x_list),
                 fill="toself",
-                fillcolor=_hex_to_rgba(line_color, 0.10),
+                fillcolor=_hex_to_rgba(line_color, _ENVELOPE_FILL_ALPHA),
                 line=dict(color="rgba(0,0,0,0)"),
-                name=f"{y_label} envelope",
-                showlegend=(row_idx == 1),
+                name="constraint envelope",
+                legendgroup=LG_ENVELOPE,
+                showlegend=False,
                 hoverinfo="skip",
             ),
             row=row_idx, col=1,
@@ -1789,9 +1938,8 @@ def constraint_envelope_trajectory(
                       row=row_idx, col=1)
         fig.add_hline(y=hi, line=dict(color=line_color, dash="dot", width=1),
                       row=row_idx, col=1)
-        # Stale-snapshot overlay: shade the post-``last_feasible_solve_t``
-        # region so the reader can't mistake the held-over snapshot for
-        # a real flat trajectory.  Drawn behind the data line.
+
+        # --- Stale-snapshot overlay ---
         if stale_from_t is not None:
             x_max = float(x[-1])
             if x_max > stale_from_t:
@@ -1803,58 +1951,104 @@ def constraint_envelope_trajectory(
                     layer="below",
                     row=row_idx, col=1,
                 )
-        # Data series: solid up to the freshness boundary, dashed
-        # afterwards so the held-over snapshot is visually demoted.
-        y_vals = timeseries[col].astype(float).values
-        if stale_from_t is not None:
-            fresh_mask = x <= stale_from_t
-            if fresh_mask.any():
-                fig.add_trace(
-                    go.Scatter(
-                        x=x[fresh_mask], y=y_vals[fresh_mask],
-                        mode="lines",
-                        line=dict(color=line_color, width=2),
-                        name=y_label,
-                        showlegend=False,
-                        hovertemplate=(
-                            f"<b>{y_label}</b><br>"
-                            "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
-                        ),
-                    ),
-                    row=row_idx, col=1,
-                )
-            stale_mask = x >= stale_from_t
-            if stale_mask.any():
-                fig.add_trace(
-                    go.Scatter(
-                        x=x[stale_mask], y=y_vals[stale_mask],
-                        mode="lines",
-                        line=dict(color=line_color, width=2, dash="dot"),
-                        name=f"{y_label} (stale)",
-                        showlegend=False,
-                        hovertemplate=(
-                            f"<b>{y_label} (held over)</b><br>"
-                            "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
-                        ),
-                    ),
-                    row=row_idx, col=1,
-                )
-        else:
+
+        avg_vals = timeseries[avg_col].astype(float).values
+        have_min = min_col in timeseries.columns
+        have_max = max_col in timeseries.columns
+        min_vals = timeseries[min_col].astype(float).values if have_min else None
+        max_vals = timeseries[max_col].astype(float).values if have_max else None
+
+        # --- Min–max spread (translucent fill between min and max) ---
+        if have_min and have_max:
             fig.add_trace(
                 go.Scatter(
-                    x=x, y=y_vals,
-                    mode="lines",
-                    line=dict(color=line_color, width=2),
-                    name=y_label,
-                    showlegend=False,
-                    hovertemplate=(
-                        f"<b>{y_label}</b><br>"
-                        "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
-                    ),
+                    x=x_list + x_list[::-1],
+                    y=list(max_vals) + list(min_vals[::-1]),
+                    fill="toself",
+                    fillcolor=_hex_to_rgba(line_color, _SPREAD_FILL_ALPHA),
+                    line=dict(color="rgba(0,0,0,0)"),
+                    name="min–max spread (across nodes)",
+                    legendgroup=LG_SPREAD,
+                    showlegend=_once(LG_SPREAD),
+                    hoverinfo="skip",
                 ),
                 row=row_idx, col=1,
             )
-        # Event vlines (same on every row for a synced read).
+
+        # --- min / max / avg series ---
+        def _add_series(y_vals, *, dash: str, width: float, legend_group: str,
+                        legend_name: str, hover_label: str) -> None:
+            # Solid up to the freshness boundary, dotted afterwards so
+            # the held-over snapshot is visually demoted.  Each split
+            # segment shares the legend group with its sibling, so the
+            # legend reads as a single concept.
+            if stale_from_t is not None:
+                fresh_mask = x <= stale_from_t
+                stale_mask = x >= stale_from_t
+                if fresh_mask.any():
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x[fresh_mask], y=y_vals[fresh_mask],
+                            mode="lines",
+                            line=dict(color=line_color, width=width, dash=dash),
+                            name=legend_name,
+                            legendgroup=legend_group,
+                            showlegend=_once(legend_group),
+                            hovertemplate=(
+                                f"<b>{y_label} — {hover_label}</b><br>"
+                                "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                            ),
+                        ),
+                        row=row_idx, col=1,
+                    )
+                if stale_mask.any():
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x[stale_mask], y=y_vals[stale_mask],
+                            mode="lines",
+                            line=dict(color=line_color, width=width, dash="dot"),
+                            opacity=0.55,
+                            name=legend_name,
+                            legendgroup=legend_group,
+                            showlegend=_once(legend_group),
+                            hovertemplate=(
+                                f"<b>{y_label} — {hover_label} (held over)</b><br>"
+                                "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                            ),
+                        ),
+                        row=row_idx, col=1,
+                    )
+            else:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x, y=y_vals,
+                        mode="lines",
+                        line=dict(color=line_color, width=width, dash=dash),
+                        name=legend_name,
+                        legendgroup=legend_group,
+                        showlegend=_once(legend_group),
+                        hovertemplate=(
+                            f"<b>{y_label} — {hover_label}</b><br>"
+                            "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                        ),
+                    ),
+                    row=row_idx, col=1,
+                )
+
+        # Order matters for z-stacking: min/max below, avg on top.
+        if have_min:
+            _add_series(min_vals, dash=_MIN_DASH, width=1.6,
+                        legend_group=LG_MIN, legend_name="min (across nodes)",
+                        hover_label="min")
+        if have_max:
+            _add_series(max_vals, dash=_MAX_DASH, width=1.6,
+                        legend_group=LG_MAX, legend_name="max (across nodes)",
+                        hover_label="max")
+        _add_series(avg_vals, dash=_AVG_DASH, width=2.4,
+                    legend_group=LG_AVG, legend_name="avg (across nodes)",
+                    hover_label="avg")
+
+        # --- Event vlines (same on every row for a synced read) ---
         if not events.empty and {"t", "kind"}.issubset(events.columns):
             for kind, style in event_styles.items():
                 ev = events[events["kind"] == kind]
@@ -1883,11 +2077,11 @@ def constraint_envelope_trajectory(
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="lines",
             line=dict(color=style["color"], dash=style["dash"], width=2),
-            name=kind, showlegend=True,
+            name=kind, legendgroup=f"event_{kind}", showlegend=True,
         ), row=1, col=1)
 
     fig.update_xaxes(title="simulation time (s)", row=len(present), col=1)
-    height = max(_FIG_HEIGHT, 180 * len(present) + 80)
+    height = max(_FIG_HEIGHT, 200 * len(present) + 100)
     return _save(_apply_theme(fig, title=title, height=height), out_path)
 
 
@@ -1940,7 +2134,7 @@ def constraint_violation_integral_bar(
             x=variants_lbl,
             y=grouped[cols[sec]].values,
             marker=dict(color=_SECTOR_COLOR.get(sec, "#888888"),
-                        line=dict(width=0.5, color="white")),
+                        line=dict(width=0)),
             hovertemplate=(
                 f"<b>{sec}</b><br>variant: %{{x}}<br>"
                 "mean integral: %{y:.4g}<extra></extra>"

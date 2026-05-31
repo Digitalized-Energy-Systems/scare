@@ -84,6 +84,7 @@ from experiment.restoration import (
     apply_microgrid_islanding,
     apply_pv_peak,
     apply_slack_budget,
+    apply_temporal_extensions,
     assign_load_priorities,
 )
 
@@ -613,6 +614,27 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         logger.info(
             "Applied slack_budget_pct=%s (per-scenario operator policy)",
             slack_budget_pct,
+        )
+
+    # Temporal-storage extensions — also orthogonal to ``kind``.  Attaches
+    # monee's GasLinepack / LumpedThermalCapacitance.  In the current
+    # single-step ``energyflow`` integration these only add vars (no
+    # temporal dynamics); the campaign uses them as a SCARE-side
+    # compatibility smoke test, not a flex benchmark.  See
+    # ``apply_temporal_extensions``.
+    linepack = bool(scenario.get("linepack", False))
+    ltc = bool(scenario.get("ltc", False))
+    if linepack or ltc:
+        ltc_t_init = scenario.get("ltc_default_t_init")
+        ext_counts = apply_temporal_extensions(
+            net,
+            linepack=linepack,
+            ltc=ltc,
+            ltc_default_t_init=ltc_t_init,
+        )
+        logger.info(
+            "Applied temporal extensions: linepack=%s ltc=%s counts=%s",
+            linepack, ltc, ext_counts,
         )
 
 

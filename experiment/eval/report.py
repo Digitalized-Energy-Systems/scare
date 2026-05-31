@@ -608,9 +608,21 @@ def _todo_section(campaign: CampaignData) -> str:
 # ---------------------------------------------------------------------------
 
 
-def generate_report(campaign_dir: Path) -> Path:
+def generate_report(
+    campaign_dir: Path,
+    *,
+    per_task_overviews: bool = False,
+) -> Path:
     """Generate plots + REPORT.md for *campaign_dir*.  Returns the
-    Markdown path."""
+    Markdown path.
+
+    ``per_task_overviews`` (default ``False``) controls whether the
+    one-figure-per-OK-task ``system_state_overview`` panels are
+    rendered.  These are the only "per-task" plots in the pipeline; on
+    a large campaign they're hundreds of HTML/PDF files of which only a
+    couple are ever opened.  Representative-task plots (one per
+    experiment-variant) are always rendered regardless.
+    """
     campaign = load_campaign(campaign_dir)
     plots_root = campaign_dir / "plots"
     plots_root.mkdir(exist_ok=True)
@@ -665,15 +677,19 @@ def generate_report(campaign_dir: Path) -> Path:
         logger.warning("Per-experiment trajectories failed: %s — skipping", exc)
 
     # One system-state overview HTML per OK task — slack + control vars
-    # + line loading + per-tier fulfilment on shared time axes.
-    try:
-        for label, figs in _per_task_overviews(
-            campaign, plots_root / "per_task_overview",
-        ):
-            if figs:
-                sections.append((label, figs))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Per-task overviews failed: %s — skipping", exc)
+    # + line loading + per-tier fulfilment on shared time axes.  Skipped
+    # by default: on a multi-hundred-task campaign this renders one
+    # html+pdf per task and almost none get opened — pass
+    # ``--per-task-overviews`` to opt in.
+    if per_task_overviews:
+        try:
+            for label, figs in _per_task_overviews(
+                campaign, plots_root / "per_task_overview",
+            ):
+                if figs:
+                    sections.append((label, figs))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Per-task overviews failed: %s — skipping", exc)
 
     md = _stitch(campaign, sections)
     report_path = campaign_dir / "REPORT.md"
@@ -733,6 +749,14 @@ def _parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
     p.add_argument("--campaign-dir", required=True, type=Path)
+    p.add_argument(
+        "--per-task-overviews",
+        action="store_true",
+        help=(
+            "Also render one system_state_overview figure per OK task "
+            "(skipped by default — hundreds of files on a large campaign)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -741,7 +765,10 @@ def main() -> None:
         level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s"
     )
     args = _parse_args()
-    generate_report(args.campaign_dir.resolve())
+    generate_report(
+        args.campaign_dir.resolve(),
+        per_task_overviews=args.per_task_overviews,
+    )
 
 
 if __name__ == "__main__":

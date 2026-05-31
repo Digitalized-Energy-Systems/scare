@@ -18,7 +18,12 @@ from monee.model.child import (
     Sink,
     Source,
 )
-from monee.model.extension import GridFormingGenerator, GridFormingSource
+from monee.model.extension import (
+    GasLinepack,
+    GridFormingGenerator,
+    GridFormingSource,
+    LumpedThermalCapacitance,
+)
 from monee.model.formulation import (
     MISOCP_NETWORK_FORMULATION,
     make_mccormick_dhs_formulation,
@@ -227,6 +232,54 @@ def apply_microgrid_islanding(
         gas=True if "gas" in carrier_set else None,
         water=True if "water" in carrier_set else None,
     )
+    return counters
+
+
+def apply_temporal_extensions(
+    mes: "object",
+    *,
+    linepack: bool = False,
+    ltc: bool = False,
+    ltc_default_t_init: float | None = None,
+) -> dict[str, int]:
+    """Attach monee's temporal-storage extensions to *mes*.
+
+    ``GasLinepack`` (per-pipe ``linepack_kg`` / ``net_pack_kgs`` vars) and
+    ``LumpedThermalCapacitance`` (per-water-junction ρ·V thermal mass) only
+    activate their dynamics inside monee's timeseries solver — the
+    single-step ``energyflow`` used by ``mango_energy_environments`` pins
+    ``net_pack_kgs = 0`` and emits no LTC inertia term.  Attaching them
+    here is therefore a **smoke test** of agent-side compatibility (the
+    LP gains new vars; the agents must not crash on the augmented obs
+    schema) rather than a flexibility benchmark.  Wiring step_state
+    through ``energyflow`` is a separate work item.
+
+    Returns ``{"linepack_pipes": n, "ltc_junctions": n}`` so the
+    campaign can sanity-check that the extension actually found
+    something to attach to on the chosen grid.
+    """
+    counters = {"linepack_pipes": 0, "ltc_junctions": 0}
+    if linepack:
+        ext = GasLinepack()
+        mes.add_extension(ext)
+        # ``prepare`` is what materialises the per-branch state; the
+        # solver normally calls it but we want the counter here too.
+        try:
+            ext.prepare(mes)
+        except Exception:  # noqa: BLE001 — count is best-effort
+            pass
+        counters["linepack_pipes"] = len(getattr(ext, "_active_branches", ()))
+    if ltc:
+        kwargs: dict = {}
+        if ltc_default_t_init is not None:
+            kwargs["default_t_init"] = float(ltc_default_t_init)
+        ext = LumpedThermalCapacitance(**kwargs)
+        mes.add_extension(ext)
+        try:
+            ext.prepare(mes)
+        except Exception:  # noqa: BLE001
+            pass
+        counters["ltc_junctions"] = len(getattr(ext, "_ltc_rho_v", {}))
     return counters
 
 
