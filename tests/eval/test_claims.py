@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 
 from experiment.eval.claims import (
+    _check_constraint_compliance,
     _check_diary_invariant,
     _check_heat_priority,
     _check_monotonic_progress,
@@ -28,6 +29,16 @@ from experiment.eval.claims import (
     _is_priority_aware,
     evaluate_task,
 )
+
+
+_CONSTRAINTS_COLS = (
+    "kind", "id", "sector", "variable",
+    "value", "lo", "hi", "overshoot", "violated",
+)
+
+
+def _write_constraints_final(path: Path, rows: list[dict]) -> Path:
+    return _write_csv(path, _CONSTRAINTS_COLS, rows)
 
 
 _SBL_COLS = (
@@ -602,3 +613,67 @@ class TestPriorityModeGate:
         (tmp_path / "config.json").write_text("not json")
         assert _holon_admm_mode(tmp_path) == "supply"
         assert _is_priority_aware(tmp_path) is True
+
+
+# ---------------------------------------------------------------------------
+# _check_constraint_compliance
+# ---------------------------------------------------------------------------
+
+
+class TestConstraintCompliance:
+    def test_missing_artefact_is_vacuously_true(self, tmp_path):
+        # Older campaigns / grids with no readings: don't fail a run we
+        # can't measure.
+        res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
+        assert res["passed"] is True
+
+    def test_empty_artefact_is_vacuously_true(self, tmp_path):
+        _write_constraints_final(tmp_path / "constraints_final.csv", [])
+        res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
+        assert res["passed"] is True
+
+    def test_all_in_bounds_passes(self, tmp_path):
+        _write_constraints_final(tmp_path / "constraints_final.csv", [
+            {"kind": "node", "id": 1, "sector": "electricity",
+             "variable": "vm_pu", "value": 1.01, "lo": 0.95, "hi": 1.05,
+             "overshoot": 0.0, "violated": 0},
+            {"kind": "branch", "id": "(1, 2)", "sector": "electricity",
+             "variable": "loading_percent", "value": 80.0, "lo": -100.0,
+             "hi": 100.0, "overshoot": 0.0, "violated": 0},
+        ])
+        res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
+        assert res["passed"] is True
+        assert res["detail"]["n_violations"] == 0
+        assert res["detail"]["n_checked"] == 2
+
+    def test_any_violation_fails_and_ranks_worst_first(self, tmp_path):
+        _write_constraints_final(tmp_path / "constraints_final.csv", [
+            {"kind": "node", "id": 1, "sector": "electricity",
+             "variable": "vm_pu", "value": 1.08, "lo": 0.95, "hi": 1.05,
+             "overshoot": 0.6, "violated": 1},
+            {"kind": "node", "id": 7, "sector": "heat",
+             "variable": "t_k", "value": 240.0, "lo": 313.15, "hi": 403.15,
+             "overshoot": 1.626, "violated": 1},
+            {"kind": "node", "id": 2, "sector": "gas",
+             "variable": "pressure_pu", "value": 1.0, "lo": 0.9, "hi": 1.1,
+             "overshoot": 0.0, "violated": 0},
+        ])
+        res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
+        assert res["passed"] is False
+        assert res["detail"]["n_violations"] == 2
+        # Worst (largest overshoot) first.
+        assert res["detail"]["violations"][0]["variable"] == "t_k"
+        assert res["detail"]["by_sector"]["heat"]["worst_overshoot"] == 1.626
+        assert res["detail"]["by_sector"]["gas"]["n_violations"] == 0
+
+    def test_wired_into_evaluate_task(self, tmp_path):
+        # A violated row should surface as a failing constraint_compliance
+        # claim through the public entry point.
+        _write_constraints_final(tmp_path / "constraints_final.csv", [
+            {"kind": "node", "id": 1, "sector": "electricity",
+             "variable": "vm_pu", "value": 1.08, "lo": 0.95, "hi": 1.05,
+             "overshoot": 0.6, "violated": 1},
+        ])
+        out = evaluate_task(tmp_path)
+        assert "constraint_compliance" in out
+        assert out["constraint_compliance"]["passed"] is False

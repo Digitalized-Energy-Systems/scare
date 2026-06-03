@@ -523,6 +523,14 @@ class CurtailmentNeed:
     sector: Sector
     total_amount: float   # aggregate fractional curtailment needed [0..1]
     auction_id: str
+    # Origin of the violation this auction relieves, so a bidder can weight
+    # its willingness by its cross-sensitivity (electrical proximity) to the
+    # violated node/branch — a load close to the violation moves the
+    # constraint more per MW shed than a distant one.  ``origin_addr`` keys
+    # into the bidder's cached multi-hop ``ConstraintStateMessage`` distance;
+    # ``variable`` selects which violation.  Defaulted for back-compat.
+    origin_addr: Any = None
+    variable: str = ""
 
 
 @dataclass
@@ -534,6 +542,15 @@ class CurtailmentBid:
     auction_id: str
     willingness: float
     sector: Sector
+    # Priority tier and current reducible draw of the bidder.  The default
+    # willingness-proportional allocator only consults ``willingness``; the
+    # branch-downstream line-relief waterfall
+    # (``enable_line_relief_waterfall``) additionally needs the bidder's tier
+    # to shed in strict reverse-priority order and its reducible draw to know
+    # when a tier is exhausted.  Defaulted for back-compat with bids that
+    # don't carry them.
+    tier: int = 0
+    reducible: float = 0.0
 
 
 # ---------------------------------------------------------------------------

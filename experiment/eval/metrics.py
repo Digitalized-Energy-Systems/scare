@@ -17,7 +17,7 @@ from typing import Any
 
 import networkx as nx
 from mango.simulation.world import WorldRecording
-from monee.model.child import HeatLoad, PowerLoad
+from monee.model.child import ExtPowerGrid, HeatLoad, PowerLoad
 from monee.solver.core import find_ignored_nodes
 
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
@@ -216,6 +216,68 @@ def _heat_served_feasible(obs: dict, sec: Any) -> bool:
     return (lo - _HEAT_T_TOL_K) <= t <= (hi + _HEAT_T_TOL_K)
 
 
+# An electricity load served *through* an overloaded line is not feasible
+# service: the oracle LP enforces ``loading_percent`` ≤ 100 %
+# (``max_line_loading=1.0``) and would shed the through-load down until the
+# line sits at its rating, whereas the live sim only enforces it softly and
+# leaves lines at 100-120 % while crediting the downstream load in full —
+# the line-side analogue of the heat ``_heat_served_feasible`` gate.  The
+# small tolerance keeps numerical wiggle at exactly 100 % from gating.
+_LINE_LOADING_TOL_PCT: float = 1.0
+
+
+def _line_feasibility_factor(monee_net: Any) -> dict[Any, float]:
+    """Map ``electricity node_id -> feasible-service factor ∈ (0, 1]``.
+
+    For every electricity node, the factor is the bottleneck headroom of
+    the *widest* supply path back to a grid-former: ``min(1, 100/loading)``
+    over the overloaded lines on that path (1.0 if none).  Multiplying a
+    load's served by its node's factor de-rates downstream service to what
+    the line ratings actually permit — matching the oracle, which sheds the
+    through-load until the binding line is at 100 % rather than crediting
+    service on a thermally-overloaded line.  Radial feeders give the exact
+    unique path; meshed sections get the widest (least-throttled) one.
+    """
+    from collections import defaultdict, deque
+
+    slack = {c.node_id for c in monee_net.childs if isinstance(c.model, ExtPowerGrid)}
+    if not slack:
+        return {}
+    adj: dict[Any, list[tuple[Any, float]]] = defaultdict(list)
+    for branch in monee_net.branches:
+        if not _branch_is_active(branch):
+            continue
+        if not _branch_carries_sector(branch, monee_net, "electricity"):
+            continue
+        a, b = branch.id[0], branch.id[1]
+        try:
+            loading = float(branch.model.loading_percent)
+        except Exception:
+            loading = 0.0
+        # Unit ambiguity (see ``obs_constraint_values``): GenericPowerBranch /
+        # MISOCP reports loading as a *fraction* (≈1.14 for 114 %); only the
+        # IntermediateEq form is already a percent.  A value ≤ 5 cannot be a
+        # real percent, so scale it up — without this a 1.14 fraction reads as
+        # "1.14 %" and the gate never fires.
+        if 0.0 < loading <= 5.0:
+            loading *= 100.0
+        edge_f = min(1.0, 100.0 / loading) if loading > 100.0 + _LINE_LOADING_TOL_PCT else 1.0
+        adj[a].append((b, edge_f))
+        adj[b].append((a, edge_f))
+    # Widest-path (maximin) relaxation from the slack set.
+    factor: dict[Any, float] = {s: 1.0 for s in slack}
+    dq = deque(slack)
+    while dq:
+        n = dq.popleft()
+        fn = factor[n]
+        for nbr, edge_f in adj.get(n, ()):
+            cand = min(fn, edge_f)
+            if cand > factor.get(nbr, -1.0):
+                factor[nbr] = cand
+                dq.append(nbr)
+    return factor
+
+
 def served_by_load(
     monee_net: Any,
     behavior: Any,
@@ -247,6 +309,7 @@ def served_by_load(
     }
 
     _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
+    line_factor = _line_feasibility_factor(monee_net)
 
     rows: list[dict[str, Any]] = []
     for child in monee_net.childs:
@@ -272,6 +335,11 @@ def served_by_load(
         temp_infeasible = not _heat_served_feasible(obs, sec)
         if temp_infeasible:
             served = 0.0
+        # De-rate electricity load served *through* an overloaded line to the
+        # feasible level its line ratings permit (the oracle holds ≤100 %) —
+        # see ``_line_feasibility_factor``.
+        if sec is Sector.ELECTRICITY:
+            served *= line_factor.get(child.node_id, 1.0)
         if priorities is not None and aid in priorities:
             tier = int(priorities[aid])
         else:
@@ -350,6 +418,7 @@ def served_breakdown(
     pw_served = 0.0
 
     disconnected = _disconnected_node_ids(monee_net)
+    line_factor = _line_feasibility_factor(monee_net)
     # Filter to actual *consumer* load childs.  In monee's hydraulic /
     # multi-energy models, ``Sink`` represents the return-side of a heat
     # exchanger and ``ExtHydrGrid`` / ``ExtPowerGrid`` are slack injectors —
@@ -413,6 +482,11 @@ def served_breakdown(
         # (matches the oracle's hard t_k bound) — see ``_heat_served_feasible``.
         if served > 0.0 and not _heat_served_feasible(obs, sec):
             served = 0.0
+        # De-rate electricity service carried through an overloaded line to
+        # the feasible level (oracle holds ≤100 %) — see
+        # ``_line_feasibility_factor``.
+        if served > 0.0 and sec is Sector.ELECTRICITY:
+            served *= line_factor.get(child.node_id, 1.0)
         if priorities is not None and aid in priorities:
             tier = int(priorities[aid])
         else:
@@ -682,6 +756,232 @@ def constraint_violation_integral(world: Any) -> dict[str, float]:
             integral += 0.5 * (ov_a + ov_b) * dt
         out[sec.value] = integral
     return out
+
+
+# ---------------------------------------------------------------------------
+# Final constraint-violation scan (end-of-sim hard-bound feasibility)
+# ---------------------------------------------------------------------------
+#
+# ``constraint_violation_integral`` above integrates the *average* per-sector
+# recorded series — a during-run proxy that masks per-node violations (the
+# mean voltage can sit inside the band while individual buses are over).  For
+# an honest, *comparable* PWSF we also need the end-of-sim feasibility of the
+# actual solved network, node-by-node and branch-by-branch, against the SAME
+# ``SECTOR_CONSTRAINTS`` envelope the oracle LP enforces (bounds_el / _gas /
+# _heat + ``max_line_loading``).  A SCARE run that "beats" the oracle's PWSF
+# only because it left voltages, pressures, temperatures, or line loadings out
+# of bounds is not solving the same problem; this scan flags it so the
+# aggregator can exclude it from the compliant-PWSF mean (the voltage / pressure
+# / line / temperature analogue of the slack-budget-compliance gate).
+
+# Per-variable absolute tolerance for the hard-bound scan.  A reading counts as
+# a violation only when it exceeds the bound by more than this, so numerical
+# wiggle exactly at the bound does not fire.  ``vm_pu`` / ``pressure_pu`` are
+# p.u.; ``t_k`` reuses the heat-served gate's 1 K tolerance and
+# ``loading_percent`` the line-feasibility 1 % tolerance, so the compliance
+# gate and the served de-rating draw the line at exactly the same place.
+_CONSTRAINT_ABS_TOL: dict[str, float] = {
+    "vm_pu": 0.005,
+    "pressure_pu": 0.005,
+    "t_k": _HEAT_T_TOL_K,
+    "loading_percent": _LINE_LOADING_TOL_PCT,
+}
+
+# Variables with only a physical upper bound (idle = 0, limit = 100); the
+# lower half of their ``SECTOR_CONSTRAINTS`` pair is a formula artefact (see
+# the ``loading_percent`` note in ``scare.base.model``) and must not gate.
+_ONE_SIDED_VARS: frozenset[str] = frozenset({"loading_percent"})
+
+
+def _model_value(model: Any, key: str) -> float | None:
+    """Return ``model.values[key]`` as a finite float, or ``None`` when the
+    attribute is absent / non-numeric / not populated by the solver."""
+    if model is None:
+        return None
+    try:
+        vals = model.values if hasattr(model, "values") else {}
+    except Exception:  # noqa: BLE001 — defensive: some models raise on access
+        return None
+    if key not in vals:
+        return None
+    try:
+        return float(vals[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def _branch_loading_percent(branch: Any) -> float | None:
+    """Worst (from/to) thermal loading of a branch in *percent*.
+
+    ``loading_percent`` is a Python property (not in ``model.values``), so
+    fall back to the per-side ``loading_{from,to}_percent`` Vars.  Applies the
+    same fraction→percent auto-scale as ``obs_constraint_values`` /
+    ``_line_feasibility_factor`` (GenericPowerBranch reports a fraction ≈1.14
+    for 114 %; only the IntermediateEq form is already a percent).
+    """
+    model = getattr(branch, "model", None)
+    if model is None:
+        return None
+    lp = _model_value(model, "loading_percent")
+    if lp is None:
+        lf = _model_value(model, "loading_from_percent")
+        lt = _model_value(model, "loading_to_percent")
+        mags = [abs(x) for x in (lf, lt) if x is not None]
+        if not mags:
+            return None
+        lp = max(mags)
+    if 0.0 < lp <= 5.0:
+        lp *= 100.0
+    return lp
+
+
+def _bound_overshoot(val: float, lo: float, hi: float, *, one_sided: bool) -> float:
+    """How far ``val`` lies beyond its nearest bound, normalised by the
+    half-span so ``0`` = in-bounds and ``1`` = a full half-span over.
+
+    Distinct from :func:`constraint_utilization`, which saturates at 1.0 at
+    the bound and so cannot rank the *severity* of a breach — exactly what the
+    "worst violation" ordering needs.  One-sided variables (``loading_percent``)
+    only ever overshoot the upper bound.
+    """
+    half_span = (hi - lo) / 2.0
+    if half_span <= 0:
+        return 0.0
+    if val > hi:
+        return (val - hi) / half_span
+    if val < lo and not one_sided:
+        return (lo - val) / half_span
+    return 0.0
+
+
+def _violation_row(
+    kind: str, cid: Any, sec: Sector, var: str, val: float, lo: float, hi: float,
+) -> dict[str, Any]:
+    tol = _CONSTRAINT_ABS_TOL.get(var, 0.0)
+    one_sided = var in _ONE_SIDED_VARS
+    if one_sided:
+        violated = val > hi + tol
+    else:
+        violated = (val < lo - tol) or (val > hi + tol)
+    overshoot = _bound_overshoot(val, lo, hi, one_sided=one_sided)
+    return {
+        "kind": kind,
+        "id": cid,
+        "sector": sec.value,
+        "variable": var,
+        "value": val,
+        "lo": lo,
+        "hi": hi,
+        "overshoot": overshoot,
+        "violated": violated,
+    }
+
+
+def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
+    """Per-node / per-branch hard-bound readings off the *final* network state.
+
+    Walks every active, connected node (``vm_pu`` / ``pressure_pu`` / ``t_k``
+    per its sector) and every active electricity branch (``loading_percent``),
+    comparing each against ``SECTOR_CONSTRAINTS``.  One row per checked
+    variable: ``{kind, id, sector, variable, value, lo, hi, overshoot,
+    violated}``.
+
+    Disconnected nodes (``_disconnected_node_ids`` — no path to a grid-former)
+    and inactive nodes/branches are skipped: their loads already count as
+    served=0, their readings are physically meaningless (t_k solves to ~0 on an
+    isolated junction), and the oracle excludes them too
+    (``exclude_unconnected_nodes=True``).  Counting them as violations would
+    fail SCARE for a physical disconnect the oracle cannot serve either.
+    """
+    disconnected = _disconnected_node_ids(monee_net)
+    rows: list[dict[str, Any]] = []
+
+    for node in monee_net.nodes:
+        if not getattr(node, "active", True) or node.id in disconnected:
+            continue
+        sec = sector_from_grid(getattr(node, "grid", None))
+        if sec is None:
+            continue
+        for var, (lo, hi) in SECTOR_CONSTRAINTS.get(sec, {}).items():
+            if var == "loading_percent":
+                continue  # branch-level — handled below
+            val = _model_value(node.model, var)
+            if val is None or not math.isfinite(val):
+                continue
+            # Solver-unpopulated / isolated junctions report t_k≈0; the live
+            # monitor skips them the same way (``_monitor`` in
+            # ``service/constraints.py``) so they are not a real breach.
+            if var == "t_k" and val <= 0.0:
+                continue
+            rows.append(_violation_row("node", node.id, sec, var, val, lo, hi))
+
+    el_loading = SECTOR_CONSTRAINTS.get(Sector.ELECTRICITY, {}).get("loading_percent")
+    if el_loading is not None:
+        lo, hi = el_loading
+        for branch in monee_net.branches:
+            if not _branch_is_active(branch):
+                continue
+            if not _branch_carries_sector(branch, monee_net, "electricity"):
+                continue
+            a, b = branch.id[0], branch.id[1]
+            if a in disconnected or b in disconnected:
+                continue
+            val = _branch_loading_percent(branch)
+            if val is None or not math.isfinite(val):
+                continue
+            rows.append(
+                _violation_row("branch", branch.id, Sector.ELECTRICITY,
+                               "loading_percent", val, lo, hi)
+            )
+    return rows
+
+
+def constraint_violations_final(monee_net: Any) -> dict[str, Any]:
+    """End-of-sim hard-bound feasibility summary over the final network state.
+
+    Returns ``{passed, n_checked, n_violations, by_sector, violations}`` where
+    ``passed`` is True iff NO active, connected node or branch breaches its
+    ``SECTOR_CONSTRAINTS`` bound (within :data:`_CONSTRAINT_ABS_TOL`).  This is
+    the accurate counterpart to :func:`constraint_violation_integral` (which
+    only sees per-sector *averages*) and the basis for the
+    ``constraint_compliance`` claim — making a run "compliant" require both the
+    operator slack budget *and* in-bounds grid state, so the PWSF gap to the
+    oracle is the real allocation gap, not feasibility one side bought by
+    violating constraints.
+    """
+    rows = constraint_rows(monee_net)
+    by_sector: dict[str, dict[str, Any]] = {}
+    violations: list[dict[str, Any]] = []
+    for r in rows:
+        entry = by_sector.setdefault(
+            r["sector"],
+            {"n_checked": 0, "n_violations": 0, "worst_overshoot": 0.0},
+        )
+        entry["n_checked"] += 1
+        if r["violated"]:
+            entry["n_violations"] += 1
+            entry["worst_overshoot"] = max(entry["worst_overshoot"], r["overshoot"])
+            violations.append(r)
+    violations.sort(key=lambda r: r["overshoot"], reverse=True)
+    return {
+        "passed": not violations,
+        "n_checked": len(rows),
+        "n_violations": len(violations),
+        "by_sector": by_sector,
+        "violations": [
+            {
+                "kind": r["kind"],
+                "id": str(r["id"]),
+                "sector": r["sector"],
+                "variable": r["variable"],
+                "value": round(r["value"], 6),
+                "lo": r["lo"],
+                "hi": r["hi"],
+                "overshoot": round(r["overshoot"], 6),
+            }
+            for r in violations[:10]
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

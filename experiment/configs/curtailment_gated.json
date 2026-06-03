@@ -1,0 +1,114 @@
+{
+  "$comment": [
+    "3-arm paired comparison: ON {} vs OFF {enable_curtailment_auction:false} vs GATED {enable_curtail_auction_gating:true}.",
+    "Tests whether scoping the auction off heat t_k + progress-gating its re-arm cuts firing without losing served demand or stability."
+  ],
+  "name": "curtailment_gated",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 15,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "name": "spot_line_stress",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_curtailment_auction": false
+        },
+        {
+          "enable_curtail_auction_gating": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "name": "spot_cold_day",
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_curtailment_auction": false
+        },
+        {
+          "enable_curtail_auction_gating": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "name": "spot_concentrated",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_curtailment_auction": false
+        },
+        {
+          "enable_curtail_auction_gating": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 6,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "02:00:00",
+    "mem": "16G",
+    "cpus": 1,
+    "max_concurrent": 64
+  }
+}

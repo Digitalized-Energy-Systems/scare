@@ -13,7 +13,6 @@ pass through untouched.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from distributed_resource_optimization.algorithm.admm.core import (
@@ -59,7 +58,14 @@ class ScareDistributedOptimizationRole(DistributedOptimizationRole):
             actual_meta = meta
             actual_content = content
 
-        asyncio.create_task(
+        # Route through mango's scheduler, not bare ``asyncio.create_task``:
+        # under discrete-stepping the world only advances tasks the scheduler
+        # knows about; an orphan task would run "on a side track" off the
+        # simulation clock and its sends would be flushed in a later step.
+        # Matches the upstream ``DistributedOptimizationRole._handle_optimization``
+        # pattern (which this subclass would otherwise inherit verbatim if
+        # the message-type allow-list above weren't needed).
+        self.context.schedule_instant_task(
             on_exchange_message(
                 self.algorithm, self._carrier, actual_content, actual_meta
             )

@@ -1,0 +1,102 @@
+{
+  "$comment": [
+    "Gossip-mode end-to-end smoke. Sweeps cp_admm_algorithm across the",
+    "replicated 'lexicographic' kernel (today's default) and the new",
+    "coordinator-free 'gossip' variant on the same scenario / seed. Three",
+    "scenarios chosen to actually exercise the cross-sector CP layer:",
+    "(1) functional_baseline on simbench_lv_cp_heavy with a heat-deficit",
+    "    cold day — heat CPs (CHP/P2H) must ramp via L3 to close the",
+    "    L0 frontier's shed gap. This is where the two algorithms most",
+    "    matter to compare.",
+    "(2) functional_baseline on simbench_lv_cp_heavy_dependent with",
+    "    generator failures and tight slack — only the CP layer can",
+    "    restore service, so any L3 divergence shows up immediately.",
+    "(3) functional_baseline on simbench_lv (vanilla LV) as a sanity",
+    "    floor — minimal cross-sector activity, both algorithms should",
+    "    agree trivially.",
+    "Single seed per scenario × 2 algorithm rows = 6 tasks total.",
+    "Wall-clock target: < 5 minutes locally."
+  ],
+  "name": "gossip_smoke",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 10.0,
+  "task_timeout_s": 600.0,
+  "failure_delay_s_max": 1.0,
+  "write_timeseries": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 1,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "name": "functional_baseline",
+      "$comment": "Cold-day heat-deficit on cp_heavy — CHP/P2H ramp via L3.",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "sweeps": [
+        {"cp_admm_algorithm": "lexicographic"},
+        {"cp_admm_algorithm": "gossip"}
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "name": "cp_flexibility",
+      "$comment": "CP-only restoration path — generator failures on cp_heavy_dependent.",
+      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "sweeps": [
+        {"cp_admm_algorithm": "lexicographic"},
+        {"cp_admm_algorithm": "gossip"}
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ]
+    },
+    {
+      "name": "sanity_baseline",
+      "$comment": "Plain LV vanilla — minimal CP activity, parity expected.",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "sweeps": [
+        {"cp_admm_algorithm": "lexicographic"},
+        {"cp_admm_algorithm": "gossip"}
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa.p",
+    "time": "00:15:00",
+    "mem": "4G",
+    "cpus": 1,
+    "max_concurrent": 6,
+    "aggregate": true
+  }
+}

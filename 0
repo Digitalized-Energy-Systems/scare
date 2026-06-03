@@ -1,0 +1,4 @@
+tier=1 demand=0.0330 served=0.0224 frac=0.6778 throttle_demand=0.0000 throttle_capped=0.0000 n=0
+tier=2 demand=0.1372 served=0.1222 frac=0.8907 throttle_demand=0.0212 throttle_capped=0.0212 n=0
+tier=3 demand=0.1485 served=0.1368 frac=0.9210 throttle_demand=0.0207 throttle_capped=0.0207 n=0
+tier=4 demand=0.0550 served=0.0302 frac=0.5499 throttle_demand=0.0070 throttle_capped=0.0070 n=0

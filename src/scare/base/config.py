@@ -87,24 +87,26 @@ class RestorationConfiguration:
     # (the single-level / component-level variants do this).
     enable_cp_priority_admm: bool = True
 
-    # L3 kernel selection.  ``"lexicographic"`` (default) runs the
-    # distributed lexicographic-cascade sharing ADMM from
-    # ``distributed_resource_optimization`` — a Π-round cascade (one
-    # round per priority tier, highest first) that *maximises* served
-    # demand per tier subject to the hard per-(sector, step) constraint
-    # ``σ + Σ_i r_i·c_{i,s} ≤ B_s − θ``.  Because the sector base supply
-    # ``B`` folds in the slack's operator budget (the slack is counted
-    # at ``|cap|`` = its budget in ``_handle_ask_flex``), this hard-caps
-    # the CPs' cross-sector draw at the budget — so a CP burning gas to
-    # make electricity cannot force the gas slack past its budget even
-    # when the gas sector carries no demand of its own.  ``"penalty"``
-    # selects the legacy ``solve_cp_priority_admm`` kernel
-    # (priority-weight marginal penalty); that kernel is *formally
-    # broken* for the budget case — a soft over-draw penalty either
-    # limit-cycles (flat) or settles with a steady-state offset
-    # (proportional), neither of which respects the hard budget — and is
-    # retained only for ablation.
-    cp_admm_algorithm: str = "lexicographic"
+    # L3 kernel selection.  ``"gossip"`` (default) runs the
+    # coordinator-free peer-to-peer sharing ADMM from
+    # ``distributed_resource_optimization.algorithm.gossip_lexicographic_cascade``:
+    # each CP runs only its own scalar x-update locally and rebuilds
+    # the shared aggregate from peer Iter broadcasts.  Crash-fault
+    # tolerant (peer death held over to next round; stale rounds
+    # discarded by ``round_id``; round-timeout fallback commits a
+    # feasible-suboptimal iterate rather than blocking).  Matches the
+    # replicated kernel's per-CP factors within float-precision noise
+    # at every N verified (5, 10, 20, 28); see
+    # ``tests/gossip_lexicographic_cascade``.  ``"lexicographic"``
+    # falls back to the replicated kernel — every CP solves the full
+    # N-CP problem locally and keeps only its own row.  Retained for
+    # ablation comparison.  ``"penalty"`` selects the legacy
+    # ``solve_cp_priority_admm`` (priority-weight marginal penalty);
+    # that kernel is *formally broken* for the budget case — a soft
+    # over-draw penalty either limit-cycles or settles with a
+    # steady-state offset, neither respecting the hard budget — and
+    # is retained only for ablation.
+    cp_admm_algorithm: str = "gossip"
 
     # Proximal step-damping coefficient ``α ≥ 0`` for the lexicographic
     # cascade's per-CP closed-form projection.  Biases the *iterate
@@ -236,6 +238,118 @@ class RestorationConfiguration:
     # When False, violations only emit a BalanceProblem to re-trigger
     # gossip; no proportional curtailment is broadcast.
     enable_curtailment_auction: bool = True
+
+    # Gate the curtailment auction so it stops firing where it cannot
+    # help.  A 90-run paired spotlight (curtailment_spotlight, 2026-06-02)
+    # found the auction fires 2.5–5× more often than there are distinct
+    # hard violations, with 63–87 % of applies stuck at the 0.02 gain
+    # floor and ~10 % applying literally 0.0 %, because ``_handle_violation``
+    # re-arms it every poll while a violation persists — even when the
+    # lever provably can't clear it.  When True this adds two guards
+    # (both no-ops when ``enable_curtailment_auction`` is False):
+    #   (a) SCOPE — the auction never fires on heat ``t_k`` or line
+    #       ``loading_percent`` violations.  Its component-wide
+    #       priority×own-sensitivity×reducible bidding is blind to WHICH
+    #       node/branch is violated, so for these it sheds whatever load is
+    #       most "willing" rather than one that relieves the violation:
+    #       no load's curtailment moves another junction's return temperature
+    #       (frontier controller's lever), and a line overload is a BRANCH
+    #       violation whose correct lever is the endpoint-targeted line-relief
+    #       path, not an arbitrary most-willing load in the component (the
+    #       auction there measured net-negative on the settled worst-line
+    #       loading).  The auction still fires on node-local ``vm_pu`` /
+    #       ``pressure_pu`` where the violating node's own load is the lever.
+    #   (b) PROGRESS GATE — for any other variable, if the violation's
+    #       overshoot has not improved beyond its best-seen value for
+    #       ``_CURTAIL_NO_PROGRESS_LIMIT`` consecutive auction rounds, stop
+    #       re-arming that variable until its overshoot improves again
+    #       (a worsening / topology change re-engages it).  Stops the
+    #       futile churn on line overloads the auction can't relieve
+    #       (the leader-directed line-relief path handles those).
+    # Default False to preserve the established baseline; set True for the
+    # ablation comparison.
+    enable_curtail_auction_gating: bool = False
+
+    # Cross-sensitivity targeting for the curtailment auction.  The auction
+    # currently allocates a bidder's curtail share by ``priority × OWN-local
+    # sensitivity × reducible`` — the "own-local" term measures how curtailing
+    # the bidder moves the bidder's OWN variable, not the (different) violated
+    # node/branch, so within a tier the shed spreads roughly uniformly across
+    # the component regardless of who can actually relieve the violation.
+    # When True, the ``CurtailmentNeed`` carries the violation's origin and a
+    # bidder additionally weights its willingness by its electrical proximity
+    # to that origin (read from the cached multi-hop ``ConstraintStateMessage``
+    # hop-distance) — a bounded within-tier multiplier, so priority stays
+    # lexicographically dominant.  Effect: the same total curtailment lands on
+    # the loads electrically nearest the violation (highest ∂constraint/∂Q),
+    # relieving it with less collateral shedding over the iterative rounds.
+    # Most meaningful for the MW/flow constraints (line ``loading_percent``,
+    # ``vm_pu``, gas ``pressure_pu``) where shedding-distance maps to leverage;
+    # heat ``t_k`` is excluded from the auction under gating anyway.  Default
+    # False; intended to be paired with ``enable_curtail_auction_gating``.
+    enable_curtail_auction_targeting: bool = False
+
+    # Iterative line-overload relief.  On a branch ``loading_percent``
+    # violation the branch monitor asks its ``home_leader`` (the line's
+    # lower-priority-demand endpoint group) to shed ``relief_mw`` via a
+    # gossip round — but the legacy path sends that ONCE per violation
+    # episode (inside the event-dedup block), so the home leader sheds a
+    # single step and the line gets stuck on a plateau still above 100 %
+    # (traced: worst line drops 121→116 % in 0.6 s then sits flat for the
+    # rest of the run).  When True, the relief is RE-ASSERTED every poll the
+    # line is still overloaded (cooldown-guarded so it can't out-pace the
+    # gossip it triggers), with the magnitude recomputed from the live
+    # overshoot — so it shrinks to zero as the line reaches its bound and
+    # keeps drawing fresh relief while it is still over, driving the line
+    # toward feasibility round-by-round instead of one-and-done.  Default
+    # False (legacy one-shot).  Electricity line-relief only; the curtailment
+    # auction and other paths are untouched.
+    enable_line_relief_reassert: bool = False
+
+    # Branch-downstream targeted line relief.  Both legacy line-overload
+    # levers shed the WRONG loads: the curtailment auction broadcasts to the
+    # whole component (picks the most-"willing" load, which need not flow
+    # through the line), and the relief path sheds the line's lower-priority
+    # ENDPOINT group (whose loads also mostly don't flow through it) — so
+    # neither reduces the binding line's loading (measured: settled worst-line
+    # ~102-108 %, unmoved by either lever, and iterating them just sheds more
+    # for no relief).  The only loads whose curtailment reduces a radial
+    # branch's flow ~1:1 are the ones DOWNSTREAM of it (the subtree fed
+    # through it).  When True, each electricity branch monitor is given the
+    # set of loads that become slack-disconnected when the branch is removed
+    # (computed once at scenario build), and on a ``loading_percent`` violation
+    # it runs the curtailment auction against THAT set instead of the whole
+    # component — so the shed lands on loads that actually relieve the line,
+    # lowest-priority-first (priority still dominates the bid).  Replaces the
+    # component-wide auction AND the endpoint-relief path for line overload;
+    # branches whose removal doesn't cleanly disconnect a side (meshed / not a
+    # bridge) get an empty set and fall back to the legacy relief.  Default
+    # False.  Best paired with ``enable_curtail_auction_gating`` so the
+    # progress gate iterates the targeted shed toward feasibility.
+    enable_branch_downstream_relief: bool = False
+
+    # Strict reverse-priority WATERFALL for the branch-downstream line-relief
+    # auction.  Only consulted when ``enable_branch_downstream_relief`` is True
+    # (the targeted downstream bidder set + the L2-clawback line lock are
+    # prerequisites).  The default downstream auction allocates the shed by
+    # ``priority_weight × sensitivity × reducible`` willingness, whose 1e8/1e4/1
+    # tier exponents pour ~all shed onto the lowest-priority (tier-4) downstream
+    # loads — typically far too small a fraction of the through-flow to clear a
+    # 10-20 % overload — and never escalate to the tier-3 bulk that actually
+    # carries the binding line, so the line plateaus above 100 % (traced:
+    # branch settles ~113 % with tiers 1-3 still at full draw).  When True, the
+    # auctioneer instead sheds the downstream set in strict reverse-priority
+    # order: it drives the lowest-priority tier with reducible draw to zero,
+    # then escalates to the next tier, re-arming each poll until the line is
+    # ≤100 %.  Tier 1 is never shed (the hard-lock); if tiers 2-4 are exhausted
+    # and the line is still over, the auction stops and records a
+    # ``line_relief_tier1_residual`` event (the line is undersized for its
+    # critical through-load alone — a supply/topology problem, not a control
+    # one).  This is the priority-clean analogue of the oracle's behaviour
+    # (shed through-load to the line rating, sparing critical load); it keeps
+    # the priority invariant green where a priority-flat shed would invert
+    # tiers 2/3.  Electricity line-relief only.  Default False.
+    enable_line_relief_waterfall: bool = False
 
     # Constraint-aware participation scaling inside the gossip step.
     # When False, ``participation_scale = 1`` always.

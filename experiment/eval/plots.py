@@ -256,35 +256,44 @@ def _empty_fig(message: str, title: str) -> go.Figure:
     return _apply_theme(fig, title=title)
 
 
-# Compliance column for slack-budget claim.  Plots that aggregate PWSF
-# must restrict to the compliant subset, otherwise a variant that
-# violates the budget (drawing slack past the operator-allowed
-# envelope) is rewarded for inflated served MW.  Mirrors the aggregator's
-# ``_compliant_split`` in ``experiment/hpc/aggregate.py``.
-_COMPLIANCE_COL = "claims__slack_budget_compliance__passed"
+# Compliance columns.  Plots that aggregate PWSF must restrict to the
+# compliant subset, otherwise a variant that violates the operator slack
+# budget (drawing slack past the allowed envelope) OR leaves the grid out of
+# bounds (crediting load served through an overloaded line / at an infeasible
+# voltage / temperature) is rewarded for inflated served MW that the
+# constraint-respecting oracle cannot match.  A run is compliant only when it
+# passes BOTH.  Mirrors the aggregator's ``_compliant_split`` in
+# ``experiment/hpc/aggregate.py``.
+_SLACK_COMPLIANCE_COL = "claims__slack_budget_compliance__passed"
+_CONSTRAINT_COMPLIANCE_COL = "claims__constraint_compliance__passed"
+_COMPLIANCE_COLS = (_SLACK_COMPLIANCE_COL, _CONSTRAINT_COMPLIANCE_COL)
 
 
 def _compliant_mask(df: pd.DataFrame) -> pd.Series:
     """Return a boolean Series aligned with ``df.index`` selecting
-    budget-compliant rows.  Treats missing compliance data as failure
-    (better to drop than reward unverifiable rows).  Returns an
-    all-True mask when the campaign has no compliance column
-    (back-compat for runs predating the slack-budget claim).
+    compliant rows (passing every available compliance claim).  Treats
+    missing per-row compliance data as failure (better to drop than reward
+    unverifiable rows).  Returns an all-True mask when the campaign has no
+    compliance column at all (back-compat for runs predating the claims).
     """
-    if _COMPLIANCE_COL not in df.columns:
+    present = [c for c in _COMPLIANCE_COLS if c in df.columns]
+    if not present:
         return pd.Series(True, index=df.index)
-    return df[_COMPLIANCE_COL].fillna(False).astype(bool)
+    mask = pd.Series(True, index=df.index)
+    for col in present:
+        mask &= df[col].fillna(False).astype(bool)
+    return mask
 
 
 def _compliance_rate(df: pd.DataFrame) -> float | None:
-    """Fraction of rows in ``df`` that pass slack-budget compliance.
-    ``None`` when the compliance column is missing (so callers can
+    """Fraction of rows in ``df`` that pass *all* compliance claims.
+    ``None`` when no compliance column is present (so callers can
     suppress the annotation rather than print a fictional 100 %).
     """
-    if _COMPLIANCE_COL not in df.columns or df.empty:
+    present = [c for c in _COMPLIANCE_COLS if c in df.columns]
+    if not present or df.empty:
         return None
-    passed = df[_COMPLIANCE_COL].fillna(False).astype(bool)
-    return float(passed.sum() / len(passed))
+    return float(_compliant_mask(df).sum() / len(df))
 
 
 def _compliance_subtitle(rate: float | None, n_compliant: int, n_total: int) -> str:

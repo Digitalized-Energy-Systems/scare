@@ -1,0 +1,99 @@
+{
+  "$comment": [
+    "Curtailment-auction spotlight A/B.  Each experiment runs two paired arms",
+    "on identical (grid, seed, scenario, failure-draw): baseline {} (auction ON,",
+    "the config.py default) vs {enable_curtailment_auction:false} (auction OFF).",
+    "Because the eval planner's seed excludes the ablation index, the two arms",
+    "share the same failure draw -> a clean paired comparison.  Scenarios are the",
+    "three regimes where GridConstraintMonitor._request_curtailment actually fires:",
+    "  line_stress  -> loading_percent violations (electricity overload)",
+    "  cold_day     -> t_k violations (heat temperature floor)",
+    "  concentrated -> deep localized deficit -> vm_pu / general violations",
+    "Question: does disabling the auction help or hurt restored demand (PWSF) and",
+    "stability constraints (constraint_violation_integral, claim pass/fail)?"
+  ],
+  "name": "curtailment_spotlight",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 15,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "$comment": "Electricity line overload: the canonical regime where the auction is the priority-aware line-relief shedding lever.",
+      "name": "spot_line_stress",
+      "grids": ["simbench_lv"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_curtailment_auction": false }
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Cold-day heat temperature stress on the CP-heavy grid: t_k violations drive the auction (alongside the heat frontier controller, which the flag does NOT gate).",
+      "name": "spot_cold_day",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_curtailment_auction": false }
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Concentrated deep deficit, tight 30% budget: localized voltage / general violations that broadcast CurtailmentNeed to same-component neighbours.",
+      "name": "spot_concentrated",
+      "grids": ["simbench_lv"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_curtailment_auction": false }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 6,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "02:00:00",
+    "mem": "16G",
+    "cpus": 1,
+    "max_concurrent": 64
+  }
+}

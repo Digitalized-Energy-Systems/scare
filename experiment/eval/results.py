@@ -29,7 +29,9 @@ from scare.base.model import Sector
 from scare.base.util import sector_from_grid
 
 from experiment.eval.metrics import (
+    constraint_rows,
     constraint_violation_integral,
+    constraint_violations_final,
     restoration_breakdown,
     served_breakdown,
     served_by_load,
@@ -59,6 +61,13 @@ def compose_result(
     served = served_breakdown(monee_net, behavior, priorities=priorities)
     restoration = restoration_breakdown(served, baseline_served)
     integral = constraint_violation_integral(world)
+    # Accurate end-of-sim feasibility: the during-run integral above only sees
+    # per-sector averages, so a run with individual buses / junctions / lines
+    # out of bounds can still integrate near-zero.  This scans the final solved
+    # network node-by-node and branch-by-branch against the same envelope the
+    # oracle enforces; the ``constraint_compliance`` claim (claims.py) gates on
+    # it so PWSF stays comparable across variants and the oracle.
+    constraints_final = constraint_violations_final(monee_net)
     t_stable = time_to_stabilise_s(world)
 
     diary_summary = diagnostics.negotiation_summary()
@@ -100,6 +109,7 @@ def compose_result(
             "n_loads": served["n_loads"],
             "n_loads_served_zero": served["n_loads_served_zero"],
             "constraint_violation_integral": integral,
+            "constraint_violations_final": constraints_final,
             "time_to_stabilise_s": t_stable,
             "regulates_total": sum(regulates_by_reason.values()),
             "regulates_by_reason": dict(regulates_by_reason),
@@ -180,6 +190,32 @@ def write_served_by_load_csv(
                 r["aid"], r["sector"], r["tier"], r["node_id"], r["component"],
                 f"{r['demand']:.6f}", f"{r['served']:.6f}", f"{r['fraction']:.6f}",
                 r["disconnected"], f"{r.get('constraint_allowed', 1.0):.6f}",
+            ])
+
+
+def write_constraints_final_csv(path: Path, monee_net: Any) -> None:
+    """Per-node / per-branch end-of-sim hard-bound readings.
+
+    One row per checked constraint variable: ``kind`` (node|branch), ``id``,
+    ``sector``, ``variable``, ``value``, ``lo``, ``hi``, ``overshoot``,
+    ``violated``.  The ``constraint_compliance`` claim
+    (``experiment.eval.claims._check_constraint_compliance``) reads this back
+    and passes iff no row is ``violated`` — the grid-feasibility half of the
+    compliance gate that keeps PWSF comparable to the oracle.
+    """
+    rows = constraint_rows(monee_net)
+    cols = (
+        "kind", "id", "sector", "variable",
+        "value", "lo", "hi", "overshoot", "violated",
+    )
+    with Path(path).open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([
+                r["kind"], r["id"], r["sector"], r["variable"],
+                f"{r['value']:.6f}", f"{r['lo']:.6f}", f"{r['hi']:.6f}",
+                f"{r['overshoot']:.6f}", int(bool(r["violated"])),
             ])
 
 

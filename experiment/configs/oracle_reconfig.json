@@ -1,0 +1,16 @@
+{
+  "name": "oracle_reconfig",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true, "write_trajectories": false, "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 4, "failure_lambda": 1.5, "max_failures": 4 },
+  "experiments": [
+    { "name": "orec", "grids": ["simbench_lv_reconfig"], "n_seeds": 4,
+      "variants": ["oracle"],
+      "scenarios": [ { "kind": "line_stress", "load_scale": 1.8, "ampacity_scale": 0.5,
+          "max_failures": 2, "priority_assignment": "skewed", "slack_budget_pct": 0.45 } ] }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "02:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 64 }
+}

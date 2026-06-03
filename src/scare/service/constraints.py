@@ -45,6 +45,7 @@ from scare.base.util import (
     obs_constraint_values,
     obs_priority,
     obs_setpoint,
+    refresh_line_curtail_lock,
     tier_priority_weight,
 )
 
@@ -131,6 +132,83 @@ _SECTOR_PRIMARY_VAR: dict[Sector, str] = {
 # any ``str(addr)`` neighbour key.
 _SELF_BID_KEY: str = "__self__"
 
+# Curtailment-auction gating (``enable_curtail_auction_gating``).
+# Consecutive auction rounds a variable may run without its overshoot
+# improving before the progress gate suspends re-arming it.
+_CURTAIL_NO_PROGRESS_LIMIT: int = 2
+# Minimum improvement in the fractional overshoot (relative to the
+# constraint span) that counts as progress for the gate above.
+_CURTAIL_PROGRESS_TOL: float = 0.01
+
+# Variables the auction must NOT fire on (under gating).  Two cases, same
+# reason — the auction's component-wide ``priority × own-sensitivity ×
+# reducible`` bidding is blind to WHICH node/branch is violated, so it sheds
+# whatever load is most "willing" regardless of whether that load relieves
+# the violation:
+#   - ``t_k``           heat temperature: no load's curtailment moves another
+#                       junction's return temperature — the frontier controller
+#                       owns this lever.
+#   - ``loading_percent`` line overload is a BRANCH violation; the branch has
+#                       no load to shed, so the auction farms it out to the
+#                       most-willing load in the component, which need not be
+#                       on (or even near) the overloaded line.  The dedicated
+#                       line-relief path (``_send_line_overload_relief``) targets
+#                       an actual endpoint of the line and is the correct lever;
+#                       the auction here only sheds unrelated nodes (measured
+#                       net-negative on the settled worst-line loading).
+# The auction still fires on node-local violations (``vm_pu``, ``pressure_pu``)
+# where the violating node's OWN load and its electrical neighbours are the
+# lever.
+_CURTAIL_AUCTION_SKIP_VARS: frozenset[str] = frozenset({"t_k", "loading_percent"})
+
+# Cross-sensitivity targeting (``enable_curtail_auction_targeting``).
+# A bidder's electrical proximity to the violated origin scales its
+# willingness within [PROX_MIN, PROX_MAX] — a bounded within-tier
+# tiebreaker (like the sensitivity multiplier) so priority stays
+# lexicographically dominant.  Proximity is derived from the cached
+# multi-hop ``ConstraintStateMessage`` distance: a node that received the
+# state with more ``hops_remaining`` is closer to the origin.  The
+# auctioneer itself IS the origin, so it self-bids at PROX_MAX.
+_CURTAIL_PROX_MIN: float = 0.25
+_CURTAIL_PROX_MAX: float = 4.0
+
+# Minimum sim-seconds between two line-relief re-assertions for the same
+# branch (``enable_line_relief_reassert``).  Sized so the re-assert never
+# out-paces the gossip round it triggers — modelled on the 2 s
+# SlackBudgetMonitor refire cooldown that damps the balance layer.  The
+# relief magnitude is recomputed from the live overshoot each time, so as
+# the line approaches its bound the ask shrinks to zero (convergent, no
+# over-shed); a still-overloaded line keeps drawing fresh relief rounds.
+_LINE_RELIEF_COOLDOWN_S: float = 2.0
+
+# Aggressive per-round gain for branch-downstream line relief (vs the gentle
+# 0.3 default).  The downstream auction must clear a 10-20 % overload within
+# the run, so each round sheds a large share of the downstream loads
+# (priority orders WHO sheds first); the round-by-round re-arm then walks the
+# line down to ≤100 %.  See ``_request_curtailment``.
+_LINE_RELIEF_GAIN: float = 1.5
+
+# Reducible-draw threshold (MW) below which a downstream bidder is treated as
+# "exhausted" by the line-relief waterfall, so the cascade escalates to the
+# next priority tier.  Matches the 0.5 kW bid-registration floor.
+_LINE_RELIEF_MIN_REDUCIBLE: float = 5e-4
+
+# Schmitt-trigger release margin (loading-percent points) for the line-relief
+# lock hold.  The relief auction engages while the line is over its bound
+# (loading > 100 %) but the downstream loads' L2-clawback lock is held fresh
+# until the line drops a further ``_LINE_RELIEF_RELEASE_MARGIN`` below the
+# bound — so once the line just-clears, L2 cannot immediately re-serve the
+# relieving loads and re-breach it (the relief↔L2 limit-cycle).  Hysteresis:
+# shed to ≤100 %, but don't release the shed until the line has ≥ this margin.
+#
+# Sized above the relief's typical settle point: the tapering per-round shed
+# walks the line to just under 100 % (observed settle ~97-99 %), and that
+# headroom exists *only because* the loads are held shed — restoring them would
+# re-breach the line — so the hold must persist there.  Released only when the
+# line sits a full margin below the bound (≤ 95 %), i.e. genuine headroom from
+# a topology change, not the relief's own success.
+_LINE_RELIEF_RELEASE_MARGIN: float = 5.0
+
 
 class GridConstraintMonitor(Role):
     """Periodically checks local grid measurements against sector-specific
@@ -159,6 +237,12 @@ class GridConstraintMonitor(Role):
         *,
         max_hops: int = _DEFAULT_MAX_HOPS,
         enable_curtailment_auction: bool = True,
+        enable_curtail_auction_gating: bool = False,
+        enable_curtail_auction_targeting: bool = False,
+        enable_line_relief_reassert: bool = False,
+        enable_branch_downstream_relief: bool = False,
+        enable_line_relief_waterfall: bool = False,
+        downstream_load_addrs: "list[Any] | None" = None,
         enable_multihop_constraint: bool = True,
         enable_heat_frontier: bool = True,
         enable_heat_priority_waterfall: bool = True,
@@ -171,6 +255,18 @@ class GridConstraintMonitor(Role):
         self.node_id = node_id
         self.max_hops = max_hops
         self.enable_curtailment_auction = enable_curtailment_auction
+        self.enable_curtail_auction_gating = enable_curtail_auction_gating
+        self.enable_curtail_auction_targeting = enable_curtail_auction_targeting
+        self.enable_line_relief_reassert = enable_line_relief_reassert
+        self.enable_branch_downstream_relief = enable_branch_downstream_relief
+        # Strict reverse-priority cascade for the downstream line-relief
+        # auction (only meaningful with ``enable_branch_downstream_relief``).
+        self.enable_line_relief_waterfall = enable_line_relief_waterfall
+        # Addresses of the loads electrically downstream of this branch (the
+        # subtree fed through it) — the only loads whose curtailment reduces
+        # this branch's flow.  Populated post-build for electricity branch
+        # monitors when ``enable_branch_downstream_relief``; empty otherwise.
+        self._downstream_load_addrs: list[Any] = list(downstream_load_addrs or [])
         self.enable_multihop_constraint = enable_multihop_constraint
         self.enable_heat_frontier = enable_heat_frontier
         # Priority-waterfall gate for the heat frontier controller: a cold
@@ -277,6 +373,22 @@ class GridConstraintMonitor(Role):
         # same variable while letting curtailment ITERATE round-by-round
         # toward feasibility once the previous round has allocated.
         self._curtail_inflight: dict[str, float] = {}
+        # Progress gate state (only consulted when
+        # ``enable_curtail_auction_gating``): variable -> {"best": best
+        # fractional overshoot seen, "no_progress": consecutive rounds
+        # without improvement}.  Reset when the variable returns in-bounds
+        # (see ``_monitor``).  Suspends re-arming a lever that isn't
+        # moving its constraint — see ``_request_curtailment``.
+        self._curtail_progress: dict[str, dict[str, float]] = {}
+        # Per-variable cooldown deadline for iterative line-relief re-assert
+        # (``enable_line_relief_reassert``); cleared when the line returns
+        # in-bounds (see ``_monitor``).
+        self._relief_inflight: dict[str, float] = {}
+        # Per-variable flag set by the line-relief waterfall allocator when the
+        # only downstream bidders with reducible draw left are tier-1 (the line
+        # cannot be relieved further without breaking the hard-lock).  Stops the
+        # auction re-arming; cleared when the line returns in-bounds.
+        self._line_relief_tier1_residual: dict[str, bool] = {}
 
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
@@ -395,6 +507,17 @@ class GridConstraintMonitor(Role):
         The in-flight guard in ``_request_curtailment`` keeps that from
         stacking overlapping auctions for the same variable.
         """
+        # Branch-downstream relief owns a line overload only when this is a
+        # branch ``loading_percent`` breach AND a downstream load set was
+        # resolved for it (a bridge branch); otherwise fall back to the
+        # legacy endpoint/auction levers.
+        downstream_active = (
+            self.enable_branch_downstream_relief
+            and self.branch_id is not None
+            and var == "loading_percent"
+            and bool(self._downstream_load_addrs)
+        )
+
         if var not in self._violation_emitted:
             self._violation_emitted.add(var)
             logger.warning(
@@ -416,15 +539,39 @@ class GridConstraintMonitor(Role):
                 sector=self.sector,
                 imbalance=val - hi if val > hi else lo - val,
             ))
+            # Branch-mode line-relief.  When branch-downstream relief owns
+            # this overload (it has a non-empty downstream set), the
+            # downstream-targeted auction below is the lever and BOTH legacy
+            # relief paths defer; otherwise the legacy endpoint relief fires
+            # (one-shot here, or iteratively via ``_reassert_line_relief``).
             if (
                 self.branch_id is not None
                 and var == "loading_percent"
                 and self.home_leader_addr is not None
+                and not downstream_active
+                and not self.enable_line_relief_reassert
             ):
-                # Branch-mode BalanceProblem has no local listener — drive
-                # the home leader to rebalance via StartBalanceNegotiation.
                 await self._send_line_overload_relief(obs, val, lo, hi)
-        if self.enable_curtailment_auction:
+        # Iterative endpoint relief (legacy lever, made to re-assert while
+        # overloaded).  Skipped when branch-downstream relief owns the line.
+        if (
+            self.enable_line_relief_reassert
+            and not downstream_active
+            and self.branch_id is not None
+            and var == "loading_percent"
+            and self.home_leader_addr is not None
+        ):
+            await self._reassert_line_relief(obs, var, val, lo, hi)
+        # Curtailment auction.  Skipped for the gated skip-vars (``t_k`` /
+        # ``loading_percent``) EXCEPT when branch-downstream relief re-enables
+        # ``loading_percent`` with a targeted (downstream) bidder set.
+        if self.enable_curtailment_auction and (
+            downstream_active
+            or not (
+                self.enable_curtail_auction_gating
+                and var in _CURTAIL_AUCTION_SKIP_VARS
+            )
+        ):
             await self._request_curtailment(var, val, lo, hi)
 
     def _handle_warning(
@@ -490,8 +637,29 @@ class GridConstraintMonitor(Role):
 
             if val < lo or val > hi:
                 await self._handle_violation(obs, var, val, lo, hi)
+                # Line over its bound: hold the downstream loads' L2-clawback
+                # lock fresh this poll (the auction only writes ``curtail`` in
+                # bursts, so without this the lock ages out between sheds and
+                # L2 re-serves mid-relief).
+                self._hold_downstream_line_locks(var, val, hi)
+            elif (
+                self._is_line_relief_branch()
+                and var == "loading_percent"
+                and val > hi - _LINE_RELIEF_RELEASE_MARGIN
+            ):
+                # Hysteresis hold band: the line has just-cleared but lacks the
+                # release margin.  Keep the lock fresh (no further shed) so L2
+                # cannot immediately claw back the relieving loads and
+                # re-breach the line.  State is NOT cleared until the line
+                # drops a full margin below the bound (the else branch).
+                self._hold_downstream_line_locks(var, val, hi)
             else:
                 self._violation_emitted.discard(var)
+                # Variable back in-bounds (with margin): clear the progress
+                # gate so a later re-breach starts with a fresh round budget.
+                self._curtail_progress.pop(var, None)
+                self._relief_inflight.pop(var, None)
+                self._line_relief_tier1_residual.pop(var, None)
 
             if util >= PROACTIVE_WARNING_FRACTION and var not in self._violation_emitted:
                 self._handle_warning(var, val, lo, hi, util)
@@ -638,6 +806,27 @@ class GridConstraintMonitor(Role):
     # Branch-mode helpers
     # ------------------------------------------------------------------
 
+    async def _reassert_line_relief(
+        self, obs: dict, var: str, val: float, lo: float, hi: float
+    ) -> None:
+        """Iterative line-relief: re-send the relief target while the line
+        stays overloaded, so the home leader sheds round-by-round toward
+        feasibility instead of stopping after the legacy single shot.
+
+        Cooldown-guarded (``_LINE_RELIEF_COOLDOWN_S``) so we never re-assert
+        faster than the gossip round each send triggers; the magnitude is
+        recomputed from the live overshoot inside
+        :meth:`_send_line_overload_relief`, so it shrinks to zero as the line
+        approaches its bound (convergent — no over-shed) and keeps drawing
+        fresh relief while the line is still over.
+        """
+        now = self.context.current_timestamp
+        deadline = self._relief_inflight.get(var)
+        if deadline is not None and now < deadline:
+            return
+        self._relief_inflight[var] = now + _LINE_RELIEF_COOLDOWN_S
+        await self._send_line_overload_relief(obs, val, lo, hi)
+
     async def _send_line_overload_relief(
         self, obs: dict, val: float, lo: float, hi: float
     ) -> None:
@@ -681,6 +870,31 @@ class GridConstraintMonitor(Role):
                 "[%s] line-overload relief send failed: %s",
                 self.context.aid, exc,
             )
+
+    def _is_line_relief_branch(self) -> bool:
+        """True iff this monitor runs the branch-downstream line-relief lever
+        (a branch agent with the flag on and a resolved downstream set)."""
+        return (
+            self.enable_branch_downstream_relief
+            and self.branch_id is not None
+            and bool(self._downstream_load_addrs)
+        )
+
+    def _hold_downstream_line_locks(self, var: str, val: float, hi: float) -> None:
+        """Keep the downstream loads' L2-clawback line locks fresh while the
+        line is over (or in the release hysteresis band), so L2 cannot
+        re-serve a just-relieved load between the auction's sheds.  No-op
+        unless this is the line-relief branch lever on a ``loading_percent``
+        reading at/above its bound."""
+        if var != "loading_percent" or not self._is_line_relief_branch():
+            return
+        if val <= hi - _LINE_RELIEF_RELEASE_MARGIN:
+            return
+        now = self.context.current_timestamp
+        for addr in self._downstream_load_addrs:
+            aid = getattr(addr, "aid", None)
+            if aid is not None:
+                refresh_line_curtail_lock(self.behavior, aid, now)
 
     # ------------------------------------------------------------------
     # Curtailment
@@ -769,11 +983,71 @@ class GridConstraintMonitor(Role):
 
         overshoot = (value - hi) / span if value > hi else (lo - value) / span
 
+        # Is this a strict reverse-priority line-relief waterfall auction?
+        _waterfall = (
+            self.enable_line_relief_waterfall
+            and self.enable_branch_downstream_relief
+            and variable == "loading_percent"
+            and bool(self._downstream_load_addrs)
+        )
+
+        if _waterfall:
+            # The waterfall is monotone and self-terminating (it re-arms only
+            # while the line is over and stops once it clears), so the generic
+            # no-progress gate is the wrong stop — a tier-transition round can
+            # briefly stall and the gate would abort before the next tier
+            # engages.  Instead stop only when the allocator has reported that
+            # the sole reducible bidders left are tier-1 (relieving further
+            # would break the hard-lock).
+            if self._line_relief_tier1_residual.get(variable):
+                return
+        elif self.enable_curtail_auction_gating:
+            # Progress gate: the in-flight guard above means we reach here once
+            # per auction round.  If this variable's overshoot keeps failing to
+            # improve on its best-seen value, the auction is not relieving it —
+            # stop re-arming until something else moves it (the overshoot
+            # worsening or a topology change re-engages the lever).  Without
+            # this a persistent, auction-unrelievable violation re-arms every
+            # poll and churns (2.5–5× more applies than distinct violations,
+            # mostly at the gain floor).  No-op unless gating is enabled.
+            prog = self._curtail_progress.setdefault(
+                variable, {"best": float("inf"), "no_progress": 0.0}
+            )
+            if overshoot < prog["best"] - _CURTAIL_PROGRESS_TOL:
+                prog["best"] = overshoot
+                prog["no_progress"] = 0.0
+            else:
+                prog["no_progress"] += 1.0
+                if prog["no_progress"] > _CURTAIL_NO_PROGRESS_LIMIT:
+                    return
+
         # Total fractional reduction needed across the group + self.
         # Announced via a two-phase auction: broadcast the *need*, collect
         # bids, then allocate proportional to each candidate's willingness
         # (priority × local sensitivity × reducible output).
-        total_amount = max(0.02, min(1.0, self._CURTAILMENT_GAIN * overshoot))
+        _downstream_line = (
+            self.enable_branch_downstream_relief
+            and variable == "loading_percent"
+            and bool(self._downstream_load_addrs)
+        )
+        if _waterfall:
+            # Waterfall sheds one priority tier at a time and the lock hold
+            # below keeps L2 from re-serving, so it can afford to taper near
+            # the bound: a low floor sheds in small steps (each tier-balance
+            # drop stays under the no-regret tolerance) and lets the per-poll
+            # re-arm walk the line down to *just* under 100 %, settling inside
+            # the lock's release band rather than overshooting well below it.
+            total_amount = min(1.0, max(0.05, _LINE_RELIEF_GAIN * overshoot))
+        elif _downstream_line:
+            # Branch-downstream line relief must drive the line to feasibility,
+            # not nudge it: the gain-0.3 / 0.02-floor schedule sheds ~1 %/round
+            # and can't clear a 10-20 % overload inside the run while the holon
+            # re-serves the rest.  Use a high gain so each round sheds a large
+            # share of the *downstream* loads (priority still orders WHO sheds),
+            # converging in a few rounds; the auction re-arms until ≤100 %.
+            total_amount = min(1.0, max(0.25, _LINE_RELIEF_GAIN * overshoot))
+        else:
+            total_amount = max(0.02, min(1.0, self._CURTAILMENT_GAIN * overshoot))
 
         # The violating agent's OWN load is the most direct lever on its own
         # junction (an upstream neighbour relieves a downstream node, but a
@@ -796,8 +1070,26 @@ class GridConstraintMonitor(Role):
         self_w = (
             self_w_raw if (self_w_raw is not None and self_w_raw > 0.0) else None
         )
+        # Targeting: the auctioneer IS the violation origin, so it is the
+        # closest possible bidder — scale its self-bid by the max proximity
+        # so it competes on the same footing as the proximity-weighted
+        # neighbour bids (priority still decides who actually absorbs).
+        if self.enable_curtail_auction_targeting and self_w is not None:
+            self_w *= _CURTAIL_PROX_MAX
 
-        neighbors = list(topology_neighbors(self, tid="groups"))
+        # Branch-downstream relief: for a line overload with a resolved
+        # downstream set, the bidders are the loads that actually flow through
+        # the branch (so the shed reduces ITS loading), not the whole
+        # component.  Priority still orders the shed (lowest-priority
+        # downstream load first).  Falls back to the component otherwise.
+        if (
+            self.enable_branch_downstream_relief
+            and variable == "loading_percent"
+            and self._downstream_load_addrs
+        ):
+            neighbors = list(self._downstream_load_addrs)
+        else:
+            neighbors = list(topology_neighbors(self, tid="groups"))
 
         if not neighbors and self_w is None:
             # Self is locked (tier-1 or nothing to curtail) and there are
@@ -814,9 +1106,11 @@ class GridConstraintMonitor(Role):
             "total": total_amount,
             "neighbours_contacted": len(neighbors),
             "bidders": {},  # sender_key -> addr
+            "bid_meta": {},  # sender_key -> (tier, reducible)
             "var": variable,
             "self_willingness": self_w,
             "self_addr": self.context.addr,
+            "waterfall": _waterfall,
         }
         self._curtail_inflight[variable] = now + self._AUCTION_TIMEOUT_S
 
@@ -830,6 +1124,8 @@ class GridConstraintMonitor(Role):
             sector=self.sector,
             total_amount=total_amount,
             auction_id=auction_id,
+            origin_addr=self.context.addr,
+            variable=variable,
         )
         for addr in neighbors:
             await self.context.send_message(need_msg, receiver_addr=addr)
@@ -848,14 +1144,58 @@ class GridConstraintMonitor(Role):
         if not obs:
             return
 
+        willingness = self._own_curtail_willingness(obs)
+        # Targeting: scale by this bidder's electrical proximity to the
+        # violation origin so the share concentrates on the loads that
+        # actually relieve THIS violation (high ∂constraint/∂Q), not just
+        # any reducible load in the component.  Bounded within-tier, so
+        # priority stays dominant.
+        if self.enable_curtail_auction_targeting:
+            willingness *= self._curtail_proximity(
+                message.origin_addr, message.variable
+            )
+        # Carry tier + reducible draw so a line-relief-waterfall auctioneer can
+        # shed in strict reverse-priority order (cheap; ignored by the default
+        # willingness-proportional allocator).
+        bid_tier = max(
+            1, obs_priority(obs, behavior=self.behavior, aid=self.context.aid)
+        )
+        bid_reducible = abs(
+            obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
+        )
         reply = CurtailmentBid(
             auction_id=message.auction_id,
-            willingness=self._own_curtail_willingness(obs),
+            willingness=willingness,
             sector=self.sector,
+            tier=bid_tier,
+            reducible=bid_reducible,
         )
         await self.context.send_message(
             reply, receiver_addr=mango_sender_addr(meta)
         )
+
+    def _curtail_proximity(self, origin_addr: Any, variable: str) -> float:
+        """Bounded proximity multiplier in ``[_CURTAIL_PROX_MIN,
+        _CURTAIL_PROX_MAX]`` for this bidder relative to the violation
+        ``origin_addr``/``variable``.
+
+        Uses the cached multi-hop ``ConstraintStateMessage`` distance: the
+        origin broadcasts at ``hops_remaining = max_hops`` and each forward
+        decrements, so a larger cached ``hops_remaining`` means this bidder
+        sat fewer hops from the origin (electrically closer → larger
+        ∂constraint/∂Q).  No cached state ⇒ the bidder never saw the
+        violation propagate (beyond the propagation radius) ⇒ neutral 1.0,
+        so targeting only ever *redistributes* toward demonstrably-close
+        bidders and never starves an unknown one below baseline.
+        """
+        if not variable or origin_addr is None or self.max_hops <= 0:
+            return 1.0
+        state = self._neighbour_state.get((str(origin_addr), variable))
+        if state is None:
+            return 1.0
+        # hops_remaining in [0, max_hops]; map to [MIN, MAX] linearly.
+        frac = max(0.0, min(1.0, float(state.hops_remaining) / float(self.max_hops)))
+        return _CURTAIL_PROX_MIN + (_CURTAIL_PROX_MAX - _CURTAIL_PROX_MIN) * frac
 
     async def _handle_curtailment_bid(
         self, message: CurtailmentBid, meta: dict
@@ -867,6 +1207,11 @@ class GridConstraintMonitor(Role):
         sender_key = str(sender)
         auction["bids"][sender_key] = message.willingness
         auction["bidders"][sender_key] = sender
+        # (tier, reducible) for the reverse-priority waterfall allocator.
+        auction["bid_meta"][sender_key] = (
+            int(getattr(message, "tier", 0) or 0),
+            float(getattr(message, "reducible", 0.0) or 0.0),
+        )
 
         if len(auction["bids"]) >= auction["neighbours_contacted"]:
             await self._allocate_auction(message.auction_id)
@@ -906,6 +1251,38 @@ class GridConstraintMonitor(Role):
                     CurtailmentRequest(sector=self.sector, amount=share),
                     receiver_addr=addr,
                 )
+
+        # Strict reverse-priority waterfall for branch-downstream line relief:
+        # drive the lowest-priority tier with reducible draw toward zero, then
+        # escalate to the next tier on the following rounds (an exhausted tier
+        # reports reducible ≈ 0 and drops out).  Tier 1 is never shed (the
+        # hard-lock); when the only reducible bidders left are tier 1, stop and
+        # surface the residual.  This keeps the shed lowest-priority-first
+        # (priority invariant stays clean) while still relieving the line.
+        if auction.get("waterfall"):
+            meta: dict[str, tuple] = dict(auction.get("bid_meta", {}))
+            var = auction.get("var", "loading_percent")
+            eligible = {
+                k: tier
+                for k, (tier, red) in meta.items()
+                if tier >= 2 and red > _LINE_RELIEF_MIN_REDUCIBLE
+            }
+            if not eligible:
+                if not self._line_relief_tier1_residual.get(var):
+                    self._line_relief_tier1_residual[var] = True
+                    record_event(
+                        t=self.context.current_timestamp,
+                        kind="line_relief_tier1_residual",
+                        aid=self.context.aid,
+                        sector=self.sector.value,
+                        detail=f"{var}: tiers 2-4 exhausted, line still over",
+                    )
+                return
+            target_tier = max(eligible.values())  # lowest priority present
+            for key, tier in eligible.items():
+                if tier == target_tier:
+                    await _dispatch(key, bidders.get(key), total_amount)
+            return
 
         sum_w = sum(bids.values())
         if sum_w <= 0.0:

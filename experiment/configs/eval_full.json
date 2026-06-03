@@ -55,6 +55,14 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.6
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
         }
       ]
     },
@@ -87,6 +95,14 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.6
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
         }
       ]
     },
@@ -106,6 +122,14 @@
       "scenarios": [
         {
           "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
           "max_failures": 4,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
@@ -303,6 +327,16 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "cold_day",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
         }
       ]
     },
@@ -394,6 +428,14 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
         }
       ]
     },
@@ -427,6 +469,14 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
         }
       ]
     },
@@ -456,6 +506,14 @@
         {
           "kind": "clean",
           "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "n_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
         }
@@ -550,6 +608,16 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "cold_day",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
         }
       ]
     },
@@ -612,6 +680,14 @@
       "scenarios": [
         {
           "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
@@ -763,6 +839,14 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
         }
       ]
     },
@@ -798,6 +882,14 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
         }
       ]
     },
@@ -827,6 +919,14 @@
       "scenarios": [
         {
           "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45

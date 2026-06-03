@@ -368,6 +368,54 @@ def _heat_curtail_lock_store(behavior: Any) -> dict[str, float]:
     return _get_behavior_store(behavior, "_scare_heat_curtail_lock")
 
 
+def _line_curtail_lock_store(behavior: Any) -> dict[str, tuple]:
+    """Per-aid electricity line-relief lock: ``aid -> (factor, t_set)``.
+
+    Set by the branch-downstream line-relief auction's ``reason="curtail"``
+    writes; while an entry is *fresh* (the auction re-asserted it within
+    ``_LINE_CURTAIL_LOCK_TTL_S``, which it does every poll the line is still
+    over), L2 holon allocation writes to that load DEFER — otherwise the
+    holon re-serves a just-shed downstream load and the line never clears.
+    The lock is freshness-lifted (no explicit release): once the line drops
+    ≤100 % the auction stops re-arming, the entry goes stale, and normal
+    restoration resumes.  Electricity analogue of the heat curtail lock."""
+    return _get_behavior_store(behavior, "_scare_line_curtail_lock")
+
+
+# How long a line-relief lock stays authoritative after its last refresh.
+# Must exceed the electricity monitor poll (~0.5 s) so the lock survives
+# between the auction's re-arms, but be short enough that it releases within
+# a second or two of the line clearing (the auction stops re-arming).
+_LINE_CURTAIL_LOCK_TTL_S: float = 3.0
+
+
+def has_line_curtail_lock(behavior: Any, aid: str, now: float) -> bool:
+    """True iff *aid* holds a FRESH line-relief lock as of sim-time ``now``."""
+    entry = _line_curtail_lock_store(behavior).get(str(aid))
+    if entry is None:
+        return False
+    _factor, t_set = entry
+    return (now - float(t_set)) < _LINE_CURTAIL_LOCK_TTL_S
+
+
+def refresh_line_curtail_lock(behavior: Any, aid: str, now: float) -> None:
+    """Re-stamp an EXISTING line-relief lock entry to ``now`` (keeping its
+    held factor) so it stays fresh, without shedding the load further.
+
+    The branch monitor calls this every poll while the line is over (or in
+    the release hysteresis band) so the lock survives the gaps between the
+    auction's actual curtail writes — otherwise, once the waterfall has shed
+    the downstream loads to their target the auction stops issuing fresh
+    ``reason="curtail"`` writes, the lock ages out mid-relief, and L2 claws the
+    loads back up and re-breaches the line.  No-op for loads with no lock
+    entry (never shed for this line)."""
+    store = _line_curtail_lock_store(behavior)
+    entry = store.get(str(aid))
+    if entry is not None:
+        factor, _t_set = entry
+        store[str(aid)] = (factor, float(now))
+
+
 def has_heat_curtail_lock(behavior: Any, aid: str) -> bool:
     """True iff *aid* is currently held by a temperature-driven curtailment
     lock — i.e. the curtailment auction or the heat frontier controller shed
@@ -597,6 +645,36 @@ def apply_regulate(
                 sector=str(sector),
                 detail=f"reason={reason} lock={_lock[str(aid)]:.4f} "
                        f"requested_factor={factor:.4f}",
+            )
+            return False
+
+    # --- Electricity line-relief lock ---------------------------------
+    # While the branch-downstream line-relief auction holds an electricity
+    # load down to relieve an overloaded line, the holon (L2) must DEFER —
+    # otherwise it re-serves the just-shed downstream load every cycle and
+    # the line never clears (diagnosed: child sheds to 0.2 yet the holon
+    # restores its neighbours and the line stays ~113 %).  Freshness-lifted:
+    # the auction re-asserts the curtail every poll the line is over, so a
+    # stale entry (line cleared) stops deferring.  Gated on the downstream-
+    # relief flag and electricity sector; other sectors fall through.
+    if _sector_e is Sector.ELECTRICITY and getattr(
+        _cfg, "enable_branch_downstream_relief", False
+    ):
+        _lline = _line_curtail_lock_store(behavior)
+        if reason == CURTAIL_AUCTION_REASON:
+            if factor < 1.0 - tolerance:
+                _lline[str(aid)] = (factor, float(timestamp))
+            else:
+                _lline.pop(str(aid), None)
+        elif reason in L2_ALLOCATION_REASONS and has_line_curtail_lock(
+            behavior, aid, float(timestamp)
+        ):
+            record_event(
+                t=float(timestamp),
+                kind="regulate_deferred_to_line_lock",
+                aid=str(aid),
+                sector=str(sector),
+                detail=f"reason={reason} requested_factor={factor:.4f}",
             )
             return False
 

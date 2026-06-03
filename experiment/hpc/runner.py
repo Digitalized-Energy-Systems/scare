@@ -61,6 +61,7 @@ from experiment.eval.claims import evaluate_task
 from experiment.eval.oracle import compose_oracle_result, compute_baseline_served
 from experiment.eval.results import (
     compose_result,
+    write_constraints_final_csv,
     write_diary_csv,
     write_events_csv,
     write_messages_csv,
@@ -372,8 +373,11 @@ async def _run_simulation(
 
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s", task.grid)
-    # Factory already applies MISOCP + McCormick formulations; re-applying
-    # MISOCP here would overwrite the McCormick partition metadata.
+    # Factory applies the MISOCP electricity formulation and leaves the
+    # district-heating physics in its nonlinear form (McCormick-DHS is
+    # intentionally off for the live simulation — it can hit envelope-
+    # bound infeasibilities on failures).  The oracle re-enables DHS
+    # linearisation for its own LP only; see ``run_oracle``.
     net = factory()
     _apply_scenario(net, task, logger)
 
@@ -446,7 +450,9 @@ def _run_oracle(
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s (oracle)", task.grid)
-    # Factory already applies MISOCP + McCormick.
+    # Factory applies MISOCP (electricity) and leaves DHS nonlinear;
+    # ``run_oracle`` (via ``compose_oracle_result``) adds the McCormick-DHS
+    # heat linearisation for the oracle LP.
     net = factory()
     _apply_scenario(net, task, logger)
     failures = _resolve_failures(net, plan, task)
@@ -848,6 +854,7 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
             write_served_by_load_csv(
                 out_dir / "served_by_load.csv", net, behavior, priorities=priorities,
             )
+            write_constraints_final_csv(out_dir / "constraints_final.csv", net)
             write_diary_csv(out_dir / "diary.csv")
             write_events_csv(out_dir / "events.csv")
             write_slack_meta(out_dir / "slack_meta.json", net)

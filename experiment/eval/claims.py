@@ -127,6 +127,14 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
         timeseries_path=task_dir / "timeseries.csv",
         slack_meta_path=task_dir / "slack_meta.json",
     )
+    # Grid-feasibility half of the compliance gate: no hard-bound violation
+    # (voltage / pressure / temperature / line loading) at end-of-sim.  Paired
+    # with ``slack_budget_compliance`` so a run is "compliant" only when it
+    # solved the SAME operator- and physics-constrained problem the oracle did
+    # — see ``_check_constraint_compliance``.
+    out["constraint_compliance"] = _check_constraint_compliance(
+        task_dir / "constraints_final.csv"
+    )
     return out
 
 
@@ -838,6 +846,76 @@ def _check_slack_budget(
             "first_t": violations[0].get("t"),
             "last_t": violations[-1].get("t"),
             "peaks_sample": peaks,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Constraint compliance (end-of-sim grid feasibility)
+# ---------------------------------------------------------------------------
+
+
+def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
+    """End-of-sim hard-bound feasibility must hold: no active, connected node
+    or branch may breach its ``SECTOR_CONSTRAINTS`` envelope (voltage,
+    pressure, junction temperature, line/transformer loading).
+
+    Reads ``constraints_final.csv`` — one row per checked variable, written by
+    ``experiment.eval.results.write_constraints_final_csv`` off the final
+    solved network (the same state the served metric is derived against).
+    Passed iff no row is flagged ``violated``.
+
+    This is the grid-feasibility companion to ``slack_budget_compliance``.
+    Together they make a SCARE run "compliant" only when it honoured both the
+    operator slack budget AND the physical operating envelope the oracle LP
+    enforces by construction (``bounds_el`` / ``bounds_gas`` / ``bounds_heat``
+    + ``max_line_loading``).  Without this gate, a variant could post a higher
+    PWSF than the oracle simply by leaving voltages / temperatures / lines out
+    of bounds — feasibility the oracle is not allowed to buy — and the gap
+    would no longer be a like-for-like allocation comparison.
+
+    Vacuously True when the artefact is absent / empty (older campaigns, or a
+    grid with no checkable readings).
+    """
+    if not constraints_path.exists():
+        return {"passed": True, "detail": "no constraints_final.csv (claim vacuous)"}
+    rows = _read_csv(constraints_path)
+    if not rows:
+        return {"passed": True, "detail": "empty constraints_final.csv (claim vacuous)"}
+
+    by_sector: dict[str, dict[str, Any]] = {}
+    violations: list[dict[str, Any]] = []
+    for r in rows:
+        sec = r.get("sector", "")
+        entry = by_sector.setdefault(
+            sec, {"n_checked": 0, "n_violations": 0, "worst_overshoot": 0.0}
+        )
+        entry["n_checked"] += 1
+        if (r.get("violated") or "0").strip() not in ("1", "true", "True"):
+            continue
+        try:
+            overshoot = float(r.get("overshoot", 0.0))
+        except (TypeError, ValueError):
+            overshoot = 0.0
+        entry["n_violations"] += 1
+        entry["worst_overshoot"] = max(entry["worst_overshoot"], overshoot)
+        violations.append({
+            "kind": r.get("kind", ""),
+            "id": r.get("id", ""),
+            "sector": sec,
+            "variable": r.get("variable", ""),
+            "value": r.get("value", ""),
+            "overshoot": round(overshoot, 6),
+        })
+
+    violations.sort(key=lambda d: d["overshoot"], reverse=True)
+    return {
+        "passed": not violations,
+        "detail": {
+            "n_checked": len(rows),
+            "n_violations": len(violations),
+            "by_sector": by_sector,
+            "violations": violations[:5],
         },
     }
 

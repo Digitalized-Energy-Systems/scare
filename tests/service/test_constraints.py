@@ -448,3 +448,268 @@ async def test_handle_constraint_state_populates_heat_peer_cache():
     assert "peer-9" in monitor._heat_peer_state
     _t, tier, reducible = monitor._heat_peer_state["peer-9"]
     assert tier == 4 and abs(reducible - 0.03) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Curtailment-auction gating (enable_curtail_auction_gating)
+# ---------------------------------------------------------------------------
+
+
+def _gating_monitor(gating: bool, sector: Sector = Sector.HEAT):
+    behavior = MockBehavior()
+    behavior.set_obs("agent-0", {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 300.0})
+    behavior.add_action("agent-0", "regulate")
+    monitor = GridConstraintMonitor(
+        behavior, sector, node_id=0, max_hops=1,
+        enable_curtailment_auction=True,
+        enable_curtail_auction_gating=gating,
+        enable_multihop_constraint=False,
+        enable_heat_frontier=False,
+    )
+    return behavior, monitor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gating,expect_fire", [(False, True), (True, False)])
+async def test_gating_scopes_auction_off_temperature(gating, expect_fire):
+    """The scope guard (a): with gating on, a ``t_k`` violation must NOT
+    arm the auction (temperature is the frontier controller's lever); with
+    gating off the legacy behaviour (auction fires on any var) is kept."""
+    behavior, monitor = _gating_monitor(gating=gating)
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    fired = []
+
+    async def _spy(var, val, lo, hi):
+        fired.append(var)
+
+    async with world:
+        monitor._request_curtailment = _spy  # type: ignore[assignment]
+        await monitor._handle_violation({}, "t_k", 300.0, 313.15, 403.15)
+
+    assert bool(fired) is expect_fire
+
+
+@pytest.mark.asyncio
+async def test_gating_progress_gate_suspends_stalled_rearm():
+    """The progress guard (b): once the violation overshoot fails to
+    improve for ``_CURTAIL_NO_PROGRESS_LIMIT`` consecutive rounds, the
+    auction stops arming.  Driven directly so each call models one round
+    (the in-flight guard is cleared between calls as ``_allocate_auction``
+    would)."""
+    from scare.service.constraints import _CURTAIL_NO_PROGRESS_LIMIT
+
+    behavior, monitor = _gating_monitor(gating=True, sector=Sector.ELECTRICITY)
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    opened = []
+
+    async def _spy_allocate(auction_id):
+        opened.append(auction_id)
+        monitor._open_auctions.pop(auction_id, None)
+
+    async with world:
+        monitor._allocate_auction = _spy_allocate  # type: ignore[assignment]
+        # No neighbours ⇒ self-only auction allocates immediately each round.
+        # Same un-improving overshoot every round (value pinned at 1.10,
+        # hi=1.05): rounds beyond the no-progress limit must be suspended.
+        n_rounds = _CURTAIL_NO_PROGRESS_LIMIT + 3
+        for _ in range(n_rounds):
+            monitor._curtail_inflight.pop("vm_pu", None)  # clear in-flight guard
+            await monitor._request_curtailment("vm_pu", 1.10, 0.95, 1.05)
+
+    # First (limit+1) rounds run (the +1 is the initial best-set round),
+    # then the gate suspends the rest.
+    assert len(opened) <= _CURTAIL_NO_PROGRESS_LIMIT + 1
+    assert len(opened) < n_rounds
+
+
+def test_curtail_proximity_monotonic_in_hops():
+    """The targeting proximity multiplier increases with cached
+    ``hops_remaining`` (closer to origin) and is neutral with no state."""
+    from scare.base.model import ConstraintStateMessage
+    from scare.service.constraints import _CURTAIL_PROX_MIN, _CURTAIL_PROX_MAX
+
+    behavior = MockBehavior()
+    behavior.set_obs("agent-0", {"p_mw": 5.0, "vm_pu": 1.0})
+    monitor = GridConstraintMonitor(
+        behavior, Sector.ELECTRICITY, node_id=0, max_hops=3,
+        enable_curtail_auction_targeting=True,
+    )
+
+    def _cache(hops):
+        monitor._neighbour_state[("orig", "vm_pu")] = ConstraintStateMessage(
+            sector=Sector.ELECTRICITY, variable="vm_pu", value=1.07,
+            utilization=1.2, hops_remaining=hops, origin_addr="orig",
+        )
+
+    # No cached state ⇒ neutral.
+    assert monitor._curtail_proximity("orig", "vm_pu") == 1.0
+    _cache(3)  # closest (received with all hops left)
+    near = monitor._curtail_proximity("orig", "vm_pu")
+    _cache(0)  # farthest
+    far = monitor._curtail_proximity("orig", "vm_pu")
+    assert near == pytest.approx(_CURTAIL_PROX_MAX)
+    assert far == pytest.approx(_CURTAIL_PROX_MIN)
+    assert near > far
+
+
+@pytest.mark.asyncio
+async def test_targeting_scales_bid_by_proximity():
+    """A bidder close to the violation origin replies with a strictly
+    larger willingness than the same bidder when far — so the auctioneer's
+    proportional allocation concentrates the shed on near (high-leverage)
+    loads."""
+    from scare.base.model import ConstraintStateMessage, CurtailmentNeed, CurtailmentBid
+
+    behavior = MockBehavior()
+    behavior.set_obs("agent-0", {"q_mw_heat": 0.05, "regulation": 1.0,
+                                 "vm_pu": 1.0, "priority": 3})
+    behavior.add_action("agent-0", "regulate")
+    monitor = GridConstraintMonitor(
+        behavior, Sector.ELECTRICITY, node_id=0, max_hops=3,
+        enable_curtail_auction_targeting=True, enable_multihop_constraint=False,
+    )
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    bids = []
+
+    async def _spy_send(msg, receiver_addr=None, **kw):
+        if isinstance(msg, CurtailmentBid):
+            bids.append(msg.willingness)
+
+    need = CurtailmentNeed(sector=Sector.ELECTRICITY, total_amount=0.3,
+                           auction_id="a1", origin_addr="orig", variable="vm_pu")
+
+    async with world:
+        monitor.context.send_message = _spy_send  # type: ignore[assignment]
+        # Far first (no cached state ⇒ neutral), then near.
+        await monitor._handle_curtailment_need(need, {"sender_addr": "orig", "sender_id": "o"})
+        monitor._neighbour_state[("orig", "vm_pu")] = ConstraintStateMessage(
+            sector=Sector.ELECTRICITY, variable="vm_pu", value=1.07,
+            utilization=1.2, hops_remaining=3, origin_addr="orig",
+        )
+        await monitor._handle_curtailment_need(need, {"sender_addr": "orig", "sender_id": "o"})
+
+    assert len(bids) == 2 and bids[1] > bids[0]
+
+
+@pytest.mark.asyncio
+async def test_line_relief_reassert_cooldown():
+    """Iterative line-relief re-asserts the relief while the line stays
+    overloaded, but the cooldown suppresses a second send until it
+    elapses (or the line clears) — so it never out-paces the gossip."""
+    behavior = MockBehavior()
+    behavior.set_obs("agent-0", {"vm_pu": 1.0, "p_from_mw": 0.5, "p_to_mw": 0.0})
+    monitor = GridConstraintMonitor(
+        behavior, Sector.ELECTRICITY, node_id=0, max_hops=1,
+        branch_id="branch-1", home_leader_addr="leader-0",
+        enable_line_relief_reassert=True,
+    )
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+
+    sends = []
+
+    async def _spy(obs, val, lo, hi):
+        sends.append(val)
+
+    obs = {"p_from_mw": 0.5, "p_to_mw": 0.0}
+    async with world:
+        monitor._send_line_overload_relief = _spy  # type: ignore[assignment]
+        # First poll over the bound ⇒ one relief send.
+        await monitor._reassert_line_relief(obs, "loading_percent", 116.0, -100.0, 100.0)
+        # Same timestamp ⇒ inside cooldown ⇒ suppressed.
+        await monitor._reassert_line_relief(obs, "loading_percent", 116.0, -100.0, 100.0)
+        assert len(sends) == 1
+        # Line returns in-bounds clears the cooldown (as _monitor does) ⇒
+        # a later re-breach re-arms.
+        monitor._relief_inflight.pop("loading_percent", None)
+        await monitor._reassert_line_relief(obs, "loading_percent", 112.0, -100.0, 100.0)
+        assert len(sends) == 2
+
+
+def _make_waterfall_monitor(behavior):
+    return GridConstraintMonitor(
+        behavior, Sector.ELECTRICITY, node_id=0, max_hops=1,
+        branch_id="branch-1",
+        enable_branch_downstream_relief=True,
+        enable_line_relief_waterfall=True,
+        downstream_load_addrs=["L4", "L3", "L2", "L1"],
+    )
+
+
+async def _run_waterfall_alloc(monitor, bid_meta, total=0.5):
+    """Drive ``_allocate_auction`` for a waterfall auction; return list of
+    (receiver_addr, amount) the auctioneer dispatched."""
+    from scare.base.model import CurtailmentRequest
+
+    world = create_world()
+    agent = world.register(RoleAgent(), suggested_aid="agent-0")
+    agent.add_role(monitor)
+    dispatched: list[tuple] = []
+
+    async def _spy_send(msg, receiver_addr=None, **kw):
+        if isinstance(msg, CurtailmentRequest):
+            dispatched.append((receiver_addr, msg.amount))
+
+    monitor._open_auctions["a1"] = {
+        "bids": {k: 1.0 for k in bid_meta},
+        "bidders": {k: k for k in bid_meta},        # addr == key for the test
+        "bid_meta": dict(bid_meta),
+        "total": total,
+        "var": "loading_percent",
+        "self_willingness": None,
+        "self_addr": None,
+        "neighbours_contacted": len(bid_meta),
+        "waterfall": True,
+    }
+    async with world:
+        monitor.context.send_message = _spy_send  # type: ignore[assignment]
+        await monitor._allocate_auction("a1")
+    return dispatched
+
+
+@pytest.mark.asyncio
+async def test_line_relief_waterfall_sheds_lowest_priority_tier_first():
+    """With all tiers reducible, only the lowest-priority (tier-4) downstream
+    loads are shed; higher tiers (incl. tier-1) are untouched this round."""
+    behavior = MockBehavior()
+    monitor = _make_waterfall_monitor(behavior)
+    # (tier, reducible) per bidder.
+    meta = {"L4": (4, 0.02), "L3": (3, 0.10), "L2": (2, 0.05), "L1": (1, 0.03)}
+    dispatched = await _run_waterfall_alloc(monitor, meta, total=0.5)
+    shed = {addr for addr, _ in dispatched}
+    assert shed == {"L4"}, shed
+    assert all(amt == pytest.approx(0.5) for _, amt in dispatched)
+
+
+@pytest.mark.asyncio
+async def test_line_relief_waterfall_escalates_when_lower_tier_exhausted():
+    """When tier-4 is exhausted (reducible below the threshold), the cascade
+    escalates to tier-3 — and never sheds tier-1."""
+    behavior = MockBehavior()
+    monitor = _make_waterfall_monitor(behavior)
+    meta = {"L4": (4, 1e-6), "L3": (3, 0.10), "L2": (2, 0.05), "L1": (1, 0.03)}
+    dispatched = await _run_waterfall_alloc(monitor, meta, total=0.5)
+    shed = {addr for addr, _ in dispatched}
+    assert shed == {"L3"}, shed
+
+
+@pytest.mark.asyncio
+async def test_line_relief_waterfall_protects_tier1_and_flags_residual():
+    """When the only reducible downstream load left is tier-1, nothing is shed
+    and the tier-1-residual flag is set so the auction stops re-arming."""
+    behavior = MockBehavior()
+    monitor = _make_waterfall_monitor(behavior)
+    meta = {"L4": (4, 1e-6), "L3": (3, 1e-6), "L2": (2, 1e-6), "L1": (1, 0.03)}
+    dispatched = await _run_waterfall_alloc(monitor, meta, total=0.5)
+    assert dispatched == [], dispatched
+    assert monitor._line_relief_tier1_residual.get("loading_percent") is True

@@ -584,6 +584,10 @@ def _populate_children(
                     sector,
                     node_id=child.node_id,
                     enable_curtailment_auction=config.enable_curtailment_auction,
+                    enable_curtail_auction_gating=config.enable_curtail_auction_gating,
+                    enable_curtail_auction_targeting=config.enable_curtail_auction_targeting,
+                    enable_line_relief_reassert=config.enable_line_relief_reassert,
+                    enable_branch_downstream_relief=config.enable_branch_downstream_relief,
                     enable_multihop_constraint=config.enable_multihop_constraint,
                     enable_heat_frontier=config.enable_heat_frontier,
                     enable_heat_priority_waterfall=config.enable_heat_priority_waterfall,
@@ -765,6 +769,11 @@ def _populate_branches(
                     branch_id=branch.id,
                     home_leader_addr=None,
                     enable_curtailment_auction=config.enable_curtailment_auction,
+                    enable_curtail_auction_gating=config.enable_curtail_auction_gating,
+                    enable_curtail_auction_targeting=config.enable_curtail_auction_targeting,
+                    enable_line_relief_reassert=config.enable_line_relief_reassert,
+                    enable_branch_downstream_relief=config.enable_branch_downstream_relief,
+                    enable_line_relief_waterfall=config.enable_line_relief_waterfall,
                     enable_multihop_constraint=config.enable_multihop_constraint,
                 )
             )
@@ -1129,6 +1138,83 @@ def _line_home_endpoint(
         return b
     return a if (a < b if isinstance(a, int) and isinstance(b, int) else str(a) < str(b)) else b
 
+def _branch_downstream_load_addrs(monee_net: Any, world: Any) -> dict[str, list[Any]]:
+    """For every electricity PowerLine branch, the addresses of the loads
+    electrically *downstream* of it — the loads on the side that becomes
+    disconnected from the slack (``ExtPowerGrid``) when the branch is
+    removed, i.e. the subtree whose power physically flows through the
+    branch.  Shedding exactly those loads reduces the branch's loading
+    ~1:1; the curtailment auction (branch-downstream mode) uses them as its
+    bidder set instead of the whole component.
+
+    Branches whose removal does NOT cleanly split a single side off the
+    slack (meshed / part of a cycle, or already-disconnected) get an empty
+    list and fall back to the legacy endpoint relief.
+    """
+    from collections import defaultdict, deque
+
+    # node_id -> [load addr]; and the slack node set.
+    node_loads: dict[Any, list[Any]] = defaultdict(list)
+    slack_nodes: set[Any] = set()
+    for child in monee_net.childs:
+        m = child.model
+        if isinstance(m, ExtPowerGrid):
+            slack_nodes.add(child.node_id)
+            continue
+        try:
+            cap = obs_capacity(dict(m.values))
+        except Exception:
+            continue
+        if cap <= 0:  # generators / non-loads can't be shed for relief
+            continue
+        ag = world._agents.get(f"child-{child.id}")
+        if ag is not None:
+            node_loads[child.node_id].append(ag.addr)
+
+    # Undirected electricity adjacency keyed by branch aid (so a single
+    # branch's edge can be excluded during the cut test).
+    adj: dict[Any, set[tuple[Any, str]]] = defaultdict(set)
+    endpoints: dict[str, tuple[Any, Any]] = {}
+    for branch in monee_net.branches:
+        if _is_cp_branch(branch):
+            continue
+        if _branch_sector_str(branch, monee_net) != "electricity":
+            continue
+        a, b = branch.id[0], branch.id[1]
+        b_aid = create_branch_aid(branch.id)
+        adj[a].add((b, b_aid))
+        adj[b].add((a, b_aid))
+        endpoints[b_aid] = (a, b)
+
+    def _reach(start: set[Any], skip_aid: str) -> set[Any]:
+        seen = set(start)
+        dq = deque(start)
+        while dq:
+            n = dq.popleft()
+            for nb, e_aid in adj.get(n, ()):
+                if e_aid == skip_aid or nb in seen:
+                    continue
+                seen.add(nb)
+                dq.append(nb)
+        return seen
+
+    result: dict[str, list[Any]] = {}
+    for b_aid, (a, b) in endpoints.items():
+        reach = _reach(slack_nodes, b_aid)  # nodes still fed without this branch
+        a_up, b_up = a in reach, b in reach
+        if a_up == b_up:
+            # both sides still fed (cycle) or both cut off — no clean subtree.
+            result[b_aid] = []
+            continue
+        down_root = b if a_up else a
+        comp = _reach({down_root}, b_aid)
+        addrs: list[Any] = []
+        for nd in comp:
+            addrs.extend(node_loads.get(nd, ()))
+        result[b_aid] = addrs
+    return result
+
+
 def _build_topologies(
     world: SimulationWorld,
     monee_net: Any,
@@ -1319,6 +1405,34 @@ def _build_topologies(
                     and role.branch_id is not None
                 ):
                     role.home_leader_addr = leader.addr
+
+    # Branch-downstream relief: give each electricity branch monitor the
+    # loads that flow through it (the slack-disconnected subtree when the
+    # branch is removed), so a line-overload auction sheds loads that
+    # actually relieve THAT line rather than the most-willing load in the
+    # component.  Computed once; branches with no clean subtree keep the
+    # legacy endpoint relief.
+    if config.enable_branch_downstream_relief and powerline_branch_agent:
+        downstream = _branch_downstream_load_addrs(monee_net, world)
+        attached = n_loads = 0
+        for b_aid, addrs in downstream.items():
+            if not addrs:
+                continue
+            branch_agent = powerline_branch_agent.get(b_aid)
+            if branch_agent is None:
+                continue
+            for role in getattr(branch_agent, "roles", []):
+                if (
+                    isinstance(role, GridConstraintMonitor)
+                    and role.branch_id is not None
+                ):
+                    role._downstream_load_addrs = list(addrs)
+                    attached += 1
+                    n_loads += len(addrs)
+        logger.info(
+            "Branch-downstream relief: attached downstream load sets to %d "
+            "branch monitors (%d load-targets total)", attached, n_loads,
+        )
 
     # Patch every SlackBudgetMonitor's home_leader_addr the same way.
     # Without this, the monitor's only escalation channel is a local

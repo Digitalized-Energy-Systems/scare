@@ -19,13 +19,22 @@ from typing import Any
 
 from monee import run_energy_flow_optimization
 from monee.model.child import ExtHydrGrid, ExtPowerGrid
+from monee.model.formulation import make_mccormick_dhs_formulation
 from monee.problem import (
     WEIGHT_DEMAND,
     create_min_load_shedding_problem,
 )
 from monee.solver.pyo import PyomoSolver
 
-from experiment.eval.metrics import restoration_breakdown, served_breakdown
+# Partition count for the oracle's McCormick-DHS heat linearisation —
+# matches the value the grid factory uses when DHS is enabled there.
+_ORACLE_MCCORMICK_PARTITIONS = 16
+
+from experiment.eval.metrics import (
+    constraint_violations_final,
+    restoration_breakdown,
+    served_breakdown,
+)
 from experiment.restoration import (
     GRIDS,
     apply_cold_day,
@@ -273,6 +282,30 @@ def run_oracle(
     # the submodule ``monee.problem`` — top-level ``monee`` re-imports
     # it but it gets filtered out of the public namespace.
     _apply_failures(monee_net, failures)
+
+    # Linearise the district-heating temperature physics for the oracle
+    # solve *only*.  The grid factory deliberately leaves DHS in its full
+    # nonlinear form (see create_large_lv_simbench — McCormick is
+    # commented out because the live SCARE energy-flow can hit envelope-
+    # bound infeasibilities on failures).  But that nonlinear heat balance
+    # is degree-2 (``mass_flow · t_pu``), and on a reconfiguration grid the
+    # backup branches carry a *binary* ``on_off`` decision var that
+    # ``create_min_load_shedding_problem`` adds.  In the junction heat
+    # balance that binary multiplies both the branch mass flow and the
+    # node temperature (``mass_flow · on_off · t_pu · on_off``), lifting the
+    # term to degree 4 — which Pyomo's LP/QCP writer cannot serialise and
+    # the solve aborts with "node_N_eq_1 contains nonlinear terms".
+    # Applying McCormick-DHS sets each water junction's
+    # ``_mccormick_dhs_active`` flag so the nonlinear balance is replaced
+    # by its piecewise-linear envelope (the binary on_off then enters only
+    # linear terms), letting the oracle solve the reconfiguration grid with
+    # its backup lines intact — keeping it comparable to SCARE, which keeps
+    # them too.  Applied here (not in the factory) so only the oracle LP is
+    # affected, never the live simulation.  Net is oracle-dedicated, so the
+    # in-place formulation swap is safe.
+    monee_net.apply_formulation(
+        make_mccormick_dhs_formulation(num_partitions=_ORACLE_MCCORMICK_PARTITIONS)
+    )
     # 2026-05-24: enforce the operator slack budget on the LP itself
     # via ``create_min_load_shedding_problem``'s native
     # ``ext_grid_*_bounds`` parameters (no Var.min/max mutation).
@@ -342,6 +375,8 @@ def run_oracle(
         bounds_el=(0.95, 1.05),
         bounds_gas=(0.90, 1.10),
         bounds_heat=(0.8796, 1.1325),
+        check_line_loading=True,
+        max_line_loading=1.0,
     )
     if weight_for_load is not None:
         logger.info(
@@ -404,9 +439,18 @@ def run_oracle(
 
     slack_summary = _slack_budget_summary(solved_net)
 
+    # End-of-sim hard-bound feasibility on the solved LP network.  The LP
+    # enforces the voltage / pressure / temperature / line-loading envelope by
+    # construction, so this should pass — scanning it anyway (a) keeps the
+    # oracle's ``constraint_compliance`` claim on exactly the same measurement
+    # path SCARE uses, and (b) surfaces any residual numerical bound excursion
+    # instead of silently assuming feasibility.
+    constraints_final = constraint_violations_final(solved_net)
+
     return {
         "served": served,
         "constraint_violation_integral": integral,
+        "constraint_violations_final": constraints_final,
         "regulations": regulations,
         "lp_success": lp_success,
         "slack_budget_summary": slack_summary,
@@ -471,7 +515,9 @@ def compute_baseline_served(
 
     if grid_name not in GRIDS:
         raise SystemExit(f"Unknown grid {grid_name!r}")
-    # Factory already applies MISOCP + McCormick.
+    # Factory applies MISOCP (electricity) but leaves DHS nonlinear;
+    # ``run_oracle`` adds the McCormick-DHS heat linearisation for the
+    # oracle solve below.
     fresh = GRIDS[grid_name]()
     if scenario:
         kind = scenario.get("kind", "clean")
@@ -516,19 +562,15 @@ def compute_baseline_served(
         slack_budget_pct = scenario.get("slack_budget_pct")
         if slack_budget_pct is not None:
             apply_slack_budget(fresh, float(slack_budget_pct))
-    # Strip ``backup=True`` from every branch on the local copy.  The
-    # baseline LP solves the no-failure case, so any backup tie-line
-    # added by :func:`add_backup_lines` would stay open anyway.  Leaving
-    # the flag set causes ``create_min_load_shedding_problem`` →
-    # ``controllable_backup_lines`` to turn ``on_off`` into a binary
-    # decision variable, which makes the gas / heat node-balance
-    # constraints (``mass_flow × on_off``) bilinear — Pyomo's
-    # shell-gurobi LP writer then refuses with "node_X_eq_K contains
-    # nonlinear terms that cannot be written to LP format".  ``fresh``
-    # is a throwaway network so we don't need to restore the flag.
-    for branch in fresh.branches:
-        if getattr(branch.model, "backup", False):
-            branch.model.backup = False
+    # Backup tie-lines are kept on the baseline LP, exactly as the
+    # post-failure oracle and SCARE keep them — the baseline must be the
+    # same problem both variants are measured against, so dropping the
+    # reconfiguration grid's backup branches here would make it
+    # incomparable.  The binary ``on_off`` that
+    # ``controllable_backup_lines`` adds used to push the nonlinear DHS
+    # heat balance past quadratic and break Pyomo's LP writer; ``run_oracle``
+    # now applies the McCormick-DHS linearisation, which removes that
+    # nonlinearity, so no flag-stripping is needed.
     out = run_oracle(fresh, [], solver=solver, priorities=priorities)
     served = out["served"]
     # Stash in cache for sibling tasks with identical inputs.
@@ -570,6 +612,23 @@ def compose_oracle_result(
         },
     }
 
+    # Grid-feasibility claim, mirroring SCARE's ``constraint_compliance`` so the
+    # aggregator gates both sides on the same pair of compliance flags.  The LP
+    # enforces the envelope, so ``passed`` is True unless the solve failed or a
+    # residual numerical excursion slipped through.
+    constraints_final = out.get("constraint_violations_final", {})
+    constraint_claim = {
+        "passed": bool(constraints_final.get("passed", True))
+        and bool(out.get("lp_success", True)),
+        "detail": {
+            "n_checked": constraints_final.get("n_checked", 0),
+            "n_violations": constraints_final.get("n_violations", 0),
+            "by_sector": constraints_final.get("by_sector", {}),
+            "violations": constraints_final.get("violations", []),
+            "enforced_at_lp": True,
+        },
+    }
+
     return {
         "task": task_meta,
         "wallclock_s": wallclock_s,
@@ -585,6 +644,7 @@ def compose_oracle_result(
             "n_loads": served["n_loads"],
             "n_loads_served_zero": served["n_loads_served_zero"],
             "constraint_violation_integral": integral,
+            "constraint_violations_final": constraints_final,
             "time_to_stabilise_s": 0.0,
             "regulates_total": 0,
             "regulates_by_reason": {},
@@ -598,6 +658,7 @@ def compose_oracle_result(
             # dispatch to invariant-check).  Other variants populate
             # this dict from claims.evaluate_task.
             "slack_budget_compliance": slack_claim,
+            "constraint_compliance": constraint_claim,
         },
         "diary": {"invariant_holds": True},   # vacuous
         "events": {},

@@ -221,7 +221,12 @@ def _format_md(df: pd.DataFrame) -> str:
 _PRIMARY_OUTCOME = "outcomes__priority_weighted_fraction"
 _TIME_TO_STABILISE = "outcomes__time_to_stabilise_s"
 _REGULATES_TOTAL = "outcomes__regulates_total"
-_COMPLIANCE_COL = "claims__slack_budget_compliance__passed"
+_SLACK_COMPLIANCE_COL = "claims__slack_budget_compliance__passed"
+_CONSTRAINT_COMPLIANCE_COL = "claims__constraint_compliance__passed"
+# Both must hold for a run to count as compliant: the operator slack budget
+# AND end-of-sim grid feasibility (no voltage / pressure / temperature / line
+# violation).  See ``_compliant_split``.
+_COMPLIANCE_COLS = (_SLACK_COMPLIANCE_COL, _CONSTRAINT_COMPLIANCE_COL)
 
 
 def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
@@ -230,32 +235,39 @@ def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
     Returns ``(pwsf_compliant, compliance_rate, n_compliant, n_total)``:
 
     * ``pwsf_compliant`` — the ``priority_weighted_fraction`` series
-      restricted to tasks that passed the slack-budget claim.  This is
-      the series the headline mean should be computed over.
+      restricted to tasks that passed *every* compliance claim (slack
+      budget **and** constraint feasibility).  This is the series the
+      headline mean should be computed over.
     * ``compliance_rate`` — fraction of tasks (with a defined PWSF) that
       passed compliance, in ``[0, 1]``.  ``nan`` when no compliance
       column is present (older runs) so the caller can suppress the
       column instead of reporting fictional 100 %.
     * ``n_compliant`` / ``n_total`` — counts for the table.
 
-    Layer-2 rationale: a variant that violates the slack budget can
-    over-serve MW by drawing the slack past the operator-allowed
-    envelope (e.g. single_level in tight-deficit scenarios draws
-    ~3× budget).  Including its inflated PWSF in the mean rewards
-    cheating.  This helper restricts the PWSF mean to compliant
-    runs and reports the compliance rate as a paired metric — the
-    reader can rank by either axis and discuss the trade.
+    Rationale: a variant can inflate PWSF two ways the oracle is not
+    allowed to.  It can draw the slack past the operator-allowed envelope
+    (e.g. single_level in tight-deficit scenarios draws ~3× budget), and
+    it can leave the grid out of bounds — crediting load served through an
+    overloaded line or at an infeasible voltage / temperature.  Both make
+    the served value non-comparable to the constraint-respecting oracle.
+    This helper restricts the PWSF mean to runs that honoured *both* and
+    reports the joint compliance rate as a paired metric, so the reader
+    can rank by either axis and discuss the trade.
     """
     full = g[_PRIMARY_OUTCOME].dropna() if _PRIMARY_OUTCOME in g.columns else pd.Series(dtype=float)
     n_total = int(len(full))
-    if _COMPLIANCE_COL not in g.columns:
+    present = [c for c in _COMPLIANCE_COLS if c in g.columns]
+    if not present:
+        # No compliance columns at all (older runs): can't verify, so
+        # report every task and suppress the rate column.
         return full, float("nan"), n_total, n_total
-    # Align the compliance bool with the PWSF series so masking lines up.
-    passed = g.loc[full.index, _COMPLIANCE_COL]
-    # Coerce to bool: NaN ⇒ False (treat unknown compliance as failure,
-    # since we'd rather under-report PWSF than over-report by including
-    # rows we can't verify).
-    passed_bool = passed.fillna(False).astype(bool)
+    # Conjunction across the available compliance flags, aligned to the
+    # PWSF series.  Coerce to bool with NaN ⇒ False (treat unknown
+    # compliance as failure — under-report PWSF rather than over-report by
+    # including rows we can't verify).
+    passed_bool = pd.Series(True, index=full.index)
+    for col in present:
+        passed_bool &= g.loc[full.index, col].fillna(False).astype(bool)
     n_compliant = int(passed_bool.sum())
     pwsf_compliant = full[passed_bool]
     rate = float(n_compliant / n_total) if n_total else float("nan")

@@ -62,12 +62,62 @@ from scare.base.util import apply_regulate, kgps_to_mw
 from distributed_resource_optimization.algorithm.distributed_lexicographic_cascade.core import (  # noqa: E501
     solve_cp_distributed_lexicographic_cascade,
 )
+from distributed_resource_optimization.algorithm.gossip_lexicographic_cascade.core import (  # noqa: E501
+    GossipCascadeInit,
+    GossipIter,
+    create_gossip_cascade_participant,
+    create_gossip_cascade_start,
+)
 
 from scare.service.cp_priority_admm import (
     CPSpec,
     SectorDemand,
     solve_cp_priority_admm,
 )
+
+
+# ---------------------------------------------------------------------------
+# Minimal Carrier adapter wrapping a mango role context.
+# ---------------------------------------------------------------------------
+
+
+class _MangoGossipCarrier:
+    """Thin :class:`Carrier`-shaped adapter the
+    :class:`~distributed_resource_optimization.algorithm.gossip_lexicographic_cascade.core.GossipParticipant`
+    can drive from inside a mango role.
+
+    Only implements the two methods the gossip participant uses
+    (:meth:`send_to_other` and :meth:`others`); the rest of the
+    :class:`Carrier` interface is intentionally omitted because the
+    gossip protocol is fire-and-forget — no awaitable replies, no
+    request/response matching.
+    """
+
+    def __init__(self, role: "CPPriorityAdmmRole") -> None:
+        self._role = role
+
+    def send_to_other(self, content: Any, receiver: Any, meta: Any = None) -> None:
+        # Fire-and-forget; we don't need the task handle.  Routes
+        # through the role's mango context.
+        try:
+            self._role.context.schedule_instant_task(
+                self._role.context.send_message(content, receiver_addr=receiver)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[%s] gossip send failed to %r: %s",
+                self._role.cp_id, receiver, exc,
+            )
+
+    def others(self, participant_id: str) -> list[Any]:
+        # Restrict to reachable peers — the topology-mirror filter
+        # naturally bounds the broadcast set.  Falls back to every
+        # known peer if the mirror isn't injected (test contexts).
+        reachable = self._role._reachable_peer_cp_ids()
+        return [
+            addr for cp_id, addr in self._role._peer_cp_addrs.items()
+            if cp_id in reachable
+        ]
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -138,6 +188,14 @@ class CPPriorityAdmmRole(Role):
         self._peer_cp_addrs: dict[str, Any] = {}
         self._peer_cp_node_ids: dict[str, Any] = {}
 
+        # Gossip mode state — populated lazily in :meth:`setup` so the
+        # participant captures ``self`` (for the on_commit callback) and
+        # the carrier adapter has the role context to send through.
+        # Stays unused in the replicated modes.
+        self._gossip_participant = None
+        self._gossip_carrier: _MangoGossipCarrier | None = None
+        self._gossip_round_id: int = 0
+
     # ------------------------------------------------------------------
     # Wiring (called by scenario.restoration after the world is built)
     # ------------------------------------------------------------------
@@ -185,6 +243,23 @@ class CPPriorityAdmmRole(Role):
                 isinstance(msg, CPSummary) and msg.publisher != self.cp_id
             ),
         )
+
+        # Gossip mode subscriptions — route Init and Iter messages to
+        # the gossip participant.  Installed unconditionally so flipping
+        # ``self.algorithm`` between modes never strands an in-flight
+        # round.  No-op for the replicated modes (participant is None).
+        if self.algorithm == "gossip":
+            self._gossip_carrier = _MangoGossipCarrier(self)
+            self._gossip_participant = create_gossip_cascade_participant(
+                cp_id=self.cp_id,
+                capacity_by_sector=self.capacity_by_sector,
+                on_commit=self._on_gossip_commit,
+            )
+            self.context.subscribe_message(
+                self,
+                _wrap(self._on_gossip_message),
+                lambda msg, meta: isinstance(msg, (GossipCascadeInit, GossipIter)),
+            )
 
         # Initial publish: announce our existence and capacity so peer
         # CPs can include us in their replicated view from the first
@@ -409,7 +484,115 @@ class CPPriorityAdmmRole(Role):
             )
         return demands
 
+    # ------------------------------------------------------------------
+    # Gossip mode — initiator gate, message routing, commit callback
+    # ------------------------------------------------------------------
+
+    def _am_gossip_initiator(self) -> bool:
+        """Lowest-cp_id among self + currently-reachable peers wins the
+        initiator slot for the next round.  Deterministic, requires no
+        election, re-evaluates per tick — so initiator death naturally
+        hands the slot to the next-lowest CP without any handover
+        protocol.  The chapter's "only one negotiation at a time"
+        requirement is enforced by this gate plus the participant's
+        per-(initiator_cp_id, round_id) dedup.
+        """
+        reachable = self._reachable_peer_cp_ids() | {self.cp_id}
+        return self.cp_id == min(reachable)
+
+    async def _on_gossip_message(
+        self, message: "GossipCascadeInit | GossipIter", meta: dict
+    ) -> None:
+        """Route an inbound gossip message to the local participant."""
+        if self._gossip_participant is None or self._gossip_carrier is None:
+            return
+        await self._gossip_participant.on_exchange_message(
+            self._gossip_carrier, message, meta,
+        )
+
+    def _on_gossip_commit(
+        self, r: np.ndarray, converged: bool, iterations: int,
+    ) -> None:
+        """End-of-round callback fired by the gossip participant on
+        every CP (initiator and responders alike).  Issues the
+        :func:`apply_regulate` for this CP's own row of the answer.
+        Synchronous — the participant calls us from inside its run
+        coroutine.
+        """
+        if r.size == 0:
+            return
+        my_factor = float(np.clip(r[0], 0.0, 1.0))
+        applied = apply_regulate(
+            self.behavior,
+            self.cp_id,
+            my_factor,
+            sector="cp",
+            reason="cp_priority_admm",
+            timestamp=float(self.context.current_timestamp),
+        )
+        if applied:
+            self._last_committed_factor = my_factor
+        logger.debug(
+            "[%s] gossip cascade committed factor=%.4f "
+            "(iters=%d, converged=%s, applied=%s)",
+            self.cp_id, my_factor, iterations, converged, applied,
+        )
+
+    async def _run_gossip_round(self) -> None:
+        """Kick off a new gossip round IF we're the current initiator.
+
+        Non-initiator CPs are pure responders — their participant
+        receives :class:`GossipCascadeInit` from the initiator's
+        broadcast and runs the cascade locally without us doing
+        anything here.  This keeps "only one negotiation at a time"
+        guaranteed by the deterministic initiator-election rule.
+        """
+        if self._gossip_participant is None or self._gossip_carrier is None:
+            return
+        if not self._am_gossip_initiator():
+            return
+        demands = self._build_demands()
+        if not demands:
+            return
+        participants = sorted(self._reachable_peer_cp_ids() | {self.cp_id})
+        self._gossip_round_id += 1
+        # Timeouts: the gossip cascade converges in the same iteration
+        # count as the replicated kernel (verified to match within 0.02
+        # at N=28 in the in-process kernel test), but each iteration is
+        # N broadcasts + N async event-loop hops over mango's message
+        # queue.  In SimpleCarrier the wallclock is ~125 ms at N=28;
+        # production mango adds 10–100× overhead per message, putting
+        # the realistic round wallclock at 1–13 s for the cp_heavy
+        # grids.  ``round_timeout_s`` is sized to comfortably absorb
+        # that tail; ``iter_timeout_s`` should catch the per-iter
+        # broadcast median without forcing premature hold-overs.
+        start = create_gossip_cascade_start(
+            round_id=self._gossip_round_id,
+            participants=participants,
+            demands=demands,
+            horizon=self.horizon,
+            rho=self.rho,
+            inner_iters_max=self.admm_max_iters,
+            inner_abs_tol=self.admm_abs_tol,
+            r_regularization=self.r_regularization,
+            adaptive_rho=True,
+            rho_mu=10.0,
+            rho_tau=2.0,
+            iter_timeout_s=1.0,
+            round_timeout_s=30.0,
+        )
+        await self._gossip_participant.on_exchange_message(
+            self._gossip_carrier, start, meta=None,
+        )
+
+    # ------------------------------------------------------------------
+    # Replicated kernel path (legacy / default)
+    # ------------------------------------------------------------------
+
     async def _run_kernel_and_commit(self) -> None:
+        if self.algorithm == "gossip":
+            await self._run_gossip_round()
+            return
         demands = self._build_demands()
         if not demands:
             return
