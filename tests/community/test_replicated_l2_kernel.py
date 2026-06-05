@@ -1,29 +1,20 @@
-"""Phase-0 contract test for the replicated-L2-kernel cutover.
+"""Contract test for the replicated-L2-kernel cutover.
 
-The plan replaces the elected coordinator in
-:class:`HolonicCommunityRole` with a per-leader replicated kernel:
-every group leader runs :func:`allocate_supply_priority` on its
-locally-replicated peer view (carried over the extended
-:class:`scare.base.channel.HolonSummary` mesh) and writes only its
-own slice via a self-addressed ``StartBalanceNegotiation``.
+The design replaces the elected coordinator in
+:class:`HolonicCommunityRole` with a per-leader replicated kernel: every
+leader runs :func:`allocate_supply_priority` on its locally-replicated
+peer view and writes only its own slice via a self-addressed
+``StartBalanceNegotiation``.
 
-This test pins down three contract properties of the post-cutover
-design.  Marked ``xfail(strict=True)`` so it:
-
-* fails today (the cutover has not landed — the flag and method don't
-  exist, and the coordinator path is still in use) → expected failure;
-* starts passing once Phase 3 ships → ``XPASS`` → CI red, prompting the
-  marker's removal.
+Marked ``xfail(strict=True)``: fails today (cutover not landed), turns
+into a CI-red XPASS once it ships, prompting the marker's removal.
 
 Properties pinned:
 
-1. No agent acts as a coordinator on behalf of others — no
-   ``ComponentAllocation`` envelope is ever sent.
-2. Every L2 dispatch is self-addressed:
-   ``StartBalanceNegotiation(service_fraction_by_sector_priority=...)``
-   has ``receiver_addr.aid == self.context.aid``.
-3. Priority order is preserved in the locally-computed allocation
-   (tier-2 fraction ≥ tier-4 fraction under scarcity).
+1. No ``ComponentAllocation`` envelope is ever sent (no coordinator).
+2. Every ``StartBalanceNegotiation`` dispatch is self-addressed
+   (``receiver_addr.aid == self.context.aid``).
+3. Priority order is preserved (tier-2 fraction >= tier-4 under scarcity).
 """
 
 from __future__ import annotations
@@ -72,7 +63,7 @@ def _summary(
     served: dict[int, float],
     version: int = 1,
 ) -> HolonSummary:
-    """Construct an extended (Phase-1 schema) HolonSummary."""
+    """Construct an extended-schema HolonSummary."""
     sec = Sector.ELECTRICITY.value
     return HolonSummary(
         publisher=aid,
@@ -97,17 +88,14 @@ def _summary(
     ),
 )
 def test_replicated_kernel_no_coordinator_self_dispatch_only() -> None:
-    """Two-leader sector-scarcity: 10 MW supply at A, 10 MW tier-2 demand
-    at A and 10 MW tier-4 demand at B.  Under the replicated kernel,
-    every leader independently runs the supply-priority waterfall on
-    its peer view and applies only its own slice — without electing a
-    coordinator and without fanning out a ``ComponentAllocation``.
+    """Two-leader scarcity: 10 MW supply + 10 MW tier-2 demand at A,
+    10 MW tier-4 demand at B. Each leader runs the supply-priority
+    waterfall on its peer view and applies only its own slice — no
+    coordinator, no ``ComponentAllocation`` fan-out.
     """
-    ctx_b = _FakeContext("leader-B")  # lex-larger — would be a follower today
+    ctx_b = _FakeContext("leader-B")  # lex-larger; a follower in the elected path
 
-    # Behavior is unused after the cutover (the kernel reads its inputs
-    # off the gossiped summary mesh).  Pre-cutover paths that still
-    # consult ``behavior`` fail loudly — fine, that's an xfail.
+    # The kernel reads inputs off the gossiped summary mesh, not behavior.
     role_b = HolonSummaryRole(
         behavior=object(),  # type: ignore[arg-type]
         sector=Sector.ELECTRICITY,

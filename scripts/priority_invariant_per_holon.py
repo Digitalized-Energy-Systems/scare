@@ -1,12 +1,10 @@
 """Re-evaluate the priority_invariant claim using per-holon aggregation
-(matching SCARE's design intent) instead of per-(sector, component)
-(the current claim, which pools across holons in the same connected
-component).
+(SCARE's design intent) instead of per-(sector, component), which pools across
+holons in the same connected component.
 
-Reads each holon leader's last ``holon_priority_allocation`` event and
-checks whether the per-tier service fractions inside that holon are
-non-increasing in tier number.  Reports the per-holon pass rate
-alongside the per-component pass rate for direct comparison.
+Reads each holon leader's last ``holon_priority_allocation`` event and checks
+that per-tier service fractions inside the holon are non-increasing in tier.
+Reports the per-holon pass rate alongside the per-component rate.
 
 Usage:
     python scripts/priority_invariant_per_holon.py <campaign_dir>

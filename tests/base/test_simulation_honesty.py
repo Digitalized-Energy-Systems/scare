@@ -2,26 +2,13 @@
 
 Honest = every coroutine spawned in response to a message goes through
 mango's scheduler (``context.schedule_instant_task`` / friends), not bare
-``asyncio.create_task``.  Bare ``create_task`` would put the work on a
-"side track" off the simulation clock: mango's ``step_simulation`` can
-return before the task completes, so its sends land in a later step than
-the message that caused them.  See the rationale block in
-``distributed_resource_optimization/carrier/mango.py:132-143`` and the
-upstream regression test ``test_mango_simulation_is_clock_gated_no_side_track``.
+``asyncio.create_task``.  Bare ``create_task`` puts the work on a "side
+track" off the simulation clock: mango's ``step_simulation`` can return
+before the task completes, so its sends land in a later step than the
+message that caused them.
 
-Two checks here:
-
-1. ``test_admm_handler_routes_through_mango_scheduler`` — direct
-   spy on ``ScareDistributedOptimizationRole._handle_optimization``: it
-   must call ``context.schedule_instant_task`` and must not call
-   ``asyncio.create_task``.
-
-2. ``test_no_bare_create_task_in_scare_source`` — static guard that
-   re-finds any ``asyncio.create_task`` / ``asyncio.ensure_future`` /
-   ``loop.create_task`` introduced into ``src/scare`` in the future.
-   The single legitimate exception today is the carrier driver pattern
-   in dro upstream (``CoordinatorRole._handle_start``), which is
-   *outside* SCARE's tree.
+Two checks: a direct spy on the ADMM handler, and a static guard that
+re-finds any scheduler-bypassing call introduced into ``src/scare``.
 """
 
 from __future__ import annotations

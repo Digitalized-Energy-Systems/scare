@@ -14,7 +14,6 @@ from tests.conftest import MockBehavior, make_electricity_gen, make_electricity_
 @pytest.mark.asyncio
 async def test_local_gen_ramps_generator():
     behavior = MockBehavior()
-    # Leader is a generator with headroom
     behavior.set_obs("leader", make_electricity_gen(p_mw=-10.0, regulation=0.5))
     behavior.add_action("leader", "regulate")
 
@@ -23,8 +22,7 @@ async def test_local_gen_ramps_generator():
     agent = world.register(RoleAgent(), suggested_aid="leader")
     agent.add_role(role)
 
-    # Build minimal topology so topology_neighbors returns empty list
-    # (the leader is alone — it will check itself)
+    # Minimal topology: the leader is alone, so it checks itself.
     with create_topology(tid="groups") as topo:
         topo.add_node(agent)
 
@@ -64,7 +62,7 @@ async def test_local_gen_ignores_wrong_sector():
 @pytest.mark.asyncio
 async def test_local_gen_no_generators():
     behavior = MockBehavior()
-    # Only a load — no generator to ramp
+    # A load, not a generator — nothing for the fallback to ramp.
     behavior.set_obs("leader", make_electricity_load(p_mw=3.0, regulation=0.5))
     behavior.add_action("leader", "regulate")
 

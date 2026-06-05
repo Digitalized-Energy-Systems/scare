@@ -44,33 +44,18 @@ def install_perturbation(
     # Latency jitter (with optional packet loss).  Use the lossy
     # ``SimpleCommunicationSimulation`` as the carrier so packet loss is
     # always honoured, and override ``calculate_communication`` to inject
-    # a per-message Gaussian-jittered delay.
+    # a per-message Gaussian-jittered delay.  Two correctness requirements:
     #
-    # Two correctness requirements drive the implementation:
-    #
-    # 1. **Quantize the delay to a coarse grid.**  mango is a
-    #    discrete-event simulator: it advances the clock to the next
-    #    distinct message-delivery timestamp and runs a full agent sweep
-    #    + an energyflow MISOCP re-solve at each one.  A *continuous*
-    #    Gaussian delay mints a unique delivery timestamp per message, so
-    #    N messages sent at one instant explode into O(N) tiny discrete
-    #    steps — each ~0.5 s of solver wall-clock.  That is the
-    #    robustness_latency timeout (tasks 56-59: ~25-350x slowdown,
-    #    never reaching 10 s sim-time inside the 1500 s wall).  Snapping
-    #    the delay to a grid bounds the number of distinct delivery
-    #    timestamps per instant to ~16 regardless of message count, while
-    #    still producing variable latency + reordering (the experiment's
-    #    actual intent).
-    # 2. **Deterministic per package.**  mango's contract
-    #    (``communication.py``) is that re-evaluating the same
-    #    ``MessagePackage`` yields the same result.  Seeding a local RNG
-    #    from the package identity (sender, receiver, sent_time) honours
-    #    that — the previous ``random.gauss`` on every property read both
-    #    broke determinism and re-rolled loss on every access.
-    #
-    # The earlier implementation used ``DelayProviderCommunicationSimulation``
-    # which had no loss support and silently dropped ``packet_loss_pct``
-    # (audit P1-3); this carrier keeps loss.
+    # 1. Quantize the delay to a coarse grid.  mango is discrete-event: it
+    #    advances to the next distinct delivery timestamp and runs a full
+    #    agent sweep + energyflow MISOCP re-solve at each one.  A continuous
+    #    Gaussian delay mints a unique timestamp per message, exploding N
+    #    co-sent messages into O(N) tiny solver-heavy steps.  Snapping to a
+    #    grid bounds distinct timestamps per instant to ~16 regardless of
+    #    message count, while still producing variable latency + reordering.
+    # 2. Deterministic per package.  mango's contract is that re-evaluating
+    #    the same ``MessagePackage`` yields the same result; seed a local
+    #    RNG from the package identity (sender, receiver, sent_time).
     sigma_s = latency_jitter_ms / 1000.0
     loss_frac = max(0.0, packet_loss_pct / 100.0) if packet_loss_pct > 0 else 0.0
     # Quantum: bound ±2σ to ~16 buckets (σ/4), but never finer than the

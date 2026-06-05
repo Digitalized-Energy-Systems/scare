@@ -1,22 +1,14 @@
-"""Regression test for the supply-priority ADMM feasibility cap.
+"""Regression tests for the supply-priority ADMM feasibility cap.
 
-Reproduces the structural infeasibility that produced the misleading
-"ADMM reached max iterations" warnings observed on the cp_coalition_eval
-campaign (task 2, child-103): total cross-tier demand was ~8× the
-holon's available supply, the L1 sharing-distance term could never
-drive the primal residual below tolerance, and the library logged
-"not converged" despite the dual residual having collapsed to zero.
+When total cross-tier demand exceeds holon supply, the L1
+sharing-distance term can never drive the primal residual below
+tolerance, so the library spuriously logs "reached max iterations". The
+fix scales ``total_T`` proportionally so the ADMM has a reachable
+target; service fractions are still computed against the original
+demand, leaving dispatch semantics unchanged.
 
-The fix scales ``total_T`` proportionally when ``sum(demand) >
-holon_supply_total``, giving the ADMM a reachable target.  Service
-fractions are still computed against the *original* demand so the
-dispatch semantics are unchanged.
-
-These tests assert two properties:
-1. The ADMM library logger does NOT emit a "reached max iterations"
-   warning on the scarcity scenario.
-2. Service fractions still respect the priority ordering — tier 1
-   gets fully (or maximally) served, low-priority tiers get shed.
+Asserts: (1) no "reached max iterations" warning under scarcity, and
+(2) priority ordering is preserved (high tiers served, low tiers shed).
 """
 
 from __future__ import annotations
@@ -33,16 +25,9 @@ def _drive(coro):
     return asyncio.run(coro)
 
 
-# ---------------------------------------------------------------------------
-# Fixtures: scarcity scenario reproducing the bug
-# ---------------------------------------------------------------------------
-
-
 def _scarcity_scenario():
-    """Two actors, one sector ("electricity"), demand across tiers
-    1/2/4/5 totalling 0.088 MW, total supply 0.011 MW (~13% coverage).
-
-    Matches the shape of the failing case in task 2 (child-103).
+    """Two actors, one sector, demand across tiers 1/2/4/5 totalling
+    0.088 MW against 0.011 MW supply (~13% coverage).
     """
     sectors = ["electricity"]
     tiers = [1, 2, 4, 5]
@@ -57,17 +42,9 @@ def _scarcity_scenario():
     return sectors, tiers, actor_supplies, actor_demands
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
 class TestSupplyPriorityFeasibilityCap:
     def test_scarcity_no_max_iters_warning(self, caplog) -> None:
-        """The ADMM library must not log a 'reached max iterations'
-        warning on the scarcity scenario.  Pre-fix this produced one
-        warning per supply-priority call on any deficit-bearing holon.
-        """
+        """No 'reached max iterations' warning under scarcity."""
         sectors, tiers, supplies, demands = _scarcity_scenario()
         caplog.set_level(
             logging.WARNING,
@@ -90,15 +67,13 @@ class TestSupplyPriorityFeasibilityCap:
             f"feasibility cap should silence ADMM max-iter warnings under "
             f"scarcity; got {len(max_iter_warns)}"
         )
-        # Sanity: meta carries both the scaled target and the original
-        # demand so callers can inspect either.
+        # meta carries both the scaled target and the original demand.
         assert "demand_per_cell" in meta
         assert "T_per_cell" in meta
 
     def test_priority_ordering_preserved(self) -> None:
-        """Service fraction at tier 1 must be ≥ service fraction at
-        tier 5 — the priority schedule must still steer the limited
-        supply toward critical loads after the feasibility cap.
+        """Tier-1 service fraction >= tier-5 after the feasibility cap:
+        the schedule still steers limited supply toward critical loads.
         """
         sectors, tiers, supplies, demands = _scarcity_scenario()
         service_fraction, _x, _meta = _drive(allocate_supply_priority(
@@ -110,32 +85,19 @@ class TestSupplyPriorityFeasibilityCap:
             abs_tol=1e-4,
         ))
         sec_frac = service_fraction["electricity"]
-        # Tier 1 (highest priority) ≥ tier 5 (lowest) — the priority
-        # invariant the supply-priority ADMM is supposed to enforce.
         assert sec_frac[1] >= sec_frac[5] - 1e-6, sec_frac
-        # And tier 1 should be served at a non-trivial fraction even
-        # though total supply is ~13% of total demand — the priority
-        # weighting concentrates supply on high tiers.
+        # Priority weighting concentrates supply: tier 1 served > 0.5
+        # even at ~13% total coverage.
         assert sec_frac[1] > 0.5, sec_frac
 
     def test_zero_supply_returns_all_zero_fractions(self) -> None:
-        """When every actor reports zero controllable supply (the
-        orphan-island case after a failure splits a sub-component off
-        every grid-forming source), the allocator must return
+        """Zero controllable supply (orphan-island case) must yield
         ``service_fraction == 0.0`` for every (sector, tier).
 
-        Pre-fix: ``holon_supply_total = sum(supplies) or 1.0`` quietly
-        substituted a 1 MW phantom pool; the waterfall short-circuit
-        then produced ``frac = demand/demand = 1.0`` across all tiers
-        — the L2 told every leader "serve everything", no shed
-        happened, and the slack backstopping the island stayed
-        over budget.
-
-        Real-world manifestation:
-        ``eval_full_small_20260529-181310/tasks/000088`` child-12's
-        orphan sub-coord (n_communities=7, supply=0) published
-        ``T2=T3=T4=1.0`` every round; result: ``slack__electricity__
-        child-39`` settled +10.6% over its 0.10948 MW budget.
+        A prior ``sum(supplies) or 1.0`` substituted a 1 MW phantom pool,
+        so the waterfall short-circuit produced ``frac = 1.0`` across all
+        tiers — L2 told every leader to serve everything and no shed
+        happened.
         """
         sectors = ["electricity"]
         tiers = [1, 2, 3, 4]
@@ -156,22 +118,18 @@ class TestSupplyPriorityFeasibilityCap:
                 f"zero-supply scenario must shed tier {tier}; "
                 f"got fraction={service_fraction['electricity'][tier]}"
             )
-        # No per-actor commitment — every actor's allocation is zero.
+        # Every actor's allocation is zero.
         for row in x_per_actor:
             assert all(v == 0.0 for v in row), row
-        # Meta surfaces the degenerate branch for caller introspection.
+        # meta surfaces the degenerate branch.
         assert meta.get("degenerate_no_supply") is True
         assert meta["holon_supply_total"] == 0.0
 
     def test_near_zero_supply_uses_waterfall_not_phantom_pool(self) -> None:
-        """A tiny-but-positive supply pool must still trigger the
-        waterfall cap (not the legacy phantom default) and serve only
-        what the actual supply covers.
-
-        Tier 1 gets the supply first; tiers 2-4 get zero.  This is the
-        scarcity ordering the supply-priority schedule guarantees, and
-        is the boundary check that the no-supply fix doesn't kick in
-        on a legitimately small (but positive) pool.
+        """A tiny-but-positive pool triggers the waterfall cap (not the
+        phantom default): tier 1 gets the supply first, tiers 2-4 zero.
+        Boundary check that the no-supply branch doesn't fire on a small
+        positive pool.
         """
         sectors = ["electricity"]
         tiers = [1, 2, 3, 4]
@@ -191,13 +149,13 @@ class TestSupplyPriorityFeasibilityCap:
         # Tier 2 onwards: pool exhausted on tier 1, so frac = 0.
         for tier in (2, 3, 4):
             assert sec[tier] == 0.0, sec
-        # Definitely not the degenerate-no-supply branch.
+        # Not the degenerate-no-supply branch.
         assert meta.get("degenerate_no_supply") is not True
         assert meta["holon_supply_total"] == pytest.approx(0.005)
 
     def test_abundant_supply_unchanged(self) -> None:
-        """When supply ≥ demand the feasibility cap is a no-op: every
-        tier should be fully served and the meta target equals demand.
+        """When supply >= demand the cap is a no-op: every tier fully
+        served and the meta target equals demand.
         """
         sectors = ["electricity"]
         tiers = [1, 2, 4]
@@ -213,7 +171,7 @@ class TestSupplyPriorityFeasibilityCap:
             actor_demands=actor_demands,
             max_iters=100,
         ))
-        # All tiers served at 1.0 — supply abundant.
+        # Supply abundant: all tiers served at 1.0.
         for t in tiers:
             assert service_fraction["electricity"][t] == pytest.approx(
                 1.0, abs=1e-3,

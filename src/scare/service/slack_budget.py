@@ -1,27 +1,15 @@
 """Slack-budget enforcement on external-grid children.
 
-``apply_slack_budget`` stamps an operator-policy budget on every
-``ExtPowerGrid`` / ``ExtHydrGrid`` model attribute (``_scare_slack_
-budget_mw`` / ``_scare_slack_budget_kgs``).  The LP Var bounds are
-intentionally widened to ``10 × budget`` so the energy-flow solve stays
-feasible across failure-induced imbalance, which means the LP itself
-will happily draw more than the budget if no other mechanism pushes
-back.
-
-This role is that mechanism.  It polls the slack child's observation at
-the sector's poll period; whenever ``|obs[<p_mw|mass_flow>]| > budget
-· (1 + tol)`` it:
-
-1. Records a ``slack_budget_violation`` diagnostics event (so
-   aggregators / claims can count violations campaign-wide).
-2. Emits a local ``BalanceProblem`` so the co-located
-   ``EnergyBalanceNegotiator`` triggers a rebalance round — the same
-   path the constraint monitor already uses, so the existing gossip,
-   curtailment-auction, and multihop propagation infrastructure light
-   up without bespoke plumbing.
-
-A re-fire suppressor mirrors ``GridConstraintMonitor`` so a single
-persistent over-budget steady state doesn't flood the event ledger.
+The LP Var bounds on each ``ExtPowerGrid`` / ``ExtHydrGrid`` slack are
+widened to ``10 × budget`` so the energy-flow solve stays feasible under
+failure-induced imbalance, so the LP will over-draw past the operator
+budget unless something pushes back. This role is that mechanism: it
+polls the slack draw at the sector poll period and, when
+``|obs[p_mw|mass_flow]| > budget·(1 + tol)``, records a
+``slack_budget_violation`` event and emits a ``BalanceProblem`` to
+trigger a rebalance round via the existing constraint-monitor path
+(gossip, curtailment-auction, multihop). A re-fire suppressor keeps a
+persistent over-budget state from flooding the event ledger.
 """
 
 from __future__ import annotations
@@ -49,67 +37,48 @@ logger = logging.getLogger(__name__)
 
 
 # Minimum sim-seconds between re-firing a violation on the same slack
-# while the over-budget condition persists.  Without this a continuously
-# over-budget slack would emit one BalanceProblem per poll tick, which
-# is both noisy and counter-productive (the rebalance round can't
-# finish in one tick).  Sized so a typical gossip round (sub-second to
-# a few seconds depending on group size) gets to complete before the
-# next nudge.
+# while over-budget persists. Sized so a typical gossip round completes
+# before the next nudge, avoiding one BalanceProblem per poll tick.
 _REFIRE_COOLDOWN_S: float = 2.0
 
-# Tolerance for the cache-gate inside ``_monitor``: if the observed
-# slack draw hasn't moved by more than this since the last poll and
-# no violation is currently active, the whole tick is a no-op.
+# Cache-gate tolerance in ``_monitor``: if the draw hasn't moved by more
+# than this and no violation is active, the tick is a no-op.
 _MONITOR_DELTA_TOL: float = 1e-4
 
-# Effective-budget integral-feedback gain.  Each poll the effective
-# budget moves by ``-gain · (|draw| - B)``.  Because the realized draw
-# tracks the advertised budget roughly 1:1 (``draw ≈ B_eff + losses``)
-# *with a one-control-cycle lag*, an aggressive gain overshoots (the
-# draw keeps falling after the budget stops moving) — observed as the
-# slack settling well *under* budget and the extra shedding tripping
-# the monotonic-progress transient guard.  0.3 damps that lag.
+# Effective-budget integral-feedback gain. Each poll moves the budget by
+# ``-gain · (|draw| - B)``. Draw tracks the advertised budget ~1:1 with a
+# one-cycle lag, so an aggressive gain overshoots (slack settles under
+# budget); 0.3 damps that lag.
 _FEEDBACK_GAIN: float = 0.3
 
-# Floor on the effective budget as a fraction of the nominal budget.
-# Every load class in \textsc{Scare} carries a ``regulate`` action
-# (PowerLoad, HeatLoad, gas Sink), so there is always a controllable
-# lever and the integral feedback can drive the eff_budget toward zero
-# without futile tightening — only as far as L1/L2 shedding needs to
-# bring the slack draw inside the operator policy.  A non-zero floor
-# would cap the wind-down before that point and leave the slack
-# structurally over-budget (gas child-237 over-draw trace, 2026-05-29).
-# Kept at 0.0 unless a sector is empirically shown to have no
+# Floor on the effective budget as a fraction of nominal. Every load class
+# carries a ``regulate`` action, so feedback can drive eff_budget to 0 as
+# far as L1/L2 shedding needs; a non-zero floor would cap the wind-down and
+# leave the slack structurally over-budget. Raise only for a sector with no
 # sheddable demand.
 _FEEDBACK_FLOOR_FRAC: float = 0.0
 
 
 class SlackBudgetMonitor(Role):
-    """Polls an external-grid slack's LP-chosen draw against the
-    operator-policy budget; on violation, records an event + emits a
-    BalanceProblem.
+    """Polls a slack's LP-chosen draw against the operator-policy budget;
+    on violation, records an event and emits a BalanceProblem.
 
     Constructor inputs:
 
-    - ``behavior`` — the shared ``RestorationEnvironmentBehavior``.
+    - ``behavior`` — shared ``RestorationEnvironmentBehavior``.
     - ``sector``   — sector this slack lives on (drives poll period).
-    - ``obs_key``  — ``"p_mw"`` for ``ExtPowerGrid``, ``"mass_flow"``
-                     for ``ExtHydrGrid``.
-    - ``budget``   — positive magnitude; the operator's per-sector
-                     allowance (``_scare_slack_budget_*`` value).
-    - ``tol``      — relative tolerance ``[0..]``: a draw of
-                     ``budget·(1+tol)`` is the trigger threshold.
-                     Default mirrors ``RestorationConfiguration``.
-    - ``home_leader_addr`` — address of the community leader that owns
-                     the slack child's group, patched in by a post-
-                     scenario-build pass once leaders are picked.  When
-                     set, an over-budget excursion also sends a
-                     ``StartBalanceNegotiation(override_target=-imbalance)``
-                     so L1's QP curtailment can shed even without a L2
-                     ``HolonicCommunityRole`` (single_level /
-                     component_level fix).  When ``None``, only the
-                     local ``BalanceProblem`` is emitted — preserves
-                     the legacy path SCARE's L2 already consumes.
+    - ``obs_key``  — ``"p_mw"`` (ExtPowerGrid) or ``"mass_flow"``
+                     (ExtHydrGrid).
+    - ``budget``   — positive per-sector allowance
+                     (``_scare_slack_budget_*``).
+    - ``tol``      — relative tolerance; trigger threshold is
+                     ``budget·(1+tol)``.
+    - ``home_leader_addr`` — address of the slack's community leader.
+                     When set, an over-budget excursion also sends
+                     ``StartBalanceNegotiation(override_target=imbalance)``
+                     so L1's QP can shed without an L2
+                     ``HolonicCommunityRole``. When ``None``, only the
+                     local ``BalanceProblem`` is emitted.
     """
 
     def __init__(
@@ -133,12 +102,12 @@ class SlackBudgetMonitor(Role):
         self.enable_feedback = bool(enable_feedback)
         self._violation_active: bool = False
         self._last_emit_t: float = float("-inf")
-        # Cache of the last observed slack draw — the polling watchdog
-        # skips when the value hasn't moved and no violation is active.
+        # Last observed draw; the poll skips when unchanged and no
+        # violation is active.
         self._last_obs_val: float | None = None
-        # Loss-compensated effective budget, maintained by the integral
-        # feedback in ``_monitor``.  Starts at the nominal budget and is
-        # tightened toward ``B - losses`` so the *actual* draw lands at B.
+        # Loss-compensated effective budget (integral feedback in
+        # ``_monitor``), tightened toward ``B - losses`` so the actual
+        # draw lands at B.
         self._eff_budget: float = float(budget)
 
     def setup(self) -> None:
@@ -158,9 +127,8 @@ class SlackBudgetMonitor(Role):
         try:
             self.context.emit_event(event)
         except KeyError:
-            # No co-located subscriber (rare on a slack child agent
-            # which always carries an EnergyBalanceNegotiator, but kept
-            # defensive in case the construction path ever skips it).
+            # No co-located subscriber (defensive; a slack child normally
+            # carries an EnergyBalanceNegotiator).
             pass
 
     async def _monitor(self) -> None:
@@ -173,18 +141,15 @@ class SlackBudgetMonitor(Role):
             val = float(obs[self.obs_key])
         except (TypeError, ValueError):
             return
-        # Effective-budget feedback (runs every poll, ahead of the cache
-        # gate so it keeps converging even at a steady draw).  Integral
-        # correction on the observed overage drives the advertised
-        # effective budget to ``B - losses`` so the slack's *actual*
-        # draw settles at the operator budget ``B`` — closing the
-        # residual gap the per-setpoint L1/L2/L3 control can't see
-        # (network losses + per-group-vs-global supply-pool slack).
+        # Effective-budget feedback runs every poll (ahead of the cache
+        # gate, so it converges even at a steady draw). Integral correction
+        # drives the advertised budget to ``B - losses`` so the actual draw
+        # settles at ``B``, closing the loss/supply-pool gap the per-setpoint
+        # control can't see.
         if self.enable_feedback:
             err = abs(val) - self.budget
-            # Deadband: once the draw is inside the operator tolerance
-            # band ``[B(1-tol), B(1+tol)]`` the budget is satisfied —
-            # stop correcting so the loop settles there instead of
+            # Deadband: stop correcting once the draw is inside
+            # ``[B(1-tol), B(1+tol)]`` so the loop settles instead of
             # hunting (and over-shedding) around exact ``B``.
             if abs(err) > self.tol * self.budget:
                 self._eff_budget -= _FEEDBACK_GAIN * err
@@ -196,10 +161,9 @@ class SlackBudgetMonitor(Role):
                 set_slack_eff_budget(
                     self.behavior, self.context.aid, self._eff_budget
                 )
-        # Cache gate: skip the whole pass when the slack draw hasn't
-        # moved and no violation is currently active.  An active
-        # violation must keep evaluating so the re-fire cooldown and
-        # cleared transition still fire correctly.
+        # Cache gate: skip when the draw is unchanged and no violation is
+        # active. An active violation keeps evaluating so the re-fire
+        # cooldown and cleared transition still fire.
         if (
             not self._violation_active
             and self._last_obs_val is not None
@@ -231,9 +195,9 @@ class SlackBudgetMonitor(Role):
                         f"threshold={threshold:.4f}"
                     ),
                 )
-                # ConstraintViolation lets the existing aggregator /
-                # claim machinery count slack-budget breaches alongside
-                # voltage / pressure / temperature breaches.
+                # ConstraintViolation lets the aggregator/claim machinery
+                # count slack-budget breaches alongside voltage/pressure/
+                # temperature breaches.
                 self._try_emit_event(ConstraintViolation(
                     sector=self.sector,
                     variable=f"slack_{self.obs_key}",
@@ -243,65 +207,33 @@ class SlackBudgetMonitor(Role):
                     node_id=None,
                 ))
                 # Over-budget magnitude in gossip-target convention
-                # (negative ⇒ shed net load, which reduces an importing
-                # slack's draw).  In the restoration setting an
-                # over-budget slack is always over-*importing* (the
-                # failure removed supply and the slack fills the
-                # deficit), so the correct response is always to shed
-                # toward the budget — independent of which raw sign the
-                # slack uses to encode import.  The previous form
-                # ``val - budget if val > 0 else val + budget`` is
-                # ``sign(val)·(|val|-budget)``: it assumed import is
-                # always the negative direction, which holds for
-                # ``ExtPowerGrid`` (p_mw<0 ⇒ import) but NOT for the
-                # ``ExtHydrGrid`` slacks that report import as a
-                # *positive* mass_flow.  Such a slack received a positive
-                # "add-load" target and was driven to the 10x LP envelope
-                # (eval task-84/85: +900% over-budget gas).  ``-(|val| -
-                # budget)`` is identical to the old form for negative-
-                # import slacks and fixes the positive-import ones.
+                # (negative ⇒ shed net load, reducing an importing slack's
+                # draw). An over-budget slack is always over-importing, so
+                # the response is always to shed toward budget regardless of
+                # the raw sign used to encode import. ``-(|val| - budget)``
+                # works for both ExtPowerGrid (import is p_mw<0) and
+                # ExtHydrGrid (import is positive mass_flow); a signed form
+                # would mis-target the positive-import case.
                 imbalance = -(abs(val) - self.budget)
-                # Routing:
-                # * If we have a known community leader, send a
-                #   ``StartBalanceNegotiation`` with the real
-                #   over-budget magnitude as ``override_target`` — the
-                #   leader's ``_handle_start_balance`` bypasses
-                #   ``_reported_setpoint`` (which reports the slack's
-                #   *target* draw, not its actual one) and feeds the
-                #   correct shed magnitude straight into the L1 QP.
-                # * Skip the local ``BalanceProblem`` emit in that case.
-                #   The two paths race on the same ``_active`` flag,
-                #   and the BalanceProblem (sync ``emit_event``) tends
-                #   to win — it triggers ``trigger_balance_negotiation``
-                #   which computes ``target = -Σ_local_setpoints`` (a
-                #   small community-local imbalance, an order of
-                #   magnitude below the actual over-budget magnitude).
-                #   Suppressing the emit when the override is being
-                #   sent stops the legacy path from masking the real
-                #   shed target.  Without a known leader (early in
-                #   scenario build, or a setup without communities),
-                #   we keep the BalanceProblem emit as a fallback so
-                #   *some* round fires.
+                # Routing: with a known leader, send the over-budget
+                # magnitude as ``override_target`` (below) and skip the
+                # local BalanceProblem. The two paths race on the same
+                # ``_active`` flag and the sync BalanceProblem tends to win,
+                # but it computes ``target = -Σ_local_setpoints`` — a
+                # community-local imbalance far below the real shed target —
+                # so it would mask the override. Without a leader, keep the
+                # BalanceProblem as a fallback so some round fires.
                 if self.home_leader_addr is None:
                     self._try_emit_event(BalanceProblem(
                         sector=self.sector,
                         imbalance=imbalance,
                     ))
-                # Direct L1 path for variants without L2: send the
-                # community leader a ``StartBalanceNegotiation`` whose
-                # ``override_target`` is the *amount to shed* in
-                # gossip-target convention.  ``_handle_start_balance``
-                # bypasses ``_reported_setpoint`` (which returns the
-                # slack's policy target rather than its actual draw)
-                # and feeds the value straight into the L1 QP.
-                #
-                # Gossip-target sign (per line-overload relief and
-                # _start_gossip): NEGATIVE ⇒ reduce net load by that
-                # magnitude.  ``imbalance`` above is now always negative
-                # (shed toward budget), so ``override_target = imbalance``
-                # feeds the correct shed magnitude straight into the L1
-                # QP for an over-importing slack of either sign
-                # convention.
+                # Direct L1 path for variants without L2: send the leader a
+                # ``StartBalanceNegotiation`` whose ``override_target`` is the
+                # amount to shed. ``_handle_start_balance`` bypasses
+                # ``_reported_setpoint`` (slack policy target, not actual
+                # draw) and feeds it straight into the L1 QP. ``imbalance``
+                # is negative (gossip-target convention: shed net load).
                 if self.home_leader_addr is not None:
                     try:
                         await self.context.send_message(
@@ -316,7 +248,5 @@ class SlackBudgetMonitor(Role):
                             self.context.aid, exc,
                         )
         else:
-            # Cleared — re-arm so the next over-budget excursion fires
-            # an event again (otherwise an oscillating slack would emit
-            # once and stay silent).
+            # Cleared: re-arm so the next over-budget excursion fires again.
             self._violation_active = False

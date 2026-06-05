@@ -1,40 +1,19 @@
 """Capture the LP state at the first energyflow infeasibility per run.
 
-Background
-----------
+When an ``energyflow`` solve returns infeasible, the host
+``RestorationEnvironmentBehavior`` keeps the previous ``SolverResult``,
+so observers don't read garbage but every recording freezes at the last
+feasible snapshot.  This helper answers the upstream question: what made
+the LP infeasible in the first place?
 
-``RestorationEnvironmentBehavior._accept_or_keep`` (in
-mango-energy-environments) holds onto the previous ``SolverResult``
-whenever a fresh ``energyflow`` solve returns infeasible — see
-``base.monee.energyflow``.  That keeps observers from reading a
-witness/garbage Var assignment, but as a side effect every
-observation-driven recording silently freezes at the last-feasible
-snapshot for the rest of the simulation.  We surface the freshness
-gap in the plots via ``last_feasible_solve_t``; the helper here
-tackles the upstream question: *what made the LP infeasible in the
-first place?*
+:func:`arm_infeasibility_capture` monkey-patches the ``energyflow`` symbol
+on the behavior's host module with a wrapper that, on the first infeasible
+solve of a run, writes a small JSON snapshot of the current ``_net`` state
+(inactive branches, non-default child regulation factors, solver-result
+fields), then returns the result unchanged.
 
-Mechanism
----------
-
-:func:`arm_infeasibility_capture` monkey-patches the
-``energyflow`` symbol on the behavior's host module so each call
-goes through a wrapper.  The wrapper:
-
-1. Delegates to the original ``energyflow``.
-2. If the returned ``SolverResult.success`` is False and this run
-   has not yet captured a snapshot, writes a small JSON file with
-   the current ``_net`` state — list of inactive branches, every
-   child's ``regulation`` factor, and a few solver-result fields.
-   The JSON is intentionally small so dropping it into every
-   affected task directory is cheap.
-3. Returns the result unchanged so the host's
-   ``_accept_or_keep`` behaviour is preserved.
-
-The patch is idempotent (subsequent ``arm_`` calls reuse the same
-wrapper).  ``disarm_infeasibility_capture`` restores the original
-symbol — used by the runner between tasks so a fresh capture window
-opens for each task directory.
+The patch is idempotent.  :func:`disarm_infeasibility_capture` returns the
+wrapper to pass-through so the runner can re-arm per task.
 """
 
 from __future__ import annotations
@@ -51,9 +30,8 @@ from mango_energy_environments.environments.restoration import (
 logger = logging.getLogger(__name__)
 
 
-# Module-level state — a single capture window is shared across the
-# process.  The runner ``arm``-s it per task with a fresh output path
-# and ``disarm``-s afterwards.
+# Single process-wide capture window.  Armed per task with a fresh output
+# path and disarmed afterwards by the runner.
 _CaptureCtx: dict[str, Any] = {
     "armed": False,
     "captured": False,
@@ -63,11 +41,11 @@ _CaptureCtx: dict[str, Any] = {
 
 
 def _summarize_net(net: Any) -> dict[str, Any]:
-    """Produce a small JSON-serialisable snapshot of the current monee
-    network state.  Captures the dimensions the LP depends on directly
-    (active branches, child regulation factors, slack bounds) so the
-    snapshot is enough to re-build the failing LP in a standalone
-    reproducer.
+    """Small JSON-serialisable snapshot of the monee network state.
+
+    Captures the dimensions the LP depends on (active branches, child
+    regulation factors, slack bounds) — enough to rebuild the failing LP
+    in a standalone reproducer.
     """
     inactive_branches: list[Any] = []
     branches_total = 0
@@ -165,12 +143,11 @@ def arm_infeasibility_capture(
         File to write the JSON snapshot to on the first infeasibility.
         Parent directory must exist.
     clock
-        Optional simulation clock (``world.clock``).  When provided,
-        the snapshot's ``sim_time_s`` is read from ``clock.time`` at
-        capture time, which is more accurate than the behavior's
-        ``_last_energy_flow_t`` (that field is only updated *after*
-        the wrapper returns, so it still reads as the previous
-        successful solve while the wrapper itself runs).
+        Optional simulation clock (``world.clock``).  When provided, the
+        snapshot's ``sim_time_s`` reads ``clock.time``, which is more
+        accurate than the behavior's ``_last_energy_flow_t`` (only updated
+        after the wrapper returns, so it still reflects the previous solve
+        while the wrapper runs).
     """
     _CaptureCtx["armed"] = True
     _CaptureCtx["captured"] = False

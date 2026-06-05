@@ -1,10 +1,9 @@
 """Tests for the grid-scenario table generator
 (:mod:`experiment.eval.grid_scenario_table`).
 
-Uses ``build=False`` throughout so the grid factories are only *introspected*
-(closure params) and never built — no simbench network load, fast and
-offline.  Node / CP counts therefore render as ``---``; the build path is
-exercised informally by the CLI and the existing metrics tests.
+Uses ``build=False`` throughout so the grid factories are only introspected
+(closure params), never built — fast and offline. Node / CP counts therefore
+render as ``---``.
 """
 
 from __future__ import annotations
@@ -54,8 +53,8 @@ class TestSlackLabel:
 
 class TestCollect:
     def test_collapses_slack_into_one_row_per_grid(self):
-        # The same grid under several slack budgets across experiments
-        # collapses to ONE row carrying every distinct budget.
+        # One grid under several slack budgets collapses to ONE row
+        # carrying every distinct budget.
         cfg = _cfg([
             {"name": "a", "grids": ["simbench_lv"],
              "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}]},

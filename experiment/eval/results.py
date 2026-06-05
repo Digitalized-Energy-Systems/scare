@@ -61,12 +61,10 @@ def compose_result(
     served = served_breakdown(monee_net, behavior, priorities=priorities)
     restoration = restoration_breakdown(served, baseline_served)
     integral = constraint_violation_integral(world)
-    # Accurate end-of-sim feasibility: the during-run integral above only sees
-    # per-sector averages, so a run with individual buses / junctions / lines
-    # out of bounds can still integrate near-zero.  This scans the final solved
-    # network node-by-node and branch-by-branch against the same envelope the
-    # oracle enforces; the ``constraint_compliance`` claim (claims.py) gates on
-    # it so PWSF stays comparable across variants and the oracle.
+    # End-of-sim per-node/per-branch feasibility against the oracle's envelope.
+    # The during-run integral only sees per-sector averages, so out-of-bounds
+    # individuals can integrate near-zero; the ``constraint_compliance`` claim
+    # gates on this so PWSF stays comparable across variants and the oracle.
     constraints_final = constraint_violations_final(monee_net)
     t_stable = time_to_stabilise_s(world)
 
@@ -78,8 +76,7 @@ def compose_result(
     # Per-message-type counts via mango's recorded_messages, if any.
     msg_counts: dict[str, int] = {}
     for rec in getattr(world, "recorded_messages", []) or []:
-        # mango records typically expose ``content_type`` or similar;
-        # fall back to repr of the message content if not.
+        # Prefer ``content_type``; fall back to the content type name.
         msg_type = (
             getattr(rec, "content_type", None)
             or type(getattr(rec, "content", rec)).__name__
@@ -170,12 +167,11 @@ def write_served_by_load_csv(
     behavior: Any,
     priorities: dict[str, int] | None = None,
 ) -> None:
-    """Per-load detail with sector, tier, node_id, component, demand,
-    served, fraction, disconnected.  The ``component`` column carries
-    the active-branch-subgraph connected-component index so the
-    priority-invariant claim check can compare tiers within each
-    post-failure island fairly (cross-island deficits are spatial
-    accidents and shouldn't count as priority inversions).
+    """Per-load detail: sector, tier, node_id, component, demand, served,
+    fraction, disconnected, constraint_allowed.  ``component`` is the
+    active-branch-subgraph connected-component index, so the priority-invariant
+    check compares tiers within each post-failure island (cross-island
+    deficits are spatial accidents, not inversions).
     """
     rows = served_by_load(monee_net, behavior, priorities=priorities)
     cols = (
@@ -196,12 +192,10 @@ def write_served_by_load_csv(
 def write_constraints_final_csv(path: Path, monee_net: Any) -> None:
     """Per-node / per-branch end-of-sim hard-bound readings.
 
-    One row per checked constraint variable: ``kind`` (node|branch), ``id``,
-    ``sector``, ``variable``, ``value``, ``lo``, ``hi``, ``overshoot``,
-    ``violated``.  The ``constraint_compliance`` claim
-    (``experiment.eval.claims._check_constraint_compliance``) reads this back
-    and passes iff no row is ``violated`` — the grid-feasibility half of the
-    compliance gate that keeps PWSF comparable to the oracle.
+    One row per checked variable: ``kind`` (node|branch), ``id``, ``sector``,
+    ``variable``, ``value``, ``lo``, ``hi``, ``overshoot``, ``violated``.  Read
+    back by the ``constraint_compliance`` claim, which passes iff no row is
+    ``violated``.
     """
     rows = constraint_rows(monee_net)
     cols = (
@@ -220,9 +214,8 @@ def write_constraints_final_csv(path: Path, monee_net: Any) -> None:
 
 
 def write_slack_meta(path: Path, monee_net: Any) -> None:
-    """Persist per-slack-child metadata (budget + LP envelope) so the
-    post-run plot tooling can overlay the operator policy on the
-    measured trajectory.
+    """Persist per-slack-child metadata (budget + LP envelope) so the post-run
+    plot tooling can overlay the operator policy on the measured trajectory.
 
     Output schema (one entry per slack-class child):
 
@@ -237,11 +230,10 @@ def write_slack_meta(path: Path, monee_net: Any) -> None:
           ...
         }
 
-    Budget is the value stamped on the model by ``apply_slack_budget``.
-    LP-envelope is the absolute Var bound after ``apply_slack_budget``
-    widened it (typically ``10 × budget``).  Both are ``null`` for
-    slack children left intentionally unbudgeted (heat-side
-    ``ExtHydrGrid``); the plot then skips the overlay for that sector.
+    Budget is stamped on the model by ``apply_slack_budget``; LP-envelope is the
+    absolute Var bound after that widened it (typically 10x budget).  Both are
+    ``null`` for intentionally unbudgeted slacks (heat-side ``ExtHydrGrid``),
+    and the plot skips the overlay for that sector.
     """
 
     meta: dict[str, dict[str, Any]] = {}
@@ -301,10 +293,9 @@ def write_trajectories_csv(path: Path) -> None:
         t_0,    f_0_1,   f_0_2,   ...,  f_0_n
         ...
 
-    Forward-fills missing values per aid (regulate is event-driven, so
-    aids report at different timestamps).  The result is consumed by
-    the C.5 cluster-synchronisation analysis in
-    :mod:`experiment.eval.adaptive_network_analysis`.
+    Forward-fills missing values per aid (regulate is event-driven, so aids
+    report at different timestamps).  Consumed by the cluster-synchronisation
+    analysis in :mod:`experiment.eval.adaptive_network_analysis`.
     """
     rows = diagnostics.trajectory_log()
     if not rows:
@@ -317,7 +308,7 @@ def write_trajectories_csv(path: Path) -> None:
             aids.append(r.aid)
     times = sorted({round(r.t, 6) for r in rows})
 
-    # last-observed factor per aid, replayed at each unique timestamp.
+    # Last-observed factor per aid, replayed at each unique timestamp.
     pending: dict[str, float] = {}
     by_t: dict[float, dict[str, float]] = {}
     for r in rows:

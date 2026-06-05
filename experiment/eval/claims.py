@@ -1,23 +1,13 @@
 """Post-run claims validation.
 
-Reads the per-task artefacts (diary.csv, served.csv, timeseries.csv,
-events.csv, ``regulate`` records) and checks each architectural claim
-the chapter makes.  Returns a dict of pass/fail flags + supporting
-detail that is folded into ``result.json["claims"]`` by the runner.
+Reads per-task artefacts (diary.csv, served*.csv, timeseries.csv,
+events.csv, constraints_final.csv) and checks each architectural claim.
+Returns a dict of pass/fail flags + supporting detail folded into
+``result.json["claims"]`` by the runner.
 
-Currently checks:
-
-- ``diary_invariant``       — ``started == Σ terminals`` from the diary
-- ``priority_invariant``    — when total demand exceeds capacity, served
-                              fraction is non-increasing in tier
-- ``monotonic_progress``    — per-load r(t) non-decreasing during periods
-                              with no constraint violation in that sector
-- ``geometric_convergence`` — R² of ``log|gap|`` vs round counter for
-                              completed (originator) negotiations
-- ``no_double_act``         — at most one regulate per (t, aid) tuple
-
-Each check returns ``(passed: bool, detail: dict)`` so the aggregator
-can surface specific failure cases without re-parsing the artefacts.
+Each check returns ``{"passed": bool, "detail": dict}`` so the
+aggregator can surface specific failure cases without re-parsing the
+artefacts.
 """
 
 from __future__ import annotations
@@ -27,44 +17,6 @@ import json
 import math
 from pathlib import Path
 from typing import Any
-
-
-# ---------------------------------------------------------------------------
-# Mode-gate for priority claims
-# ---------------------------------------------------------------------------
-#
-# The priority-ordering claims (``priority_invariant`` and
-# ``monotonic_progress``) presume the controller actually arbitrates by
-# priority.  ``holon_admm_mode="demand"`` is documented as an ablation-only
-# formulation (see ``src/scare/base/config.py``): in pure-load groups the
-# per-actor coupling ``Σ x_g ≤ flex_g`` never binds, so the priority weight
-# only modulates magnitudes — it does NOT order tiers.  Gating an ablation
-# against a claim its design pre-states it cannot satisfy is meaningless;
-# the eval should report a transparent skip, not a fatal failure.
-#
-# Read from ``<task_dir>/config.json["sweep"]["holon_admm_mode"]`` (default
-# ``"supply"``); when absent (older runs / non-sweep tasks) the gate
-# returns True so the claim runs as before.
-_PRIORITY_AWARE_MODE: str = "supply"
-
-
-def _holon_admm_mode(task_dir: Path) -> str:
-    """Return the active ``holon_admm_mode`` for this task, or
-    ``"supply"`` as the production default when unparseable.
-    """
-    cfg_path = task_dir / "config.json"
-    if not cfg_path.exists():
-        return _PRIORITY_AWARE_MODE
-    try:
-        cfg = json.loads(cfg_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return _PRIORITY_AWARE_MODE
-    sweep = cfg.get("sweep") or {}
-    return str(sweep.get("holon_admm_mode", _PRIORITY_AWARE_MODE))
-
-
-def _is_priority_aware(task_dir: Path) -> bool:
-    return _holon_admm_mode(task_dir) == _PRIORITY_AWARE_MODE
 
 
 # ---------------------------------------------------------------------------
@@ -78,49 +30,28 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     out["diary_invariant"] = _check_diary_invariant(task_dir / "diary.csv")
-    # Mode gate: when ``holon_admm_mode != "supply"`` the controller does
-    # not arbitrate by priority (see ``_PRIORITY_AWARE_MODE``); the
-    # gating priority claims are skipped with ``passed=True`` and a
-    # ``skipped`` detail so the run is reported as ablation-honest
-    # rather than spuriously failed.
-    priority_aware = _is_priority_aware(task_dir)
-    skip_detail = {"skipped": f"holon_admm_mode={_holon_admm_mode(task_dir)!r}"}
-    # Physics-aware (primary): exclude loads throttled by a local
-    # constraint — they are physically capped, not priority-shed, the
-    # same rationale as the existing ``disconnected`` exclusion.
-    if priority_aware:
-        out["priority_invariant"] = _check_priority_invariant(
-            task_dir / "served_by_load.csv",
-            legacy_served_csv=task_dir / "served.csv",
-            exclude_constraint_throttled=True,
-            near_full_exempt=True,
-        )
-    else:
-        out["priority_invariant"] = {"passed": True, "detail": skip_detail}
-    # Strict (validation only): the original check, no constraint
-    # exclusion.  Kept as a raw inversion signal — the headline metric
-    # is priority-weighted served fraction, so this is diagnostic, not
-    # gating (not in ``fatal_claims``).
-    if priority_aware:
-        out["priority_invariant_strict"] = _check_priority_invariant(
-            task_dir / "served_by_load.csv",
-            legacy_served_csv=task_dir / "served.csv",
-            exclude_constraint_throttled=False,
-            near_full_exempt=False,
-        )
-    else:
-        out["priority_invariant_strict"] = {"passed": True, "detail": skip_detail}
-    if priority_aware:
-        out["monotonic_progress"] = _check_monotonic_progress(
-            task_dir / "timeseries.csv", task_dir / "events.csv"
-        )
-    else:
-        out["monotonic_progress"] = {"passed": True, "detail": skip_detail}
+    # Physics-aware (gating): excludes loads capped by a local constraint
+    # — physically limited, not priority-shed.
+    out["priority_invariant"] = _check_priority_invariant(
+        task_dir / "served_by_load.csv",
+        legacy_served_csv=task_dir / "served.csv",
+        exclude_constraint_throttled=True,
+        near_full_exempt=True,
+    )
+    # Strict (diagnostic, non-gating): raw inversion signal with no
+    # constraint exclusion.
+    out["priority_invariant_strict"] = _check_priority_invariant(
+        task_dir / "served_by_load.csv",
+        legacy_served_csv=task_dir / "served.csv",
+        exclude_constraint_throttled=False,
+        near_full_exempt=False,
+    )
+    out["monotonic_progress"] = _check_monotonic_progress(
+        task_dir / "timeseries.csv", task_dir / "events.csv"
+    )
     # Diagnostic (non-gating): heat is excluded from the priority-ordering
-    # claims above because its shedding follows local temperature
-    # feasibility; this tracks the per-tier feasible-heat served fraction so
-    # the residual controllable heat-priority gap stays measurable (vs the
-    # oracle at aggregation time).
+    # claims; this tracks the per-tier feasible-heat served fraction so the
+    # controllable heat-priority gap stays measurable against the oracle.
     out["heat_priority"] = _check_heat_priority(task_dir / "served_by_load.csv")
     out["slack_budget_compliance"] = _check_slack_budget(
         task_dir / "events.csv",
@@ -130,8 +61,7 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
     # Grid-feasibility half of the compliance gate: no hard-bound violation
     # (voltage / pressure / temperature / line loading) at end-of-sim.  Paired
     # with ``slack_budget_compliance`` so a run is "compliant" only when it
-    # solved the SAME operator- and physics-constrained problem the oracle did
-    # — see ``_check_constraint_compliance``.
+    # solved the same operator- and physics-constrained problem the oracle did.
     out["constraint_compliance"] = _check_constraint_compliance(
         task_dir / "constraints_final.csv"
     )
@@ -167,39 +97,29 @@ def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-# A load counts as physically constraint-throttled (and is excluded
-# from the physics-aware check) when its local constraint cap is below
-# ~full AND it is actually serving at/near that cap — i.e. it is limited
-# by physics, not held down by a priority/balance shed.  A load served
-# *below* its physical cap has been shed by a decision and still counts.
+# A load is physically constraint-throttled (excluded from the physics-aware
+# check) when its local cap is below ~full AND it serves at/near that cap —
+# limited by physics, not a priority/balance shed.  A load served below its
+# cap was shed by a decision and still counts.
 _THROTTLE_CAP_TOL: float = 0.02
 
 # Sectors excluded from the priority-ordering claims (``priority_invariant``,
-# its strict variant, and ``monotonic_progress``).  Heat load control is
-# governed by *local* junction-temperature feasibility, not a global
-# priority allocation: a heat load on a flow-starved node must be shed to
-# keep its return temperature feasible regardless of its tier, and the act
-# of shedding it can recover the node to a feasible temperature so the
-# end-of-sim ``constraint_allowed`` reads ~1.0 — making a temperature-forced
-# shed indistinguishable from a priority shed.  Checking aggregate per-tier
-# served fractions on heat therefore mis-flags physically-forced shedding as
-# a priority violation.  Heat priority is instead tracked by the (non-gating)
-# ``heat_priority`` diagnostic, which is honest only relative to the oracle.
+# its strict variant, ``monotonic_progress``).  Heat is governed by *local*
+# junction-temperature feasibility, not a global priority allocation: a heat
+# load on a flow-starved node must be shed regardless of tier, and shedding it
+# can recover the node so end-of-sim ``constraint_allowed`` reads ~1.0 —
+# making a temperature-forced shed indistinguishable from a priority shed.
+# Heat priority is instead tracked by the non-gating ``heat_priority``
+# diagnostic.
 _LOCAL_PHYSICS_SECTORS: frozenset[str] = frozenset({"heat"})
 
 # Near-full exemption (physics-aware check only).  A higher-priority tier
-# served at or above this fraction is treated as *essentially fully
-# served*: a marginal shortfall below a fully-served lower-priority tier
-# is a CLPU-ramp / ADMM-convergence residual at the end-of-sim snapshot
-# (the higher tier is ramping up toward full, not being shed *in favour
-# of* the lower one), not a priority decision.  This is deliberately a
-# guard on the *higher* tier's absolute service — NOT a wider gap
-# tolerance: a genuine inversion where both tiers are under-served (e.g.
-# tier-3 at 0.50 below tier-4 at 0.53) still has the higher tier well
-# below this floor and is flagged.  Calibrated from the eval residuals:
-# post-fix near-converged cases sit at ≥0.976 served on the higher tier,
-# while real structural inversions leave it ≤0.80.  The strict variant
-# keeps the raw 1e-3 signal (``near_full_exempt=False``).
+# served at/above this fraction is treated as essentially fully served: a
+# marginal shortfall below a fully-served lower tier is a ramp/convergence
+# residual, not a priority decision.  This guards the *higher* tier's
+# absolute service, not the gap width — a genuine inversion where both tiers
+# are under-served still has the higher tier below this floor and is flagged.
+# The strict variant keeps the raw 1e-3 signal (``near_full_exempt=False``).
 _NEAR_FULL_FRAC: float = 0.95
 
 
@@ -211,54 +131,37 @@ def _check_priority_invariant(
     near_full_exempt: bool = True,
     skip_sectors: frozenset[str] = _LOCAL_PHYSICS_SECTORS,
 ) -> dict[str, Any]:
-    """At end-of-sim, when total demand exceeds capacity *within a
-    connected component*, the served fraction must be non-increasing in
-    priority tier (per (sector, component)): tier 1 ≥ tier 2 ≥ … ≥ tier
-    P.
+    """At end-of-sim, when total demand exceeds capacity within a connected
+    component, served fraction must be non-increasing in priority tier per
+    (sector, component): tier 1 >= tier 2 >= ... >= tier P.
 
-    ``skip_sectors`` (default ``{"heat"}``): sectors whose service is
-    governed by *local* physics rather than a global priority allocation
-    are dropped entirely — see ``_LOCAL_PHYSICS_SECTORS``.  The count of
-    skipped loads is reported via ``n_loads_sector_skipped`` so the loss
-    stays visible.
+    ``skip_sectors`` (default ``{"heat"}``): sectors governed by local physics
+    rather than global priority are dropped entirely (see
+    ``_LOCAL_PHYSICS_SECTORS``); count reported via ``n_loads_sector_skipped``.
 
-    ``exclude_constraint_throttled`` (physics-aware, default): also drop
-    loads that are capped by a *local constraint* (``served`` at/near the
-    ``constraint_allowed`` fraction recorded in ``served_by_load.csv``).
-    Such a load cannot be served regardless of priority — e.g. a heat
-    load on a node below its temperature bound — so counting it as a
-    priority inversion penalises the controller for correctly serving
-    the loads it physically *can* (the eval task-72/105 cold-day case,
-    where shedding follows temperature, not tier).  A load served
-    *below* its physical cap is still a genuine priority/balance shed and
-    is kept.  Set False for the strict raw-inversion validation signal.
+    ``exclude_constraint_throttled`` (physics-aware, default): also drop loads
+    capped by a local constraint (``served`` at/near ``constraint_allowed``) —
+    unservable regardless of priority, so counting them as inversions would
+    penalise correctly serving the physically-servable loads.  A load served
+    below its cap is still a genuine shed and is kept.  Set False for the
+    strict raw-inversion signal.
 
-    Why per-component: heat and gas cannot be transported through a
-    broken pipe, and electricity cannot cross a disconnected feeder
-    without active reconfiguration.  A load on a healthy island will be
-    served 100 % regardless of priority, and that's a spatial accident
-    of where the failure landed — not a SCARE priority violation.  By
-    grouping on the active-branch-subgraph component (recorded in
-    ``served_by_load.csv``'s ``component`` column), the check evaluates
-    only the priority decisions SCARE could plausibly have made.
+    Per-component because flow cannot cross a broken pipe / disconnected
+    feeder: a load on a healthy island served 100% is a spatial accident of
+    where the failure landed, not a priority decision.  Grouping on the
+    active-branch-subgraph ``component`` column evaluates only the priority
+    decisions SCARE could plausibly have made.
 
-    Loads marked ``disconnected=1`` are *excluded* from the per-tier
-    aggregation: ``disconnected`` comes from monee's
-    ``find_ignored_nodes`` and flags nodes with no path to a
-    grid-forming source (ExtPowerGrid / ExtHydrGrid) through the active
-    branches.  The LP cannot serve those loads regardless of priority —
-    they are physically unservable, not a SCARE shedding decision.
-    Including them drags down their tier's aggregate fraction and
-    produces a spurious "inversion" whenever the lost-source island
-    happens to contain a single high-tier load.  Reported separately
-    via ``n_loads_stranded`` so the loss is still visible.
+    Loads marked ``disconnected=1`` (no path to a grid-forming source via
+    active branches, per monee's ``find_ignored_nodes``) are split into a
+    separate ``stranded`` bucket: physically unservable, not a shedding
+    decision.  Reported via ``n_loads_stranded``.
 
-    Components with no deficit (every tier at 1.0 within the per-tier
-    capacity-weighted tolerance) are skipped — they carry no priority
-    decision to evaluate.
+    Components with no deficit (every tier at 1.0 within tolerance) are
+    skipped — no priority decision to evaluate.
 
-    Falls back to the legacy per-sector check on ``served.csv`` if the
-    per-load file is absent (older campaign artefacts).
+    Falls back to the legacy per-sector check on ``served.csv`` when the
+    per-load file is absent.
     """
     if not by_load_path.exists():
         if legacy_served_csv is not None and legacy_served_csv.exists():
@@ -268,10 +171,8 @@ def _check_priority_invariant(
     if not rows:
         return {"passed": True, "detail": "empty served_by_load.csv"}
 
-    # Aggregate per (sector, component, tier): demand and served.
-    # Loads with ``disconnected=1`` are split off into a separate
-    # ``stranded`` bucket so the per-tier aggregation reflects only
-    # the loads SCARE could plausibly have served.
+    # Aggregate demand/served per (sector, component, tier); stranded
+    # (disconnected) loads go to a separate bucket.
     agg: dict[tuple[str, str], dict[int, dict[str, float]]] = {}
     stranded_by_sector: dict[str, dict[int, dict[str, float]]] = {}
     n_loads_stranded = 0
@@ -289,9 +190,8 @@ def _check_priority_invariant(
             served = float(r["served"])
         except (KeyError, ValueError):
             continue
-        # Locally-governed sectors (heat): excluded from the priority
-        # ordering check — their shedding follows junction-temperature
-        # feasibility, not tier (see ``_LOCAL_PHYSICS_SECTORS``).
+        # Locally-governed sectors (heat): excluded — shedding follows
+        # junction-temperature feasibility, not tier.
         if sec in skip_sectors:
             n_loads_sector_skipped += 1
             sector_skipped_demand_mw += demand
@@ -307,8 +207,8 @@ def _check_priority_invariant(
             entry["served"] += served
             continue
         # Constraint-throttled loads (physics-aware mode): capped by a
-        # local constraint and serving at/near that cap → physically
-        # limited, not priority-shed.  Excluded like stranded loads.
+        # local constraint and serving at/near it — physically limited,
+        # not priority-shed.  Excluded like stranded loads.
         if exclude_constraint_throttled and "constraint_allowed" in r:
             try:
                 allowed = float(r["constraint_allowed"])
@@ -340,7 +240,7 @@ def _check_priority_invariant(
             skipped_no_deficit += 1
             continue
         checked += 1
-        # Compute per-tier fraction, then check non-increasing ordering.
+        # Per-tier fraction, then check non-increasing ordering.
         fracs = []
         for tier, e in tiers:
             f = e["served"] / e["demand"] if e["demand"] > 0 else 1.0
@@ -350,9 +250,8 @@ def _check_priority_invariant(
             t_cur, f_cur = fracs[i]
             if f_cur <= f_prev + 1e-3:
                 continue
-            # Near-full exemption: a higher-priority tier that is itself
-            # essentially fully served is mid-ramp, not shed in favour of
-            # the lower tier (see ``_NEAR_FULL_FRAC``).
+            # Near-full exemption: a higher tier that is itself essentially
+            # fully served is mid-ramp, not shed in favour of the lower one.
             if near_full_exempt and f_prev >= _NEAR_FULL_FRAC:
                 continue
             inversions.append({
@@ -386,22 +285,16 @@ def _check_priority_invariant(
 def _check_heat_priority(by_load_path: Path) -> dict[str, Any]:
     """Diagnostic (non-gating) heat-priority metric.
 
-    Heat is excluded from the gating ``priority_invariant`` claim because
-    its shedding tracks local junction-temperature feasibility, not tier
-    (see ``_LOCAL_PHYSICS_SECTORS``).  But heat priority is still worth
-    *measuring*: this reports the per-tier heat served fraction restricted
-    to the **feasible** subset (loads whose ``constraint_allowed`` is at
-    full — i.e. those the controller could serve regardless of
-    temperature).  Among that subset, served fraction *should* be
-    non-increasing in tier; a residual inversion there is a controllable
-    priority error (e.g. a feasible high-priority heat load shed to zero
-    while a feasible lower-priority one is served).
+    Heat is excluded from the gating ``priority_invariant`` claim (shedding
+    tracks local junction-temperature feasibility, not tier).  This reports
+    the per-tier heat served fraction over the *feasible* subset
+    (``constraint_allowed`` at full — servable regardless of temperature),
+    where served fraction should be non-increasing in tier; a residual
+    inversion there is a controllable priority error.
 
-    This is honest only *relative to the oracle*: a node the failures
-    flow-starved is temperature-infeasible and drops out of the feasible
-    subset for SCARE and the oracle alike, so the aggregator compares
-    ``per_tier_served_feasible`` against the oracle's to read the true
-    controllable gap.  Reported, never gating.
+    Honest only relative to the oracle: a flow-starved node is
+    temperature-infeasible for SCARE and oracle alike, so the aggregator
+    compares ``per_tier_served_feasible`` against the oracle's.  Never gating.
     """
     if not by_load_path.exists():
         return {"passed": True, "detail": "no served_by_load.csv"}
@@ -480,8 +373,8 @@ def _check_heat_priority(by_load_path: Path) -> dict[str, Any]:
 
 
 def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
-    """Original per-sector check on ``served.csv`` — retained as a
-    fallback for runs predating the per-load artefact."""
+    """Fallback per-sector check on ``served.csv`` for runs lacking the
+    per-load artefact."""
     rows = _read_csv(served_path)
     by_sector: dict[str, list[tuple[int, float]]] = {}
     for r in rows:
@@ -523,12 +416,15 @@ def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
 
 _WARMUP_S: float = 1.0
 _DROP_TOL: float = 0.05
-# A lower-priority tier counts as "still served" (so that shedding a
-# higher tier above it is a priority-order violation) when its regulation
-# sum exceeds this fraction of its own peak.  Below it the tier is treated
-# as already shed, so dropping a higher tier is legitimate bottom-up
-# shedding, not a regret switch.
+# A lower-priority tier counts as "still served" (so shedding a higher tier
+# above it is a priority-order violation) when its regulation sum exceeds this
+# fraction of its own peak.  Below it the tier is treated as already shed, so
+# dropping a higher tier is legitimate bottom-up shedding, not a regret switch.
 _SHED_EPS: float = 0.1
+# Loading-percent above which an electricity line counts as overloaded for the
+# line-relief exemption (mirrors the constraint monitor's 100% bound plus the
+# numerical-wiggle tolerance ``metrics._LINE_LOADING_TOL_PCT``).
+_LINE_OVERLOAD_PCT: float = 101.0
 
 
 def _check_monotonic_progress(
@@ -536,30 +432,24 @@ def _check_monotonic_progress(
 ) -> dict[str, Any]:
     """No-regret-switching check.
 
-    The restoration must not *regret-switch* — un-serve a load it had
-    already restored — except to free supply for a higher-priority tier
-    (the intended L3→L2→L1 re-shed; ``enable_monotonic_floor`` is off by
-    design).  The earlier proxy watched each sector's *aggregate*
-    regulation balance and flagged any >``_DROP_TOL`` drop, but that
-    cannot distinguish a *correct* priority-ordered low-tier shed (which
-    drops the aggregate) from a genuine regression — it false-positived
-    on every CP-coupled run that correctly sheds its least-critical
-    electricity tier.
+    Restoration must not regret-switch — un-serve a load it had restored —
+    except to free supply for a higher-priority tier (the intended L3->L2->L1
+    re-shed; ``enable_monotonic_floor`` is off by design).
 
     Primary check (when the per-(sector, tier) ``tier_balance__<sector>__
     <tier>`` series are present): within a sector, a drop in a tier's
-    regulation sum is a violation *only* when a strictly lower-priority
-    tier in the **same** sector is still being served (above ``_SHED_EPS``
-    of its peak).  Bottom-up shedding (lower tiers already shed) passes;
-    shedding a higher tier while a lower one stays served fails.  Same-
-    sector comparison so cross-sector independence is never mis-flagged.
+    regulation sum is a violation only when a strictly lower-priority tier in
+    the *same* sector is still served (above ``_SHED_EPS`` of its peak).
+    Bottom-up shedding passes; shedding a higher tier while a lower one stays
+    served fails.  Same-sector comparison so cross-sector independence is
+    never mis-flagged.
 
-    Falls back to the legacy per-sector aggregate drop check on older
-    artefacts that lack the per-tier series.
+    Falls back to the legacy per-sector aggregate-drop check on artefacts
+    lacking the per-tier series.
 
-    Both paths exclude (1) the warm-up window ``t < _WARMUP_S`` (initial
-    dispatch off the LP default), (2) active ``constraint_violation``
-    windows, and (3) post-failure ringing (``Δt ≤ _POST_FAILURE_S``).
+    Both paths exclude (1) the warm-up window ``t < _WARMUP_S``, (2) active
+    ``constraint_violation`` windows, and (3) post-failure ringing
+    (``dt <= _POST_FAILURE_S``).
     """
     if not timeseries_path.exists():
         return {"passed": True, "detail": "no timeseries"}
@@ -573,6 +463,21 @@ def _check_monotonic_progress(
         _failure_windows(events_path) if events_path.exists() else []
     )
 
+    # Line-overload exemption (electricity): while a power line is over its
+    # thermal rating, the line-relief lever sheds through-load to restore
+    # feasibility — a constraint-driven shed (the oracle does the same), not a
+    # priority regret.  Derived from the ``max_line_loading_percent`` series
+    # rather than the deduped ``constraint_violation`` event so every overloaded
+    # instant is exempt.  The line analogue of the ``_LOCAL_PHYSICS_SECTORS``
+    # heat exemption.
+    line_overload_windows: list[tuple[float, float]] = []
+    ml = series.get("max_line_loading_percent")
+    if ml:
+        t_ml, y_ml = ml
+        for tt, yy in zip(t_ml, y_ml):
+            if yy > _LINE_OVERLOAD_PCT:
+                line_overload_windows.append((tt, tt + _DISRUPTION_GRACE_S))
+
     def _excluded(sec: str, ti: float) -> bool:
         if ti < _WARMUP_S:
             return True
@@ -580,6 +485,10 @@ def _check_monotonic_progress(
         if any(lo <= ti <= hi for lo, hi in windows):
             return True
         if any(lo <= ti <= hi for lo, hi in failure_windows):
+            return True
+        if sec == "electricity" and any(
+            lo <= ti <= hi for lo, hi in line_overload_windows
+        ):
             return True
         return False
 
@@ -600,8 +509,8 @@ def _check_monotonic_progress(
         skipped_sectors: list[str] = []
         for sec, tier_series in by_sector_tier.items():
             # Heat shedding follows local junction-temperature feasibility,
-            # not tier order (see ``_LOCAL_PHYSICS_SECTORS``), so a tier's
-            # regulation can correctly drop while a lower tier stays served.
+            # not tier order, so a tier can correctly drop while a lower tier
+            # stays served.
             if sec in _LOCAL_PHYSICS_SECTORS:
                 skipped_sectors.append(sec)
                 continue
@@ -612,7 +521,7 @@ def _check_monotonic_progress(
             tiers_sorted = sorted(tier_series)
             for k in tiers_sorted:
                 t_k, ys_k = tier_series[k]
-                lower = [j for j in tiers_sorted if j > k]  # lower priority
+                lower = [j for j in tiers_sorted if j > k]  # lower-priority tiers
                 for i in range(1, len(ys_k)):
                     if _excluded(sec, t_k[i]):
                         continue
@@ -646,7 +555,7 @@ def _check_monotonic_progress(
 
     # --- Fallback: legacy per-sector aggregate drop ---------------------
     # Heat omitted: its shedding tracks local temperature feasibility, not
-    # tier order (see ``_LOCAL_PHYSICS_SECTORS``).
+    # tier order.
     sectors = {
         "electricity": "electrical_balance",
         "gas": "gas_balance",
@@ -684,20 +593,16 @@ _POST_FAILURE_S: float = 2.0
 
 
 def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
-    """Return ``[(t_fail, t_fail + _POST_FAILURE_S)]`` for every
-    failure event in the run.  Branch / node / custom failures all
-    qualify — each opens a short quiescence window in which a
-    monotonic-progress drop is physical, not a SCARE regression.
+    """Return ``[(t_fail, t_fail + _POST_FAILURE_S)]`` per failure event.
+    Branch / node / custom / line failures qualify — each opens a short
+    quiescence window in which a monotonic-progress drop is physical, not a
+    regression.
 
-    Coalition / holon-priority allocations are *not* excluded —
-    those represent the system deliberately re-allocating among
-    tiers, and silencing the aggregate-regulation drop they produce
-    would mask exactly the regret-switching the claim exists to
-    detect.  When the per-tick redistribution is small enough (as
-    with the worst-gap-only target in the L2.5 coalition), this
-    aggregate metric tolerates it; if a coalition shows up here as
-    a violation, the redistribution was large enough that it
-    deserves attention rather than a free pass.
+    Coalition / holon-priority re-allocations are *not* excluded: silencing
+    the aggregate-regulation drop they produce would mask exactly the
+    regret-switching this claim detects.  Small per-tick redistributions are
+    tolerated by the metric; a coalition flagged here redistributed enough to
+    deserve attention.
     """
     rows = _read_csv(events_path)
     windows: list[tuple[float, float]] = []
@@ -718,17 +623,12 @@ def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
 # ---------------------------------------------------------------------------
 
 
-# Settling window: the slack draw must be within budget at *steady
-# state*, not at every instant.  Every child starts at regulation=1.0
-# and the LP draws the full unconstrained import before the first MAS
-# dispatch lands (~t=0.1-0.5); that initial-dispatch transient fires a
-# ``slack_budget_violation`` the controller then clears within a
-# rebalance round.  Counting it as a failure conflated cold-start with
-# a real policy breach — the same conflation ``_check_monotonic_progress``
-# already avoids with ``_WARMUP_S``.  We judge the draw over the final
-# ``_SLACK_SETTLE_S`` seconds of the run instead: a transient spike that
-# recovers passes, a sustained over-draw (tier-1 floor or an
-# infeasibly-tight budget) still fails.
+# Settling window: the slack draw must be within budget at steady state, not
+# at every instant.  The initial-dispatch transient (LP draws full import
+# before the first MAS dispatch lands) fires a ``slack_budget_violation`` that
+# the controller clears within a rebalance round, so judge the draw over the
+# final ``_SLACK_SETTLE_S`` seconds: a recovering spike passes, a sustained
+# over-draw still fails.
 _SLACK_SETTLE_S: float = 2.0
 _SLACK_TOL: float = 0.05
 
@@ -739,26 +639,20 @@ def _check_slack_budget(
     timeseries_path: Path | None = None,
     slack_meta_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Operator slack-budget constraint must be honoured at steady
-    state.  ``SlackBudgetMonitor`` (service/slack_budget.py) polls each
-    registered slack child and records a ``slack_budget_violation``
-    event whenever ``|draw| > budget · (1 + tol)``.
+    """Operator slack-budget constraint must hold at steady state.
 
-    The recorded steady-state draw is read from ``timeseries.csv``'s
-    ``slack__<sector>__<aid>`` columns and compared against the
-    per-slack budget in ``slack_meta.json``.  Passed iff the peak draw
-    over the final :data:`_SLACK_SETTLE_S` seconds is within
-    ``budget · (1 + _SLACK_TOL)`` for every budgeted slack.  Falls back
-    to the legacy "any ``slack_budget_violation`` event" check when the
-    timeseries / slack-meta artefacts are absent (older campaigns).
+    The steady-state draw from ``timeseries.csv``'s ``slack__<sector>__<aid>``
+    columns is compared against the per-slack budget in ``slack_meta.json``.
+    Passed iff the peak draw over the final ``_SLACK_SETTLE_S`` seconds is
+    within ``budget * (1 + _SLACK_TOL)`` for every budgeted slack.  Falls back
+    to the legacy "any ``slack_budget_violation`` event" check when those
+    artefacts are absent.
 
-    Vacuously True on tasks where no slack child carries an explicit
-    budget (``slack_budget_pct`` absent; monitor never installed).
+    Vacuously True when no slack child carries an explicit budget.
 
-    Mirrors the budget claim the oracle reports from the LP itself via
-    ``compose_oracle_result`` — passing both says SCARE and oracle
-    solved the *same* operator-constrained problem and the PWSF gap is
-    the real allocation gap, not a policy violation by one side.
+    Mirrors the oracle's budget claim so passing both means SCARE and oracle
+    solved the same operator-constrained problem and the PWSF gap is a real
+    allocation gap, not a policy violation by one side.
     """
     # Always collect the event ledger for diagnostics / fallback.
     rows = _read_csv(events_path) if events_path.exists() else []
@@ -773,7 +667,7 @@ def _check_slack_budget(
 
     # --- Steady-state path (preferred) -------------------------------
     if budgets and series:
-        # Determine the settling window from the longest slack series.
+        # Settling window taken from the longest slack series.
         t_end = 0.0
         for col in budgets:
             if col in series:
@@ -860,22 +754,16 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
     or branch may breach its ``SECTOR_CONSTRAINTS`` envelope (voltage,
     pressure, junction temperature, line/transformer loading).
 
-    Reads ``constraints_final.csv`` — one row per checked variable, written by
-    ``experiment.eval.results.write_constraints_final_csv`` off the final
-    solved network (the same state the served metric is derived against).
-    Passed iff no row is flagged ``violated``.
+    Reads ``constraints_final.csv`` (one row per checked variable, off the
+    final solved network).  Passed iff no row is flagged ``violated``.
 
-    This is the grid-feasibility companion to ``slack_budget_compliance``.
-    Together they make a SCARE run "compliant" only when it honoured both the
-    operator slack budget AND the physical operating envelope the oracle LP
-    enforces by construction (``bounds_el`` / ``bounds_gas`` / ``bounds_heat``
-    + ``max_line_loading``).  Without this gate, a variant could post a higher
-    PWSF than the oracle simply by leaving voltages / temperatures / lines out
-    of bounds — feasibility the oracle is not allowed to buy — and the gap
-    would no longer be a like-for-like allocation comparison.
+    Grid-feasibility companion to ``slack_budget_compliance``: together they
+    make a run "compliant" only when it honoured both the operator slack budget
+    and the physical envelope the oracle LP enforces by construction.  Without
+    this gate a variant could post a higher PWSF by leaving voltages /
+    temperatures / lines out of bounds — feasibility the oracle cannot buy.
 
-    Vacuously True when the artefact is absent / empty (older campaigns, or a
-    grid with no checkable readings).
+    Vacuously True when the artefact is absent / empty.
     """
     if not constraints_path.exists():
         return {"passed": True, "detail": "no constraints_final.csv (claim vacuous)"}
@@ -921,7 +809,7 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
 
 
 def _load_slack_budgets(slack_meta_path: Path | None) -> dict[str, float]:
-    """Map ``slack__<sector>__<aid>`` timeseries column → budget, from
+    """Map ``slack__<sector>__<aid>`` timeseries column -> budget, from
     ``slack_meta.json``.  Skips slacks with a ``null`` budget (heat-side
     ``ExtHydrGrid`` is intentionally unbudgeted)."""
     if slack_meta_path is None or not slack_meta_path.exists():
@@ -998,27 +886,19 @@ _DISRUPTION_GRACE_S = 2.0
 
 
 def _violation_windows(events_path: Path) -> dict[str, list[tuple[float, float]]]:
-    """Open a disruption window around every event that physically or
-    operationally invalidates the monotonic-progress invariant.  Two
-    classes feed the window set:
+    """Open a disruption window around every event that invalidates the
+    monotonic-progress invariant:
 
-      * ``constraint_violation`` — a bound was breached; restoration
-        agents are mid-correction.
-      * ``line_failure`` / ``node_failure`` / ``branch_failure`` — a
-        physical disconnection; the resulting balance drop is the
-        immediate consequence of lost capacity, not an agent regression.
+      * ``constraint_violation`` — a bound was breached; agents mid-correction.
+      * ``line_failure`` / ``node_failure`` / ``branch_failure`` — a physical
+        disconnection; the balance drop is lost capacity, not a regression.
 
     Each window runs from the event timestamp for ``_DISRUPTION_GRACE_S``
-    seconds.  Earlier versions closed the window at the next event of
-    any kind, but dense holon_formed / negotiation events at the same
-    timestamp collapsed the window to zero, leaving the real failure
-    transient counted as an agent regression.  A fixed grace period is
-    coarse but robust — agents reliably finish responding to a single
-    failure within a couple of seconds on the LV grids we run.
+    seconds (a fixed grace period rather than "until next event", which dense
+    same-timestamp events would collapse to zero).
 
-    Failure events carry no sector tag, so they open a window for
-    *every* sector under key ``"*"`` — the caller treats matches under
-    that key as applying universally.
+    Failure events carry no sector tag, so they open a window for every sector
+    under key ``"*"``, which the caller treats as universal.
     """
     rows = _read_csv(events_path)
     if not rows:
@@ -1034,8 +914,7 @@ def _violation_windows(events_path: Path) -> dict[str, list[tuple[float, float]]
             continue
         t1 = t0 + _DISRUPTION_GRACE_S
         sec = r.get("sector") or ""
-        # Failure events come without a sector tag; bucket them as
-        # universal disruption windows so all three sectors honour them.
+        # Failure events come without a sector tag; bucket them as universal.
         if kind != "constraint_violation" and not sec:
             sec = "*"
         by_sec.setdefault(sec, []).append((t0, t1))

@@ -23,38 +23,37 @@
   "experiments": [
     {
       "name": "tuning",
-      "grids": ["simbench_lv_cp_heavy"],
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
       "n_seeds": 1,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {
           "community_partition_method": "label_propagation",
-          "holon_max_size": 4,
-          "hebbian_warmup_s": 4.0
+          "holon_max_size": 4
         },
         {
           "community_partition_method": "modularity",
           "community_modularity_resolution": 1.0,
-          "holon_max_size": 3,
-          "hebbian_warmup_s": 4.0
+          "holon_max_size": 3
         },
         {
           "community_partition_method": "modularity",
           "community_modularity_resolution": 1.0,
-          "holon_max_size": 6,
-          "hebbian_warmup_s": 4.0
+          "holon_max_size": 6
         },
         {
           "community_partition_method": "modularity",
           "community_modularity_resolution": 0.5,
-          "holon_max_size": 4,
-          "hebbian_warmup_s": 4.0
+          "holon_max_size": 4
         },
         {
           "community_partition_method": "modularity",
           "community_modularity_resolution": 0.5,
-          "holon_max_size": 3,
-          "hebbian_warmup_s": 4.0
+          "holon_max_size": 3
         }
       ],
       "scenarios": [

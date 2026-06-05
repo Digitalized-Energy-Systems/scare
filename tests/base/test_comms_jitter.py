@@ -1,14 +1,9 @@
 """Tests for the latency-jitter communication sim.
 
-Regression guard for the robustness_latency timeout (tasks 56-59): the
-previous implementation drew a fresh ``random.gauss`` on every read of
-``default_delay_s``, minting a unique delivery timestamp per message.
-In mango's discrete-event loop that explodes into O(messages) tiny
-steps, each running a full energyflow MISOCP re-solve — so a 10 s sim
-under 200 ms jitter never finished inside the 1500 s wall.
-
-The fix quantizes the jittered delay to a coarse grid and makes it
-deterministic per package.  These tests pin both properties.
+Pins two properties of the jittered delivery delay: it is deterministic
+per package, and it is quantized to a coarse grid so the number of
+distinct delivery timestamps stays bounded (preventing a discrete-event
+step explosion under jitter).
 """
 
 from __future__ import annotations
@@ -48,9 +43,8 @@ def test_jitter_delay_is_deterministic_per_package():
 
 
 def test_jitter_delays_are_grid_quantized():
-    """All jittered delays must land on a coarse grid so the number of
-    distinct delivery timestamps stays bounded regardless of message
-    count — this is what prevents the discrete-event step explosion."""
+    """All jittered delays land on a coarse grid, so the count of distinct
+    delivery timestamps stays bounded regardless of message count."""
     sim = _make_sim(base_delay_s=0.02, jitter_ms=200.0)
     # 500 messages from distinct senders sent at the same instant.
     msgs = [_pkg(f"s{i}", "leader", 5.0) for i in range(500)]
@@ -74,8 +68,7 @@ def test_jitter_quantum_scales_with_sigma():
 
 
 def test_no_jitter_is_noop():
-    """Both knobs zero → no perturbation sim installed (preserves the
-    default-config invariance check)."""
+    """Both knobs zero → no perturbation sim installed."""
     world = SimpleNamespace(communication_sim="sentinel")
     install_perturbation(
         world, base_delay_s=0.02, packet_loss_pct=0.0, latency_jitter_ms=0.0
@@ -84,7 +77,7 @@ def test_no_jitter_is_noop():
 
 
 def test_packet_loss_preserved_with_jitter():
-    """Jitter carrier must still honour packet loss (audit P1-3)."""
+    """Jitter carrier must still honour packet loss."""
     sim = _make_sim(jitter_ms=200.0, loss_pct=100.0)
     msgs = [_pkg("a", "b", 1.0)]
     res = sim.calculate_communication(1.0, msgs).package_results[0]

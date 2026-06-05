@@ -1,12 +1,10 @@
-"""Scenario test: full multi-energy restoration with real monee network.
+"""Scenario test: full multi-energy restoration with a real monee network.
 
-This test exercises the entire pipeline: world creation, failure injection,
-gossip-based negotiation, constraint monitoring, and generation control.
-It verifies that the system responds to failures — not that it perfectly
-resolves them (that depends on convergence tuning and network topology).
+Exercises the whole pipeline (world creation, failure injection, gossip
+negotiation, constraint monitoring, generation control) and checks the
+system runs and responds to failures — not that it perfectly resolves them.
 
-The GEKKO solver is stubbed out so these tests don't require a numerical
-solver installation.
+GEKKO is stubbed out so no numerical solver install is required.
 """
 
 import pytest
@@ -41,7 +39,7 @@ def _stub_energyflow(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 async def test_restoration_scenario_runs_without_error():
-    """Full scenario: create world, inject failure, run 10s of simulation."""
+    """Create world, inject a failure, run 10 s of simulation to completion."""
     net = fetch_example_net()
 
     world = create_restoration_scenario_world(
@@ -51,17 +49,15 @@ async def test_restoration_scenario_runs_without_error():
     failures = create_failures(net, "branch", num_failures=1, delay_s_max=1.0)
     assert len(failures) >= 1
 
-    # The main check: the simulation runs to completion without raising
     await start_restoration_simulation(world, failures, simulation_duration_s=10.0)
 
-    # Basic sanity: world clock advanced
     assert world.clock.time > 0
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 async def test_restoration_scenario_has_recordings():
-    """After simulation, world should contain recording data."""
+    """Simulation accumulates agent recording data."""
     net = fetch_example_net()
 
     world = create_restoration_scenario_world(
@@ -71,5 +67,4 @@ async def test_restoration_scenario_has_recordings():
     failures = create_failures(net, "branch", num_failures=1, delay_s_max=0.5)
     await start_restoration_simulation(world, failures, simulation_duration_s=5.0)
 
-    # The world should have accumulated some agent recording data
     assert len(world.data_agent_collections) > 0

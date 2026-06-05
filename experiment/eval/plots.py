@@ -1,18 +1,10 @@
-"""Plotly-based plot primitives for the dissertation evaluation.
+"""Plotly plot primitives for the evaluation.
 
 Each function takes a slice of the summary DataFrame (or a per-task
-artefact) and writes one figure to disk in two formats:
-
-- ``<name>.html`` — interactive Plotly figure for exploration.
-- ``<name>.pdf``  — vector static image for inclusion in chapters.
-
-Style is consistent across all figures via the ``_apply_theme`` helper:
-serif title, sans-serif body, light gridlines, scientific colour
-palette, no chart junk.  Variants get fixed colours so the eye learns
-them across the report.
-
-Each primitive returns the *base* path stem (``out_path`` without a
-suffix) so the caller can reference both the .html and .pdf alongside.
+artefact) and writes one figure as ``<name>.html`` (interactive) and
+``<name>.pdf`` (vector, for chapter inclusion). Style is shared via
+``_apply_theme``; variants get fixed colours for cross-figure consistency.
+Returns the base path stem (``out_path`` without suffix).
 """
 
 from __future__ import annotations
@@ -32,12 +24,11 @@ from plotly.subplots import make_subplots
 # ---------------------------------------------------------------------------
 
 
-# Variant palette — picked for a) good contrast on white, b) print-friendly,
-# c) consistent meaning across every figure that splits by variant.
+# Variant palette — fixed colour per variant across every figure.
 _VARIANT_COLOR = {
     "oracle": "#2E7D32",            # green — upper bound
-    "scare": "#1F4E96",             # deep blue — the protagonist
-    "single_level": "#E07A1F",      # warm orange — the strawman
+    "scare": "#1F4E96",             # deep blue
+    "single_level": "#E07A1F",      # warm orange — baseline
     "component_level": "#9467BD",   # purple — component-scoped variant
 }
 
@@ -48,7 +39,7 @@ _SECTOR_COLOR = {
     "heat": "#D62728",
 }
 
-# Qualitative palette for ablations / sweeps / scenarios — colour-blind safe.
+# Qualitative palette for ablations / sweeps / scenarios — colourblind-safe.
 _QUAL_PALETTE = [
     "#1F4E96", "#2E7D32", "#E07A1F", "#9467BD", "#8C564B",
     "#17BECF", "#BCBD22", "#7F7F7F", "#E377C2", "#AEC7E8",
@@ -57,16 +48,11 @@ _QUAL_PALETTE = [
 _FONT_FAMILY = "Inter, -apple-system, Segoe UI, Roboto, sans-serif"
 _TITLE_FONT_FAMILY = "Charter, Georgia, 'Times New Roman', serif"
 
-# Figure dimensions tuned to match the dissertation's resilience-chapter
-# bar/line style: full-width landscape figures with generous label
-# breathing room.  The reference page (``Figures/resilience/pooled_srs``)
-# uses ~1500×600 pixel renders at \linewidth; we mirror that aspect so
-# the SCARE chapter reads as one continuous style.
+# Full-width landscape figures with generous label breathing room.
 _FIG_WIDTH = 1000
 _FIG_HEIGHT = 440
 
-# Font sizing — bumped up to read at full-width PDF without further
-# scaling; the dissertation's bar plots inline at ~14–18 pt printed.
+# Font sizes tuned to read at full-width PDF without further scaling.
 _BASE_FONT_SIZE = 17
 _TITLE_FONT_SIZE = 22
 _AXIS_TITLE_FONT_SIZE = 18
@@ -78,10 +64,8 @@ _GRID_COLOR = "#ECECEC"
 _AXIS_COLOR = "#1A1A1A"
 _MUTED_COLOR = "#666666"
 
-# Axis style — dissertation reference shows horizontal gridlines only
-# (no vertical grid, no enclosing box).  ``showline=False`` removes the
-# axis spine; the ticks and labels are enough.  X-axis is overridden
-# below to hide grid lines entirely.
+# Horizontal gridlines only, no axis spine or enclosing box. X-axis
+# overrides below to hide grid lines entirely.
 _AXIS_STYLE = dict(
     gridcolor=_GRID_COLOR,
     gridwidth=0.8,
@@ -104,8 +88,7 @@ _DEFAULT_LAYOUT = dict(
     width=_FIG_WIDTH,
     height=_FIG_HEIGHT,
     font=dict(family=_FONT_FAMILY, size=_BASE_FONT_SIZE, color=_AXIS_COLOR),
-    # Centered title — matches dissertation/pooled_srs reference where
-    # the title is the most prominent text on the page.
+    # Centered title.
     title=dict(
         font=dict(family=_TITLE_FONT_FAMILY, size=_TITLE_FONT_SIZE, color=_AXIS_COLOR),
         x=0.5,
@@ -117,9 +100,7 @@ _DEFAULT_LAYOUT = dict(
     paper_bgcolor="white",
     plot_bgcolor="white",
     margin=dict(l=84, r=160, t=72, b=72),
-    # Legend on the right (vertical) — same as the dissertation
-    # reference; lets bar/line plots use the full plot area without
-    # the bottom-stacked horizontal legend stealing vertical room.
+    # Vertical legend on the right — keeps the full plot area for the data.
     legend=dict(
         bgcolor="rgba(255,255,255,0)",
         bordercolor="rgba(0,0,0,0)",
@@ -140,8 +121,7 @@ _DEFAULT_LAYOUT = dict(
         bordercolor=_AXIS_COLOR,
         font=dict(family=_FONT_FAMILY, size=13),
     ),
-    # Solid bar fills without the white separator stroke — dissertation
-    # reference treats bars as continuous coloured blocks.
+    # Solid bar fills, no white separator stroke.
     bargap=0.2,
     bargroupgap=0.06,
 )
@@ -155,10 +135,8 @@ def _apply_theme(
     width: int = _FIG_WIDTH,
     font_bump: int = 0,
 ) -> go.Figure:
-    """Apply the shared figure theme.  ``font_bump`` adds the same delta
-    (in pt) to every text element — used by figures that ship as large
-    panels in the dissertation and need larger labels than the default
-    column-width-sized defaults.
+    """Apply the shared figure theme. ``font_bump`` adds the same delta
+    (pt) to every text element, for figures shown as large panels.
     """
     fig.update_layout(_DEFAULT_LAYOUT)
     fig.update_layout(
@@ -218,8 +196,8 @@ def _save(fig: go.Figure, out_path: Path) -> Path:
     try:
         fig.write_image(pdf_path, format="pdf")
     except Exception:
-        # Kaleido failure shouldn't kill the whole report — HTML is
-        # the canonical format; PDF is for static inclusion only.
+        # PDF is for static inclusion only; HTML is canonical, so a
+        # Kaleido failure shouldn't kill the report.
         pass
     return out_path
 
@@ -256,25 +234,21 @@ def _empty_fig(message: str, title: str) -> go.Figure:
     return _apply_theme(fig, title=title)
 
 
-# Compliance columns.  Plots that aggregate PWSF must restrict to the
-# compliant subset, otherwise a variant that violates the operator slack
-# budget (drawing slack past the allowed envelope) OR leaves the grid out of
-# bounds (crediting load served through an overloaded line / at an infeasible
-# voltage / temperature) is rewarded for inflated served MW that the
-# constraint-respecting oracle cannot match.  A run is compliant only when it
-# passes BOTH.  Mirrors the aggregator's ``_compliant_split`` in
-# ``experiment/hpc/aggregate.py``.
+# Compliance columns. PWSF aggregates must restrict to the compliant
+# subset: a variant violating the slack budget or leaving the grid out
+# of bounds otherwise gets credited inflated served MW the oracle can't
+# match. Compliant ⇔ passes BOTH. Mirrors the aggregator's
+# ``_compliant_split`` in ``experiment/hpc/aggregate.py``.
 _SLACK_COMPLIANCE_COL = "claims__slack_budget_compliance__passed"
 _CONSTRAINT_COMPLIANCE_COL = "claims__constraint_compliance__passed"
 _COMPLIANCE_COLS = (_SLACK_COMPLIANCE_COL, _CONSTRAINT_COMPLIANCE_COL)
 
 
 def _compliant_mask(df: pd.DataFrame) -> pd.Series:
-    """Return a boolean Series aligned with ``df.index`` selecting
-    compliant rows (passing every available compliance claim).  Treats
-    missing per-row compliance data as failure (better to drop than reward
-    unverifiable rows).  Returns an all-True mask when the campaign has no
-    compliance column at all (back-compat for runs predating the claims).
+    """Boolean Series over ``df.index`` selecting rows passing every
+    available compliance claim. Missing per-row data counts as failure
+    (drop rather than reward unverifiable rows). All-True when no
+    compliance column is present at all.
     """
     present = [c for c in _COMPLIANCE_COLS if c in df.columns]
     if not present:
@@ -286,9 +260,8 @@ def _compliant_mask(df: pd.DataFrame) -> pd.Series:
 
 
 def _compliance_rate(df: pd.DataFrame) -> float | None:
-    """Fraction of rows in ``df`` that pass *all* compliance claims.
-    ``None`` when no compliance column is present (so callers can
-    suppress the annotation rather than print a fictional 100 %).
+    """Fraction of rows passing all compliance claims. ``None`` when no
+    compliance column is present, so callers can suppress the annotation.
     """
     present = [c for c in _COMPLIANCE_COLS if c in df.columns]
     if not present or df.empty:
@@ -297,9 +270,8 @@ def _compliance_rate(df: pd.DataFrame) -> float | None:
 
 
 def _compliance_subtitle(rate: float | None, n_compliant: int, n_total: int) -> str:
-    """Build the ``"compliant runs: M/N (X%)"`` subtitle line for
-    plots that aggregate over the compliant subset.  Empty when the
-    campaign predates the compliance column (rate is None)."""
+    """Build the ``"compliant runs: M/N (X%)"`` subtitle line. Empty
+    when rate is None (no compliance column)."""
     if rate is None:
         return ""
     if n_total == 0:
@@ -321,10 +293,8 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r}, {g}, {b}, {alpha:.2f})"
 
 
-# Display-only alias helpers.  The plot pipeline routes every grid /
-# scenario / variant string through these so the canonical long names
-# in summary.csv stay machine-readable while the figures show the
-# short labels defined in ``experiment/configs/display_aliases.json``.
+# Display-only alias helpers: map canonical summary.csv names to the
+# short figure labels in ``experiment/configs/display_aliases.json``.
 from experiment.eval.aliases import (  # noqa: E402
     alias_experiment,
     alias_grid,
@@ -356,12 +326,8 @@ def variant_comparison_bar(
     if df.empty or metric_col not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
 
-    # Restrict the PWSF mean to slack-budget-compliant rows.  See
-    # ``_compliant_mask`` for rationale: a variant violating the
-    # budget gets inflated served MW because the LP draws slack past
-    # the operator envelope, masking the priority-shedding quality
-    # we actually want to compare.  Compliance rate is reported as
-    # a per-(grid, variant) hover field + an overall subtitle.
+    # Restrict the PWSF mean to compliant rows (see ``_compliant_mask``).
+    # Compliance rate is reported per-(grid, variant) in hover + subtitle.
     compliant = df[_compliant_mask(df)]
     grouped_c = compliant.groupby(["grid", "variant"])[metric_col].apply(list)
     # Full counts so the hover can report ``n_compliant/n_total``.
@@ -426,11 +392,9 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
-    # Restrict the pair to rows where BOTH variants pass the slack-
-    # budget claim.  Otherwise an over-drawing scare run plotted
-    # against a compliant oracle reports a misleading "negative gap"
-    # (scare > oracle) that comes from scare violating the budget,
-    # not from genuinely outperforming the LP.
+    # Keep only rows where both variants are compliant — else an
+    # over-drawing scare reports a misleading "negative gap" against a
+    # compliant oracle.
     df = df[_compliant_mask(df)]
     pivot = df.pivot_table(index=["grid", "seed"], columns="variant", values=metric)
     if "scare" not in pivot.columns or "oracle" not in pivot.columns:
@@ -495,7 +459,7 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
-    # Same compliance filter as the scatter — see ``optimality_gap_scatter``.
+    # Same compliance filter as ``optimality_gap_scatter``.
     df = df[_compliant_mask(df)]
     pivot = df.pivot_table(index=["grid", "seed"], columns="variant", values=metric)
     if "scare" not in pivot.columns or "oracle" not in pivot.columns:
@@ -541,9 +505,8 @@ def ablation_impact_bar(df: pd.DataFrame, out_path: Path) -> Path:
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
-    # Per-ablation compliance counts before filtering, so the hover
-    # can show ``n_compliant/n_total`` and the reader can spot an
-    # ablation where the flag actively breaks budget compliance.
+    # Pre-filter counts so the hover can show ``n_compliant/n_total``
+    # and flag ablations that break budget compliance.
     full_counts = df.groupby("ablation").size()
     df_c = df[_compliant_mask(df)]
     grouped = df_c.groupby("ablation")[metric].agg(mean="mean", count="count", std="std")
@@ -616,10 +579,9 @@ def robustness_curve(
     if parsed.empty:
         return _save(_empty_fig(f"no {sweep_param} sweep", title), out_path)
 
-    # Per-sweep-point compliance + PWSF on compliant subset.  A sweep
-    # value that pushes the variant out of compliance (e.g. very tight
-    # ``slack_budget_pct``) should still show its compliance rate even
-    # when the mean PWSF column is empty.
+    # PWSF over the compliant subset, per sweep point. A sweep value
+    # that pushes the variant out of compliance still shows its
+    # compliance rate even when its mean PWSF is empty.
     full_counts = parsed.groupby("x").size()
     parsed_c = parsed[_compliant_mask(parsed)]
     grouped = parsed_c.groupby("x")[metric].agg(["mean", "std", "count"])
@@ -634,7 +596,7 @@ def robustness_curve(
     lower = (grouped["mean"] - grouped["ci"]).tolist()
 
     fig = go.Figure()
-    # CI ribbon — fill between upper and lower with a transparent band.
+    # CI ribbon.
     fig.add_trace(go.Scatter(
         x=x + x[::-1],
         y=upper + lower[::-1],
@@ -694,11 +656,8 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
     if df.empty or metric not in df.columns or "n_failures" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
 
-    # Per-failure-count compliance: higher n_failures pushes the
-    # variant toward deficit where the budget is harder to honor.
-    # The curve should plot PWSF over the compliant subset so the
-    # cliff at high n_failures reflects "lost compliance" rather
-    # than "scare got generous with the slack budget".
+    # PWSF over the compliant subset per failure count, so the cliff at
+    # high n_failures reflects lost compliance, not slack overdraw.
     full_counts = df.groupby("n_failures").size()
     df_c = df[_compliant_mask(df)]
     grouped = df_c.groupby("n_failures")[metric].agg(["mean", "std", "count"])
@@ -769,8 +728,8 @@ def sweep_curve_dual(
     if parsed.empty:
         return _save(_empty_fig(f"no {sweep_param} sweep", title), out_path)
 
-    # Compliant subset for the served axis; wallclock axis uses all
-    # rows (timing is a system property, not a metric-validity property).
+    # Served axis uses the compliant subset; wallclock axis uses all
+    # rows (timing is a system property, not metric-validity).
     parsed_c = parsed[_compliant_mask(parsed)]
     if parsed_c.empty:
         return _save(_empty_fig(f"no compliant {sweep_param} rows", title), out_path)
@@ -812,7 +771,7 @@ def sweep_curve_dual(
     if rate is not None:
         n_c_total = int(_compliant_mask(parsed).sum())
         title = f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(parsed))}"
-        # Re-apply title (theme override) so the updated subtitle shows.
+        # Re-apply so the updated subtitle shows.
         fig.update_layout(title=dict(text=title))
     return _save(_apply_theme(fig, title=title), out_path)
 
@@ -882,7 +841,7 @@ def restoration_trajectory(
                 hovertemplate=f"<b>{sec}</b><br>t: %{{x:.2f}}s<br>balance: %{{y:.4f}}<extra></extra>",
             ))
 
-    # Event markers — distinct shapes / colours so they read at a glance.
+    # Event markers — distinct colours/dashes per kind.
     if not events.empty and {"t", "kind"}.issubset(events.columns):
         event_styles = {
             "line_failure": dict(color="#1A1A1A", dash="dash"),
@@ -901,7 +860,7 @@ def restoration_trajectory(
                     line=dict(color=style["color"], dash=style["dash"], width=1),
                     opacity=0.7,
                 )
-            # Add a sentinel scatter so it appears in the legend.
+            # Sentinel scatter so the kind appears in the legend.
             fig.add_trace(go.Scatter(
                 x=[None], y=[None],
                 mode="lines",
@@ -983,15 +942,11 @@ def restoration_vs_baseline_bar(
     *,
     title: str = "Absolute restoration vs no-failure baseline",
 ) -> Path:
-    """Per-grid grouped bars: pre-failure served (baseline) vs
-    post-restoration served, in raw MW (unweighted).  Overlay shows
-    PWSF (priority-weighted) so the reader can compare *absolute load
-    actually lost* against the priority-weighted view.
-
-    Reads ``outcomes__restoration__total_served_baseline_mw`` and
-    ``outcomes__restoration__total_served_post_mw``.  Falls back to an
-    empty figure if the baseline columns are missing (campaigns that
-    pre-date the restoration metric).
+    """Per-grid grouped bars: pre-failure (baseline) vs post-restoration
+    served, in raw MW (unweighted). PWSF ratio overlaid so absolute loss
+    can be compared against the priority-weighted view. Reads the
+    ``total_served_baseline_mw`` / ``total_served_post_mw`` columns;
+    empty figure if absent.
     """
     base_col = "outcomes__restoration__total_served_baseline_mw"
     post_col = "outcomes__restoration__total_served_post_mw"
@@ -1072,10 +1027,9 @@ def restoration_by_tier_bar(
     *,
     title: str = "Per-tier restoration ratio (post / baseline served, MW)",
 ) -> Path:
-    """Grouped bars per grid × tier showing how much of each tier's
-    pre-failure served load survived restoration.  Tier 1 = most
-    critical; if it doesn't sit close to 1.0 the protocol is failing
-    on the loads that matter most.
+    """Grouped bars per grid × tier: fraction of each tier's pre-failure
+    served load that survived restoration. Tier 1 (most critical) sitting
+    below 1.0 means the protocol is failing the loads that matter most.
     """
     if df.empty or "variant" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
@@ -1105,7 +1059,7 @@ def restoration_by_tier_bar(
     fig = go.Figure()
     for tier in tiers:
         col = tier_cols[tier]
-        # Tier 1 = brightest red (critical); fade towards grey for low priority.
+        # Tier 1 brightest red, fading toward grey for low priority.
         intensity = max(0.15, 1.0 - 0.13 * max(0, tier - 1))
         color = f"rgba(214, 39, 40, {intensity:.2f})" if tier <= 3 else _QUAL_PALETTE[tier % len(_QUAL_PALETTE)]
         fig.add_trace(go.Bar(
@@ -1129,27 +1083,22 @@ def restoration_loss_split_by_tier_bar(
     *,
     title: str = "Per-tier loss split: physical disconnect vs agent-shed (MW)",
 ) -> Path:
-    """Stacked bars per tier showing the *attribution* of each tier's
-    restoration loss:
+    """Stacked bars per tier attributing each tier's restoration loss:
 
     - ``disconnect_lost`` (priority-blind): demand whose node had no
-      active path to a grid-forming source.  Physics decides; the
-      agents cannot save it regardless of priority.
-    - ``agent_shed`` (priority-aware): load the QP / ADMM layers chose
-      to drop.  This is the only contribution the priority weighting
-      actually controls.
+      active path to a grid-forming source — physics, unsavable by agents.
+    - ``agent_shed`` (priority-aware): load the QP / ADMM layers chose to
+      drop — the only contribution priority weighting controls.
 
-    The chapter's "tier 1 protected, tier 10 sheds first" claim
-    applies to the *agent_shed* component only.  Plotting both
-    contributions side-by-side makes that clear: if tier 1's bar is
-    dominated by ``disconnect_lost`` it is *not* a failure of the
-    priority machinery, just a failure of the physical topology.
+    The "tier 1 protected, tier 10 sheds first" claim applies to
+    ``agent_shed`` only: a tier-1 bar dominated by ``disconnect_lost`` is
+    a topology limit, not a priority-machinery failure.
     """
     if df.empty or "variant" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
     sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
 
-    # Discover tiers by inspecting per-tier disconnect / agent columns.
+    # Discover tiers from the per-tier disconnect columns.
     disc_pat = "outcomes__restoration__by_tier__"
     disc_suf = "__disconnect_lost_mw"
     agt_suf  = "__agent_shed_mw"
@@ -1214,12 +1163,10 @@ def agent_only_ratio_by_tier_bar(
     *,
     title: str = "Per-tier restoration ratio (agent-shed only — disconnect excluded)",
 ) -> Path:
-    """Per-tier waterfall using ``agent_only_ratio`` — the share of
-    demand each tier kept *after removing physically disconnected
-    load* from the denominator.  This isolates the priority signal
-    from the topology noise: if the chapter's claim holds, tier 1
-    should sit near 1.0 across grids and the curve should slope down
-    monotonically to tier 10.
+    """Per-tier bars of ``agent_only_ratio`` — the share each tier kept
+    after removing physically-disconnected load from the denominator.
+    Isolates the priority signal from topology noise: if the claim holds,
+    tier 1 sits near 1.0 and the curve slopes down monotonically.
     """
     if df.empty or "variant" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
@@ -1274,12 +1221,10 @@ def restoration_ratio_by_variant_bar(
     *,
     title: str = "Raw restoration ratio (post / baseline) by grid × variant",
 ) -> Path:
-    """Per-grid grouped bars comparing scare / single_level / oracle on
-    raw_restoration_ratio.  This is the missing direct comparison —
-    ``restoration_vs_baseline_bar`` only plots one variant at a time;
-    ``optimality_gap_scatter`` only shows scare vs oracle.  Here the
-    reader sees how each variant performs against the no-failure
-    baseline across every grid in one figure.
+    """Per-grid grouped bars comparing every variant on
+    raw_restoration_ratio against the no-failure baseline, in one figure
+    (``restoration_vs_baseline_bar`` plots one variant;
+    ``optimality_gap_scatter`` only scare vs oracle).
     """
     col = "outcomes__restoration__raw_restoration_ratio"
     if df.empty or col not in df.columns or "variant" not in df.columns:
@@ -1322,11 +1267,9 @@ def absolute_load_lost_bar(
     *,
     title: str = "Absolute load lost despite restoration (MW, unweighted)",
 ) -> Path:
-    """Per-grid view of ``absolute_load_dropped_mw`` — how much served
-    load was lost relative to the no-failure baseline.  Complements the
-    PWSF view by showing the *unweighted* shortfall, so the reader can
-    tell whether high PWSF is hiding a sizeable absolute loss on
-    low-priority loads.
+    """Per-grid ``absolute_load_dropped_mw`` — served load lost vs the
+    no-failure baseline. The unweighted shortfall shows whether a high
+    PWSF hides a large absolute loss on low-priority loads.
     """
     col = "outcomes__restoration__absolute_load_dropped_mw"
     base_col = "outcomes__restoration__total_served_baseline_mw"
@@ -1392,9 +1335,8 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
     if df.empty or not cols:
         return _save(_empty_fig("no diary data", title), out_path)
 
-    # Oracle is a snapshot LP solve — it does not run the negotiation
-    # protocol, so every diary counter is zero by construction.  Showing
-    # it would draw an empty stack that just crowds the x-axis.
+    # Oracle is a snapshot LP solve with no negotiation, so every diary
+    # counter is zero — drop it to avoid an empty stack.
     if "variant" in df.columns:
         df = df[df["variant"] != "oracle"]
     if df.empty:
@@ -1431,18 +1373,10 @@ def time_to_stabilise_box(
     *,
     title: str = "Time to stabilise by variant",
 ) -> Path:
-    """Box-plot of ``outcomes.time_to_stabilise_s`` per variant.
-
-    The metric is the simulation time it took the system to reach a
-    steady-state after the failure (NaN for runs that never stabilised
-    — we drop those, the box-plot only reflects successful tasks).
-    Reviewers ask for "restoration time" first; this is it.
-
-    Oracle is excluded: it does a single snapshot solve and has no
-    temporal dynamics, so the result schema hard-codes
-    ``time_to_stabilise_s = 0.0`` for every oracle task.  Including it
-    would draw a degenerate strip at y=0 that just visually crushes the
-    scare / single_level distributions.
+    """Box-plot of ``outcomes.time_to_stabilise_s`` per variant — sim
+    time to reach steady-state after the failure. NaN (never stabilised)
+    rows are dropped. Oracle is excluded: its snapshot solve hard-codes
+    the metric to 0.0, which would crush the other distributions at y=0.
     """
     col = "outcomes__time_to_stabilise_s"
     if df.empty or col not in df.columns:
@@ -1490,13 +1424,10 @@ def solver_health_bar(
     *,
     title: str = "Solver health by variant",
 ) -> Path:
-    """Per-variant stacked bars of mean solver-failure counts per task.
-
-    Splits the count into ``solver_infeasibilities`` (LP infeasibilities
-    — the symptom of the energy-flow degeneracy after a branch failure)
-    and ``solver_warnings`` (non-OK terminations like gap / time
-    limit).  ``solver_failures`` is the union; we plot the components
-    so a regression in either pathway is visible.
+    """Per-variant stacked bars of mean solver-failure counts per task,
+    split into ``solver_infeasibilities`` (LP infeasibilities) and
+    ``solver_warnings`` (non-OK terminations like gap / time limit).
+    Plotting the components surfaces a regression in either pathway.
     """
     inf_col = "solver_infeasibilities"
     warn_col = "solver_warnings"
@@ -1554,10 +1485,9 @@ def solver_health_bar(
 # ---------------------------------------------------------------------------
 
 
-# Human-readable label + colour per reason.  Drawn from the
-# ``record_regulate(... reason=...)`` call sites in ``scare/service/*.py``;
-# unknown reasons that the dynamic discovery picks up are still plotted,
-# coloured from the qualitative palette as a fallback.
+# Label + colour per regulate reason (from the ``record_regulate(reason=)``
+# call sites in ``scare/service/*.py``). Unknown reasons fall back to the
+# qualitative palette.
 _REGULATE_REASON_LABELS: dict[str, tuple[str, str]] = {
     # Balance / gossip layer
     "balance":               ("balance gossip",        "#1F4E96"),
@@ -1583,25 +1513,17 @@ def regulates_by_reason_bar(
     title: str = "Regulation actions by trigger (per variant)",
 ) -> Path:
     """Stacked bar of mean ``outcomes.regulates_by_reason`` counts per
-    variant.  Answers "did each layer actually fire?" for ablations —
-    a variant that disables the holonic ADMM should show zero
-    ``holon_*`` actions, a variant with the local-generation fallback
-    turned off should show zero ``local_gen_fallback``, etc.
-
-    Discovers reasons *dynamically* from the column set so newly-added
-    triggers in ``scare/service/*.py`` show up without the plot having
-    to be edited.  Reasons not in ``_REGULATE_REASON_LABELS`` get a
-    fallback colour from the qualitative palette and the raw key as
-    label.
+    variant — "did each layer actually fire?". An ablation that disables
+    the holonic ADMM should show zero ``holon_*`` actions, etc. Reasons
+    are discovered dynamically from the columns; unknown ones use the raw
+    key and a fallback colour.
     """
     prefix = "outcomes__regulates_by_reason__"
     reason_keys = sorted({c[len(prefix):] for c in df.columns if c.startswith(prefix)})
     if df.empty or not reason_keys:
         return _save(_empty_fig("no regulates_by_reason columns", title), out_path)
     sub = df.dropna(subset=["variant"]).copy()
-    # Oracle is a snapshot LP solve — it never fires the regulate path,
-    # so its bar is empty by construction.  Drop it so the remaining
-    # variants get full horizontal real estate.
+    # Oracle never fires the regulate path — drop its empty bar.
     sub = sub[sub["variant"] != "oracle"]
     if sub.empty:
         return _save(_empty_fig("no non-oracle rows with a variant", title), out_path)
@@ -1651,11 +1573,10 @@ def restoration_by_sector_bar(
     *,
     title: str = "Per-sector restoration ratio (post / baseline served, MW)",
 ) -> Path:
-    """Mirror of :func:`restoration_by_tier_bar` along the sector axis:
-    one bar per (grid × sector) showing how much of each carrier's
-    pre-failure served load survived restoration.  Reads the
-    ``outcomes__restoration__by_sector__<sector>__ratio`` columns the
-    aggregator already flattens.
+    """:func:`restoration_by_tier_bar` along the sector axis: one bar per
+    (grid × sector) showing each carrier's pre-failure served load that
+    survived restoration. Reads the
+    ``outcomes__restoration__by_sector__<sector>__ratio`` columns.
     """
     if df.empty or "variant" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
@@ -1706,18 +1627,15 @@ def restoration_by_sector_bar(
 # ---------------------------------------------------------------------------
 
 
-# Operating envelopes — pulled from scare's authoritative
-# ``SECTOR_CONSTRAINTS`` so the band the plot shades matches the
-# bounds the ``GridConstraintMonitor`` actually fires on.  Lazy import
-# keeps this module importable from environments without the scare
-# package on PYTHONPATH; if the import fails we fall back to the
-# widest envelope the LP would accept so the band is informative even
-# when scare is unavailable.
+# Operating envelopes from scare's ``SECTOR_CONSTRAINTS`` so the shaded
+# band matches the bounds ``GridConstraintMonitor`` fires on. Lazy import
+# keeps this module usable without scare on PYTHONPATH; on failure, fall
+# back to the relaxed LP bounds.
 def _sector_envelope_bounds() -> dict[str, tuple[float, float]]:
     try:
         from scare.base.model import SECTOR_CONSTRAINTS, Sector
     except Exception:  # pragma: no cover — only on import-path issues
-        # Fallback — relaxed LP bounds (see monee.solve_load_shedding_*).
+        # Relaxed LP bounds (see monee.solve_load_shedding_*).
         return {
             "avg_vm_pu":       (0.90, 1.10),
             "avg_pressure_pu": (0.90, 1.10),
@@ -1730,19 +1648,15 @@ def _sector_envelope_bounds() -> dict[str, tuple[float, float]]:
     }
 
 
-# Operating-envelope visuals.  The envelope band is drawn per row in
-# the sector colour at a low alpha so the data series stay legible on
-# top.  The unified legend entry is neutral grey (one entry covers all
-# three sectors) — visualised via a square marker swatch tinted with
-# the same low-alpha grey.
+# Envelope band drawn per row in low-alpha sector colour; the single
+# legend entry is neutral grey (covers all three sectors).
 _ENVELOPE_GRAY = "#7F7F7F"
 _ENVELOPE_FILL_ALPHA = 0.10
 _ENVELOPE_FILL_RGBA = "rgba(127, 127, 127, 0.18)"
 _SPREAD_FILL_ALPHA = 0.20
 
-# Dash styles for avg / min / max — chosen so they remain distinguishable
-# in greyscale and to colour-blind readers (different stroke patterns
-# beat colour for binary discrimination).
+# Dash styles for avg / min / max — distinguishable in greyscale and
+# for colourblind readers.
 _AVG_DASH = "solid"
 _MIN_DASH = "longdash"
 _MAX_DASH = "dashdot"
@@ -1751,20 +1665,16 @@ _MAX_DASH = "dashdot"
 def _stale_data_segment(
     timeseries: pd.DataFrame,
 ) -> tuple[float | None, int]:
-    """Return ``(stale_from_t, solver_failures)`` derived from the
+    """Return ``(stale_from_t, repeated_samples)`` from the
     ``last_feasible_solve_t`` column.
 
-    The mango-energy-environments behavior keeps the previous
-    ``_net_results`` whenever an energyflow recompute returns infeasible
-    (see ``_accept_or_keep``).  As a side effect every observation-based
-    metric (avg_vm_pu, *_balance, …) silently freezes at the last-
-    feasible state.  Scenario builder records ``last_feasible_solve_t``
-    as the wallclock of the most recent successful refresh; anything
-    past that timestamp is the same stale snapshot repeated.  The
-    return value is the earliest ``time_s`` after which the rows are
-    stale (``None`` when the column is absent or the whole trace is
-    fresh), plus a coarse count of repeated-state samples that doubles
-    as a "solver failures" proxy when ``result.json`` is not in scope.
+    When an energyflow recompute returns infeasible the previous
+    ``_net_results`` is kept, so every observation-based metric freezes
+    at the last-feasible state. ``last_feasible_solve_t`` is the most
+    recent successful refresh; rows past it repeat that snapshot.
+    ``stale_from_t`` is the earliest such ``time_s`` (``None`` when the
+    column is absent or the trace is fresh); the count of repeated
+    samples doubles as a solver-failure proxy.
     """
     if "last_feasible_solve_t" not in timeseries.columns:
         return None, 0
@@ -1790,53 +1700,27 @@ def constraint_envelope_trajectory(
     failure_t: float | None = None,
     solver_failures: int | None = None,
 ) -> Path:
-    """Trajectory of voltage / pressure / temperature with the operating
-    envelopes shaded.  Three stacked sub-plots, one per sector; missing
-    sectors are skipped (so a single-sector grid just shows one row).
+    """Voltage / pressure / temperature trajectories with operating
+    envelopes shaded. One stacked subplot per sector; missing sectors
+    are skipped.
 
-    Each sector panel draws four data series:
+    Each sector panel draws four series: average (solid, node mean), min
+    (long-dash), max (dash-dot), and the min–max node spread (translucent
+    fill). The envelope is a sector-tinted band with dotted boundaries;
+    the legend folds all sectors into one neutral-grey "constraint
+    envelope" entry, and min/max/avg/spread are legended once each.
+    Failure / reconfiguration events are vertical guides on every row.
 
-    * **average** (solid sector colour) — population mean across the
-      sector's nodes.
-    * **minimum** (long-dash sector colour) — the node that's closest
-      to (or below) the lower envelope.
-    * **maximum** (dash-dot sector colour) — the node that's closest
-      to (or above) the upper envelope.
-    * **min–max spread** (translucent sector-colour fill) — the
-      population band between min and max; a glance tells you whether
-      the average hides a tail.
-
-    The operating envelope is drawn as a sector-tinted shaded band
-    bounded by dotted lines in the sector colour.  Because the same
-    envelope concept repeats per sector with a different colour, the
-    legend folds all three into a single neutral-grey "constraint
-    envelope" entry — colour identity already lives in the subplot
-    title and the line palette.  ``min`` / ``max`` / ``avg`` / spread
-    are likewise legended once each.  Distinct dash patterns keep
-    avg / min / max distinguishable in greyscale and for colour-blind
-    readers.
-
-    Failure / reconfiguration events are marked as vertical guides on
-    every row so the reader can read causality against the failure.
-
-    **Stale-data handling.**  When the energyflow recompute returns
-    infeasible the underlying mango-energy-environments behavior keeps
-    the previous ``_net_results`` so every observation-based metric
-    (avg/min/max) silently freezes at the last-feasible state.
-    Recording ``last_feasible_solve_t`` lets us mark the post-failure
-    region.  Crucially: lfs lagging behind ``time_s`` alone is NOT
-    proof of staleness — the recording tick can simply be finer than
-    the solve schedule, in which case the unchanged observations are
-    legitimately current.  We therefore mark a stretch as stale ONLY
-    when ``solver_failures > 0`` (real infeasibilities reported by the
-    runner).  Old runs that pre-date ``solver_failures`` get a
-    fall-back lfs-based detection.
+    Stale-data handling: an infeasible energyflow recompute freezes every
+    observation-based metric at the last-feasible state. lfs lagging
+    ``time_s`` alone is NOT staleness (the recording tick can be finer
+    than the solve schedule), so a stretch is marked stale only when
+    ``solver_failures > 0``; older runs fall back to lfs-based detection.
     """
     if timeseries.empty or "time_s" not in timeseries.columns:
         return _save(_empty_fig("no timeseries", title), out_path)
-    # Stale segmentation: only believed when the runner reported real
-    # infeasibilities; lfs-vs-time lag without failures is just normal
-    # sampling between scheduled solves (false positive otherwise).
+    # Trust staleness only when the runner reported real infeasibilities;
+    # lfs-vs-time lag without failures is normal inter-solve sampling.
     lfs_from_t, lfs_sample_count = _stale_data_segment(timeseries)
     if solver_failures is not None and solver_failures > 0:
         stale_from_t = lfs_from_t
@@ -1872,7 +1756,7 @@ def constraint_envelope_trajectory(
         subplot_titles=[r[3] for r in present],
     )
 
-    # Determine event markers once — applied as vlines on every row.
+    # Event marker styles — applied as vlines on every row.
     event_styles = {
         "line_failure":              dict(color="#1A1A1A", dash="dash"),
         "branch_failure":            dict(color="#1A1A1A", dash="dash"),
@@ -1901,9 +1785,8 @@ def constraint_envelope_trajectory(
         legend_emitted.add(group)
         return True
 
-    # Neutral-grey sentinel legend entry for "constraint envelope":
-    # the per-row fills are sector-tinted but the legend entry stays
-    # gray to say "this is context, not a specific sector".
+    # Neutral-grey sentinel legend entry for the constraint envelope
+    # (per-row fills are sector-tinted; the legend stays context-grey).
     fig.add_trace(
         go.Scatter(
             x=[None], y=[None],
@@ -1926,9 +1809,6 @@ def constraint_envelope_trajectory(
         lo, hi = bounds
 
         # --- Operating envelope (sector-tinted band + dotted boundaries) ---
-        # Fill is sector-coloured so the panel reads "this is voltage's
-        # safe band" without consulting the legend; the legend keeps a
-        # single neutral entry (above) since the encoding repeats.
         fig.add_trace(
             go.Scatter(
                 x=x_band,
@@ -1987,10 +1867,9 @@ def constraint_envelope_trajectory(
         # --- min / max / avg series ---
         def _add_series(y_vals, *, dash: str, width: float, legend_group: str,
                         legend_name: str, hover_label: str) -> None:
-            # Solid up to the freshness boundary, dotted afterwards so
-            # the held-over snapshot is visually demoted.  Each split
-            # segment shares the legend group with its sibling, so the
-            # legend reads as a single concept.
+            # Solid up to the freshness boundary, dotted afterwards to
+            # demote the held-over snapshot; split segments share a
+            # legend group.
             if stale_from_t is not None:
                 fresh_mask = x <= stale_from_t
                 stale_mask = x >= stale_from_t
@@ -2106,15 +1985,9 @@ def constraint_violation_integral_bar(
     title: str = "Constraint-violation integral by sector",
 ) -> Path:
     """Grouped bars: per-variant mean of the per-sector violation
-    integral ``∫ max(0, util(t) − 1) dt``.
-
-    The integral is computed in :func:`metrics.constraint_violation_integral`
-    from the recorded ``avg_vm_pu`` / ``avg_pressure_pu`` / ``avg_t_k``
-    averages.  Zero ↔ the sector never left the operating envelope on
-    average; larger values ↔ longer / deeper excursions.  Together
-    with the envelope trajectory plot this answers "did the constraint
-    layer keep the network inside its safe envelope, and which sector
-    was hardest?".
+    integral ``∫ max(0, util(t) − 1) dt`` (from
+    :func:`metrics.constraint_violation_integral`). Zero ⇔ the sector
+    never left its envelope on average; larger ⇔ longer/deeper excursions.
     """
     sectors = ["electricity", "gas", "heat"]
     cols = {
@@ -2160,8 +2033,7 @@ def constraint_violation_integral_bar(
 
 
 # ---------------------------------------------------------------------------
-# Validity plots — verify the multi-level controller behaves the way the
-# architecture chapter claims it should
+# Validity plots — verify the multi-level controller behaves as claimed
 # ---------------------------------------------------------------------------
 
 
@@ -2173,12 +2045,9 @@ def system_balance_trajectory(
     title: str = "System balance — Σ regulation per sector",
     failure_t: float | None = None,
 ) -> Path:
-    """Per-sector ``Σ regulation`` over time (the full-system view).
-
-    The same series ``restoration_trajectory`` shows, but with an
-    explicit title that names what's plotted — useful as a standalone
-    "did the global controller settle?" view in the validity overview
-    next to the per-coalition / per-holon decompositions.
+    """Per-sector ``Σ regulation`` over time (full-system view). Same
+    series as ``restoration_trajectory`` but with an explicit
+    "did the global controller settle?" framing.
     """
     return restoration_trajectory(
         timeseries, events, out_path, title=title, failure_t=failure_t,
@@ -2194,12 +2063,8 @@ def _group_balance_lines(
     title: str,
 ) -> Path:
     """Shared body for ``coalition_balance_lines`` / ``holon_balance_lines``.
-
-    Plots every column matching ``<column_prefix>__<sector>__<idx>`` —
-    one line per group, coloured by sector, opacity-faded slightly so
-    overlapping groups stay readable.  Layout uses three sub-rows (one
-    per sector) so the eye doesn't have to disentangle electricity
-    groups from heat groups.
+    Plots every ``<column_prefix>__<sector>__<idx>`` column — one faded
+    line per group, one subplot row per sector.
     """
     if timeseries.empty or "time_s" not in timeseries.columns:
         return _save(_empty_fig("no timeseries", title), out_path)
@@ -2233,8 +2098,7 @@ def _group_balance_lines(
         cols = sorted(by_sector[sec])
         base = _SECTOR_COLOR.get(sec, "#888888")
         for i, col in enumerate(cols):
-            # Slight hue/opacity stagger so overlapping groups stay
-            # readable without a 50-entry legend.
+            # Fade opacity when many groups overlap.
             opacity = 0.55 if len(cols) > 6 else 0.85
             fig.add_trace(go.Scatter(
                 x=x, y=timeseries[col].astype(float).values,
@@ -2266,22 +2130,15 @@ def slack_trajectory(
     slack_meta: dict[str, dict[str, Any]] | None = None,
 ) -> Path:
     """Per-slack-child trajectory — one line per ExtPowerGrid /
-    ExtHydrGrid child, three subplots (electricity / gas / heat).
+    ExtHydrGrid child, one subplot per sector. Reads the
+    ``slack__<sector>__<aid>`` columns from ``_register_recordings`` in
+    ``scare.scenario.restoration``: electricity carries ``p_mw``, gas /
+    heat carry ``mass_flow``. A dashed vline marks the first failure.
 
-    Reads the ``slack__<sector>__<aid>`` columns emitted by
-    ``_register_recordings`` in ``scare.scenario.restoration``.
-    Electricity rows carry ``p_mw``; gas / heat rows carry
-    ``mass_flow``.  A dashed vertical line marks the first failure
-    time so the post-failure transient is visually anchored.
-
-    When ``slack_meta`` is supplied (loaded from ``slack_meta.json``),
-    the plot overlays per-slack-child reference lines: ``±budget``
-    (the operator-policy target stamped by ``apply_slack_budget``) as
-    a thin solid horizontal, and ``±lp_envelope`` (the actual LP Var
-    bound, typically 10× budget) as a thin dotted horizontal.  Slack
-    children left unbudgeted (heat-side ExtHydrGrid) get no overlay.
-    The combination makes "did the MAS keep the slack inside its
-    budget envelope?" answerable at a glance.
+    With ``slack_meta`` (from ``slack_meta.json``), overlays per-child
+    ``±budget`` (solid, operator-policy target) and ``±lp_envelope``
+    (dotted, the LP Var bound) so "did the MAS stay inside its budget
+    envelope?" reads at a glance. Unbudgeted children get no overlay.
     """
     if timeseries.empty or "time_s" not in timeseries.columns:
         return _save(_empty_fig("no timeseries", title), out_path)
@@ -2337,11 +2194,9 @@ def slack_trajectory(
                 ),
             ), row=row_idx, col=1)
 
-            # Overlay operator-policy ±budget and LP ±envelope when
-            # ``slack_meta`` carries them for this aid.  Legend entries
-            # collapse onto the first child of each sector so the
-            # legend stays compact when many slack children share the
-            # same budget.
+            # Overlay ±budget and ±LP-envelope when ``slack_meta`` has
+            # them for this aid; legend collapses onto each sector's
+            # first child to stay compact.
             child_meta = meta.get(aid) or {}
             budget = child_meta.get("budget")
             envelope = child_meta.get("lp_envelope")
@@ -2397,14 +2252,9 @@ def coalition_balance_lines(
     title: str = "Coalition balances (Level-1) over time",
 ) -> Path:
     """Per-coalition ``Σ regulation`` lines — one trace per Level-1
-    community, three subplots by sector.  Reads the
-    ``coalition_balance__<sec>__<idx>`` columns emitted by
-    ``_register_recordings`` in ``scare.scenario.restoration``.
-
-    Validity claim: each coalition should converge to a flat (or
-    slowly-trending) Σ-regulation track after its members finish their
-    gossip round.  Outliers that stay oscillating after the rest have
-    settled point at a Level-2 / inter-coalition coordination gap.
+    community, subplots by sector. Reads ``coalition_balance__<sec>__<idx>``.
+    Each coalition should converge to a flat track after its gossip round;
+    persistent oscillation flags a Level-2 coordination gap.
     """
     return _group_balance_lines(
         timeseries, out_path,
@@ -2421,13 +2271,10 @@ def holon_balance_lines(
     title: str = "Holon balances (Level-2) over time",
 ) -> Path:
     """Per-holon ``Σ regulation`` lines — one trace per Level-2 chunk,
-    one subplot per sector.  Reads ``holon_balance__<sec>__<idx>``.
-
-    Validity claim: a holon's trace should smooth out faster than its
-    member coalitions individually (the ADMM coupling spreads the
-    burden).  When the holonic layer is disabled (``enable_holonic =
-    False``) the topology stays empty and the corresponding columns
-    are absent — the plot falls back to a "no data" placeholder.
+    one subplot per sector. Reads ``holon_balance__<sec>__<idx>``.
+    A holon should smooth out faster than its member coalitions (ADMM
+    spreads the burden). With ``enable_holonic=False`` the columns are
+    absent and the plot shows a "no data" placeholder.
     """
     return _group_balance_lines(
         timeseries, out_path,
@@ -2444,19 +2291,13 @@ def regulation_per_child_lines(
     title: str = "Per-child regulation factor over time",
     max_lines: int = 60,
 ) -> Path:
-    """One line per child aid showing the applied regulation factor
-    over simulation time.  Reads the wide ``trajectories.csv`` produced
-    by ``write_trajectories_csv`` (event-driven, forward-filled).
+    """One line per child aid showing the applied regulation factor over
+    sim time. Reads the wide ``trajectories.csv`` from
+    ``write_trajectories_csv`` (event-driven, forward-filled).
 
-    The series cardinality is high (one per child agent), so:
-
-    - Lines are drawn semi-transparent and thin so the cloud reads as
-      a density of behaviour rather than a forest of legend entries.
-    - We pick at most ``max_lines`` aids, prioritising those whose
-      regulation factor *moves* (std > 0) so the plot focuses on the
-      agents that actually did something.  When more than ``max_lines``
-      moved, we show the highest-variance ones and footnote the
-      truncation in the title.
+    Cardinality is high, so lines are thin/transparent and at most
+    ``max_lines`` aids are shown, prioritising those whose factor moves
+    (std > 0); truncation is footnoted in the title.
     """
     if trajectories.empty or "time_s" not in trajectories.columns:
         return _save(_empty_fig("no trajectories.csv", title), out_path)
@@ -2465,9 +2306,8 @@ def regulation_per_child_lines(
     if not aid_cols:
         return _save(_empty_fig("no per-aid columns", title), out_path)
 
-    # Variance per column → pick the most active aids.  Constant series
-    # (typical for unmodulated loads) get filtered so the plot doesn't
-    # drown in flat lines at 1.0.
+    # Pick the most active aids by variance; constant series (unmodulated
+    # loads) are filtered so the plot isn't flat lines at 1.0.
     arr = trajectories[aid_cols].astype(float).fillna(method="ffill")
     stds = arr.std(axis=0).fillna(0.0)
     active = stds[stds > 1e-9].sort_values(ascending=False)
@@ -2549,11 +2389,9 @@ def system_state_overview(
     5. **Per-tier served MW** — absolute served-load timeseries per
        tier so the absolute loss is visible alongside the fraction view.
 
-    Reads all signals from the per-task ``timeseries.csv`` that
-    ``_register_recordings`` emits.  Missing columns degrade gracefully:
-    panels without any input data are drawn but tagged "(no data)".
-    Failure / reconfiguration events are marked as synced vertical
-    guides across every panel so causality is readable end-to-end.
+    Reads all signals from the per-task ``timeseries.csv``. Missing
+    columns degrade gracefully (panel drawn but tagged "(no data)").
+    Failure / reconfiguration events are synced vlines across every panel.
     """
     if timeseries.empty or "time_s" not in timeseries.columns:
         return _save(_empty_fig("no timeseries", title), out_path)
@@ -2618,8 +2456,7 @@ def system_state_overview(
     # --- Panel 1: slack ---------------------------------------------------
     panel_idx = 1
     if slack_cols_by_sector:
-        # One trace per slack child, coloured by sector.  Legend grouped
-        # so the reader can toggle a whole sector at once.
+        # One trace per slack child, coloured and legend-grouped by sector.
         legend_seen: set[str] = set()
         for sec in sorted(slack_cols_by_sector):
             base = _SECTOR_COLOR.get(sec, "#888888")
@@ -2644,13 +2481,9 @@ def system_state_overview(
 
     # --- Panel 2: control variables --------------------------------------
     if ctrl_rows:
-        # Use per-variable secondary axes so vm_pu (≈1) and t_k (≈300+)
-        # don't collapse onto one scale.  Plotly subplots can't have
-        # multiple y-axes per row natively without the secondary_y dance,
-        # so we normalise each variable to its envelope-band centre
-        # (0 = lo, 1 = hi) and plot the normalised value so the three
-        # series share one axis with the band-edges drawn at 0 and 1.
-        # Hover still reports the raw value via customdata.
+        # vm_pu (≈1) and t_k (≈300+) would collapse on a shared scale, so
+        # normalise each to its envelope band (0=lo, 1=hi) and plot that;
+        # hover reports the raw value via customdata.
         for col, label, bounds, color in ctrl_rows:
             lo, hi = bounds
             raw = timeseries[col].astype(float).values
@@ -2672,7 +2505,7 @@ def system_state_overview(
                 legendgroup="ctrl",
                 showlegend=True,
             ), row=panel_idx, col=1)
-        # Operating-envelope band at [0, 1] (since values are normalised).
+        # Envelope band at [0, 1] (values are normalised).
         fig.add_hrect(y0=0.0, y1=1.0, fillcolor="rgba(150,150,150,0.10)",
                       line=dict(width=0), layer="below",
                       row=panel_idx, col=1)
@@ -2685,8 +2518,7 @@ def system_state_overview(
 
     # --- Panel 3: line loading -------------------------------------------
     if line_cols:
-        # max in red, p95 in orange, avg in muted blue.  100 % reference
-        # line so an overload reads at a glance.
+        # max red, p95 orange, avg blue; 100% reference line for overloads.
         colors = {
             "max_line_loading_percent": ("#D62728", "max"),
             "p95_line_loading_percent": ("#E07A1F", "p95"),

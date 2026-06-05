@@ -1,12 +1,9 @@
-"""Regression test for the slack-budget override sign.
+"""Slack-budget override sign.
 
-eval_full_small_20260527-165650 task-84/85: a gas (``ExtHydrGrid``)
-slack that reports *import* as a **positive** ``mass_flow`` received a
-positive (add-load) override target and was driven to the 10x LP
-envelope (+900% over budget).  The override must always *shed* toward
-the budget for an over-importing slack, independent of which raw sign
-the slack uses to encode import.  ``ExtPowerGrid`` slacks (import =
-negative ``p_mw``) must be unchanged.
+The override must always *shed* toward budget for an over-importing
+slack, independent of which raw sign the slack uses to encode import:
+gas (``ExtHydrGrid``) encodes import as positive ``mass_flow``, while
+electricity (``ExtPowerGrid``) encodes it as negative ``p_mw``.
 """
 
 from __future__ import annotations
@@ -69,8 +66,8 @@ def test_positive_import_slack_sheds_not_adds():
 
 
 def test_negative_import_slack_unchanged():
-    # Electricity slack: import encoded as NEGATIVE p_mw — the historical
-    # (working) case; target must be the same -(|val|-budget) shed value.
+    # Electricity slack: import encoded as NEGATIVE p_mw; target must be
+    # the same -(|val|-budget) shed value as the positive-encoding case.
     tgt = _run_monitor(obs_key="p_mw", draw=-0.19, budget=0.168,
                        sector=Sector.ELECTRICITY)
     assert tgt is not None

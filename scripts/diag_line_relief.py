@@ -1,8 +1,8 @@
-"""Root-cause diagnostic for the branch-106-7 line overload (seed 0).
+"""Diagnose the branch-106-7 line overload.
 
-Builds the line_stress scenario, applies seed-0's two failures, then runs
-plain power flows under counterfactual shed policies to answer: is the
-residual overload priority-blocked (tier-1 through-load) or structural?
+Builds the line_stress scenario, applies the failures, then runs power flows
+under counterfactual shed policies to tell whether the residual overload is
+priority-blocked (tier-1 through-load) or structural.
 """
 from __future__ import annotations
 from collections import deque, defaultdict
@@ -12,7 +12,7 @@ from monee.model.child import ExtPowerGrid, PowerLoad
 from experiment.restoration import GRIDS, apply_line_stress, assign_load_priorities
 
 SEED = 0
-FAILS = [(355, 372, 0), (239, 164, 0)]   # seed-0 failures from failures.json
+FAILS = [(355, 372, 0), (239, 164, 0)]
 TARGET = (106, 7)                        # binding line branch-106-7
 
 
@@ -92,8 +92,8 @@ def main():
     prios = assign_load_priorities(net, seed=SEED, distribution="skewed")
     slack = slack_nodes(net)
 
-    # Downstream set of TARGET = loads that lose their path to slack when
-    # TARGET is removed (post-failure topology).
+    # Downstream loads: those that lose their path to slack when TARGET is
+    # removed (post-failure topology).
     adj_cut = active_el_adj(net, exclude_edge=TARGET, failed=FAILS)
     reach = reachable(adj_cut, slack)
     node_loads = load_children(net)

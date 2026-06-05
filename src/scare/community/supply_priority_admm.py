@@ -1,33 +1,17 @@
-"""Pure-compute helper for the supply-priority ADMM allocation.
+"""Supply-priority ADMM allocator shared by L2 (chunk-mate) and L2.5
+(coalition) roles.
 
-Lifted from :meth:`HolonicCommunityRole._run_supply_priority_admm` so
-both L2 (chunk-mate ADMM in ``HolonicCommunityRole``) and L2.5 (coalition
-ADMM in ``HolonSummaryRole``) can call the same allocator.  Keeping it
-as a free coroutine makes it directly unit-testable and isolates the
-arithmetic from the per-role flex-collection / dispatch wiring.
+Mechanism: for each (sector, tier) cell the coordinator pulls Σ_g x_g
+toward total demand ``T[s, t]`` with an L1 distance penalty weighted by
+priority. Each actor's per-cell upper bound caps its contribution, and a
+per-actor coupling ``Σ x_g ≤ supply_g`` prevents committing more than it
+holds. Priority weighting plus the share-scaled S coefficient bias toward
+high-priority cells, so under scarcity high-priority tiers serve first.
 
-Mechanism
----------
-
-For each (sector, tier) cell the coordinator pulls Σ_g x_g toward the
-total demand ``T[s, t]`` with the L1 distance penalty weighted by
-priority (``2^(P − tier + 1)``).  Each actor's per-cell upper bound
-caps its contribution to that cell, and a single per-actor coupling
-``Σ_{s, t} x_g[s, t] ≤ supply_g`` enforces that an actor cannot
-commit more than it physically holds.  Priority weighting plus the
-share-scaled S coefficient bias the per-actor solution toward
-high-priority cells, so under scarcity the high-priority tiers get
-served first.
-
-Deliverability hook
--------------------
-
-The coalition layer needs to model that an actor's supply can only
-reach demand cells whose loads sit at physically-reachable nodes after
-failures.  The ``actor_ub_overrides`` parameter lets the caller cap
-``ub[(sec, tier)]`` below the raw supply-vs-demand minimum on a
-per-actor, per-cell basis.  When ``None`` or missing for a cell the
-override is a no-op — preserving the original L2 semantics.
+Deliverability: ``actor_ub_overrides`` caps ``ub[(sec, tier)]`` below the
+raw supply-vs-demand minimum per actor/cell, modelling that supply only
+reaches loads at physically-reachable nodes after failures. ``None``/
+missing is a no-op.
 """
 
 from __future__ import annotations
@@ -59,23 +43,16 @@ def _waterfall_target(
     """Priority-waterfall allocation of ``supply_pool`` across cells.
 
     Visits cells in descending-priority order, assigning
-    ``min(demand_cell, remaining_pool)`` to each, stopping once the
-    pool is exhausted.  Returns the per-cell target the ADMM should
-    track when ``sum(demand) > supply_pool`` so the primal residual
-    can drop to zero (the structural gap that produces the misleading
-    "ADMM reached max iterations" warnings on deficit-bearing holons).
-
-    Lower tier number = higher priority in the SCARE schedule, but
-    the helper sorts on ``priorities[]`` directly so the caller can
-    pass any monotone-in-priority weighting.
+    ``min(demand_cell, remaining_pool)`` until the pool is exhausted.
+    Used as the ADMM target when ``sum(demand) > supply_pool`` so the
+    primal residual can reach zero. Sorts on ``priorities[]`` directly,
+    so any monotone-in-priority weighting works.
     """
     out = np.zeros_like(demand_per_cell, dtype=float)
     remaining = float(supply_pool)
     if remaining <= 0.0:
         return out
-    # Sort cells by priority weight DESC.  np.argsort is ascending, so
-    # negate to flip; stable so ties break by cell index for
-    # reproducibility.
+    # Sort by priority weight DESC; stable so ties break by cell index.
     order = np.argsort(-priorities, kind="stable")
     for j in order:
         if remaining <= 1e-12:
@@ -107,69 +84,50 @@ async def allocate_supply_priority(
 ]:
     """Run the supply-priority ADMM on the given actor flex slices.
 
-    The mango role event loop is already async, so callers inside an
-    ``async def`` handler ``await`` this coroutine directly.
-
     Parameters
     ----------
     sectors
-        Sector value strings (e.g. ``"electricity"``) the allocation
-        spans.  Must be non-empty.
+        Sector value strings (e.g. ``"electricity"``). Non-empty.
     tiers
-        Priority tier integers (1 = highest priority).  Must be non-
-        empty.  Demand at tiers outside this list is ignored.
+        Priority tier integers (1 = highest). Non-empty; demand at
+        tiers outside this list is ignored.
     actor_supplies
-        One entry per actor: ``{sector_value: total_supply_mw}``.
-        Sector-scalar — within a sector, supply is fungible across
-        tiers (the per-cell ub cap models this).
+        Per actor: ``{sector_value: total_supply_mw}``. Sector-scalar —
+        supply is fungible across tiers within a sector.
     actor_demands
-        One entry per actor (positionally matched to actor_supplies):
-        ``{sector_value: {tier: demand_mw}}``.  Used to compute the
-        target ``T``.
+        Per actor (positional with actor_supplies):
+        ``{sector_value: {tier: demand_mw}}``. Used to compute target ``T``.
     actor_ub_overrides
-        Optional per-actor ``{(sector_value, tier): cap_mw}`` map.
-        When present, ``ub[(sec, tier)]`` for that actor is set to
-        ``min(raw_ub, cap_mw)``.  Use this to model deliverability:
-        if actor ``g`` cannot route to a tier-t demand region after a
-        failure, set the cap to 0 (modelled as 1e-6 to keep the
-        solver well-conditioned).
+        Optional per-actor ``{(sector_value, tier): cap_mw}``; sets
+        ``ub[(sec, tier)] = min(raw_ub, cap_mw)`` to model deliverability.
+        Use cap 0 (→ 1e-6 for conditioning) when actor cannot reach a cell.
     priority_tiers
         ``P`` in the strict-monotone schedule ``P − tier + 1`` (see
-        ``base.util.tier_priority_weight_strict``).  4 by default,
-        matching the new tier model.
+        ``base.util.tier_priority_weight_strict``).
     max_iters, abs_tol
         Coordinator convergence knobs.
     cp_coupling
-        Optional list of ``(actor_index, sector_in, sector_out, ratio)``
-        tuples expressing cross-sector coupling at coupling-point (CP)
-        actors.  For each entry the actor's per-cell vector gets two
-        extra inequality rows in its ``(C, d)`` constraint matrix:
-        ``Σ_t x[sector_out, t] − ratio · Σ_t x[sector_in, t] ≤ 0`` and
-        the reversed sign — together expressing the equality ``output
-        = ratio · input``.  Convention: ``sector_in`` is the CP's
-        input (consumes from this sector), ``sector_out`` is the
-        output (produces into this sector).  A P2H bridging
-        electricity → heat with η = 0.9 passes
-        ``(cp_idx, "electricity", "heat", 0.9)``.  None or empty
-        list ⇒ no coupling rows added (legacy behaviour).
+        Optional ``(actor_index, sector_in, sector_out, ratio)`` tuples.
+        Each adds two inequality rows pinning ``Σ_t x[out] = ratio · Σ_t
+        x[in]`` for that actor: ``sector_in`` is consumed, ``sector_out``
+        produced. A P2H with η=0.9 passes ``(cp_idx, "electricity",
+        "heat", 0.9)``. None/empty ⇒ no coupling rows.
 
     Returns
     -------
     service_fraction
-        ``{sector: {tier: fraction_in_[0,1]}}`` — the global service
-        fraction the ADMM converged on per cell.
+        ``{sector: {tier: fraction_in_[0,1]}}`` — per-cell global service
+        fraction.
     per_actor_x
-        Per-actor flat allocation vectors (length ``len(sectors) *
-        len(tiers)``).
+        Per-actor flat allocation vectors (length ``n_sectors * n_tiers``).
     meta
-        Diagnostics: ``T_per_cell``, ``sum_x_per_cell``,
-        ``actor_supply_total``, ``holon_supply_total``,
-        ``priorities``, ``sectors``, ``tiers``, ``degenerate``.
+        Diagnostics (``T_per_cell``, ``sum_x_per_cell``,
+        ``holon_supply_total``, ``priorities``, ``degenerate``, ...).
 
     Raises
     ------
     ValueError
-        On empty sectors or tiers, or mismatched actor list lengths.
+        On empty sectors/tiers or mismatched actor list lengths.
     """
     if not sectors:
         raise ValueError("supply-priority ADMM: sectors must be non-empty")
@@ -196,10 +154,8 @@ async def allocate_supply_priority(
     def _flat_idx(s: str, t: int) -> int:
         return sec_idx[s] * n_tier + tier_idx[t]
 
-    # Total demand per (sector, tier) across all actors — the
-    # *semantic* target.  Used at the bottom of this function to
-    # compute the service fraction (committed / demand) which is what
-    # the dispatch layer needs.
+    # Total demand per (sector, tier) — the semantic target. The final
+    # service fraction is committed/demand against this.
     total_demand_per_cell = np.zeros(n_dims)
     for demand in actor_demands:
         for sec, tier_to_dem in demand.items():
@@ -208,17 +164,13 @@ async def allocate_supply_priority(
             for tier, dem in tier_to_dem.items():
                 if tier in tier_idx:
                     total_demand_per_cell[_flat_idx(sec, tier)] += float(dem)
-    # ADMM target ``total_T`` defaults to total demand.  It is rewritten
-    # below to a *feasible* version when supply < demand, so the
-    # sharing-distance term has a reachable target.  Keeping it
-    # separate from ``total_demand_per_cell`` preserves the per-cell
-    # service-fraction semantics for the dispatch layer.
+    # ADMM target; rewritten below to a feasible (waterfall) version when
+    # supply < demand. Kept separate from total_demand_per_cell so the
+    # service-fraction semantics stay against real demand.
     total_T = total_demand_per_cell.copy()
 
     if not np.any(np.abs(total_T) >= 1e-6):
-        # Degenerate: no demand anywhere in the requested cells.
-        # Return all-1.0 fractions (a no-op) and let the caller skip
-        # the dispatch.
+        # No demand anywhere: return all-1.0 fractions (no-op).
         return (
             {sec: {tier: 1.0 for tier in tiers} for sec in sectors},
             [[0.0] * n_dims for _ in actor_supplies],
@@ -239,16 +191,10 @@ async def allocate_supply_priority(
     priorities = np.zeros(n_dims)
     for tier in tiers:
         # Strictly-monotone tier weight (tier 1 → P, tier P → 1) for the
-        # waterfall sort and ADMM S-coefficient.  We deliberately do NOT
-        # use the L1 QP schedule here: that schedule returns weight 0
-        # for tier 1 (because tier 1 is hard-locked off-QP at L1) and
-        # 1e8 for tier 2 (because L1 wants effectively-strict precedence
-        # on a single per-cell variable).  Bringing those magnitudes
-        # into the L2 ADMM would (a) sort tier-1 cells AFTER tier-2
-        # cells in the waterfall — wrong; (b) destabilise the sharing-
-        # distance objective whose dual scales with Σ a_j.  The strict-
-        # monotone schedule keeps the sort correct (tier 1 first) and
-        # the magnitudes well-conditioned (range ``[1, P]``).
+        # waterfall sort and S-coefficient. Not the L1 QP schedule: that
+        # returns 0 for tier 1 and 1e8 for tier 2, which would mis-sort the
+        # waterfall and destabilise the sharing-distance dual. Range [1, P]
+        # keeps the sort correct (tier 1 first) and well-conditioned.
         if enable_priority_weighting:
             weight = tier_priority_weight_strict(
                 tier, priority_tiers=priority_tiers,
@@ -262,33 +208,12 @@ async def allocate_supply_priority(
         sum(float(v) for v in s.values()) for s in actor_supplies
     )
 
-    # Degenerate no-supply branch.  When every actor reports zero
-    # supply (the orphan-island case after a failure splits a sub-
-    # component off the grid-forming sources), the legacy code fell
-    # back to ``or 1.0`` — silently substituting a 1 MW phantom pool
-    # that produced ``service_fraction == 1.0`` across every tier
-    # via the waterfall short-circuit below.  In a real orphan island
-    # this means the L2 dispatches "serve everything" → no shed →
-    # the slack backstopping the island stays over-budget.
-    #
-    # Evidence (eval_full_small_20260529-181310/tasks/000088):
-    # child-12's orphan sub-coord reports ``supply=0.0000`` every
-    # round; the phantom pool produced ``T2=T3=T4=1.0``; child-12's
-    # 7 leaders held all 13 island electricity loads at fraction 1.0;
-    # the slack ``child-39`` (the LV ext-grid feeding the whole
-    # island) settled at +10.6% over budget — the breach the
-    # remainder of the eval picked up after Bug 1/2/3/4 closed the
-    # primary inversions.
-    #
-    # Correct behaviour: a truly no-supply sub-component sheds every
-    # load.  The ``SlackBudgetMonitor`` feedback path then sees the
-    # restored balance and re-opens the effective budget within
-    # ``_FEEDBACK_GAIN`` rounds, restoring whatever service the
-    # backstop budget allows.  We deliberately do NOT fall back to
-    # "include the slack budget as supply" here — that requires
-    # plumbing ``HolonSummary.slack_budget_by_sector`` into this
-    # allocator (a larger refactor) and is the architecturally
-    # cleaner follow-up.  Shedding-then-recovery is the safe minimum.
+    # No-supply branch (orphan island split off from grid-forming
+    # sources): shed every load. Returning fraction 1.0 here would let
+    # the slack backstopping the island stay over-budget. After shedding,
+    # the SlackBudgetMonitor feedback re-opens the effective budget and
+    # restores whatever service the backstop allows. Slack-budget-as-
+    # supply is intentionally not modelled here (larger refactor).
     if holon_supply_total <= 0.0:
         logger.debug(
             "supply-priority ADMM degenerate no-supply: sheds everything "
@@ -311,31 +236,14 @@ async def allocate_supply_priority(
             },
         )
 
-    # --- Feasibility cap on the ADMM target ---
-    # When demand exceeds available supply (the common case on a
-    # deficit-bearing holon), the sharing-distance term
-    # ``|| Σ_g x_g − T ||`` can never close because the per-actor
-    # box (ub) and the per-actor coupling (Σ x_g ≤ supply_g) clamp
-    # ``Σ x_g`` at the supply pool size.  The primal residual then
-    # plateaus at the structural gap, the dual residual collapses to
-    # zero (z stops moving), and the library logs a spurious "ADMM
-    # reached max iterations" warning — the optimum is correctly
-    # found but the convergence test never accepts it.
-    #
-    # The fix replaces ``T`` (demand everywhere) with the
-    # priority-waterfall target: starting from the highest-priority
-    # cell, allocate ``min(demand_cell, remaining_supply)`` until the
-    # pool is exhausted.  The resulting target has
-    # ``sum(T) == holon_supply_total`` and per-cell values that match
-    # the priority-correct answer exactly.  ADMM then converges with
-    # zero structural residual; the per-actor allocation (which actor
-    # contributes how much to each cell) is still ADMM's job under
-    # the box + coupling constraints.
-    #
-    # The original demand is retained in ``total_demand_per_cell`` so
-    # the service-fraction calculation at the bottom is
-    # committed-divided-by-demand, which is what the dispatch layer
-    # expects.
+    # Feasibility cap on the ADMM target. When demand > supply, the
+    # sharing-distance term ``||Σ_g x_g − T||`` can never close (the box
+    # ub + coupling Σ x_g ≤ supply_g clamp Σ x_g at the pool size), so the
+    # residual plateaus on the structural gap and the solver spuriously
+    # hits max-iterations. Replacing T with the priority-waterfall target
+    # gives ``sum(T) == holon_supply_total`` and the priority-correct
+    # per-cell values, so ADMM converges with zero structural residual.
+    # Per-actor split remains ADMM's job under the box + coupling.
     total_demand_sum = float(total_demand_per_cell.sum())
     if total_demand_sum > holon_supply_total > 0:
         total_T = _waterfall_target(
@@ -347,20 +255,12 @@ async def allocate_supply_priority(
             total_demand_sum, holon_supply_total, float(total_T.sum()),
         )
 
-    # Waterfall short-circuit: when there are no per-actor reach
-    # restrictions and no CP coupling, the ``total_T`` vector IS the
-    # priority-optimal allocation per cell, regardless of how it
-    # distributes across actors.  The dispatch layer only reads
-    # ``service_fraction = T / demand``, never the per-actor ``x``.
-    # The ADMM would otherwise be solving "which actor commits how
-    # much to each cell" — a degree of freedom we don't actually
-    # need, and one its share-weighted S term solves badly (small
-    # actors with weak priority bias chronically under-commit, so
-    # ``Σ x`` converges well below ``T``; 2026-05-24 deficit audit
-    # showed waterfall T = 0.268 but ADMM committed only 0.115 on
-    # simbench_lv with 6 failures and slack 0.15).  Covers both
-    # supply ≥ demand (T = demand → frac = 1) and supply < demand
-    # (T = waterfall → frac matches the priority-correct schedule).
+    # Waterfall short-circuit: with no per-actor reach restrictions and no
+    # CP coupling, ``total_T`` already IS the priority-optimal per-cell
+    # allocation and the dispatch layer only reads ``service_fraction =
+    # T / demand``, never per-actor ``x``. Running the ADMM here only
+    # solves the unneeded per-actor split, which its share-weighted S term
+    # solves badly (small actors chronically under-commit, so Σ x < T).
     if (
         actor_ub_overrides is None
         and (cp_coupling is None or len(cp_coupling) == 0)
@@ -402,8 +302,7 @@ async def allocate_supply_priority(
             },
         )
 
-    # Index the cp_coupling entries by actor so we can extend that
-    # actor's (C, d) below.  Each entry is consumed once.
+    # Index cp_coupling entries by actor to extend each actor's (C, d).
     cp_couplings_by_actor: dict[int, list[tuple[str, str, float]]] = {}
     for entry in (cp_coupling or []):
         try:
@@ -411,8 +310,8 @@ async def allocate_supply_priority(
         except (TypeError, ValueError):
             continue
         if sec_in not in sec_idx or sec_out not in sec_idx:
-            # Skip couplings that reference sectors not in the current
-            # multi-sector ADMM scope (e.g. a P2G when gas is absent).
+            # Skip couplings referencing sectors outside this ADMM scope
+            # (e.g. a P2G when gas is absent).
             continue
         cp_couplings_by_actor.setdefault(int(g_idx), []).append(
             (str(sec_in), str(sec_out), float(ratio))
@@ -435,40 +334,27 @@ async def allocate_supply_priority(
                     cap = overrides.get((sec, tier))
                     if cap is not None:
                         raw_cap = min(raw_cap, float(cap))
-                # Waterfall-shed cells: when the priority waterfall set
-                # ``T[j] = 0`` (cell is below the supply cutoff in the
-                # priority order), force the per-actor ub to *exact* 0
-                # so the local QP cannot leak supply into a cell the
-                # waterfall decided to drop.  Without this, the
-                # sharing-ADMM's weak per-actor S preference + the local
-                # QP's quadratic round-off let small actors deposit
-                # tiny positive amounts on shed cells; ``x_avg[j] > 0``
-                # then anchors ``z[j] > 0`` via the z-update's
-                # quadratic term, and the convergence check passes on
-                # a leaked allocation.  Using exact 0 (bypassing the
-                # ``max(raw_cap, 1e-6)`` well-conditioning floor) is
-                # safe because the constraint ``0 ≤ x ≤ 0`` is feasible
-                # for OSQP and pins the variable exactly; the floor
-                # only matters when ``raw_cap > 0`` and the solver
-                # needs slack to handle near-degenerate cells.
+                # Waterfall-shed cell (T[j] = 0): force ub to exact 0 so
+                # the local QP cannot leak supply into a dropped cell.
+                # Otherwise round-off lets actors deposit tiny amounts that
+                # anchor z[j] > 0 and pass the convergence check on a leaked
+                # allocation. Exact 0 (bypassing the 1e-6 conditioning floor)
+                # is safe: 0 ≤ x ≤ 0 is feasible for OSQP and pins x exactly.
                 if total_T[j] <= 1e-12:
                     ub[j] = 0.0
                 else:
                     ub[j] = max(raw_cap, 1e-6)
 
-        # Per-actor coupling: Σ commitments ≤ total supply.  Binding
-        # constraint that creates scarcity when supply < demand.
+        # Per-actor coupling Σ commitments ≤ total supply; creates the
+        # scarcity binding when supply < demand.
         total_supply = sum(float(v) for v in supply_map.values())
         actor_supply_total.append(total_supply)
         C_rows = [np.ones(n_dims)]
         d_rows = [max(total_supply, 0.0)]
 
-        # CP coupling: for each (sector_in, sector_out, ratio) attached
-        # to this actor, add the equality ``Σ_t x[out, t] = ratio · Σ_t
-        # x[in, t]`` as a pair of inequalities.  Together they pin the
-        # CP actor's per-sector flow ratio so its output supply commit
-        # stays consistent with its input draw under the conversion
-        # efficiency.  No-op for non-CP actors (the list is empty).
+        # CP coupling: pin ``Σ_t x[out] = ratio · Σ_t x[in]`` as a pair of
+        # inequalities so output commit tracks input draw under conversion
+        # efficiency. No-op for non-CP actors.
         for sec_in, sec_out, ratio in cp_couplings_by_actor.get(g, []):
             row_out_minus_r_in = np.zeros(n_dims)
             for tier in tiers:
@@ -484,9 +370,8 @@ async def allocate_supply_priority(
         C = np.vstack(C_rows)
         d = np.array(d_rows, dtype=float)
 
-        # S biases each actor toward high-priority cells.  Magnitude
-        # scaled by share of pool supply so larger pools have a
-        # stronger preference signal.
+        # S biases each actor toward high-priority cells; scaled by pool
+        # share so larger pools have a stronger preference signal.
         share = total_supply / holon_supply_total
         S = -share * priorities
 
@@ -511,10 +396,8 @@ async def allocate_supply_priority(
         np.sum(np.array(results), axis=0) if results else np.zeros(n_dims)
     )
 
-    # Service fraction = committed / *original* demand per cell.  The
-    # ADMM target ``total_T`` may have been scaled down for
-    # feasibility, but the dispatch layer needs the fraction of real
-    # demand actually served, not the fraction of the scaled target.
+    # Service fraction = committed / original demand (not the scaled
+    # feasibility target ``total_T``).
     service_fraction: dict[str, dict[int, float]] = {}
     for sec in sectors:
         service_fraction.setdefault(sec, {})
@@ -540,10 +423,7 @@ async def allocate_supply_priority(
         "degenerate": False,
     }
 
-    # Per-cell breakdown of the allocator's inputs and outputs.  Kept
-    # at DEBUG so it stays grep-able from run.log when investigating a
-    # priority-invariant regression but doesn't dominate the file in
-    # normal runs.  Lines are tagged with a recognisable prefix.
+    # Per-cell input/output breakdown at DEBUG, tagged PRIPROBE for grep.
     if logger.isEnabledFor(logging.DEBUG):
         n_actors = len(actor_supplies)
         ub_per_actor: list[list[float]] = []

@@ -52,8 +52,7 @@ class TestComputeActualPriority:
         assert _compute_actual_priority(1, target=1.0) == 1
 
     def test_restoration_load_priority_3(self):
-        # Mid-tier load under the 4-tier model — priority 3 maps to
-        # round 3 in restoration (lower number = earlier round).
+        # Restoration: priority maps to round number (lower = earlier).
         assert _compute_actual_priority(3, target=1.0) == 3
 
     def test_restoration_load_capped_at_tiers(self):

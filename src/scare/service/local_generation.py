@@ -1,18 +1,11 @@
 """Local-generation fallback for unresolved negotiation deficits.
 
-Implements the SHOULD-level requirement from improvements.txt §5:
-"Fallback / islanding capability — if an agent cannot find a feasible
-restoration through negotiation with neighbors, it should be able to
-form a local island using local DGs or storage."
-
-Despite the §5 wording, this role does *not* perform real electrical
-islanding (no switch is opened, no f/V control, no supply≡demand
-match).  It is a dispatch heuristic: when gossip converges with a
-significant residual deficit, the role mops up what gossip could not
-redistribute by ramping local generator-class children up to their
-remaining headroom.  Genuine physical islanding (grid-forming, sub-
-island anchoring) lives in monee's ``enable_islanding`` extension and
-the ``GridReconfigurator`` / ``GridTieSwitchOperator`` roles.
+Not real electrical islanding (no switch opened, no f/V control, no
+supply==demand match): a dispatch heuristic that, when gossip converges
+with a significant residual deficit, mops it up by ramping local
+generator-class children up to their remaining headroom.  Genuine physical
+islanding lives in monee's ``enable_islanding`` extension and the
+``GridReconfigurator`` / ``GridTieSwitchOperator`` roles.
 """
 
 from __future__ import annotations
@@ -45,25 +38,17 @@ logger = logging.getLogger(__name__)
 
 
 class LocalGenerationFallbackRole(Role):
-    """Activates local DGs to cover residual load deficit when gossip
-    negotiation fails to fully resolve the imbalance.
+    """Activate local DGs to cover residual load deficit when gossip fails
+    to resolve the imbalance.
 
-    The role listens for ``LocalGenerationApproval`` events/messages.
-    The approval is dispatched by L2's ``HolonicCommunityRole`` after
-    the holon has had a chance to absorb the residual cross-group, or
-    emitted locally by the L1 negotiator when no holon layer is wired
-    (non-holonic config).  On receipt the role:
+    Listens for ``LocalGenerationApproval`` (sent by L2's
+    ``HolonicCommunityRole`` after its absorption attempt, or emitted
+    locally by the L1 negotiator in non-holonic configs).  On receipt,
+    scans group members for generators (priority == 0) with headroom and
+    distributes the deficit across them proportional to headroom.
 
-    1. Scans group members for generators (priority == 0) with
-       available headroom.
-    2. Distributes the residual deficit across available generators
-       proportional to their capacity.
-    3. Sets each generator's regulation factor to cover its share.
-
-    This is a last-resort mechanism — it activates only after L1
-    gossip and the L2 absorption attempt have both been exhausted.
-    It only adjusts setpoints; it never opens a switch or otherwise
-    alters physical topology.
+    Last-resort: runs only after L1 gossip and L2 absorption are exhausted,
+    and only adjusts setpoints — never opens a switch or alters topology.
     """
 
     def __init__(
@@ -76,15 +61,13 @@ class LocalGenerationFallbackRole(Role):
         self.sector = sector
 
     def setup(self) -> None:
-        # Local-event subscription handles the non-holonic config where
-        # the L1 negotiator emits the approval directly because no
-        # holon peer exists to mediate.
+        # Event path: non-holonic config where the L1 negotiator emits the
+        # approval directly (no holon peer to mediate).
         self.context.subscribe_event(
             self, LocalGenerationApproval, self._on_local_gen_approval_event
         )
-        # Message subscription handles the L2-mediated path: a holon
-        # peer (lex-smallest co-recipient) returns the approval after
-        # triggering its own rebalance attempt.
+        # Message path: L2-mediated, a holon peer returns the approval after
+        # its own rebalance attempt.
         self.context.subscribe_message(
             self,
             self._on_local_gen_approval_message,
@@ -117,7 +100,6 @@ class LocalGenerationFallbackRole(Role):
         neighbours = topology_neighbors(self, tid="groups")
         member_aids = [self.context.aid] + [a.aid for a in neighbours]
 
-        # Identify generators with available headroom
         generators: list[tuple[str, float, float]] = []  # (aid, capacity, headroom)
         for aid in member_aids:
             obs = self.behavior.observe(aid) or {}
@@ -145,7 +127,6 @@ class LocalGenerationFallbackRole(Role):
 
         covered = 0.0
         for aid, cap, headroom in generators:
-            # Distribute deficit proportional to each generator's headroom
             share = min(headroom, deficit * (headroom / total_headroom))
             obs = self.behavior.observe(aid) or {}
             current_sp = abs(obs_setpoint(obs, behavior=self.behavior, aid=aid))

@@ -17,10 +17,8 @@ class TaskSpec:
     """One reproducible run; everything else is derived from ``seed``.
 
     The four evaluation axes (variant / ablation / sweep / scenario)
-    default to "the established baseline" so legacy task lists stay
-    valid: an old ``manifest.jsonl`` written by the pre-eval planner is
-    a strict subset of the new format and the planner / runner read
-    extras with ``getattr(..., default)``.
+    default to the baseline so legacy manifests stay valid as a strict
+    subset of the new format.
     """
 
     task_id: int
@@ -28,7 +26,7 @@ class TaskSpec:
     seed: int
     n_failures: int
     # ---- Evaluation axes (all optional for backward compat) --------
-    variant: str = "scare"                 # "scare" | "single_level" | "component_level" | "oracle"
+    variant: str = "scare"                 # scare | single_level | component_level | oracle
     experiment: str = ""                    # campaign-internal label
     ablation: dict[str, Any] = field(default_factory=dict)
     sweep: dict[str, Any] = field(default_factory=dict)
@@ -60,7 +58,7 @@ class GridSpec:
 class GridDefaults:
     runs_per_grid: int = 32
     # n_failures = clip(1 + Poisson(failure_lambda), 1, max_failures).
-    # 0.6 ≈ 55% single, 33% double, 10% triple, 2% quadruple-or-more failures.
+    # 0.6 ~ 55% single, 33% double, 10% triple, 2% quadruple+ failures.
     failure_lambda: float = 0.6
     max_failures: int = 5
 
@@ -84,17 +82,17 @@ class SlurmConfig:
 
 @dataclass
 class ExperimentSpec:
-    """One experiment in a campaign — expands into TaskSpecs via
-    Cartesian product of (grids × seeds × variants × ablations × sweeps × scenarios).
+    """One experiment in a campaign — expands into TaskSpecs via the
+    Cartesian product of (grids x seeds x variants x ablations x sweeps x
+    scenarios).
 
-    Each list defaults to a single trivial entry so an experiment with
-    no axes set is just "run baseline scare on these grids and seeds".
-    Empty ``grids`` marks the experiment as a TODO placeholder
-    (skipped at expansion, surfaced in metadata).
+    Each list defaults to a single trivial entry, so an experiment with
+    no axes set just runs baseline scare on its grids and seeds. Empty
+    ``grids`` marks a TODO placeholder (skipped, surfaced in metadata).
     """
     name: str
     grids: list[GridSpec] = field(default_factory=list)
-    n_seeds: int = 0                          # 0 ⇒ defer to campaign default
+    n_seeds: int = 0                          # 0 => defer to campaign default
     variants: list[str] = field(default_factory=lambda: ["scare"])
     ablations: list[dict[str, Any]] = field(default_factory=lambda: [{}])
     sweeps: list[dict[str, Any]] = field(default_factory=lambda: [{}])
@@ -128,22 +126,18 @@ class CampaignConfig:
     task_timeout_s: float = 1500.0
     failure_delay_s_max: float = 2.0
     write_timeseries: bool = True
-    # Per-aid regulation trajectories — sparse event-driven series so
-    # cost is bounded.  Defaults ON because the validity plots
-    # (regulation-per-child line plot, coalition / holon balance) read
-    # them; disable explicitly when running a high-task-count
-    # production campaign where the extra ~few-MB-per-task is material.
+    # Per-aid regulation trajectories — sparse event-driven series.
+    # Default ON because the validity plots read them; disable for
+    # high-task-count campaigns where the few MB/task is material.
     write_trajectories: bool = True
     timestamp_dir: bool = True
     notes: str = ""
     defaults: GridDefaults = field(default_factory=GridDefaults)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
     # Overrides applied on top of ``slurm`` for the post-array eval /
-    # plotting job (see experiment.hpc.submit_plot). Any SlurmConfig
-    # field is overridable — partition, nodelist, account, qos, cpus,
-    # extra_sbatch_args, etc. Unset keys inherit from ``slurm``; set a
-    # key to ``null`` to drop it (e.g. ``"nodelist": null`` to release
-    # a per-task node pin for the eval job).
+    # plotting job (see submit_plot). Any SlurmConfig field is
+    # overridable; unset keys inherit from ``slurm``, and ``null`` drops a
+    # key (e.g. ``"nodelist": null`` releases a per-task node pin).
     slurm_eval: dict[str, Any] | None = None
 
     # ---- I/O -----------------------------------------------------------
@@ -155,8 +149,8 @@ class CampaignConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "CampaignConfig":
-        # Strip any unknown top-level keys (e.g. "$schema") so users can
-        # add comments-via-keys without breaking the loader.
+        # Strip ``$``-prefixed keys (e.g. "$schema") so config comments
+        # don't break the loader.
         data = {k: v for k, v in data.items() if not k.startswith("$")}
         grids_raw = data.pop("grids", [])
         experiments_raw = data.pop("experiments", [])
@@ -180,8 +174,8 @@ class CampaignConfig:
             )
         except TypeError as exc:
             raise ValueError(f"invalid config: {exc}") from exc
-        # Validate slurm_eval keys early so a typo surfaces at plan time,
-        # not when submit_plot constructs the merged SlurmConfig.
+        # Validate slurm_eval keys now so a typo surfaces at plan time,
+        # not when submit_plot builds the merged SlurmConfig.
         if slurm_eval_raw:
             try:
                 cfg.effective_eval_slurm()
@@ -224,15 +218,13 @@ class RuntimePlan:
     task_timeout_s: float = 1500.0
     failure_delay_s_max: float = 2.0
     write_timeseries: bool = True
-    # Per-aid regulation trajectories — sparse event-driven series so
-    # cost is bounded.  Defaults ON because the validity plots
-    # (regulation-per-child line plot, coalition / holon balance) read
-    # them; disable explicitly when running a high-task-count
-    # production campaign where the extra ~few-MB-per-task is material.
+    # Per-aid regulation trajectories — sparse event-driven series.
+    # Default ON because the validity plots read them; disable for
+    # high-task-count campaigns where the few MB/task is material.
     write_trajectories: bool = True
-    # Claims that flip task status to ``claims_failed`` when they don't
-    # pass.  Default set covers the two chapter-claim invariants we
-    # cannot silently violate without invalidating the headline numbers.
+    # Claims that flip task status to ``claims_failed`` when they fail.
+    # Default set covers the invariants we cannot silently violate
+    # without invalidating the headline numbers.
     fatal_claims: tuple[str, ...] = ("priority_invariant", "monotonic_progress")
 
     @classmethod
@@ -251,8 +243,8 @@ class RuntimePlan:
 
 
 CAMPAIGN_LAYOUT = {
-    "config": "config.json",        # the resolved CampaignConfig (source of truth)
-    "config_source": "config.source.json",  # original config file as user passed it
+    "config": "config.json",        # resolved CampaignConfig (source of truth)
+    "config_source": "config.source.json",  # original config as passed
     "manifest": "manifest.jsonl",
     "metadata": "metadata.json",
     "tasks": "tasks",

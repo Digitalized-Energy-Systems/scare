@@ -1,12 +1,11 @@
-"""Integration tests for the priority-aware oracle (Option B).
+"""Integration tests for the priority-aware oracle.
 
-Run monee's ``min_load_shedding`` LP through ``run_oracle`` with and
-without a priorities map.  When priorities are present and the LP must
-shed, high-priority loads should keep more of their served setpoint
-than low-priority loads.
+Runs monee's ``min_load_shedding`` LP through ``run_oracle`` with and
+without a priorities map. When priorities are present and the LP must
+shed, high-priority loads should keep more of their served setpoint than
+low-priority loads.
 
-These tests need a real LP solver (Pyomo + Gurobi).  They're tagged
-``@pytest.mark.slow`` so the fast unit-test pass can skip them.
+Needs a real LP solver (Pyomo + Gurobi); skipped when Gurobi is absent.
 """
 
 from __future__ import annotations
@@ -32,22 +31,18 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_factory_returns_none_without_priorities():
-    """No priorities supplied → factory returns None → monee uses
-    its legacy flat-weight behaviour (no priority discrimination).
-    """
+    """No priorities → factory returns None → monee uses its default
+    flat-weight behaviour (no priority discrimination)."""
     net = fetch_example_net()
     assert _weight_for_load_factory(net, None, base_demand_weight=1e3) is None
     assert _weight_for_load_factory(net, {}, base_demand_weight=1e3) is None
 
 
 def test_factory_returns_per_tier_weights():
-    """With priorities, the factory returns a callable that emits
+    """With priorities, the factory returns a callable emitting
     ``base × _ORACLE_TIER_WEIGHT[tier]`` for known loads and ``None``
-    for unmapped models.  Tier 1 → 1e12, tier 2 → 1e8, tier 3 → 1e4,
-    tier 4 → 1 — see ``oracle._ORACLE_TIER_WEIGHT``.
-    """
+    for unmapped models (tier 1 → 1e12 ... tier 4 → 1)."""
     net = fetch_example_net()
-    # Pick two real load aids
     load_aids = [
         f"child-{c.id}"
         for c in net.childs
@@ -89,12 +84,9 @@ def test_factory_returns_per_tier_weights():
 
 @pytest.mark.slow
 def test_oracle_with_priorities_sheds_low_priority_first():
-    """End-to-end LP test: run the oracle on the example MES with
-    priorities skewed so two known PowerLoads have tier-1 vs tier-10.
-    With no failure (steady state), nothing should shed.  Then apply
-    a contrived failure that forces shedding and verify the tier-10
-    load gets shed first.
-    """
+    """End-to-end LP test: with no failure nothing should shed; under a
+    forced deficit the lower-priority load is shed at least as deeply as
+    the higher-priority one."""
     from monee.model.formulation import MISOCP_NETWORK_FORMULATION
     from mango_energy_environments.environments.restoration.multi_energy_monee import (
         Failure,
@@ -113,9 +105,8 @@ def test_oracle_with_priorities_sheds_low_priority_first():
     aid_tier1 = f"child-{power_loads[0][0]}"
     aid_tier4 = f"child-{power_loads[1][0]}"
 
-    # Assign ALL childs a priority (skewed so the LP can't trivially
-    # ignore tiers).  Two specific loads get tier 1 (critical) and
-    # tier 4 (sheddable); the rest get tier 3 (middle).
+    # Assign every child a priority: two specific loads get tier 1 and
+    # tier 4, the rest tier 3.
     priorities: dict[str, int] = {}
     for c in net.childs:
         aid = f"child-{c.id}"
@@ -126,7 +117,7 @@ def test_oracle_with_priorities_sheds_low_priority_first():
         elif type(c.model).__name__ == "PowerLoad":
             priorities[aid] = 3
 
-    # No failure — sanity: oracle should fully serve everything.
+    # No failure: oracle should fully serve everything.
     out_clean = run_oracle(net, [], priorities=priorities)
     if not out_clean.get("lp_success", True):
         pytest.skip(
@@ -141,11 +132,10 @@ def test_oracle_with_priorities_sheds_low_priority_first():
         f"tier-4 should be fully served on clean net, got {regs[aid_tier4]}"
     )
 
-    # Force a deficit by stamping a tight slack budget on the external
-    # power grid.  ``run_oracle`` reads ``_scare_slack_budget_mw`` via
-    # ``_collect_slack_budgets`` and feeds it as ``ext_grid_el_bounds``
-    # to the LP — raw ``p_mw.min / max`` modifications are ignored by
-    # the oracle path.  Mirrors ``experiment.restoration.apply_slack_budget``.
+    # Force a deficit via a tight slack budget on the external power grid.
+    # ``run_oracle`` reads ``_scare_slack_budget_mw`` and feeds it as
+    # ``ext_grid_el_bounds`` to the LP; raw ``p_mw.min/max`` edits are
+    # ignored by the oracle path.
     total_p_load_mw = sum(
         getattr(c.model, "p_mw", 0.0)
         for c in net.childs
@@ -160,10 +150,9 @@ def test_oracle_with_priorities_sheds_low_priority_first():
 
     out_shed = run_oracle(net, [], priorities=priorities)
     regs_shed = out_shed["regulations"]
-    # monee silently accepts ``infeasibleOrUnbounded`` and returns the
-    # witness solution (every regulation pinned to its 1.0 default),
-    # which makes the shedding assertions meaningless.  Detect that
-    # degenerate case explicitly and skip.
+    # monee may silently return the trivial witness (all regulations
+    # pinned to 1.0) under infeasibleOrUnbounded, making the shedding
+    # assertions meaningless — skip that degenerate case.
     if all(abs(r - 1.0) < 1e-9 for r in regs_shed.values()):
         pytest.skip(
             "Oracle LP returned trivial witness (all regulations = 1.0) "
@@ -173,11 +162,8 @@ def test_oracle_with_priorities_sheds_low_priority_first():
     r_tier1 = regs_shed.get(aid_tier1)
     r_tier4 = regs_shed.get(aid_tier4)
     assert r_tier1 is not None and r_tier4 is not None
-    # The whole point of priority-aware shedding: tier-4 should be
-    # cut at least as deeply as tier-1.  Tolerance handles ties on
-    # tiny-demand corner cases; the substantive assertion is the
-    # ordering (and that *some* shedding actually happened, i.e. at
-    # least one regulation moved off the unit envelope).
+    # tier-4 should be cut at least as deeply as tier-1 (tolerance
+    # handles tiny-demand ties), and some shedding must have happened.
     assert r_tier1 >= r_tier4 - 1e-6, (
         f"priority inversion under deficit: tier-1 r={r_tier1:.4f} < "
         f"tier-4 r={r_tier4:.4f}"

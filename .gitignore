@@ -53,3 +53,4 @@ docs
 _runs
 *.mat
 .claude
+_eval_snap

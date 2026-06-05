@@ -7,7 +7,7 @@ designated home group leader.  Verifies:
 
 1. The monitor fires when ``loading_percent`` crosses the (-100, 100)
    bound and the message reaches the home leader.
-2. The relief target carries the right sign (negative ⇒ home group
+2. The relief target carries the right sign (negative => home group
    must shed) and a non-zero magnitude derived from the line flow.
 3. Disabling ``enable_curtailment_auction`` does not suppress the
    StartBalanceNegotiation channel (independent code paths).
@@ -31,7 +31,6 @@ class _RecordingRole:
     def __init__(self):
         self.received: list[StartBalanceNegotiation] = []
 
-    # mango Role interface (duck-typed) — subscribe in setup.
     def __init_subclass__(cls, **kwargs):  # pragma: no cover - unused
         super().__init_subclass__(**kwargs)
 
@@ -72,9 +71,9 @@ def _make_branch_obs(
 ) -> dict:
     """Synthetic PowerLine observation dict.
 
-    ``loading_percent`` is fed in percent (consistent with the
-    SECTOR_CONSTRAINTS bound at ±100); ``obs_constraint_values`` keeps
-    the raw value when |val| > 5 so this maps straight through.
+    ``loading_percent`` is in percent (matching the SECTOR_CONSTRAINTS
+    bound at +/-100); ``obs_constraint_values`` keeps the raw value when
+    |val| > 5 so it maps straight through.
     """
     return {
         "loading_percent": loading_percent,
@@ -98,7 +97,6 @@ def _build_world(
         communication_sim=SimpleCommunicationSimulation(default_delay_s=0.001)
     )
 
-    # Branch agent
     behavior.set_obs(branch_aid, branch_obs)
 
     # Build leader first so we can pass its address to the branch monitor.
@@ -117,9 +115,9 @@ def _build_world(
     branch_agent = world.register(RoleAgent(), suggested_aid=branch_aid)
     branch_agent.add_role(monitor)
 
-    # Empty groups topology — multi-hop / auction paths reach for it
-    # via ``topology_neighbors`` and would otherwise raise.  An empty
-    # topology keeps those calls safe no-ops.
+    # Empty groups topology: multi-hop / auction paths reach for it via
+    # ``topology_neighbors`` and would otherwise raise; empty keeps those
+    # calls safe no-ops.
     with create_topology(tid="groups"):
         pass
 
@@ -128,8 +126,8 @@ def _build_world(
 
 @pytest.mark.asyncio
 async def test_line_overload_triggers_balance_negotiation():
-    """loading_percent = 130 must produce a StartBalanceNegotiation
-    on the home leader with a negative override_target."""
+    """loading_percent=130 produces a StartBalanceNegotiation on the
+    home leader with a negative override_target."""
     behavior = MockBehavior()
     world, _, leader_recorder = _build_world(
         behavior,
@@ -145,15 +143,15 @@ async def test_line_overload_triggers_balance_negotiation():
     )
     msg = leader_recorder.received[0]
     assert msg.override_target is not None
-    # relief is negative — group must reduce net load
+    # Relief is negative (group must reduce net load).
     assert msg.override_target < 0
-    # relief magnitude is flow_mw * overshoot/100 = 1.0 * 0.30 = 0.30 MW
+    # Relief = flow_mw * overshoot/100 = 1.0 * 0.30 = 0.30 MW.
     assert abs(msg.override_target + 0.30) < 1e-6
 
 
 @pytest.mark.asyncio
 async def test_line_loading_within_bounds_emits_nothing():
-    """loading_percent = 80 stays within (-100, 100) — no message."""
+    """loading_percent=80 stays within (-100, 100): no message."""
     behavior = MockBehavior()
     world, _, leader_recorder = _build_world(
         behavior,
@@ -174,7 +172,7 @@ async def test_relief_magnitude_scales_with_flow():
     world, _, leader_recorder = _build_world(
         behavior,
         branch_aid="branch-5-6",
-        # 120% loading with 2.0 MW flowing.  Relief = 2.0 * 0.20 = 0.40 MW.
+        # 120% loading, 2.0 MW flowing: relief = 2.0 * 0.20 = 0.40 MW.
         branch_obs=_make_branch_obs(loading_percent=120.0, p_from_mw=2.0, p_to_mw=1.9),
     )
 
@@ -188,9 +186,8 @@ async def test_relief_magnitude_scales_with_flow():
 
 @pytest.mark.asyncio
 async def test_no_home_leader_addr_skips_relief_send():
-    """When home_leader_addr is None the monitor must not crash and
-    must not send anything.  Defensive guard for scenarios where the
-    home assignment failed to resolve (e.g., orphan PowerLine)."""
+    """When home_leader_addr is None (e.g. an orphan PowerLine whose home
+    assignment failed to resolve) the monitor must neither crash nor send."""
     behavior = MockBehavior()
     branch_aid = "branch-7-8"
     behavior.set_obs(branch_aid, _make_branch_obs(loading_percent=140.0))
@@ -202,7 +199,7 @@ async def test_no_home_leader_addr_skips_relief_send():
         behavior,
         Sector.ELECTRICITY,
         branch_id=(7, 8),
-        home_leader_addr=None,  # unresolved
+        home_leader_addr=None,
         enable_curtailment_auction=False,
         enable_multihop_constraint=False,
     )
@@ -214,4 +211,4 @@ async def test_no_home_leader_addr_skips_relief_send():
     async with world:
         await discrete_step_until(world, max_advance_time_s=1.5)
 
-    # No exceptions and no leader to receive — success is reaching here.
+    # Success is reaching here without an exception.

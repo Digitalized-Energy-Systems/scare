@@ -1,18 +1,15 @@
 """Configuration for the restoration scenario builder.
 
-A single dataclass that the scenario builder consumes to enable / disable
-architectural components and tune their parameters.  Defaults reproduce
-the current (post-Gap-1..6 + options 3+4 + B/A/C) behaviour, so existing
-callers that don't pass a config get the established baseline.
-
-Used by the evaluation harness to run ablations (turn each component
-off in isolation) and sensitivity sweeps (vary tunables) without
-duplicating the scenario plumbing.
+A single dataclass the scenario builder consumes to enable/disable
+architectural components and tune their parameters.  Defaults give the
+baseline behaviour, so callers that pass no config get the baseline.
+Used by the evaluation harness for ablations (turn one component off)
+and sensitivity sweeps (vary tunables).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -21,522 +18,394 @@ class RestorationConfiguration:
     # Architectural levels (ablation flags)
     # ----------------------------------------------------------------
 
-    # Level-2 holonic ADMM across same-sector group leaders.  When
-    # False, no HolonicCommunityRole is installed and the ``holons``
-    # topology is empty; group-level rebalancing falls back to local
-    # constraint-violation triggers and the local-generation fallback.
+    # Level-2 holonic ADMM across same-sector group leaders.  False:
+    # no HolonicCommunityRole, empty ``holons`` topology; group-level
+    # rebalancing falls back to local constraint-violation triggers and
+    # the local-generation fallback.
     enable_holonic: bool = True
 
-    # Whether the MW-balance coordination layers (L2/L3 holon supply-priority
-    # dispatch AND the L1 gossip balance negotiation) run for the HEAT sector.
-    # Default False (deactivated).  Heat service is temperature-limited, not
-    # MW-limited (the heat ExtHydrGrid slack is intentionally unbounded), so
-    # these layers have no MW imbalance to resolve and instead read a cold
-    # node's thermal deficit / the islanded sub-network's unservable demand as
-    # an MW deficit and shed connected loads.  A multi-seed A/B (6 cold-day
-    # tasks, 3 seeds) found enabling them changes mean heat served by only
-    # ~+0.0025 — within the run-to-run noise floor and with no mechanism that
-    # explains why MW coordination should help a temperature-limited sector.
-    # So heat is coordinated solely by the frontier controller (temperature) +
-    # curtailment auction, which we DO understand.  El/gas are unaffected.
-    # Set True to re-enable holon+gossip on heat for ablations.
-    enable_heat_mw_balance: bool = False
-
-    # Re-establish the heat sector's link to the Layer-3 CP coordination
-    # after the MW-balance deactivation above severed it.  The cold loads'
-    # leaders signal their *delivered* heat (served) — not the unbounded
-    # heat-slack budget — as the L3 base supply, so the unmet heat demand
-    # (nominal − delivered) drives the reachable heat-producing coupling
-    # points (CHP / P2H) to ramp their heat output.  Without this, L3 sees
-    # the heat slack's effectively-infinite pool, judges heat fully
-    # supplied, and leaves every heat CP idle even while flow-starved
-    # junctions sit below the temperature floor.  Heat-scoped; el/gas
-    # keep the slack-budget base supply.  Set False to ablate.
+    # Re-establish the heat sector's link to Layer-3 CP coordination.
+    # Heat MW-balance (L2/L3 supply-priority dispatch + L1 gossip) is
+    # off for the temperature-limited heat sector, which severs heat's
+    # L3 link.  When True, cold-load leaders signal their *delivered*
+    # heat (not the unbounded heat-slack budget) as the L3 base supply,
+    # so unmet demand (nominal − delivered) drives reachable heat CPs
+    # (CHP/P2H) to ramp output.  Without it, L3 sees the slack's
+    # effectively-infinite pool, judges heat fully supplied, and leaves
+    # every heat CP idle while junctions sit below the temperature
+    # floor.  Heat-scoped; el/gas keep the slack-budget base supply.
     enable_heat_cp_supply: bool = True
     # Refresh cadence (s) for a heat leader's HolonSummary so the
     # post-failure delivered-heat vector reaches L3 within the episode.
-    # Needed because heat's normal summary triggers (L1 gossip finish /
-    # L2 dispatch) are off under ``enable_heat_mw_balance=False`` and the
-    # 30 s liveness watchdog never fires inside a short run.
+    # Needed because heat's normal summary triggers (L1/L2) are off and
+    # the 30 s liveness watchdog never fires inside a short run.
     heat_cp_supply_refresh_s: float = 2.0
 
-    # Level-3 cross-sector ADMM at coupling-point agents.  When False,
+    # Level-3 cross-sector ADMM at coupling-point agents.  False:
     # ``EnergyConverterRole`` / ``DistributedOptimizationRole`` /
-    # ``CoordinatorRole`` are not installed on CP nodes/branches and
-    # the ``cps`` topology is empty.
+    # ``CoordinatorRole`` are not installed on CP nodes/branches and the
+    # ``cps`` topology is empty.
     enable_cp_admm: bool = True
 
-    # Replicated priority-cascaded sharing ADMM at L3 (the decentralised
-    # replacement for the Option-B elected-coordinator path).  When
-    # True, every CP runs the same :func:`scare.service.cp_priority_admm.
-    # solve_cp_priority_admm` kernel locally on its replicated peer view
-    # and commits its own regulation factor as a single self-addressed
-    # ``apply_regulate`` write — no per-component coordinator, no
-    # cross-CP fan-out.  Each CP sources per-sector demand/supply from
-    # the extended L2 ``holon_summary_<sector>`` meshes (the CP joins
-    # those meshes at scenario build time) and CP-specific slices from
-    # peer ``CPSummary`` envelopes.
-    #
-    # Default flipped to True as of the L3 cutover: the new path
-    # shadows the legacy Option-B installation through the
-    # ``if priority_admm: new_path; elif cp_admm: legacy_path`` install
-    # chain in ``scenario.restoration``, so ``enable_cp_admm`` stays at
-    # its True default for ablation reachability without competing with
-    # the new role.  Set False to fall back to the legacy elected-
-    # coordinator path; both can be False to install no L3 role at all
-    # (the single-level / component-level variants do this).
+    # Replicated priority-cascaded sharing ADMM at L3 (decentralised
+    # replacement for the elected-coordinator path).  True: every CP
+    # runs the same L3 sharing-ADMM kernel (selected by
+    # ``cp_admm_algorithm``) locally on its replicated peer view and
+    # commits its own regulation factor as one self-addressed
+    # ``apply_regulate`` write — no coordinator, no cross-CP fan-out.
+    # Each CP sources per-sector demand/supply from the L2
+    # ``holon_summary_<sector>`` meshes (joined at build time) and
+    # CP-specific slices from peer ``CPSummary`` envelopes.  This path
+    # shadows the legacy install via the
+    # ``if priority_admm: new; elif cp_admm: legacy`` chain in
+    # ``scenario.restoration``.  False falls back to the legacy
+    # coordinator path; both False installs no L3 role.
     enable_cp_priority_admm: bool = True
 
-    # L3 kernel selection.  ``"gossip"`` (default) runs the
-    # coordinator-free peer-to-peer sharing ADMM from
-    # ``distributed_resource_optimization.algorithm.gossip_lexicographic_cascade``:
-    # each CP runs only its own scalar x-update locally and rebuilds
-    # the shared aggregate from peer Iter broadcasts.  Crash-fault
-    # tolerant (peer death held over to next round; stale rounds
-    # discarded by ``round_id``; round-timeout fallback commits a
-    # feasible-suboptimal iterate rather than blocking).  Matches the
-    # replicated kernel's per-CP factors within float-precision noise
-    # at every N verified (5, 10, 20, 28); see
-    # ``tests/gossip_lexicographic_cascade``.  ``"lexicographic"``
-    # falls back to the replicated kernel — every CP solves the full
-    # N-CP problem locally and keeps only its own row.  Retained for
-    # ablation comparison.  ``"penalty"`` selects the legacy
-    # ``solve_cp_priority_admm`` (priority-weight marginal penalty);
-    # that kernel is *formally broken* for the budget case — a soft
-    # over-draw penalty either limit-cycles or settles with a
-    # steady-state offset, neither respecting the hard budget — and
-    # is retained only for ablation.
+    # L3 kernel selection.  ``"gossip"`` (default): coordinator-free
+    # peer-to-peer sharing ADMM from
+    # ``distributed_resource_optimization.algorithm.gossip_lexicographic_cascade``
+    # — each CP runs only its own scalar x-update and rebuilds the
+    # shared aggregate from peer Iter broadcasts.  Crash-fault tolerant
+    # (peer death held to next round; stale rounds discarded by
+    # ``round_id``; round-timeout commits a feasible-suboptimal iterate
+    # rather than blocking).  ``"lexicographic"``: replicated kernel —
+    # every CP solves the full N-CP problem locally and keeps only its
+    # own row (retained for ablation).
     cp_admm_algorithm: str = "gossip"
 
     # Proximal step-damping coefficient ``α ≥ 0`` for the lexicographic
-    # cascade's per-CP closed-form projection.  Biases the *iterate
-    # step* (not the saddle): at any fixed point ``r = r_prev`` so the α
-    # term cancels and the asymptote is the bare sharing-ADMM optimum.
-    # 0.1 is the DRO empirical sweet spot; α = 0 is still correct but
-    # can oscillate on a degenerate optimal face and never trip the
-    # per-iter convergence test.  Ignored when
-    # ``cp_admm_algorithm == "penalty"``.
+    # cascade's per-CP closed-form projection.  Biases the iterate step,
+    # not the saddle: at any fixed point ``r = r_prev`` so the α term
+    # cancels and the asymptote is the bare sharing-ADMM optimum.
+    # α = 0 is correct but can oscillate on a degenerate optimal face.
     cp_admm_r_regularization: float = 0.1
 
     # Distributed FailureNotice propagation through ProblemDetector.
-    # When False, a centralised ``behavior_in(BranchFailureEvent)``
-    # callback triggers all leaders directly (legacy behaviour, kept
-    # for the ablation comparison).
+    # False: a centralised ``behavior_in(BranchFailureEvent)`` callback
+    # triggers all leaders directly (legacy, kept for ablation).
     enable_distributed_failure_notice: bool = True
 
-    # Concept C — Layer-2 dynamic holon-membership filter.  When True,
-    # a ``DynamicHolonRole`` sits next to ``HolonicCommunityRole`` on
-    # every holon-eligible leader and drops members that have become
-    # physically unreachable through the live sector subgraph after a
-    # branch failure (see scare.community.dynamic_holon).  When False
-    # the holon keeps its static chunk-time membership and may try to
-    # allocate flow across islanded members.  Default on so the
-    # holon's allocations stay physically realisable.
+    # Layer-2 dynamic holon-membership filter.  True: a
+    # ``DynamicHolonRole`` beside ``HolonicCommunityRole`` on every
+    # holon-eligible leader drops members that became physically
+    # unreachable through the live sector subgraph after a branch
+    # failure (see scare.community.dynamic_holon).  False: holon keeps
+    # static membership and may allocate flow across islanded members.
     enable_dynamic_holon_topology: bool = True
 
-    # Concept C — Layer-3 dynamic CP-connector filter.  When True, a
-    # ``DynamicConnectorRole`` sits next to ``EnergyConverterRole`` on
-    # every CP agent and drops group-leader peers that have become
-    # physically unreachable through the cross-sector graph (incl. CP
-    # bridges) after a branch failure.  Default on for the same
-    # physically-realisable-allocations reason as L2.
+    # Layer-3 dynamic CP-connector filter.  True: a
+    # ``DynamicConnectorRole`` beside ``EnergyConverterRole`` on every
+    # CP drops group-leader peers that became physically unreachable
+    # through the cross-sector graph (incl. CP bridges) after a failure.
     enable_dynamic_cp_topology: bool = True
 
     # Layer 2.5 — sector-wide holon-summary mesh + cross-holon priority
-    # invariant detection.  Milestone 1: each leader periodically
-    # publishes its per-tier served/demand summary on the
-    # ``holon_summary_<sector>`` topology; every same-sector leader
-    # subscribes and runs a local inversion check across received
-    # summaries.  On detection, ``record_event("priority_inversion_
-    # detected", ...)`` fires for post-run analysis.  Milestone 2
-    # (later) will form an ad-hoc coalition that re-balances across
-    # the inverted holons.  Cheap when off: no topology + no role.
+    # inversion detection.  Each leader periodically publishes its
+    # per-tier served/demand summary on ``holon_summary_<sector>``;
+    # every same-sector leader subscribes and checks for inversions
+    # across received summaries, firing
+    # ``record_event("priority_inversion_detected", ...)`` on detection.
+    # Cheap when off: no topology + no role.
     enable_holon_summary: bool = True
 
-    # Period between HolonSummary publishes (sim-seconds).  A leader's
-    # role schedules ``_publish`` every ``holon_summary_period_s`` and
-    # ``_check_invariants`` at the same cadence.  Faster picks up
-    # cross-holon inversions sooner but costs O(N²) extra messages
-    # per sector per period.
-    #
-    # The L2 holon ADMM dispatches its initial allocation reactively
-    # at ~ t=0.08 s (right after holon formation).  That allocation
-    # is what *creates* the cross-holon inversions L2.5 then races to
-    # close.  Detection needs (a) one self-publish, (b) peer publishes
-    # to arrive, (c) a second tick where this leader sees ≥1 peer
-    # summary and can compute the cross-holon aggregate.  At 1 s
-    # period that was ≥ 2 s of inversion before the first coalition
-    # ever fired — the dominant cause of the per-component priority
-    # invariant lingering low even at 60 s sim runs.  0.25 s lets the
-    # first coalition open by ~0.6 s sim time so the post-L2 inversion
-    # gap is closed within the first second.
+    # Period between HolonSummary publishes (sim-seconds); also the
+    # ``_check_invariants`` cadence.  Faster picks up cross-holon
+    # inversions sooner but costs O(N²) extra messages per sector per
+    # period.  Detection needs a self-publish, peer publishes to arrive,
+    # then a tick where this leader sees ≥1 peer summary — so the period
+    # bounds how fast a post-L2-dispatch inversion can be closed.
     holon_summary_period_s: float = 0.25
 
     # Per-tier served-fraction tolerance for declaring a priority
     # inversion.  A pair (tier_high, tier_low) is flagged when
     # ``frac[tier_high] < frac[tier_low] - holon_summary_inversion_tol``.
-    # Mirrors the priority-invariant claim's 1e-3 tolerance so the
-    # detector and the claim agree on what counts as an inversion.
+    # Mirrors the priority-invariant claim's 1e-3 tolerance.
     holon_summary_inversion_tol: float = 1e-3
 
-    # Layer 2.5 milestone 2 — coalition formation.  When True, the
-    # lex-smallest leader that detects a cross-holon priority
-    # inversion opens an ad-hoc coalition with the affected peers,
-    # runs a scoped priority-greedy allocation over their flex, and
-    # broadcasts per-tier service-fraction constraints via the same
-    # ``StartBalanceNegotiation(service_fraction_by_sector_priority=
-    # ...)`` handler L2 uses for its supply-priority ADMM result.
-    # Constraints are re-asserted every L2.5 tick until ``ttl_s`` or
-    # a ``BranchFailureEvent`` invalidates them.  Off ⇒ M1 behaviour
-    # (detect + record event, no scoped allocation).
-    #
-    # Default off as of 2026-05-23: with ``holon_admm_scope="sector"``
-    # the new sector-wide L2 already produces a sector-uniform per-tier
-    # service fraction across all holons in the same sector, so the
-    # intra-sector coalition has nothing to fix.  Set True to opt
-    # back in (e.g. when paired with ``holon_admm_scope="holon"``).
+    # Layer 2.5 coalition formation.  True: the lex-smallest leader that
+    # detects a cross-holon inversion opens an ad-hoc coalition with the
+    # affected peers, runs a scoped priority-greedy allocation over their
+    # flex, and broadcasts per-tier service-fraction constraints via the
+    # ``StartBalanceNegotiation(service_fraction_by_sector_priority=...)``
+    # handler L2 uses.  Constraints re-asserted every L2.5 tick until
+    # ``ttl_s`` or a ``BranchFailureEvent`` invalidates them.  False:
+    # detect + record event only, no scoped allocation.
     enable_holon_coalition: bool = False
 
     # Window the initiator waits after broadcasting
-    # ``CoalitionInvitation`` before running the allocation pass.
-    # Short enough that the coalition tick cadence (``holon_summary_
-    # period_s``) still dominates; long enough that even loaded peers
-    # have time to reply.  Default 1 s matches the M1 tick period.
+    # ``CoalitionInvitation`` before running the allocation pass.  Short
+    # enough that the tick cadence (``holon_summary_period_s``) still
+    # dominates; long enough that loaded peers can reply.
     holon_coalition_accept_window_s: float = 1.0
 
     # TTL on coalition constraints.  After ``issued_at + ttl_s`` the
-    # constraint is dropped and the underlying L2 holon ADMM
-    # allocation takes over on the next L2 rebalance.  Sized so the
-    # coalition's effect outlasts a few L2.5 ticks (so re-assert keeps
-    # the fraction stable) but doesn't survive past the next
-    # significant grid state change.
+    # constraint is dropped and the L2 holon ADMM allocation takes over
+    # on the next rebalance.  Sized to outlast a few L2.5 ticks but not
+    # survive the next significant grid state change.
     holon_coalition_constraint_ttl_s: float = 8.0
 
-    # Cross-sector coalition extension (L2.5).  When True,
-    # ``HolonSummaryRole`` additionally detects priority inversions
-    # *across* sectors connected by a CP (e.g. tier-1 electricity
-    # under-served while tier-5 heat fully served, with a P2H
-    # between them) and forms a coalition spanning both sectors plus
-    # the bridging CP(s).  The coalition issues a ``CPCommitment``
-    # envelope to each CP member and per-sector service fractions to
-    # the leader members — both written to the shared
-    # ``CoalitionConstraintStore`` so L2 (per-sector) and L3 (CP
-    # ADMM) honour the commitment for the TTL window.
-    #
-    # Off ⇒ per-sector behaviour only.  Default off as of 2026-05-23:
-    # the smoke campaign showed L2.5 firing reactively after the bad
-    # initial L2 dispatch has already been made (electrical balance
-    # collapses ~22 % in the first 300 ms of sim time) and only
-    # marginally recovers — see the 2026-05-22 eval_full_smoke phase
-    # analysis.  The new sector-wide L2 (all holons as ADMM peers,
-    # intra-sector) is intended to subsume L2.5's role; cross-sector
-    # coupling will be re-introduced in a later milestone once the
-    # in-sector path is correct.  Set True to opt back in.
+    # Cross-sector coalition extension (L2.5).  True: ``HolonSummaryRole``
+    # also detects inversions *across* sectors connected by a CP (e.g.
+    # tier-1 electricity under-served while tier-5 heat fully served via
+    # a P2H) and forms a coalition spanning both sectors plus the
+    # bridging CP(s).  It issues a ``CPCommitment`` to each CP member and
+    # per-sector service fractions to leader members, both written to the
+    # shared ``CoalitionConstraintStore`` so L2 and L3 honour the
+    # commitment for the TTL window.  False: per-sector behaviour only.
     enable_cross_sector_coalitions: bool = False
 
     # Curtailment auction in GridConstraintMonitor on hard violations.
-    # When False, violations only emit a BalanceProblem to re-trigger
-    # gossip; no proportional curtailment is broadcast.
+    # False: violations only emit a BalanceProblem to re-trigger gossip;
+    # no proportional curtailment is broadcast.
     enable_curtailment_auction: bool = True
 
     # Gate the curtailment auction so it stops firing where it cannot
-    # help.  A 90-run paired spotlight (curtailment_spotlight, 2026-06-02)
-    # found the auction fires 2.5–5× more often than there are distinct
-    # hard violations, with 63–87 % of applies stuck at the 0.02 gain
-    # floor and ~10 % applying literally 0.0 %, because ``_handle_violation``
-    # re-arms it every poll while a violation persists — even when the
-    # lever provably can't clear it.  When True this adds two guards
-    # (both no-ops when ``enable_curtailment_auction`` is False):
+    # help.  No-ops when ``enable_curtailment_auction`` is False.  True
+    # adds two guards:
     #   (a) SCOPE — the auction never fires on heat ``t_k`` or line
     #       ``loading_percent`` violations.  Its component-wide
     #       priority×own-sensitivity×reducible bidding is blind to WHICH
-    #       node/branch is violated, so for these it sheds whatever load is
-    #       most "willing" rather than one that relieves the violation:
-    #       no load's curtailment moves another junction's return temperature
-    #       (frontier controller's lever), and a line overload is a BRANCH
-    #       violation whose correct lever is the endpoint-targeted line-relief
-    #       path, not an arbitrary most-willing load in the component (the
-    #       auction there measured net-negative on the settled worst-line
-    #       loading).  The auction still fires on node-local ``vm_pu`` /
-    #       ``pressure_pu`` where the violating node's own load is the lever.
-    #   (b) PROGRESS GATE — for any other variable, if the violation's
-    #       overshoot has not improved beyond its best-seen value for
-    #       ``_CURTAIL_NO_PROGRESS_LIMIT`` consecutive auction rounds, stop
-    #       re-arming that variable until its overshoot improves again
-    #       (a worsening / topology change re-engages it).  Stops the
-    #       futile churn on line overloads the auction can't relieve
-    #       (the leader-directed line-relief path handles those).
-    # Default False to preserve the established baseline; set True for the
-    # ablation comparison.
+    #       node/branch is violated, so for these it sheds the most
+    #       "willing" load, not one that relieves the violation (no
+    #       load's curtailment moves another junction's return
+    #       temperature — the frontier controller's lever; a line
+    #       overload's correct lever is the endpoint-targeted relief
+    #       path).  Still fires on node-local ``vm_pu`` / ``pressure_pu``
+    #       where the violating node's own load is the lever.
+    #   (b) PROGRESS GATE — for any other variable, if the overshoot has
+    #       not improved beyond its best-seen value for
+    #       ``_CURTAIL_NO_PROGRESS_LIMIT`` consecutive rounds, stop
+    #       re-arming that variable until its overshoot improves (a
+    #       worsening / topology change re-engages it).
     enable_curtail_auction_gating: bool = False
 
-    # Cross-sensitivity targeting for the curtailment auction.  The auction
-    # currently allocates a bidder's curtail share by ``priority × OWN-local
-    # sensitivity × reducible`` — the "own-local" term measures how curtailing
-    # the bidder moves the bidder's OWN variable, not the (different) violated
-    # node/branch, so within a tier the shed spreads roughly uniformly across
-    # the component regardless of who can actually relieve the violation.
-    # When True, the ``CurtailmentNeed`` carries the violation's origin and a
-    # bidder additionally weights its willingness by its electrical proximity
-    # to that origin (read from the cached multi-hop ``ConstraintStateMessage``
-    # hop-distance) — a bounded within-tier multiplier, so priority stays
-    # lexicographically dominant.  Effect: the same total curtailment lands on
-    # the loads electrically nearest the violation (highest ∂constraint/∂Q),
-    # relieving it with less collateral shedding over the iterative rounds.
-    # Most meaningful for the MW/flow constraints (line ``loading_percent``,
-    # ``vm_pu``, gas ``pressure_pu``) where shedding-distance maps to leverage;
-    # heat ``t_k`` is excluded from the auction under gating anyway.  Default
-    # False; intended to be paired with ``enable_curtail_auction_gating``.
+    # Cross-sensitivity targeting for the curtailment auction.  The
+    # auction allocates a bidder's curtail share by
+    # ``priority × OWN-local sensitivity × reducible`` — the own-local
+    # term measures how curtailing the bidder moves the bidder's OWN
+    # variable, not the violated node/branch, so the shed spreads
+    # roughly uniformly within a tier.  True: ``CurtailmentNeed`` carries
+    # the violation's origin and each bidder additionally weights its
+    # willingness by electrical proximity to that origin (from the cached
+    # multi-hop ``ConstraintStateMessage`` hop-distance) — a bounded
+    # within-tier multiplier, so priority stays lexicographically
+    # dominant.  Effect: shed lands on loads nearest the violation
+    # (highest ∂constraint/∂Q).  Most meaningful for MW/flow constraints
+    # (``loading_percent``, ``vm_pu``, gas ``pressure_pu``); intended to
+    # pair with ``enable_curtail_auction_gating``.
     enable_curtail_auction_targeting: bool = False
 
     # Iterative line-overload relief.  On a branch ``loading_percent``
     # violation the branch monitor asks its ``home_leader`` (the line's
     # lower-priority-demand endpoint group) to shed ``relief_mw`` via a
-    # gossip round — but the legacy path sends that ONCE per violation
-    # episode (inside the event-dedup block), so the home leader sheds a
-    # single step and the line gets stuck on a plateau still above 100 %
-    # (traced: worst line drops 121→116 % in 0.6 s then sits flat for the
-    # rest of the run).  When True, the relief is RE-ASSERTED every poll the
-    # line is still overloaded (cooldown-guarded so it can't out-pace the
-    # gossip it triggers), with the magnitude recomputed from the live
-    # overshoot — so it shrinks to zero as the line reaches its bound and
-    # keeps drawing fresh relief while it is still over, driving the line
-    # toward feasibility round-by-round instead of one-and-done.  Default
-    # False (legacy one-shot).  Electricity line-relief only; the curtailment
-    # auction and other paths are untouched.
+    # gossip round.  Legacy (False): sent ONCE per violation episode, so
+    # the home leader sheds a single step and the line plateaus above
+    # 100 %.  True: relief is RE-ASSERTED every poll the line is still
+    # overloaded (cooldown-guarded), with magnitude recomputed from the
+    # live overshoot, so it shrinks to zero as the line reaches its bound
+    # and drives the line toward feasibility round-by-round.  Electricity
+    # line-relief only.
     enable_line_relief_reassert: bool = False
 
-    # Branch-downstream targeted line relief.  Both legacy line-overload
-    # levers shed the WRONG loads: the curtailment auction broadcasts to the
-    # whole component (picks the most-"willing" load, which need not flow
-    # through the line), and the relief path sheds the line's lower-priority
-    # ENDPOINT group (whose loads also mostly don't flow through it) — so
-    # neither reduces the binding line's loading (measured: settled worst-line
-    # ~102-108 %, unmoved by either lever, and iterating them just sheds more
-    # for no relief).  The only loads whose curtailment reduces a radial
-    # branch's flow ~1:1 are the ones DOWNSTREAM of it (the subtree fed
-    # through it).  When True, each electricity branch monitor is given the
-    # set of loads that become slack-disconnected when the branch is removed
-    # (computed once at scenario build), and on a ``loading_percent`` violation
-    # it runs the curtailment auction against THAT set instead of the whole
-    # component — so the shed lands on loads that actually relieve the line,
-    # lowest-priority-first (priority still dominates the bid).  Replaces the
-    # component-wide auction AND the endpoint-relief path for line overload;
-    # branches whose removal doesn't cleanly disconnect a side (meshed / not a
-    # bridge) get an empty set and fall back to the legacy relief.  Default
-    # False.  Best paired with ``enable_curtail_auction_gating`` so the
-    # progress gate iterates the targeted shed toward feasibility.
-    enable_branch_downstream_relief: bool = False
+    # Branch-downstream targeted line relief.  The only loads whose
+    # curtailment reduces a radial branch's flow ~1:1 are those
+    # DOWNSTREAM of it (the subtree it feeds); the component-wide auction
+    # and the endpoint-relief path both shed loads that need not flow
+    # through the line.  True: each electricity branch monitor gets the
+    # set of loads that become slack-disconnected when the branch is
+    # removed (computed once at build), and on a ``loading_percent``
+    # violation runs the curtailment auction against THAT set instead of
+    # the whole component — shed lands on loads that actually relieve the
+    # line, lowest-priority-first.  Replaces the component-wide auction
+    # AND the endpoint-relief path for line overload; branches whose
+    # removal doesn't cleanly disconnect a side (meshed / not a bridge)
+    # get an empty set and fall back to legacy relief.
+    enable_branch_downstream_relief: bool = True
 
-    # Strict reverse-priority WATERFALL for the branch-downstream line-relief
-    # auction.  Only consulted when ``enable_branch_downstream_relief`` is True
-    # (the targeted downstream bidder set + the L2-clawback line lock are
-    # prerequisites).  The default downstream auction allocates the shed by
-    # ``priority_weight × sensitivity × reducible`` willingness, whose 1e8/1e4/1
-    # tier exponents pour ~all shed onto the lowest-priority (tier-4) downstream
-    # loads — typically far too small a fraction of the through-flow to clear a
-    # 10-20 % overload — and never escalate to the tier-3 bulk that actually
-    # carries the binding line, so the line plateaus above 100 % (traced:
-    # branch settles ~113 % with tiers 1-3 still at full draw).  When True, the
-    # auctioneer instead sheds the downstream set in strict reverse-priority
-    # order: it drives the lowest-priority tier with reducible draw to zero,
-    # then escalates to the next tier, re-arming each poll until the line is
-    # ≤100 %.  Tier 1 is never shed (the hard-lock); if tiers 2-4 are exhausted
-    # and the line is still over, the auction stops and records a
-    # ``line_relief_tier1_residual`` event (the line is undersized for its
-    # critical through-load alone — a supply/topology problem, not a control
-    # one).  This is the priority-clean analogue of the oracle's behaviour
-    # (shed through-load to the line rating, sparing critical load); it keeps
-    # the priority invariant green where a priority-flat shed would invert
-    # tiers 2/3.  Electricity line-relief only.  Default False.
-    enable_line_relief_waterfall: bool = False
+    # Strict reverse-priority WATERFALL for the branch-downstream relief
+    # auction.  Only consulted when ``enable_branch_downstream_relief``
+    # is True.  The willingness-proportional default
+    # (``priority_weight × sensitivity × reducible``, 1e8/1e4/1 tier
+    # exponents) pours ~all shed onto the lowest-priority downstream
+    # loads — often too small a fraction of the through-flow to clear a
+    # 10-20 % overload — and never escalates to the tier-3 bulk carrying
+    # the line, so it plateaus above 100 %.  True: shed the downstream
+    # set in strict reverse-priority order — drive the lowest-priority
+    # tier with reducible draw to zero, then escalate, re-arming each
+    # poll until the line is ≤100 %.  Tier 1 is never shed (hard-lock);
+    # if tiers 2-4 are exhausted and the line is still over, the auction
+    # stops and records a ``line_relief_tier1_residual`` event (the line
+    # is undersized for its critical through-load — a supply/topology
+    # problem, not a control one).  Keeps the priority invariant green
+    # where a priority-flat shed would invert tiers 2/3.  Electricity
+    # line-relief only.  False falls back to the willingness-proportional
+    # auction.
+    enable_line_relief_waterfall: bool = True
 
     # Constraint-aware participation scaling inside the gossip step.
-    # When False, ``participation_scale = 1`` always.
+    # False: ``participation_scale = 1`` always.
     enable_constraint_aware_gossip: bool = True
 
     # Multi-hop ConstraintStateMessage forwarding from
-    # GridConstraintMonitor.  When False, only direct neighbours see
-    # the local utilization.
+    # GridConstraintMonitor.  False: only direct neighbours see the local
+    # utilization.
     enable_multihop_constraint: bool = True
 
-    # Priority-weighted waterfall S parameter in the holon ADMM.
-    # When False, S=0 ⇒ ADMM redistributes proportionally to balance
-    # only, ignoring critical-tier urgency.
+    # Priority-weighted waterfall S parameter in the holon ADMM.  False:
+    # S=0 ⇒ ADMM redistributes to balance only, ignoring critical-tier
+    # urgency.
     enable_priority_holon_allocation: bool = True
 
-    # No-regret floor in EnergyBalanceNegotiator._apply_setpoint
-    # during restoration directions.  When True, a load that has
-    # once reached factor=X cannot drop below X in a subsequent
-    # gossip round.
-    #
-    # Default flipped to False as of 2026-05-23: the floor blocks
-    # the L3→L2→L1 cascade's re-shed semantics.  When L3 commits a
-    # P2H increase to serve a high-priority heat load, the
-    # source-sector L2 must shed lower-priority elec loads to free
-    # the supply; the floor preserved the old (now stale) factor
-    # and prevented the shed, leading to LP over-commitment or
-    # priority inversions.  Set True to opt back into the no-regret
-    # behaviour for ablations against the pre-Option-B path.
+    # No-regret floor in EnergyBalanceNegotiator._apply_setpoint during
+    # restoration directions.  True: a load that once reached factor=X
+    # cannot drop below X in a later gossip round.  Kept False because
+    # the floor blocks the L3→L2→L1 re-shed: when L3 commits a P2H
+    # increase to serve high-priority heat, the source-sector L2 must
+    # shed lower-priority elec loads to free supply, but the floor
+    # preserves the stale factor and prevents the shed (LP
+    # over-commitment / priority inversions).
     enable_monotonic_floor: bool = False
 
     # L2 priority-floor: clamp L1 reactive sheds (gossip ``balance`` +
     # ``stability`` re-apply) up to ``min(L2 allocation,
     # constraint-allowed fraction)`` for tiers 2/3/4.  Stops a
-    # supply-poor *local* gossip group from shedding a load the
-    # *component*-scope holon ADMM decided to serve — the L2→L1 override
-    # that produced the tier-3 < tier-4 / tier-2 < tier-3 inversions
-    # (eval task-88, task-51).  The constraint-allowed cap (same util as
-    # ``clamp_to_constraints``) lets curtailment/physics still shed the
-    # load during a real violation, per-load and continuously, so the
-    # floor and the constraint clamp never fight (the coarse-flag version
-    # regressed the cold-day task-72).  Applies to all load tiers incl.
-    # tier 1 (whose constraint-allowed is always 1.0, so the floor just
-    # re-asserts its hard-lock against ``stability`` erosion); the
-    # curtailment auction can still shed any tier when physics demands.
-    # Set False to ablate against the pre-floor override behaviour.
+    # supply-poor local gossip group from shedding a load the
+    # component-scope holon ADMM decided to serve.  The constraint-allowed
+    # cap (same util as ``clamp_to_constraints``) lets curtailment/physics
+    # still shed the load during a real violation, per-load and
+    # continuously, so the floor and the clamp never fight.  Applies to
+    # all tiers incl. tier 1 (whose cap is always 1.0, so the floor just
+    # re-asserts its hard-lock against ``stability`` erosion).
     enable_l2_priority_floor: bool = True
 
-    # Cold-load pickup ramp limit on regulation increases.
-    # When False, factor jumps are not throttled.
+    # Write the PHYSICALLY-actuated (constraint-clamped / floored) delta back
+    # into the gossip ledger after ``_apply_setpoint`` so the dual sees a
+    # constrained load's true (smaller) contribution and reallocates the freed
+    # supply to unconstrained loads. False: the ledger keeps the unclamped
+    # requested delta, so a constraint-clamped load's freed supply is never
+    # re-served (the slack/generator just draws less). The constraint stays
+    # solved either way — only the gossip accounting changes. Raw-restoration /
+    # capacity-utilisation gain; PWSF-neutral (the freed supply, by
+    # construction, only reaches lower-priority loads).
+    enable_actuated_ledger_writeback: bool = True
+
+    # Cold-load pickup ramp limit on regulation increases.  False: factor
+    # jumps are not throttled.
     enable_clpu_ramp: bool = True
 
-    # Heat-only curtailment-auction lock.  When a heat load is curtailed for
-    # a live temperature violation (``reason="curtail"`` — by the community
-    # auction or the heat frontier controller), that lever becomes
-    # authoritative: the L2 holon supply-priority dispatch must DEFER (skip
-    # the load) rather than claw it back up — otherwise the MW-based L2
-    # re-dispatch restores a just-curtailed cold node, re-cools it below the
-    # t_k floor, and the two layers limit-cycle (the cold-day task-36
-    # oscillation).  The lock lifts when the frontier controller's
-    # ``heat_recovery`` ramp restores the load to ~1.0; otherwise it
-    # persists, so a load shed for a permanent failure stays shed.  Strictly
-    # heat-scoped — electricity/gas L2 dispatch is untouched.  Set False to
-    # ablate against the pre-lock (L2-dominant) behaviour.
+    # Heat-only curtailment-auction lock.  When a heat load is curtailed
+    # for a live temperature violation (``reason="curtail"``), that lever
+    # becomes authoritative: the L2 holon supply-priority dispatch must
+    # DEFER (skip the load) rather than claw it back up — otherwise the
+    # MW-based L2 re-dispatch restores the just-curtailed cold node,
+    # re-cools it below the t_k floor, and the two layers limit-cycle.
+    # The lock lifts when the frontier controller's ``heat_recovery``
+    # ramp restores the load to ~1.0; else it persists (a load shed for a
+    # permanent failure stays shed).  Heat-scoped; el/gas L2 untouched.
     enable_heat_curtail_lock: bool = True
 
-    # Heat-only frontier feedback controller.  Each poll, every heat load's
-    # GridConstraintMonitor drives its regulation toward the point where its
-    # junction temperature sits at the feasibility floor (~t_k = 313.15 K) —
-    # the maximum feasible service — using the local dT/dreg sensitivity as
-    # the gain, rate-limited and with a restore-hysteresis band.  This
-    # replaces SCARE's bang-bang heat behaviour (``constraint_allowed_fraction``
-    # is a feasibility GATE that returns 0 for any out-of-bounds node, so the
-    # holon/clamp can only serve-full -> temp-collapse -> 0, or shed-to-0)
-    # with the oracle-style partial-frontier serving (e.g. a critical load at
-    # 0.6 served feasibly beats 1.0 -> 0).  Applies to ALL tiers incl. tier-1
-    # (holding a critical heat load at full draw collapses its temperature and
-    # the barrier then credits zero).  Writes use ``reason="curtail"`` (shed)
-    # / ``"heat_recovery"`` (restore) so the heat curtail-lock makes L2 defer.
-    # Strictly heat-scoped.  Set False to ablate against the gate behaviour.
+    # Heat-only frontier feedback controller.  Each poll, every heat
+    # load's GridConstraintMonitor drives its regulation toward the point
+    # where its junction temperature sits at the feasibility floor
+    # (~t_k = 313.15 K) — the maximum feasible service — using local
+    # dT/dreg as the gain, rate-limited with a restore-hysteresis band.
+    # Replaces bang-bang heat behaviour (``constraint_allowed_fraction``
+    # is a feasibility GATE returning 0 for any out-of-bounds node, so
+    # the holon/clamp can only serve-full→collapse→0 or shed-to-0) with
+    # oracle-style partial-frontier serving.  Applies to ALL tiers incl.
+    # tier-1.  Writes use ``reason="curtail"`` (shed) / ``"heat_recovery"``
+    # (restore) so the heat curtail-lock makes L2 defer.  Heat-scoped.
     enable_heat_frontier: bool = True
 
     # Priority-waterfall gate for the heat frontier controller.  Heat
     # shedding is otherwise tier-blind: each load drives its OWN junction
-    # temperature to the feasibility frontier independently, so the shed
-    # burden falls by geography, not priority (a critical tier-1 load on a
-    # flow-starved node sheds itself while a lower-priority load on a warm
-    # node keeps drawing).  With this on, a cold heat load broadcasts its
+    # temperature to the frontier independently, so the shed burden falls
+    # by geography, not priority.  True: a cold heat load broadcasts its
     # (tier, reducible) and defers its own shed while a strictly
-    # lower-priority load in its hydraulic region still has reducible draw
-    # — so shedding follows the priority order (lowest priority first),
-    # matching the oracle.  Heat-scoped; set False to recover the
-    # tier-blind frontier behaviour.
+    # lower-priority load in its hydraulic region still has reducible
+    # draw — so shedding follows priority order (lowest first).
+    # Heat-scoped.
     enable_heat_priority_waterfall: bool = True
 
     # Local Q-V droop at every inverter-coupled PowerGenerator (PV).
     # Follows the VDE-AR-N 4105 Q(U) characteristic: piecewise-linear
     # with a 0.97–1.03 pu deadband, saturating at ±Q_max at 0.95 / 1.05.
-    # Q_max is bounded by the apparent-power capability circle of the
-    # inverter (S_n = |p_n| / cos φ_min, with cos φ_min = 0.95 for
-    # S_n ≤ 13.8 kVA, else 0.90).  When False, no droop role is
-    # installed and reactive dispatch stays at simbench defaults — used
-    # for the ablation comparison showing the contribution of local
-    # voltage support to overall restoration quality.
+    # Q_max is bounded by the inverter's apparent-power capability circle
+    # (S_n = |p_n| / cos φ_min, cos φ_min = 0.95 for S_n ≤ 13.8 kVA, else
+    # 0.90).  False: no droop role; reactive dispatch stays at simbench
+    # defaults.
     enable_qv_droop: bool = True
 
-    # Voltage reference for the Q(U) curve (per unit).  Per VDE-AR-N
-    # 4105 the curve is anchored at 1.0 pu; exposed so the sensitivity
-    # sweep can probe the effect of a re-centred droop.
+    # Voltage reference for the Q(U) curve (per unit); VDE-AR-N 4105
+    # anchors it at 1.0 pu.  Exposed for the re-centred-droop sweep.
     qv_droop_voltage_ref_pu: float = 1.0
 
-    # F2: slack-infeed target as a fraction of the registered slack
-    # rating.  Per-community gossip uses this to bias its imbalance
-    # accounting away from "balance ⇒ zero slack draw" toward
-    # "balance ⇒ slack draws its target fraction of rating".  In
-    # practice this only matches the operator's intent when the
-    # slack's community spans the full LP balance scope (i.e.
-    # ``community_partition_method="connected_component"``); for
-    # the holonic and label-propagation partitions the gossip target
-    # derived from this setpoint contradicts the global budget.  Left
-    # at 0.0 by default; budget enforcement instead routes through
-    # :class:`~scare.service.slack_budget.SlackBudgetMonitor`'s
-    # signed ``override_target`` path, which is partition-agnostic.
+    # Slack-infeed target as a fraction of the registered slack rating.
+    # Per-community gossip biases its imbalance accounting toward
+    # "balance ⇒ slack draws its target fraction of rating".  Only
+    # matches operator intent when the slack's community spans the full
+    # LP balance scope (``community_partition_method="connected_component"``);
+    # for holonic/label-propagation partitions the derived target
+    # contradicts the global budget.  Left at 0.0; budget enforcement
+    # instead routes through
+    # :class:`~scare.service.slack_budget.SlackBudgetMonitor`'s signed
+    # ``override_target`` path, which is partition-agnostic.
     slack_target_fraction: float = 0.0
 
-    # P6 primal-dual QP gossip.  When True (default), the receiving
-    # agent computes its δ_i in closed form from the gossiped dual
-    # variable λ as ``δ_i = clamp(w_i · λ, dmin_i, dmax_i)``, with
-    # priority encoded continuously in w_i and the dual updated by
-    # gradient ascent on the primal residual.  When False, the legacy
-    # equal-share / priority-gated update is used (intra-tier
-    # serialisation via deterministic sub-rounds).  Both routes share
-    # the P1 saturation flag, P2 stall detection, P3 step decay, and
-    # all the other infrastructure; only the per-agent update rule
-    # differs.  Exposed as an ablation flag so the harness can run
-    # head-to-head comparisons between QP and equal-share gossip.
+    # P6 primal-dual QP gossip.  True: the receiving agent computes δ_i
+    # in closed form from the gossiped dual λ as
+    # ``δ_i = clamp(w_i · λ, dmin_i, dmax_i)``, priority encoded
+    # continuously in w_i, dual updated by gradient ascent on the primal
+    # residual.  False: legacy equal-share / priority-gated update
+    # (intra-tier serialisation via deterministic sub-rounds).  Both
+    # share the saturation flag, stall detection, and step decay; only
+    # the per-agent update rule differs.
     enable_qp_gossip: bool = True
 
-    # Branch-side line-loading monitor.  When True every PowerLine
-    # branch (switchable or not) gets a GridConstraintMonitor watching
-    # the line's loading_percent.  On overload the monitor sends
-    # StartBalanceNegotiation with a relief-MW override target to the
-    # branch's home group leader (picked at scenario setup time as the
-    # endpoint with the lower priority-weighted demand, so shedding
-    # falls on the less-critical side) and propagates a
-    # ConstraintStateMessage to both endpoint groups so neighbouring
-    # gossip agents throttle their participation.  When False the
-    # branch agents are not registered and line overload is silent.
+    # Branch-side line-loading monitor.  True: every PowerLine branch
+    # gets a GridConstraintMonitor watching its loading_percent; on
+    # overload it sends StartBalanceNegotiation with a relief-MW override
+    # to the branch's home group leader (the endpoint with lower
+    # priority-weighted demand, so shedding falls on the less-critical
+    # side) and propagates a ConstraintStateMessage to both endpoint
+    # groups so neighbouring gossip agents throttle participation.
+    # False: branch agents not registered, line overload is silent.
     enable_line_loading_constraint: bool = True
 
-    # External-grid slack budget monitor.  When True, every slack-class
-    # child (ExtPowerGrid / ExtHydrGrid with ``_scare_slack_budget_*``
-    # stamped by ``apply_slack_budget``) carries a ``SlackBudgetMonitor``
-    # role that polls the LP-chosen ``p_mw`` / ``mass_flow`` and, when
-    # the absolute draw exceeds ``budget · (1 + slack_budget_violation_tol)``,
-    # records a ``slack_budget_violation`` event and emits a
-    # ``BalanceProblem`` so the co-located ``EnergyBalanceNegotiator``
-    # triggers a rebalance round (and the optional curtailment auction
-    # / multihop propagation chained off it).  Goal: make the operator-
-    # policy ``slack_budget_pct`` a runtime-enforced constraint rather
-    # than a passive label, while leaving the LP envelope (10× budget)
-    # wide enough that the energy-flow solve stays feasible.
+    # External-grid slack budget monitor.  True: every slack-class child
+    # (ExtPowerGrid / ExtHydrGrid stamped with ``_scare_slack_budget_*``
+    # by ``apply_slack_budget``) carries a ``SlackBudgetMonitor`` that
+    # polls the LP-chosen ``p_mw`` / ``mass_flow`` and, when the absolute
+    # draw exceeds ``budget · (1 + slack_budget_violation_tol)``, records
+    # a ``slack_budget_violation`` event and emits a ``BalanceProblem``
+    # so the co-located ``EnergyBalanceNegotiator`` triggers a rebalance.
+    # Makes the operator ``slack_budget_pct`` a runtime-enforced
+    # constraint, while the LP envelope (10× budget) stays wide enough to
+    # keep the energy-flow solve feasible.
     enable_slack_budget_monitor: bool = True
 
     # Relative tolerance for the slack-budget monitor.  A draw is flagged
     # only when ``|obs| > budget · (1 + slack_budget_violation_tol)``;
-    # the small margin avoids flagging the steady-state numerical wiggle
-    # of an LP that's already converged inside the envelope.
+    # the margin avoids flagging steady-state numerical wiggle of an LP
+    # already converged inside the envelope.
     slack_budget_violation_tol: float = 0.05
 
     # Loss-compensating effective-budget feedback in the slack monitor.
-    # The operator budget caps the slack's *actual* draw, but the
-    # L1/L2/L3 control only shapes the served setpoints — network losses
-    # (plus the per-leader-group vs global supply-pool mismatch) leave
-    # the realized draw above budget even when the controller believes
-    # it hit the target.  When True, ``SlackBudgetMonitor`` runs an
-    # integral correction on the observed overage and advertises a
-    # tightened *effective* budget (``B - losses``) into the supply pool
-    # so the actual draw converges to the operator budget.  When False,
-    # the pool advertises the nominal budget (legacy behaviour).
+    # The budget caps the slack's *actual* draw, but L1/L2/L3 control
+    # only shapes served setpoints — network losses leave the realized
+    # draw above budget even when the controller believes it hit target.
+    # True: ``SlackBudgetMonitor`` runs an integral correction on the
+    # observed overage and advertises a tightened *effective* budget
+    # (``B - losses``) into the supply pool so actual draw converges to
+    # the operator budget.  False: pool advertises the nominal budget.
     enable_slack_budget_feedback: bool = True
 
-    # GridReconfigurator path ranking by line loading.  When True the
+    # GridReconfigurator path ranking by line loading.  True: the
     # reconfigurator carries a running max_loading_percent along each
     # GridPathMessage, buffers all results within a short window, and
     # picks the path with the lowest peak loading instead of the
-    # first-arrived (typically shortest).  When False the legacy
-    # first-arrival behaviour is preserved.
+    # first-arrived (typically shortest).  False: legacy first-arrival.
     enable_reconfig_feasibility_ranking: bool = True
 
     # Window during which the reconfigurator collects candidate paths
@@ -544,216 +413,126 @@ class RestorationConfiguration:
     # too short loses alternatives, too long delays restoration.
     reconfig_path_window_s: float = 1.5
 
-    # Holon ADMM iteration cap.  50 was chosen historically so concurrent
-    # holon ADMMs across sectors don't block discrete-time progress, but
-    # smoke runs show non-convergence at this cap on simbench_lv (residuals
-    # 1e-3 to 2e-2).  Exposed so the campaign can trade convergence quality
-    # against wallclock cost.
+    # Holon ADMM iteration cap.  Concurrent holon ADMMs across sectors
+    # must not block discrete-time progress; trades convergence quality
+    # against wallclock cost (can leave residuals 1e-3 to 2e-2 unconverged
+    # on simbench_lv).
     holon_admm_max_iters: int = 50
 
-    # ADMM absolute residual tolerance — convergence quality the holon
-    # coordinator stops at when |r| < this.  The package default 1e-4 is
-    # tight; relaxing to 1e-3 lets typical scenarios converge inside the
-    # 50-iter cap without changing the qualitative behaviour.
+    # ADMM absolute residual tolerance — the coordinator stops when
+    # |r| < this.  Relaxed from the package default 1e-4 so typical
+    # scenarios converge inside the iteration cap.
     holon_admm_abs_tol: float = 1e-3
 
-    # Tier-stratified holon ADMM (Package C).  When True, the holon's
-    # ADMM target vector is built per-(sector, priority_tier) instead
-    # of per-sector only, and the L1 honour path dispatches per-tier
-    # targets directly to member agents — preserving the holon's
-    # global priority decision through the L2 → L1 handoff.  Legacy
-    # path (False) uses one scalar target per (member, sector) and
-    # L1 re-derives priority locally, which can invert priority on
-    # finely-partitioned grids (see priority_invariant claim in
-    # eval/claims.py).
+    # Tier-stratified holon ADMM.  True: the ADMM target vector is built
+    # per-(sector, priority_tier) and the L1 honour path dispatches
+    # per-tier targets directly to members, preserving the holon's global
+    # priority decision through the L2 → L1 handoff.  False: one scalar
+    # target per (member, sector) and L1 re-derives priority locally,
+    # which can invert priority on finely-partitioned grids (see
+    # priority_invariant claim in eval/claims.py).
     enable_tier_stratified_holon_admm: bool = True
 
     # Number of priority tiers the tier-stratified ADMM allocates over.
     # Mirrors ``base.util.tier_priority_weight``'s 4-tier schedule
     # (tier 1 = critical / hard-locked at the L1 leader pre-step;
-    # tiers 2-4 = QP-weighted with 1e8 / 1e4 / 1.0 exponents).  Larger
-    # would re-introduce the over-soft proportional split this redesign
-    # was meant to fix; smaller would collapse the QP into pure tier-1
-    # gating with no QP-side ordering.
+    # tiers 2-4 = QP-weighted with 1e8 / 1e4 / 1.0 exponents).
     priority_tiers: int = 4
 
-    # Holon ADMM mode (Package C variants).  Only consulted when
-    # ``enable_tier_stratified_holon_admm`` is True.
+    # Holon ADMM scope — which actors participate in one ADMM round.
     #
-    # - ``"supply"`` (default, Route A): supply-side formulation.
-    #   ``T`` = total demand at each (sec, tier), each actor's
-    #   contribution represents supply commitment.  Coupling
-    #   ``Σ x_g ≤ supply_g`` binds whenever holon-wide supply <
-    #   holon-wide demand.  Priority weights then decide which
-    #   tiers get the scarce supply.  Enables cross-community
-    #   generation routing (e.g. shed A's tier-8 load to free
-    #   supply for B's tier-2 load).  L1 dispatch interprets the
-    #   result as per-tier service fractions and applies them
-    #   uniformly to local loads at that tier.  This is the
-    #   formulation that actually arbitrates priority across
-    #   communities in end-to-end runs; ``demand`` is preserved as
-    #   an ablation but does not exercise priority weighting in
-    #   practice (see eval/claims.py:priority_invariant).
-    # - ``"demand"`` (legacy, ablation only): Package C demand-side
-    #   formulation.  ``T`` = per-cell deficit, each actor absorbs
-    #   its share of the per-cell deficit (`ub = local_deficit`).
-    #   Priority weights arbitrate only when the per-actor coupling
-    #   (``Σ x_g ≤ flex_g``) binds, which is rare in pure-load
-    #   groups where flex == deficit.  Solves the "where to spend
-    #   limited flex" problem.
-    holon_admm_mode: str = "supply"
-
-    # Holon ADMM *scope* — which actors participate in a single ADMM
-    # round.  Decoupled from ``holon_admm_mode`` (which picks the LP
-    # formulation regardless of scope).
-    #
-    # - ``"component"`` (default as of 2026-05-23): every *group
-    #   leader* in the same active connected component of the sector
-    #   is an ADMM actor.  The elected coordinator (lex-smallest
-    #   leader aid among leaders mutually reachable on the active
-    #   branch subgraph) collects each leader's community flex
-    #   (supply + per-tier demand), runs the ADMM, and dispatches the
-    #   resulting per-tier ``service_fraction`` to every leader in
-    #   the component.  Each leader then applies the fractions to
-    #   its OWN community members directly (no holon hop).
-    #
-    #   Why per-component: priority is a global ordering whose
-    #   guarantee scope is exactly the connected component of the
-    #   active grid (the priority-invariant claim aggregates per
-    #   ``(sector, component)``).  Aligning the optimisation scope
-    #   with the claim scope means cross-leader inversions cannot
-    #   arise *and* a failure that splits a component re-elects two
-    #   coordinators that decide independently for their halves.
-    #
-    #   Why every group leader (not every holon): the previous
-    #   sector-scope path dispatched only via holon leaders, leaving
-    #   communities not in any holon at the LP-default factor=1.0 —
-    #   the actual root cause of the inversions surfaced by the
-    #   2026-05-22 smoke.  This default puts every community leader
-    #   in the dispatch loop.
-    #
-    # - ``"sector"`` (deprecated, 2026-05-22 default): all holon
-    #   leaders in the sector were ADMM actors.  Suffered the
-    #   coverage gap above — kept reachable as an ablation for the
-    #   campaign comparison; will be removed once the per-component
-    #   path is validated.
-    # - ``"holon"`` (legacy): each holon leader runs its own ADMM
-    #   over its member groups only.  Produces per-holon per-tier
-    #   service fractions that need not agree across holons — i.e.
-    #   the cross-holon inversions the original smoke surfaced.
-    #   Retained as an ablation knob.
+    # - ``"component"`` (default): every *group leader* in the same
+    #   active connected component is an ADMM actor.  The elected
+    #   coordinator (lex-smallest reachable leader aid) collects each
+    #   leader's community flex (supply + per-tier demand), runs the
+    #   ADMM, and dispatches the per-tier ``service_fraction`` to every
+    #   leader in the component; each leader applies the fractions to its
+    #   OWN community members directly (no holon hop).  Aligns the
+    #   optimisation scope with the priority-invariant claim's
+    #   ``(sector, component)`` scope, so cross-leader inversions cannot
+    #   arise and a component split re-elects independent coordinators.
+    # - ``"sector"`` (deprecated): all holon leaders in the sector are
+    #   actors; leaves communities not in any holon at factor=1.0.
+    #   Retained as an ablation.
+    # - ``"holon"`` (legacy): each holon leader runs its own ADMM over
+    #   its member groups, producing per-holon fractions that need not
+    #   agree across holons (cross-holon inversions).  Retained as an
+    #   ablation.
     holon_admm_scope: str = "component"
-
-    # Hebbian-emergent holon membership refinement (Aoki & Aoyagi 2009).
-    # Leaders broadcast their normalised sector imbalance δ_g as
-    # HebbianFlexBeacon, accumulate a per-peer co-variance estimate
-    # H_{gh} = (1-η)·H + η·δ_g·δ_h, and after ``hebbian_warmup_s``
-    # rebuild holon membership from peers with H_{gh} > threshold.  This
-    # replaces / refines the static lex-chunked partition from
-    # _build_topologies, so groups whose stress dynamics correlate end
-    # up cooperating regardless of aid ordering.  Disable for the
-    # static-partition ablation.
-    enable_hebbian_formation: bool = True
-
-    # Sim-seconds before the recluster begins (during which the co-
-    # variance estimate accumulates).  Default 12 s matches the
-    # original holonic.py constructor default; campaigns with shorter
-    # simulations should drop this (e.g. 4 s) so reclustering has time
-    # to fire within the run window.
-    hebbian_warmup_s: float = 12.0
-
-    # Co-variance threshold above which a peer is admitted to the
-    # dynamically-emergent holon.  Higher = stricter (fewer peers
-    # admitted, smaller holons).
-    hebbian_threshold: float = 0.35
 
     # Level-1 (sub-community) partition method.
     #
-    # - ``"label_propagation"`` (default, preserves legacy behaviour):
-    #   radius-bounded min-label propagation — communities are
-    #   ≤``community_label_propagation_radius``-hop balls centred on
-    #   the lex-smallest reachable seed.
+    # - ``"label_propagation"`` (default): radius-bounded min-label
+    #   propagation — communities are
+    #   ≤``community_label_propagation_radius``-hop balls centred on the
+    #   lex-smallest reachable seed.
     # - ``"modularity"``: distributed-Louvain Phase 1 — communities
-    #   form to maximise local modularity gain, respecting the graph's
-    #   natural cluster structure.  Sizes vary; not bounded by radius.
-    # - ``"connected_component"``: one community per connected
-    #   component of the per-sector subgraph.  Used by the
-    #   ``component_level`` baseline — gives the gossip negotiator a
-    #   global per-component view rather than many small radius-bounded
-    #   sub-communities.  Combine with ``cps_join_communities=True`` so
-    #   the CPs that bridge two components actually participate.
+    #   maximise local modularity gain.  Sizes vary, not radius-bounded.
+    # - ``"connected_component"``: one community per connected component
+    #   of the per-sector subgraph.  Used by the ``component_level``
+    #   baseline; gives the gossip negotiator a global per-component view.
+    #   Combine with ``cps_join_communities=True`` so bridging CPs
+    #   participate.
     community_partition_method: str = "label_propagation"
 
-    # Radius bound for ``label_propagation`` method (ignored by
-    # modularity).  Mirrors the per-sector ``_LABEL_PROPAGATION_RADIUS``
-    # default of 2 historically wired in scenario/restoration.py.
+    # Radius bound for ``label_propagation`` (ignored by modularity).
     community_label_propagation_radius: int = 2
 
-    # Resolution γ for ``modularity`` method (ignored by label
-    # propagation).  γ > 1 ⇒ finer partition (more, smaller
-    # communities); γ < 1 ⇒ coarser.  Default 1.0 = standard
-    # modularity.
+    # Resolution γ for ``modularity`` (ignored by label propagation).
+    # γ > 1 ⇒ finer (more, smaller communities); γ < 1 ⇒ coarser.
     community_modularity_resolution: float = 1.0
 
-    # Iteration cap for the modularity phase-1 sweep.  Convergence
-    # typically in 3-5 rounds; 10 is a safe cap.
+    # Iteration cap for the modularity phase-1 sweep (converges in ~3-5).
     community_modularity_iterations: int = 10
 
     # ----------------------------------------------------------------
     # ``component_level`` baseline tunables
     # ----------------------------------------------------------------
     #
-    # When True, every CP agent joins the per-sector community of each
+    # True: every CP agent joins the per-sector community of each
     # endpoint it bridges (a P2G bridges one electricity + one gas
-    # community).  CPs become normal members of those communities' L1
-    # gossip rounds and drop their separate CP-ADMM path —
-    # ``EnergyConverterRole`` is replaced by
-    # ``MultiCommunityCPRole``, which collects per-community signals,
-    # combines them with an EMA over per-sector setpoint targets, and
-    # commits via ``apply_regulate`` under a deadband + cooldown guard
-    # so a CP sitting in two communities can't ping-pong between
-    # contradictory asks.  Only meaningful with
-    # ``enable_cp_admm=False``; the variant builder in
-    # ``experiment/hpc/runner.py`` enforces the combination.
+    # community), becomes a normal member of those L1 gossip rounds, and
+    # drops its separate CP-ADMM path — ``EnergyConverterRole`` is
+    # replaced by ``MultiCommunityCPRole``, which collects per-community
+    # signals, blends them with an EMA over per-sector setpoint targets,
+    # and commits via ``apply_regulate`` under a deadband + cooldown
+    # guard so a CP in two communities can't ping-pong between
+    # contradictory asks.  Only meaningful with ``enable_cp_admm=False``;
+    # the variant builder in ``experiment/hpc/runner.py`` enforces it.
     cps_join_communities: bool = False
 
     # EMA blending factor for the multi-community CP guard.  Each tick
     # the new per-sector target is ``α · proposed + (1 − α) · current``;
-    # higher means more reactive to incoming proposals, lower means
-    # heavier filtering.  0.3 mirrors the smoothing band used by the
-    # existing slack-budget cooldown plumbing.
+    # higher = more reactive, lower = heavier filtering.
     cp_oscillation_ema_alpha: float = 0.3
 
-    # Minimum |target − current| (in the sector's natural units — MW
-    # for electricity, MW for heat, kg/s for gas) below which a new
-    # target is treated as noise and not committed.  Sits above the
-    # 0.01 MW fixed-point tolerance the legacy ``EnergyConverterRole``
-    # already uses on incoming setpoints.
+    # Minimum |target − current| (sector natural units — MW for
+    # electricity/heat, kg/s for gas) below which a new target is treated
+    # as noise and not committed.
     cp_oscillation_deadband_mw: float = 0.05
 
-    # Minimum simulation-second gap between two regulation commits on
-    # the same CP.  Modelled on the 2.0 s ``SlackBudgetMonitor`` refire
-    # cooldown that successfully damps oscillation in the gossip layer.
+    # Minimum simulation-second gap between two regulation commits on the
+    # same CP.
     cp_oscillation_min_interval_s: float = 1.0
 
     # ----------------------------------------------------------------
     # Sensitivity-sweep tunables
     # ----------------------------------------------------------------
 
-    # monee-side solver throttle.  0 means "solve whenever monee
-    # decides".  Non-zero buffers regulate writes per aid and flushes
-    # at fixed simulation-time boundaries (see comms wrapper, step 10).
+    # monee-side solver throttle.  0: solve whenever monee decides.
+    # Non-zero buffers regulate writes per aid and flushes at fixed
+    # simulation-time boundaries (see comms wrapper, step 10).
     cooldown_s: float = 0.0
 
     # FailureNotice TTL stamped at endpoint detectors.
     ttl_hops: int = 3
 
-    # Hop cost across CP-bridge edges in the FailureNotice
-    # propagation.  Same-sector edges always cost 1.
+    # Hop cost across CP-bridge edges in FailureNotice propagation;
+    # same-sector edges always cost 1.
     cp_bridge_cost: int = 2
 
-    # Maximum members per holon (excluding initiator that's the
-    # chunk's lex-smallest leader).
+    # Maximum members per holon (excluding the initiator, the chunk's
+    # lex-smallest leader).
     holon_max_size: int = 4
 
     # Gossip protocol parameters.
@@ -772,68 +551,18 @@ class RestorationConfiguration:
     # via a Poisson-mixed delay provider; 0 means deterministic.
     comms_latency_jitter_ms: float = 0.0
 
-    # Agent dropout: at ``agent_dropout_at_s`` simulation seconds, the
-    # listed aids are unregistered from the world.  Empty tuple means
-    # no dropout.
-    agent_dropout_aids: tuple[str, ...] = field(default_factory=tuple)
-    agent_dropout_at_s: float = float("inf")
-
     # ----------------------------------------------------------------
     # Logging detail
     # ----------------------------------------------------------------
 
-    # When True, every send_message goes through a counting wrapper
-    # so per-message-type counts can be reported in result.json.
-    # Off by default — high volume; turned on for the comm-cost
-    # campaign only.
+    # True: every send_message goes through a counting wrapper so
+    # per-message-type counts are reported in result.json.  High volume;
+    # off except for the comm-cost campaign.
     record_messages: bool = False
-
-    # ----------------------------------------------------------------
-    # Islanding / microgrid configuration (opt-in)
-    # ----------------------------------------------------------------
-    #
-    # When set, monee's ``enable_islanding`` is applied at grid-build
-    # time so that any ``GridFormingMixin`` child can lead an island
-    # for its carrier when the main grid-former is unreachable.  The
-    # default is ``None`` — only ``ExtPowerGrid`` / ``ExtHydrGrid``
-    # form a grid, which mirrors realistic LV networks where black-
-    # start hardware is rare.  The microgrid scenarios opt in by
-    # passing the per-carrier dict here.
-    #
-    # Schema is a per-carrier mapping ``{"electricity": True,
-    # "water": True, "gas": True}`` (None or missing carrier means
-    # "leave that carrier unchanged").  Values can also be a custom
-    # ``IslandingMode`` instance for fine-tuning.
-    #
-    # ``frozenset`` of carriers is used at the dataclass-level so the
-    # frozen-dataclass invariant is preserved; a richer mapping can
-    # be plumbed via a separate hashable wrapper if/when scenarios
-    # need it.
-    microgrid_islanding_carriers: frozenset[str] = field(default_factory=frozenset)
-
-    # When True, the grid factory tries to convert eligible
-    # PowerGenerator / HeatGenerator / Source children into the
-    # corresponding ``GridForming*`` types so that monee's islanding
-    # extension actually has grid-formers to anchor sub-islands on.
-    # Off by default; setting True alongside ``microgrid_islanding_
-    # carriers`` is the "what-if every unit could black-start" upper-
-    # bound scenario.  Use ``microgrid_grid_former_aids`` instead to
-    # mark specific units only.
-    microgrid_promote_all_generators: bool = False
-
-    # Aids (or node-ids) of children to promote to grid-formers for
-    # their sector.  Empty means "no specific units"; if combined
-    # with ``microgrid_promote_all_generators=True``, that flag wins.
-    # When neither is set but ``microgrid_islanding_carriers`` is non-
-    # empty, the LP can still benefit (e.g.\ adjacent sub-islands
-    # connected through the surviving Ext*Grid) but distant sub-
-    # islands stay ignored exactly as before.
-    microgrid_grid_former_aids: tuple[str, ...] = field(default_factory=tuple)
 
 
 def default_config() -> RestorationConfiguration:
-    """Return a fresh default config.  Equivalent to
-    ``RestorationConfiguration()``; the named function makes intent
-    explicit at call sites that want to be obviously baseline.
+    """Return a fresh baseline config (``RestorationConfiguration()``);
+    the named function makes baseline intent explicit at call sites.
     """
     return RestorationConfiguration()

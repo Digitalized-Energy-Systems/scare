@@ -108,11 +108,9 @@ class TaskArtefacts:
         return min(delays) if delays else None
 
     def solver_failures(self) -> int:
-        """Count of energyflow solves that returned infeasible during the
-        task run.  Surfaced by the runner from ``_InfeasibilityCounter``
-        and saved into ``status.json``.  Used by trajectory plots to
-        annotate when the observation pipeline froze on a held-over
-        ``_net_results`` snapshot.
+        """Count of energyflow solves that returned infeasible during the run
+        (from ``status.json``).  Trajectory plots use it to annotate when the
+        observation pipeline froze on a held-over ``_net_results`` snapshot.
         """
         try:
             return int(self.status.get("solver_failures") or 0)
@@ -170,11 +168,9 @@ class CampaignData:
     ) -> TaskArtefacts | None:
         """Pick one OK task in the given experiment for trajectory plots.
 
-        Prefers tasks with no solver infeasibilities — a task whose
-        ``_net_results`` froze on a held-over snapshot makes a bad
-        representative because every observation-based metric flatlines
-        after the freeze.  When the summary column is unavailable
-        (older runs), falls back to the lowest task_id for stability.
+        Prefers tasks with no solver infeasibilities (a frozen
+        ``_net_results`` snapshot flatlines every observation-based metric).
+        Falls back to the lowest task_id when the column is unavailable.
         """
         df = self.by_experiment(experiment)
         df = df[df["variant"] == variant]

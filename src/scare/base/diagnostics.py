@@ -18,31 +18,22 @@ from typing import Any, Deque
 
 logger = logging.getLogger(__name__)
 
-# Keep enough history to capture every regulate action across a typical
-# smoke run: 5 s sim × ~200 agents × a few regulate calls each easily
-# pushes past 64 (the original cap, which silently truncated child-1's
-# regulate trace during the priority-inversion investigation).  10k is
-# still well below 1 MB of memory and lets diagnostics.txt remain a
-# faithful audit log of every actuation.
+# Ring buffer of recent regulate/switch/failure actions.  10k entries
+# (<1 MB) keeps a full per-run actuation trace without unbounded growth.
 _MAX_ACTIONS = 10000
 _armed: bool = False
 _log: Deque["ActionRecord"] = deque(maxlen=_MAX_ACTIONS)
 
-# Negotiation lifecycle ledger.  Unbounded list because the post-run
-# aggregator wants the full picture, not just the last few entries.
-# Cleared by ``arm()`` so each experiment run starts fresh.
+# Negotiation lifecycle ledger.  Unbounded so the post-run aggregator sees
+# the full picture; cleared by ``arm()`` so each run starts fresh.
 _negotiation_log: list["NegotiationRecord"] = []
 
-# Event ledger — failures, reconfigurations, local-gen fallback requests,
-# constraint violations.  One row per occurrence so the aggregator can
-# count by type and reconstruct timing.  Same lifecycle as the
-# negotiation log: unbounded, cleared on ``arm()``.
+# Event ledger — failures, reconfigurations, local-gen requests, constraint
+# violations.  One row per occurrence; unbounded, cleared on ``arm()``.
 _event_log: list["EventRecord"] = []
 
-# Per-aid trajectory log — every applied regulation factor with timestamp.
-# Powers the C.5 cluster-synchronisation analysis.  Off by default; arm
-# turns it on, ``set_trajectory_logging`` toggles independently because
-# this log can grow large on long runs and is therefore opt-in.
+# Per-aid regulation-factor trajectory log, with timestamps.  Off by
+# default and toggled independently because it can grow large on long runs.
 _trajectory_log: list["TrajectoryRecord"] = []
 _trajectory_armed: bool = False
 
@@ -74,10 +65,9 @@ class EventRecord:
 class TrajectoryRecord:
     """One sample of a device's regulation factor.
 
-    Generated whenever a role calls ``record_regulate`` and trajectory
-    logging is armed.  Aggregated downstream into per-task
-    ``trajectories.csv`` (one column per aid, one row per timestamp,
-    factor in [0, 1] with the last seen value forward-filled).
+    Recorded on ``record_regulate`` when trajectory logging is armed.
+    Aggregated into ``trajectories.csv`` (one column per aid, one row per
+    timestamp, factor in [0, 1], last value forward-filled).
     """
 
     t: float
@@ -101,8 +91,8 @@ class NegotiationRecord:
     - ``"abandoned"``         → still active when the world tore down
 
     A single negotiation contributes one ``"started"`` record and exactly
-    one terminal record (any of finished/timed_out/cancelled/abandoned),
-    so a healthy run satisfies ``started == sum(terminals)``.
+    one terminal record (finished/timed_out/cancelled/abandoned), so a
+    healthy run satisfies ``started == sum(terminals)``.
     """
     t: float
     aid: str
@@ -117,10 +107,8 @@ class NegotiationRecord:
 def arm() -> None:
     """Enable recording and reset every per-run log to empty.
 
-    Called once at process start by ``install_solver_failure_dump`` and
-    again at the top of each task by the campaign runner so per-task
-    ``result.json`` event counts are not polluted by earlier tasks
-    sharing the same worker process.
+    Called at the top of each task so per-task event counts are not
+    polluted by earlier tasks sharing the same worker process.
     """
     global _armed
     _armed = True
@@ -133,10 +121,8 @@ def arm() -> None:
 def set_trajectory_logging(enabled: bool) -> None:
     """Toggle per-aid regulation-factor trajectory logging.
 
-    Default is OFF: the log can grow to thousands of rows per device
-    on long runs, and only the C.5 cluster-synchronisation analysis
-    needs it.  The eval runner enables it via the corresponding plan
-    flag.
+    Off by default: the log can grow to thousands of rows per device on
+    long runs, so it is opt-in via the eval runner's plan flag.
     """
     global _trajectory_armed
     _trajectory_armed = bool(enabled)
@@ -166,8 +152,8 @@ def record_switch(*, t: float, aid: str, reason: str) -> None:
         ActionRecord(t=t, kind="switch", aid=aid, sector="",
                      value=float("nan"), reason=reason)
     )
-    # Also surface in the event ledger so the post-run aggregator can
-    # count tie-switch closes alongside other domain events.
+    # Also record in the event ledger so the aggregator counts tie-switch
+    # closes alongside other domain events.
     _event_log.append(
         EventRecord(t=t, kind=f"switch:{reason}", aid=aid, sector="", detail="")
     )
@@ -193,11 +179,7 @@ def record_negotiation(
     residual: float = float("nan"),
     group_size: int = 0,
 ) -> None:
-    """Append a gossip-lifecycle record.
-
-    Cheap (single list append).  No-op until ``arm()`` is called, so unit
-    tests that don't enable diagnostics aren't affected.
-    """
+    """Append a gossip-lifecycle record.  No-op until ``arm()`` is called."""
     if not _armed:
         return
     _negotiation_log.append(
@@ -220,12 +202,12 @@ def negotiation_log() -> list[NegotiationRecord]:
 
 
 def negotiation_summary() -> dict[str, int]:
-    """Aggregate counts per lifecycle event.  Useful for at-a-glance
-    accounting at the end of a run.  An invariant a healthy run should
-    satisfy: ``started == finished + timed_out + cancelled + abandoned
-    + stalled + skipped_singleton`` (plus ``skipped_balanced`` which
-    doesn't count as "started").  ``stalled`` is the P2 early-termination
-    terminal: gossip's gap-window range fell below tolerance while the
+    """Aggregate counts per lifecycle event.
+
+    A healthy run satisfies ``started == finished + timed_out + cancelled
+    + abandoned + stalled + skipped_singleton`` (``skipped_balanced`` does
+    not count as "started").  ``stalled`` is the early-termination
+    terminal: the gossip gap-window range fell below tolerance while the
     gap was still above the per-group threshold.
     """
     summary: dict[str, int] = {}
@@ -247,7 +229,7 @@ def record_event(
     local_gen_covered, constraint_violation, constraint_warning,
     holon_formed, holon_admm_result, holon_admm_failed).
 
-    Cheap (single list append).  No-op until ``arm()`` is called.
+    No-op until ``arm()`` is called.
     """
     if not _armed:
         return
@@ -291,10 +273,9 @@ def dump_recent(limit: int = _MAX_ACTIONS) -> str:
 
 
 class _SolverWarningHandler(logging.Filter):
-    """Attached to ``monee.solver.pyo`` — on every warning, append the
-    action history to the log record so the dump appears alongside the
-    infeasibility report.  Returns ``True`` so the original record still
-    propagates."""
+    """Attached to ``monee.solver.pyo``: on a solve-failure warning, log
+    the recent action history alongside it.  Returns ``True`` so the
+    original record still propagates."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno >= logging.WARNING and "Pyomo solve failed" in record.getMessage():

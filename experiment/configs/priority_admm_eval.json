@@ -24,29 +24,29 @@
   "experiments": [
     {
       "name": "tier_stratified_admm",
-      "grids": ["simbench_lv_cp_heavy"],
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
       "n_seeds": 1,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {
           "community_partition_method": "label_propagation",
-          "enable_tier_stratified_holon_admm": false,
-          "hebbian_warmup_s": 4.0
+          "enable_tier_stratified_holon_admm": false
         },
         {
           "community_partition_method": "label_propagation",
-          "enable_tier_stratified_holon_admm": true,
-          "hebbian_warmup_s": 4.0
+          "enable_tier_stratified_holon_admm": true
         },
         {
           "community_partition_method": "modularity",
-          "enable_tier_stratified_holon_admm": false,
-          "hebbian_warmup_s": 4.0
+          "enable_tier_stratified_holon_admm": false
         },
         {
           "community_partition_method": "modularity",
-          "enable_tier_stratified_holon_admm": true,
-          "hebbian_warmup_s": 4.0
+          "enable_tier_stratified_holon_admm": true
         }
       ],
       "scenarios": [

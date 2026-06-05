@@ -1,9 +1,8 @@
 """Unit tests for :mod:`scare.base.solver_guard`.
 
-Validates the per-solve wall-clock cap is installed defensively
-(catches the eval_full_small task-64 / task-67 / task-98 case where
-a synchronous SCIP MISOCP solve exceeded ``task_timeout_s`` and
-blocked ``asyncio.wait_for`` cancellation until the SLURM SIGTERM).
+Verifies the per-solve wall-clock cap is installed so a synchronous
+SCIP/Gurobi MISOCP solve cannot run unbounded and block asyncio
+cancellation.
 """
 
 from __future__ import annotations

@@ -1,12 +1,8 @@
-"""Post-hoc metrics computed from a finished restoration run.
+"""Post-hoc outcome metrics computed from a finished restoration run.
 
-The world / monee net are still in scope at the end of the runner —
-this module pulls the final regulation factors and the recorded
-timeseries / event ledger out of them and computes the dissertation's
-primary outcome metrics.
-
-Outputs are dicts of plain Python scalars / nested dicts so they can be
-serialised straight into ``result.json`` and aggregated downstream.
+Pulls final regulation factors and recorded timeseries from the world /
+monee net. Outputs are plain scalars / nested dicts, serialisable straight
+into ``result.json``.
 """
 
 from __future__ import annotations
@@ -33,9 +29,9 @@ from scare.base.util import (
 logger = logging.getLogger(__name__)
 
 
-# Priority-tier weight schedule.  Mirrors the chapter's ``w(π) = 2^(P − π)``
-# (P = 10 ⇒ tier 1 weighs 512×, tier 10 weighs 1×).  Tier 0 (generators)
-# contributes nothing to the served metric — only loads count.
+# Priority-tier weight schedule ``w(tier) = 2^(P - tier)`` (P=10 => tier 1
+# weighs 512x, tier 10 weighs 1x). Tier 0 (generators) weighs 0; only loads
+# count toward the served metric.
 _P = 10
 
 
@@ -51,27 +47,11 @@ def _tier_weight(tier: int) -> float:
 
 
 def _disconnected_node_ids(monee_net: Any) -> set[int]:
-    """Return the set of node IDs that have no path to any grid-forming
-    component (ExtPowerGrid / ExtHydrGrid) through the *currently active*
-    branch topology.  These nodes' loads are physically un-servable
-    regardless of what the LP or the agents claim — they must be counted
-    as zero served in the restoration metric.
-
-    Mirrors monee's solver-side ``find_ignored_nodes`` but operates
-    purely on the user-visible network so we don't depend on whether
-    the solver was invoked with ``exclude_unconnected_nodes=True``.
-
-    The two failure modes we're guarding against:
-
-    1. ``inject_nans`` zeroes ``regulation`` on the LP *copy*; the
-       original (which the metric reads) keeps the constructor default
-       of 1.0.  A disconnected load then reports ``served = cap``.
-    2. The solver was run without ``exclude_unconnected_nodes=True``
-       (currently the case for both oracle and scare's per-step solver),
-       went infeasible, and left every regulation at 1.0.
-
-    Both routes lead to the metric over-counting served load on
-    physically disconnected nodes.  This helper closes both holes.
+    """Node IDs with no path to any grid-forming component (ExtPowerGrid /
+    ExtHydrGrid) through the active branch topology. Their loads are
+    physically un-servable and must count as zero served, regardless of what
+    the LP or agents report (a disconnected load can otherwise keep a default
+    regulation of 1.0 and report ``served = cap``).
     """
     try:
         return set(find_ignored_nodes(monee_net))
@@ -80,37 +60,22 @@ def _disconnected_node_ids(monee_net: Any) -> set[int]:
 
 
 def _branch_carries_sector(branch: Any, monee_net: Any, sector: str | None) -> bool:
-    """Whether this branch should be admitted into the component
-    subgraph for ``sector``.
+    """Whether this branch is admitted into the component subgraph for
+    ``sector``.
 
-    ``sector is None`` admits every branch (legacy "full-graph" view).
-    A named sector admits ONLY same-sector edges — CP couplings
-    (``branch.model.is_cp() == True``) are excluded.  This matches the
-    L2 component-scope ADMM coordinator-election scope at
-    ``src/scare/community/holonic.py:_resolve_component_peer_addrs``,
-    which calls ``mirror.reachable_from(my_node, sector=self.sector)``
-    and the topology-mirror explicitly rejects CP bridges when a
-    sector filter is set (``src/scare/base/topology_mirror.py``
-    ``reachable_from`` raises on ``allow_cp_bridges=True`` with a sector).
-
-    Aligning the metric here with the control's scope is the fix for
-    the priority-invariant inversions observed in
-    ``eval_full_small_20260529-181310/tasks/{52,88,132,133}``: when two
-    electricity sub-islands are bridged only by a CP → heat → CP chain,
-    the L2 splits into two coordinators (each making independent
-    per-tier shed decisions) while the legacy full-graph metric merged
-    them and spuriously read an inversion across the coordinator
-    boundary.  See ``tests/community/test_component_scope_cp_bridge.py``
-    for the minimal reproducer.
+    ``sector is None`` admits every branch (full-graph view). A named sector
+    admits only same-sector edges; CP couplings (``model.is_cp()``) are
+    excluded, matching the L2 coordinator-election scope (sector subgraph
+    without CP bridges). This keeps the priority-invariant metric on the same
+    partition the control uses, so two electricity sub-islands bridged only by
+    a CP->heat->CP chain are not spuriously merged.
     """
     if sector is None:
         return True
     model = getattr(branch, "model", None)
     if model is not None and getattr(model, "is_cp", lambda: False)():
         return False
-    # Same-sector check: walk to one endpoint's grid → sector.  Reuse
-    # ``sector_from_grid`` (the same resolver the rest of the codebase
-    # uses) so a future sector enum addition lands in one place.
+    # Same-sector check via one endpoint's grid -> sector.
     a = branch.id[0]
     try:
         node = monee_net.node_by_id(a)
@@ -123,24 +88,13 @@ def _branch_carries_sector(branch: Any, monee_net: Any, sector: str | None) -> b
 def _active_node_components(
     monee_net: Any, *, sector: str | None = None,
 ) -> dict[Any, int]:
-    """Return a mapping ``node_id -> component_index`` over the
-    *active*-branch subgraph.  Failed branches (``branch.active is
-    False``) and the failed branches' contribution to graph connectivity
-    are removed; the result captures the post-failure islands that the
-    priority-invariant check needs in order to compare tiers fairly
-    within each connected partition.
+    """Map ``node_id -> component_index`` over the active-branch subgraph
+    (failed branches removed), capturing the post-failure islands within
+    which the priority-invariant check compares tiers.
 
-    ``sector``: when set, restrict the subgraph to same-sector branches
-    only (CP couplings excluded).  Default ``None`` preserves the
-    legacy full-graph behaviour for callers that don't yet pass a
-    sector — but :func:`served_by_load` now stamps each row's
-    ``component`` from the **sector-specific** map so the
-    ``priority_invariant`` claim aggregates on the same scope L2's
-    coordinator election uses.
-
-    Disconnected single nodes get their own component.  Component
-    indices are arbitrary but stable within a single call (assigned in
-    discovery order via union-find).
+    ``sector``: when set, restrict to same-sector branches (CP couplings
+    excluded); ``None`` is the full-graph view. Disconnected single nodes get
+    their own component. Indices are arbitrary but stable within a call.
     """
     graph = nx.Graph()
     for node in monee_net.nodes:
@@ -160,13 +114,9 @@ def _active_node_components(
 
 
 def _component_label(comp_idx: int, sector: str | None) -> str:
-    """Stringify a component label for the CSV ``component`` column.
-
-    Sector-aware labels are prefixed (``"electricity:0"``) so the
-    ``priority_invariant`` aggregator naturally groups per-sector even
-    if a future caller mixes legacy (un-prefixed) and per-sector rows.
-    The unprefixed form is preserved for ``sector is None`` so existing
-    artefacts (and the strict legacy fallback) round-trip unchanged.
+    """Component label for the CSV ``component`` column. Sector-aware labels
+    are prefixed (``"electricity:0"``) so the ``priority_invariant`` aggregator
+    groups per-sector; ``sector is None`` yields the bare index.
     """
     if sector is None:
         return str(comp_idx)
@@ -174,32 +124,25 @@ def _component_label(comp_idx: int, sector: str | None) -> str:
 
 
 def _branch_is_active(branch: Any) -> bool:
-    """``branch.model.active`` when present, falling back to
-    ``branch.active``.  Mirrors :meth:`Network._set_active` so we read
-    the same flag the simulator writes to."""
+    """``branch.model.active`` when present, else ``branch.active`` — the same
+    flag the simulator writes to."""
     model = getattr(branch, "model", None)
     if model is not None and "active" in getattr(model, "vars", {}):
         return bool(model.active)
     return bool(getattr(branch, "active", True))
 
 
-# Heat "served" at a node whose temperature is outside the hard heat
-# bounds the oracle LP enforces (``SECTOR_CONSTRAINTS[HEAT]["t_k"]``) is
-# not physically valid service — the centralised baseline refuses to
-# serve it.  The live sim only enforces ``t_k`` softly (reactive
-# GridConstraintMonitor), so without this gate it counts heat served at
-# infeasible node temperatures and "beats" the temperature-constrained
-# oracle (the CP-heavy ``post > baseline`` ratios).  A small tolerance
-# keeps marginal numerical wiggle at the bound from over-firing while
-# still catching gross violations (cold-day nodes solve to ~240 K).
+# Heat served at a node whose temperature is outside the oracle's hard t_k
+# bounds is not valid service. The live sim enforces t_k only softly, so this
+# gate prevents crediting heat served at infeasible temperatures. Tolerance
+# absorbs numerical wiggle at the bound.
 _HEAT_T_TOL_K: float = 1.0
 
 
 def _heat_served_feasible(obs: dict, sec: Any) -> bool:
-    """False iff this is a heat load whose node temperature is outside the
-    hard ``t_k`` bounds the oracle enforces (within ``_HEAT_T_TOL_K``).
-    Non-heat loads, missing / non-finite readings, and configs without a
-    heat ``t_k`` bound all pass (never gate on absent data)."""
+    """False iff a heat load's node temperature is outside the oracle's hard
+    ``t_k`` bounds (within ``_HEAT_T_TOL_K``). Non-heat loads, missing /
+    non-finite readings, and configs without a heat ``t_k`` bound all pass."""
     if sec is not Sector.HEAT:
         return True
     bounds = SECTOR_CONSTRAINTS.get(Sector.HEAT, {}).get("t_k")
@@ -216,27 +159,21 @@ def _heat_served_feasible(obs: dict, sec: Any) -> bool:
     return (lo - _HEAT_T_TOL_K) <= t <= (hi + _HEAT_T_TOL_K)
 
 
-# An electricity load served *through* an overloaded line is not feasible
-# service: the oracle LP enforces ``loading_percent`` ≤ 100 %
-# (``max_line_loading=1.0``) and would shed the through-load down until the
-# line sits at its rating, whereas the live sim only enforces it softly and
-# leaves lines at 100-120 % while crediting the downstream load in full —
-# the line-side analogue of the heat ``_heat_served_feasible`` gate.  The
-# small tolerance keeps numerical wiggle at exactly 100 % from gating.
+# Line-side analogue of the heat gate: the oracle enforces loading_percent
+# <= 100% and sheds through-load until lines sit at rating, while the live sim
+# leaves lines at 100-120% and credits the downstream load in full. Tolerance
+# absorbs numerical wiggle at exactly 100%.
 _LINE_LOADING_TOL_PCT: float = 1.0
 
 
 def _line_feasibility_factor(monee_net: Any) -> dict[Any, float]:
-    """Map ``electricity node_id -> feasible-service factor ∈ (0, 1]``.
+    """Map ``electricity node_id -> feasible-service factor in (0, 1]``.
 
-    For every electricity node, the factor is the bottleneck headroom of
-    the *widest* supply path back to a grid-former: ``min(1, 100/loading)``
-    over the overloaded lines on that path (1.0 if none).  Multiplying a
-    load's served by its node's factor de-rates downstream service to what
-    the line ratings actually permit — matching the oracle, which sheds the
-    through-load until the binding line is at 100 % rather than crediting
-    service on a thermally-overloaded line.  Radial feeders give the exact
-    unique path; meshed sections get the widest (least-throttled) one.
+    The factor is the bottleneck headroom of the *widest* supply path back to
+    a grid-former: ``min(1, 100/loading)`` over the overloaded lines on that
+    path (1.0 if none). Multiplying a load's served by its node's factor
+    de-rates downstream service to what line ratings permit, matching the
+    oracle. Radial feeders give the unique path; meshed sections the widest.
     """
     from collections import defaultdict, deque
 
@@ -254,11 +191,9 @@ def _line_feasibility_factor(monee_net: Any) -> dict[Any, float]:
             loading = float(branch.model.loading_percent)
         except Exception:
             loading = 0.0
-        # Unit ambiguity (see ``obs_constraint_values``): GenericPowerBranch /
-        # MISOCP reports loading as a *fraction* (≈1.14 for 114 %); only the
-        # IntermediateEq form is already a percent.  A value ≤ 5 cannot be a
-        # real percent, so scale it up — without this a 1.14 fraction reads as
-        # "1.14 %" and the gate never fires.
+        # Unit normalisation: GenericPowerBranch / MISOCP reports loading as a
+        # fraction (~1.14 for 114%); IntermediateEq reports a percent. A value
+        # <= 5 cannot be a real percent, so scale it to percent.
         if 0.0 < loading <= 5.0:
             loading *= 100.0
         edge_f = min(1.0, 100.0 / loading) if loading > 100.0 + _LINE_LOADING_TOL_PCT else 1.0
@@ -286,23 +221,17 @@ def served_by_load(
     """Per-load served / demand / fraction with node + component tag.
 
     Returns a list of dicts ready for CSV-writing or per-component
-    aggregation.  Shape:
+    aggregation. Shape: ``[{aid, sector, tier, node_id, component, demand,
+    served, fraction, disconnected, constraint_allowed}, ...]``.
 
-    ``[{aid, sector, tier, node_id, component, demand, served, fraction,
-        disconnected}, ...]``
-
-    Loads on physically disconnected nodes get ``served = 0``,
-    matching :func:`served_breakdown`'s contract.  ``component`` is the
-    active-subgraph component index from :func:`_active_node_components`
-    so the priority-invariant claim can group by it.
+    Loads on physically disconnected nodes get ``served = 0``, matching
+    :func:`served_breakdown`. ``component`` is the per-sector active-subgraph
+    index so the priority-invariant claim can group by it.
     """
     disconnected = _disconnected_node_ids(monee_net)
-    # Per-sector component maps so each row's ``component`` label
-    # matches the L2 coordinator-election scope (sector subgraph), not
-    # the legacy full-graph view that merged electricity sub-islands
-    # via CP couplings.  See ``_branch_carries_sector`` for the
-    # rationale and the eval_full_small_20260529-181310 failing tasks
-    # (52/88/132/133) for the manifestation.
+    # Per-sector component maps so each row's ``component`` matches the L2
+    # coordinator-election scope (sector subgraph), not a full-graph view that
+    # would merge electricity sub-islands via CP couplings.
     components_by_sector: dict[str, dict[Any, int]] = {
         sec.value: _active_node_components(monee_net, sector=sec.value)
         for sec in Sector
@@ -330,29 +259,23 @@ def served_by_load(
         sec = sector_from_grid(node.grid)
         if sec is None:
             continue
-        # Don't credit heat served at an out-of-bounds node temperature
-        # (the oracle won't either) — see ``_heat_served_feasible``.
+        # Don't credit heat served at an out-of-bounds node temperature.
         temp_infeasible = not _heat_served_feasible(obs, sec)
         if temp_infeasible:
             served = 0.0
-        # De-rate electricity load served *through* an overloaded line to the
-        # feasible level its line ratings permit (the oracle holds ≤100 %) —
-        # see ``_line_feasibility_factor``.
+        # De-rate electricity served through an overloaded line to the feasible
+        # level (see ``_line_feasibility_factor``).
         if sec is Sector.ELECTRICITY:
             served *= line_factor.get(child.node_id, 1.0)
         if priorities is not None and aid in priorities:
             tier = int(priorities[aid])
         else:
             tier = obs_priority(obs)
-        # Physical serve cap from the load's local constraints (same
-        # util→fraction the gossip clamp uses).  A load served at/near
-        # this cap is throttled by *physics*, not by a priority decision
-        # — the physics-aware priority-invariant check excludes it the
-        # way it already excludes disconnected loads.  A temperature-
-        # infeasible heat load is hard-capped at 0 here (overriding the
-        # tier-dependent deadband, incl. tier-1's immunity) so the
-        # priority-invariant check excludes it as constraint-throttled
-        # rather than reading its barrier-zeroed served as a priority shed.
+        # Physical serve cap from local constraints (same util->fraction the
+        # gossip clamp uses). A load at/near this cap is throttled by physics,
+        # not priority, so the priority-invariant check excludes it (as it does
+        # disconnected loads). A temperature-infeasible heat load is hard-capped
+        # at 0 here so it reads as constraint-throttled, not a priority shed.
         if temp_infeasible:
             allowed = 0.0
         elif is_disconnected:
@@ -366,10 +289,6 @@ def served_by_load(
             "sector": sec.value,
             "tier": tier,
             "node_id": child.node_id,
-            # Sector-prefixed label.  ``priority_invariant`` groups by
-            # ``(sector, component)``, so the prefix is informational —
-            # the grouping is correct either way — but it makes the CSV
-            # self-describing under inspection.
             "component": _component_label(comp_idx, sec.value),
             "demand": cap,
             "served": served,
@@ -385,8 +304,8 @@ def served_breakdown(
     behavior: Any,
     priorities: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Walk every load child, compute served / demand per (sector, tier)
-    and per-sector aggregates, plus the priority-weighted-served scalar.
+    """Served / demand per (sector, tier) and per-sector aggregate, plus the
+    priority-weighted scalar.
 
     Shape:
 
@@ -401,13 +320,9 @@ def served_breakdown(
         "n_loads_served_zero": int
     }``
 
-    ``priority_weighted_*`` divide by total weighted demand so the
-    fraction is in [0, 1] and comparable across grids of different
-    absolute size.
-
-    Loads on nodes with no active path to a grid-forming source are
-    forced to ``served = 0`` (see :func:`_disconnected_node_ids`) — the
-    LP / agent state can't be trusted to reflect physical disconnect.
+    ``priority_weighted_fraction`` divides by total weighted demand, giving a
+    value in [0, 1] comparable across grids of different size. Loads on
+    disconnected nodes are forced to ``served = 0``.
     """
     by_tier_sector: dict[str, dict[int, dict[str, float]]] = {}
     by_sector: dict[str, dict[str, float]] = {}
@@ -419,14 +334,9 @@ def served_breakdown(
 
     disconnected = _disconnected_node_ids(monee_net)
     line_factor = _line_feasibility_factor(monee_net)
-    # Filter to actual *consumer* load childs.  In monee's hydraulic /
-    # multi-energy models, ``Sink`` represents the return-side of a heat
-    # exchanger and ``ExtHydrGrid`` / ``ExtPowerGrid`` are slack injectors —
-    # none of them are customer demand, yet all three carry mass-flow /
-    # p_mw fields that ``obs_capacity`` would otherwise pick up post-LP.
-    # Without this filter, scare's metric inflates ``served`` past
-    # baseline (validation run: post=6.21 MW vs baseline=5.20 MW on
-    # cp_heavy_dependent_45; the 1 MW excess was 170 Sinks + 2 ExtHydrGrids).
+    # Restrict to consumer loads. Sink (HE return side) and ExtHydrGrid /
+    # ExtPowerGrid (slack injectors) carry mass-flow / p_mw fields that
+    # ``obs_capacity`` would otherwise pick up, inflating served past demand.
     _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
 
     for child in monee_net.childs:
@@ -436,20 +346,15 @@ def served_breakdown(
         obs = behavior.observe(aid) or {}
         cap = obs_capacity(obs)
         # Skip generators (cap < 0), zero-capacity placeholders, and
-        # NaN-capacity entries.  monee's ``persist_solution`` propagates
-        # NaN values from ``inject_nans`` back into compound port-childs
-        # (e.g.\ SubHG on a disconnected heat node) — those carry no
-        # consumer demand of their own and would otherwise pollute the
-        # sector totals.
+        # NaN-capacity entries (NaN propagates into compound port-childs on
+        # disconnected nodes and carries no consumer demand).
         if not (cap > 0):
             continue
         n_loads += 1
-        # ``is_disconnected`` distinguishes the *physical* loss path
-        # (priority-blind by definition: no path to a grid-forming
-        # source) from the *agent-driven* path (where the QP / ADMM
-        # priority weighting actually decides who sheds).  The
-        # restoration_breakdown downstream uses this to split per-tier
-        # losses into the two contributions.
+        # ``is_disconnected`` distinguishes the physical loss path
+        # (priority-blind: no path to a grid-forming source) from the
+        # agent-driven path (QP / ADMM priority weighting decides who sheds).
+        # restoration_breakdown uses this to split per-tier losses.
         is_disconnected = (
             not getattr(child, "active", True)
             or child.node_id in disconnected
@@ -458,33 +363,24 @@ def served_breakdown(
             sp = 0.0
         else:
             sp = obs_setpoint(obs)
-        # Clamp to [0, cap] — a load physically can't consume more than its
-        # rated demand, and the MAS variants are free to set regulation > 1.0
-        # (bound is [0, 2]).  Without clamping, agents over-serving one load
-        # mask genuine zero-served loads in the totals: post-restoration
-        # ``served`` can exceed pre-failure baseline even when 30+ loads sit
-        # disconnected.  Confirmed in the validation run on cp_heavy_45 with
-        # generator failures (scare reports 6.05 MW served vs 5.20 MW baseline
-        # while 30 loads are at zero).
+        # Clamp to [0, cap]: a load can't consume more than rated demand, and
+        # MAS variants may set regulation > 1.0. Without this, over-served loads
+        # mask genuine zero-served loads in the totals.
         served = max(0.0, min(cap, sp))
         demand = cap
-        # Demand on physically disconnected nodes — the priority-blind
-        # share of the per-tier loss.  Baseline runs (no failures) have
-        # this at zero on every tier; the restoration_breakdown uses
-        # the difference to attribute losses.
+        # Demand on disconnected nodes — the priority-blind share of the
+        # per-tier loss; restoration_breakdown uses it to attribute losses.
         demand_disc = demand if is_disconnected else 0.0
 
         node = monee_net.node_by_id(child.node_id)
         sec = sector_from_grid(node.grid)
         if sec is None:
             continue
-        # Don't credit heat served at an out-of-bounds node temperature
-        # (matches the oracle's hard t_k bound) — see ``_heat_served_feasible``.
+        # Don't credit heat served at an out-of-bounds node temperature.
         if served > 0.0 and not _heat_served_feasible(obs, sec):
             served = 0.0
-        # De-rate electricity service carried through an overloaded line to
-        # the feasible level (oracle holds ≤100 %) — see
-        # ``_line_feasibility_factor``.
+        # De-rate electricity served through an overloaded line to the feasible
+        # level (see ``_line_feasibility_factor``).
         if served > 0.0 and sec is Sector.ELECTRICITY:
             served *= line_factor.get(child.node_id, 1.0)
         if priorities is not None and aid in priorities:
@@ -520,7 +416,6 @@ def served_breakdown(
         if served < 1e-9 and demand > 1e-9:
             n_zero += 1
 
-    # Fill in fractions.
     for entry in by_sector.values():
         entry["fraction"] = (
             entry["served"] / entry["demand"] if entry["demand"] > 0 else 1.0
@@ -557,13 +452,12 @@ def served_breakdown(
 def restoration_breakdown(
     post: dict[str, Any], baseline: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """Compare post-restoration served breakdown against the pre-failure
-    baseline, producing the metrics that show "how much got lost
-    despite restoration".
+    """Compare the post-restoration served breakdown against the pre-failure
+    baseline, quantifying how much load was lost despite restoration.
 
-    ``post`` and ``baseline`` are both ``served_breakdown`` dicts
-    (same shape).  When ``baseline`` is None or has zero demand the
-    derived ratios collapse to ``1.0`` (no failure → no degradation).
+    ``post`` and ``baseline`` are both ``served_breakdown`` dicts. When
+    ``baseline`` is None or has zero demand the derived ratios collapse to
+    ``1.0`` (no failure => no degradation).
 
     Output:
 
@@ -583,10 +477,8 @@ def restoration_breakdown(
                                   served_post_mw, ratio},
     }``
 
-    The ``raw_*`` fields are unweighted MW so the chapter can show
-    "absolute load lost despite restoration" alongside the
-    priority-weighted fraction.  ``by_tier.ratio`` is what surfaces
-    "did tier-1 critical loads actually get fully restored?".
+    The ``raw_*`` fields are unweighted MW (absolute load lost) alongside the
+    priority-weighted fraction. ``by_tier.ratio`` surfaces per-tier restoration.
     """
     if not baseline:
         return {"baseline_available": False}
@@ -612,22 +504,15 @@ def restoration_breakdown(
         d_b = float(tb.get("demand", 0.0))
         s_b = float(tb.get("served", 0.0))
         s_p = float(tp.get("served", 0.0))
-        # ``demand_disconnected`` is the priority-blind share of the
-        # per-tier loss: load that physically lost its path to a
-        # grid-forming source and is therefore irrecoverable regardless
-        # of what the agents decide.  The rest of the per-tier loss is
-        # the *agent-shed* portion — load the QP / ADMM chose to drop.
-        # Splitting the two makes the chapter's priority-waterfall
-        # claim verifiable: priority should drive ``agent_shed``, not
-        # ``disconnect_lost``.  See P0/P1 audit + restoration
-        # validation pass for context.
+        # Split the per-tier loss: ``disconnect_lost`` is the priority-blind
+        # share (load that physically lost its path to a grid-former,
+        # irrecoverable); the rest is ``agent_shed`` (load the QP / ADMM chose
+        # to drop). Priority should drive agent_shed, not disconnect_lost.
         disc_p = float(tp.get("demand_disconnected", 0.0))
         total_loss = max(0.0, s_b - s_p)
         disconnect_lost = max(0.0, min(disc_p, total_loss))
-        # ``disconnect_lost > total_loss`` would imply we lost more to
-        # physical disconnect than the total drop — arithmetically
-        # impossible.  Log + clamp so the inversion is visible instead
-        # of silently masked by the outer min(1, …).
+        # disconnect_lost > total_loss is arithmetically impossible; log + clamp
+        # so the inversion is visible rather than masked by the outer min.
         if disc_p > total_loss + 1e-12:
             logger.warning(
                 "Tier %s: demand_disconnected=%.4g > total_loss=%.4g; "
@@ -636,8 +521,7 @@ def restoration_breakdown(
             )
         agent_shed = max(0.0, total_loss - disconnect_lost)
         ratio = s_p / s_b if s_b > 1e-12 else (1.0 if d_b < 1e-12 else 0.0)
-        # Agent-only ratio: how would tier i look if disconnection
-        # hadn't happened?  Used by the priority-awareness plot.
+        # Agent-only ratio: tier restoration excluding physical disconnect.
         s_b_recoverable = max(1e-12, s_b - disconnect_lost)
         agent_ratio = (s_b - total_loss + disconnect_lost) / s_b_recoverable
         by_tier_out[str(tier)] = {
@@ -672,9 +556,7 @@ def restoration_breakdown(
             "agent_shed_mw":        agent_shed,
         }
 
-    # Campaign-level disconnect vs agent split — sum the per-sector
-    # contributions so the aggregator + restoration plot can quote the
-    # priority-blind share at a glance.
+    # Campaign-level disconnect vs agent split (sum of per-sector shares).
     total_disconnect_lost = sum(
         s.get("disconnect_lost_mw", 0.0) for s in by_sector_out.values()
     )
@@ -716,13 +598,10 @@ def restoration_breakdown(
 
 
 def constraint_violation_integral(world: Any) -> dict[str, float]:
-    """Per-sector ``∫ max(0, util(t) − 1) dt`` proxied by the recorded
-    average utilization timeseries (avg_vm_pu / avg_pressure_pu / avg_t_k).
-
-    Recorded series store the *average* across each sector; we compute
-    util from those vs the sector bounds and integrate the overshoot
-    above 1.0.  The result is dimensionless and comparable across runs
-    on the same grid.
+    """Per-sector ``integral of max(0, util(t) - 1) dt``, proxied by the
+    recorded sector-average utilization series (avg_vm_pu / avg_pressure_pu /
+    avg_t_k). Dimensionless; comparable across runs on the same grid. Being an
+    average, it masks per-node violations (see ``constraint_violations_final``).
     """
     recordings = getattr(world, "data_collections", {}) or {}
 
@@ -762,24 +641,17 @@ def constraint_violation_integral(world: Any) -> dict[str, float]:
 # Final constraint-violation scan (end-of-sim hard-bound feasibility)
 # ---------------------------------------------------------------------------
 #
-# ``constraint_violation_integral`` above integrates the *average* per-sector
-# recorded series — a during-run proxy that masks per-node violations (the
-# mean voltage can sit inside the band while individual buses are over).  For
-# an honest, *comparable* PWSF we also need the end-of-sim feasibility of the
-# actual solved network, node-by-node and branch-by-branch, against the SAME
-# ``SECTOR_CONSTRAINTS`` envelope the oracle LP enforces (bounds_el / _gas /
-# _heat + ``max_line_loading``).  A SCARE run that "beats" the oracle's PWSF
-# only because it left voltages, pressures, temperatures, or line loadings out
-# of bounds is not solving the same problem; this scan flags it so the
-# aggregator can exclude it from the compliant-PWSF mean (the voltage / pressure
-# / line / temperature analogue of the slack-budget-compliance gate).
+# Node-by-node / branch-by-branch feasibility of the final solved network
+# against the same ``SECTOR_CONSTRAINTS`` envelope the oracle LP enforces
+# (bounds_el / _gas / _heat + ``max_line_loading``). Flags a SCARE run that
+# "beats" the oracle's PWSF only by leaving voltages, pressures, temperatures,
+# or line loadings out of bounds, so the aggregator can exclude it from the
+# compliant-PWSF mean.
 
-# Per-variable absolute tolerance for the hard-bound scan.  A reading counts as
-# a violation only when it exceeds the bound by more than this, so numerical
-# wiggle exactly at the bound does not fire.  ``vm_pu`` / ``pressure_pu`` are
-# p.u.; ``t_k`` reuses the heat-served gate's 1 K tolerance and
-# ``loading_percent`` the line-feasibility 1 % tolerance, so the compliance
-# gate and the served de-rating draw the line at exactly the same place.
+# Per-variable absolute tolerance: a reading violates only when it exceeds the
+# bound by more than this. ``vm_pu`` / ``pressure_pu`` are p.u.; ``t_k`` and
+# ``loading_percent`` reuse the heat-served / line-feasibility tolerances so the
+# compliance gate and the served de-rating draw the line at the same place.
 _CONSTRAINT_ABS_TOL: dict[str, float] = {
     "vm_pu": 0.005,
     "pressure_pu": 0.005,
@@ -788,8 +660,8 @@ _CONSTRAINT_ABS_TOL: dict[str, float] = {
 }
 
 # Variables with only a physical upper bound (idle = 0, limit = 100); the
-# lower half of their ``SECTOR_CONSTRAINTS`` pair is a formula artefact (see
-# the ``loading_percent`` note in ``scare.base.model``) and must not gate.
+# lower half of their ``SECTOR_CONSTRAINTS`` pair is a formula artefact and
+# must not gate.
 _ONE_SIDED_VARS: frozenset[str] = frozenset({"loading_percent"})
 
 
@@ -800,7 +672,7 @@ def _model_value(model: Any, key: str) -> float | None:
         return None
     try:
         vals = model.values if hasattr(model, "values") else {}
-    except Exception:  # noqa: BLE001 — defensive: some models raise on access
+    except Exception:  # noqa: BLE001 — some models raise on access
         return None
     if key not in vals:
         return None
@@ -813,11 +685,9 @@ def _model_value(model: Any, key: str) -> float | None:
 def _branch_loading_percent(branch: Any) -> float | None:
     """Worst (from/to) thermal loading of a branch in *percent*.
 
-    ``loading_percent`` is a Python property (not in ``model.values``), so
-    fall back to the per-side ``loading_{from,to}_percent`` Vars.  Applies the
-    same fraction→percent auto-scale as ``obs_constraint_values`` /
-    ``_line_feasibility_factor`` (GenericPowerBranch reports a fraction ≈1.14
-    for 114 %; only the IntermediateEq form is already a percent).
+    ``loading_percent`` is a Python property (not in ``model.values``), so fall
+    back to the per-side ``loading_{from,to}_percent`` Vars. Applies the same
+    fraction->percent normalisation as ``_line_feasibility_factor``.
     """
     model = getattr(branch, "model", None)
     if model is None:
@@ -837,12 +707,10 @@ def _branch_loading_percent(branch: Any) -> float | None:
 
 def _bound_overshoot(val: float, lo: float, hi: float, *, one_sided: bool) -> float:
     """How far ``val`` lies beyond its nearest bound, normalised by the
-    half-span so ``0`` = in-bounds and ``1`` = a full half-span over.
-
-    Distinct from :func:`constraint_utilization`, which saturates at 1.0 at
-    the bound and so cannot rank the *severity* of a breach — exactly what the
-    "worst violation" ordering needs.  One-sided variables (``loading_percent``)
-    only ever overshoot the upper bound.
+    half-span (0 = in-bounds, 1 = a full half-span over). Unlike
+    :func:`constraint_utilization` (saturates at the bound), this ranks breach
+    severity for the "worst violation" ordering. One-sided variables
+    (``loading_percent``) only overshoot the upper bound.
     """
     half_span = (hi - lo) / 2.0
     if half_span <= 0:
@@ -878,20 +746,16 @@ def _violation_row(
 
 
 def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
-    """Per-node / per-branch hard-bound readings off the *final* network state.
+    """Per-node / per-branch hard-bound readings off the final network state.
 
     Walks every active, connected node (``vm_pu`` / ``pressure_pu`` / ``t_k``
-    per its sector) and every active electricity branch (``loading_percent``),
-    comparing each against ``SECTOR_CONSTRAINTS``.  One row per checked
-    variable: ``{kind, id, sector, variable, value, lo, hi, overshoot,
-    violated}``.
+    per its sector) and every active electricity branch (``loading_percent``)
+    against ``SECTOR_CONSTRAINTS``. One row per checked variable: ``{kind, id,
+    sector, variable, value, lo, hi, overshoot, violated}``.
 
-    Disconnected nodes (``_disconnected_node_ids`` — no path to a grid-former)
-    and inactive nodes/branches are skipped: their loads already count as
-    served=0, their readings are physically meaningless (t_k solves to ~0 on an
-    isolated junction), and the oracle excludes them too
-    (``exclude_unconnected_nodes=True``).  Counting them as violations would
-    fail SCARE for a physical disconnect the oracle cannot serve either.
+    Disconnected and inactive nodes/branches are skipped: their loads already
+    count as served=0, their readings are meaningless (t_k ~0 on an isolated
+    junction), and the oracle excludes them too.
     """
     disconnected = _disconnected_node_ids(monee_net)
     rows: list[dict[str, Any]] = []
@@ -908,9 +772,8 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
             val = _model_value(node.model, var)
             if val is None or not math.isfinite(val):
                 continue
-            # Solver-unpopulated / isolated junctions report t_k≈0; the live
-            # monitor skips them the same way (``_monitor`` in
-            # ``service/constraints.py``) so they are not a real breach.
+            # Solver-unpopulated / isolated junctions report t_k~0; not a real
+            # breach (the live monitor skips them the same way).
             if var == "t_k" and val <= 0.0:
                 continue
             rows.append(_violation_row("node", node.id, sec, var, val, lo, hi))
@@ -940,14 +803,11 @@ def constraint_violations_final(monee_net: Any) -> dict[str, Any]:
     """End-of-sim hard-bound feasibility summary over the final network state.
 
     Returns ``{passed, n_checked, n_violations, by_sector, violations}`` where
-    ``passed`` is True iff NO active, connected node or branch breaches its
-    ``SECTOR_CONSTRAINTS`` bound (within :data:`_CONSTRAINT_ABS_TOL`).  This is
-    the accurate counterpart to :func:`constraint_violation_integral` (which
-    only sees per-sector *averages*) and the basis for the
-    ``constraint_compliance`` claim — making a run "compliant" require both the
-    operator slack budget *and* in-bounds grid state, so the PWSF gap to the
-    oracle is the real allocation gap, not feasibility one side bought by
-    violating constraints.
+    ``passed`` is True iff no active, connected node or branch breaches its
+    ``SECTOR_CONSTRAINTS`` bound (within :data:`_CONSTRAINT_ABS_TOL`). Basis for
+    the ``constraint_compliance`` claim: a "compliant" run needs both the
+    operator slack budget and in-bounds grid state, so the PWSF gap to the
+    oracle is a real allocation gap, not feasibility bought by violations.
     """
     rows = constraint_rows(monee_net)
     by_sector: dict[str, dict[str, Any]] = {}
@@ -990,14 +850,12 @@ def constraint_violations_final(monee_net: Any) -> dict[str, Any]:
 
 
 def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
-    """First simulation time after which all sector imbalance series stay
-    near steady state for at least ``hold_s`` seconds.
+    """First simulation time after which all sector imbalance series stay near
+    steady state for at least ``hold_s`` seconds.
 
-    Heuristic: the recorded ``electrical_balance / gas_balance /
-    heat_balance`` series are the per-sector regulation sums.  A run is
-    "stable" when the absolute first-difference of every sector's
-    series is below 0.5 % of its maximum magnitude for a sustained
-    window.  Returns None if no such window is found.
+    "Stable" = the absolute first-difference of every sector's balance series
+    (``electrical_balance`` / ``gas_balance`` / ``heat_balance``) stays below
+    0.5% of its max magnitude for a sustained window. None if never found.
     """
     recordings = getattr(world, "data_collections", {}) or {}
     sector_keys = ("electrical_balance", "gas_balance", "heat_balance")
@@ -1021,9 +879,8 @@ def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
         for k, (_, ts) in series.items()
     }
 
-    # Walk a common timestep grid (from the first series — they share
-    # the same recording cadence).  Mark t as "stable" only if every
-    # series' diff at this step is below threshold.
+    # Common timestep grid (series share recording cadence); a step is stable
+    # only if every series' diff is below threshold.
     ref_t, _ = next(iter(series.values()))
 
     def step_stable(i: int) -> bool:
@@ -1052,12 +909,8 @@ def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
 
 
 def optimality_gap(scare_pw_served: float, oracle_pw_served: float) -> float:
-    """Relative gap ``(oracle − scare) / oracle`` clipped to ``[0, 1]``.
-
-    Computed in the aggregator after both result.jsons exist.  Negative
-    inputs (oracle worse than scare — shouldn't happen but guard
-    against numerical edge cases) are clipped to 0.
-    """
+    """Relative gap ``(oracle - scare) / oracle`` clipped to ``[0, 1]``.
+    Negative inputs (oracle worse than scare) clip to 0."""
     if oracle_pw_served <= 0:
         return 0.0
     gap = (oracle_pw_served - scare_pw_served) / oracle_pw_served

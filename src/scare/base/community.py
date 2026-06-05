@@ -1,20 +1,14 @@
 """Community partitioning for hierarchical self-organisation.
 
-Implements the Level-1 partitioning step described in
-``docs/chapter_method.tex``: each connected sector subgraph is split into
-multiple sub-communities so that the existing Level-2 (``HolonicCommunityRole``)
-and Level-3 (``EnergyConverterRole``) coordination layers actually receive
-multiple groups to aggregate.
+Level-1 partitioning: each connected sector subgraph is split into
+sub-communities so the Level-2 (``HolonicCommunityRole``) and Level-3
+(``EnergyConverterRole``) layers receive multiple groups to aggregate.
 
-The chosen scheme is **radius-bounded min-label propagation**.  Each node
-starts as its own seed and in each synchronous round adopts the smallest
-label it can see among its neighbours' labels, provided that label is
-still within ``max_radius`` hops of its origin.  A node prefers a smaller
-label even at greater distance, but never adopts a label whose distance
-from its seed would exceed ``max_radius`` — that bound keeps each
-community at most a ``max_radius``-hop ball around its seed and produces
-multiple sub-communities per connected component as soon as the
-component's diameter exceeds ``max_radius``.
+The default scheme is radius-bounded min-label propagation.  Each node
+starts as its own seed and per round adopts the smallest neighbour label
+that stays within ``max_radius`` hops of its seed.  The bound caps each
+community at a ``max_radius``-hop ball and yields multiple sub-communities
+per component once the component diameter exceeds ``max_radius``.
 """
 
 from __future__ import annotations
@@ -97,21 +91,13 @@ def modularity_partition(
     the resolution parameter.  Iterates synchronous rounds until no
     node moves or ``max_iterations`` is reached.
 
-    The algorithm is the canonical Louvain Phase 1 — fully local at
-    each step (everything in the formula except ``m`` is computable
-    from the node's neighbour view); the centralised driver here is
-    a faithful simulation of the distributed run, returning the same
-    deterministic partition the distributed version would converge
-    to.  ``m`` is a single scalar broadcast once at scenario time in
-    the production distributed version.
+    Fully local per step except for ``m`` (total edge count, a single
+    scalar broadcast once); this centralised driver returns the same
+    deterministic partition the distributed run would converge to.
 
-    ``resolution > 1`` produces finer partitions (more, smaller
-    communities); ``< 1`` coarser.  Default 1.0 = standard
-    modularity.
-
-    Returns ``{node_id: label}``, same shape as
-    :func:`label_propagation_partition`, so call sites are
-    interchangeable.
+    ``resolution > 1`` gives finer partitions, ``< 1`` coarser; 1.0 is
+    standard modularity.  Returns ``{node_id: label}``, same shape as
+    :func:`label_propagation_partition`.
     """
     if max_iterations < 1:
         raise ValueError("max_iterations must be >= 1")
@@ -125,7 +111,7 @@ def modularity_partition(
 
     label: dict[Hashable, Hashable] = {n: n for n in graph.nodes}
     degree: dict[Hashable, int] = dict(graph.degree())
-    # Σ_tot per community.  Maintained incrementally as nodes move.
+    # Σ_tot per community, maintained incrementally as nodes move.
     comm_degree: dict[Hashable, float] = {n: float(degree[n]) for n in graph.nodes}
 
     nodes_ordered = sorted(graph.nodes, key=_label_key)
@@ -141,8 +127,8 @@ def modularity_partition(
                 cn = label[neigh]
                 edges_to_comm[cn] = edges_to_comm.get(cn, 0) + 1
 
-            # Remove node from its current community for the
-            # evaluation; we'll add it back to whichever it joins.
+            # Remove node from its community for the evaluation; re-added
+            # to whichever it joins.
             comm_degree[curr] -= k_i
 
             candidates = set(edges_to_comm) | {curr}
@@ -179,16 +165,13 @@ def connected_component_partition(
     """Return a partition with one community per connected component.
 
     Each node's label is the lex-smallest node id in its component
-    (using :func:`_label_key` for stable comparison across heterogeneous
-    id types).  Used by the ``component_level`` baseline so the gossip
-    negotiator sees a single per-sector community per connected
-    component — i.e. as wide a view as is physically reachable —
-    instead of the many ``max_radius``-bounded sub-communities the
-    label-propagation partition produces.
+    (via :func:`_label_key` for stable comparison across id types).  Used
+    by the ``component_level`` baseline so the gossip negotiator sees one
+    per-sector community per component (as wide a view as is physically
+    reachable) rather than many ``max_radius``-bounded sub-communities.
 
     Returns ``{node_id: label}``, same shape as
-    :func:`label_propagation_partition`, so call sites are
-    interchangeable.
+    :func:`label_propagation_partition`.
     """
     label: dict[Hashable, Hashable] = {}
     for component in nx.connected_components(graph):
@@ -209,9 +192,8 @@ def modularity_of_partition(
     ``Q = (1/2m) Σ_ij [A_ij − γ · k_i k_j / (2m)] · δ(c_i, c_j)``
     expanded per-community as
     ``Q = Σ_c [L_c/m − γ · (K_c/(2m))²]``
-    where ``L_c`` is the number of intra-community edges and ``K_c``
-    the degree sum.  Used for diagnostic comparison of partitions
-    produced by different methods (label-propagation vs modularity).
+    where ``L_c`` is the intra-community edge count and ``K_c`` the degree
+    sum.  Used to compare partitions from different methods.
     """
     m = graph.number_of_edges()
     if m == 0:
@@ -219,7 +201,6 @@ def modularity_of_partition(
     two_m = 2.0 * m
 
     degree = dict(graph.degree())
-    # Group node sets per community label.
     members: dict[Hashable, list[Hashable]] = {}
     for n, c in label_by_node.items():
         members.setdefault(c, []).append(n)
@@ -232,7 +213,7 @@ def modularity_of_partition(
             for v in graph.neighbors(u):
                 if v in member_set[c] and v != u:
                     l_c += 1
-        l_c //= 2  # each edge counted twice in the undirected sum
+        l_c //= 2  # each undirected edge counted twice in the sum above
         k_c = sum(degree[n] for n in nodes)
         q += (l_c / m) - resolution * (k_c / two_m) ** 2
     return q
@@ -249,10 +230,8 @@ def partition_label_by_node(
     """Return ``{node_id: label}`` for the given partition method.
 
     Same method semantics as :func:`communities_from_topology`; exposed
-    separately so callers that need the per-node label assignment (e.g.
-    the ``component_level`` baseline's CP injection step, which has to
-    answer "which community contains node X?") can avoid recomputing
-    it.
+    separately for callers that need the per-node label assignment
+    directly (e.g. the ``component_level`` baseline's CP injection step).
     """
     if method == "modularity":
         return modularity_partition(

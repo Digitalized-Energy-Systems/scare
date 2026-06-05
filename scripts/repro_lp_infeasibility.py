@@ -1,9 +1,9 @@
-"""Replay the LP that goes infeasible in priority_dispatch_probe at sim_t=0.1.
+"""Replay an infeasible priority_dispatch_probe LP from a captured snapshot.
 
-Reads the captured infeasibility_snapshot.json from a campaign task, rebuilds
-the network the same way the runner does (line_stress + slack_budget),
-deactivates the same branches, applies the same regulation factors, and
-re-runs energyflow.  Then bisects: failure-only, regulations-only, both.
+Reads infeasibility_snapshot.json from a campaign task, rebuilds the network the
+way the runner does (line_stress + slack_budget), deactivates the same branches,
+applies the same regulation factors, and re-runs energyflow. With --bisect,
+isolates the cause: failure-only, regulations-only, by sector, by child class.
 """
 from __future__ import annotations
 
@@ -100,14 +100,13 @@ def main():
     solve(net, "baseline (no failure, no regulations)")
 
     if not args.bisect:
-        # full reproduction
         net = build_net(scenario)
         deactivate_branches(net, inactive)
         apply_regulations(net, regs)
         solve(net, "FULL repro (failure + regulations)")
 
-        # repeat with the SCARE heat-Sink guard applied: simulate the
-        # dispatcher dropping any regulation < 1 that targets a heat-side Sink.
+        # Repeat with the heat-Sink guard: drop any regulation < 1 targeting a
+        # heat-side Sink.
         net = build_net(scenario)
         deactivate_branches(net, inactive)
         from monee.model.child import Sink
@@ -140,7 +139,7 @@ def main():
         solve(net, "GUARDED repro (failure + regulations, heat-Sinks unchanged)")
         return
 
-    # bisection
+    # --bisect: isolate which inputs drive infeasibility
     net = build_net(scenario)
     deactivate_branches(net, inactive)
     solve(net, "failure ONLY")
@@ -156,29 +155,29 @@ def main():
     apply_regulations(net, rounded)
     solve(net, "failure + regulations rounded to {0,1}")
 
-    # only zero-out the regulations that are < 1e-3 (the "numerical residue" ones)
+    # snap near-0 and near-1 regulations to exact 0/1
     net = build_net(scenario)
     deactivate_branches(net, inactive)
     snapped = {k: (0.0 if v < 1e-3 else (1.0 if v > 1 - 1e-3 else v)) for k, v in regs.items()}
     apply_regulations(net, snapped)
     solve(net, "failure + regulations snapped near 0/1")
 
-    # only non-zero regulations (skip the curtailments)
+    # kept-on regulations only (drop curtailments)
     net = build_net(scenario)
     deactivate_branches(net, inactive)
     keep_nonzero = {k: v for k, v in regs.items() if v > 0.5}
     apply_regulations(net, keep_nonzero)
     solve(net, "failure + only kept-on regulations (drop curtailments)")
 
-    # only curtailments (skip the ones near 1.0)
+    # curtailments only (drop kept-ons)
     net = build_net(scenario)
     deactivate_branches(net, inactive)
     keep_curtail = {k: v for k, v in regs.items() if v < 0.5}
     apply_regulations(net, keep_curtail)
     solve(net, "failure + only curtailments (drop kept-ons)")
 
-    # bisect curtailments by sector — need to know which child belongs to which
-    # sector. Build a map by walking the network.
+    # bisect curtailments by sector; map each child to its sector by walking
+    # the network
     net = build_net(scenario)
     sector_of_child: dict[str, str] = {}
     for child in net.childs:
@@ -226,10 +225,9 @@ def main():
         apply_regulations(net, sub)
         solve(net, f"curtailments only / sectors={label} (n={len(sub)})")
 
-    # zoom in: heat curtailments by child class
+    # break heat curtailments down by monee child class
     heat_curt = by_sector(curtailments, {"heat"})
 
-    # break heat curtailments down by monee child class
     def classify_heat_child(cid: str) -> str:
         for child in net.childs:  # uses last `net` from loop; just for naming
             if str(child.id) == cid:
@@ -248,19 +246,18 @@ def main():
         apply_regulations(net, sub)
         solve(net, f"heat curtailments / cls={cls} only (n={len(sub)})")
 
-    # try: floor heat regulations at small positive value (0.01) instead of 0
+    # floor heat regulations at a small positive value instead of 0
     net = build_net(scenario)
     floored = {k: max(0.01, v) for k, v in heat_curt.items()}
     apply_regulations(net, floored)
     solve(net, f"heat curtailments floored at 0.01 (n={len(floored)})")
 
-    # try: floor at 0.001
     net = build_net(scenario)
     floored = {k: max(0.001, v) for k, v in heat_curt.items()}
     apply_regulations(net, floored)
     solve(net, f"heat curtailments floored at 0.001 (n={len(floored)})")
 
-    # Sink-only sub-bisect: one sink at a time, write the LP for the first that fails
+    # Sink-only sub-bisect: try one sink at a time, record the first that fails
     sinks = list(by_cls.get("Sink", {}).items())
     log.info("trying each Sink curtailment individually (n=%d)", len(sinks))
     first_failing_sink = None

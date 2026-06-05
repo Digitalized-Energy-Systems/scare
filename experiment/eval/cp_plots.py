@@ -1,31 +1,28 @@
-"""Elegant plots for the L2.5 cross-sector coalition pathway.
+"""Plots for the L2.5 cross-sector coalition pathway.
 
-These figures consume the event ledger produced by the e2e test (or
-any campaign run) and render the cross-sector CP-specific behaviour:
+Consume an event ledger (from the e2e test or any campaign run) and
+render cross-sector CP behaviour:
 
-* :func:`cp_setpoint_timeline` — per-CP per-sector flow over time,
-  with cross-sector coalition events overlaid as shaded TTL windows.
+* :func:`cp_setpoint_timeline` — per-CP per-sector flow over time, with
+  active coalition envelopes overlaid as shaded TTL windows.
 * :func:`coalition_lifecycle_gantt` — one horizontal bar per coalition,
-  spanning ``issued_at → issued_at + ttl_s``, coloured by the CP it
-  commits.
-* :func:`envelope_clamp_arrows` — before/after arrows showing how the
-  CP envelope re-routed each ADMM-decided sector flow.
-* :func:`flag_on_off_comparison` — side-by-side event counts so the
-  ablation effect is unmistakable at a glance.
+  spanning ``issued_at -> issued_at + ttl_s``, coloured by committed CP.
+* :func:`envelope_clamp_arrows` — before/after arrows showing how the CP
+  envelope re-routed each ADMM-decided sector flow.
+* :func:`flag_on_off_comparison` — side-by-side event counts for the
+  ablation.
 * :func:`cross_sector_transfer_distribution` — histogram of committed
-  transfer magnitudes (by sector) across an entire campaign.
+  transfer magnitudes (by sector) across a campaign.
 
-Input format is the JSON written by
-``tests/integration/test_cross_sector_coalition_e2e.py`` (and the
-matching real-campaign aggregator):
+Input format:
 
 * ``events.json``  — list of EventRecord dicts (``t, kind, aid,
   sector, detail``).
 * ``summary.json`` — ``{"all": {kind: count}, "cross_sector":
   {kind: count}}``.
 
-Each function returns the directory-relative stem of the figure
-(without extension) — same contract as :mod:`experiment.eval.plots`.
+Each function returns the figure's directory-relative stem (no
+extension) — same contract as :mod:`experiment.eval.plots`.
 """
 
 from __future__ import annotations
@@ -42,8 +39,7 @@ from typing import Any, Iterable
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Reuse the shared theme so cross-sector figures look identical to
-# the rest of the dissertation plot pack.
+# Reuse the shared theme to match the rest of the plot pack.
 from experiment.eval.plots import (
     _AXIS_COLOR,
     _DEFAULT_LAYOUT,
@@ -65,21 +61,16 @@ from experiment.eval.plots import (
 # ---------------------------------------------------------------------------
 
 
-# ``flows={electricity: 0.5000, heat: -1.0000}`` style — used by
-# cp_setpoint, cp_envelope_set, cp_envelope_clamp.
+# ``flows={electricity: 0.5000, heat: -1.0000}`` (cp_setpoint,
+# cp_envelope_set, cp_envelope_clamp).
 _FLOWS_RE = re.compile(r"flows=\{([^}]*)\}")
-# ``coalition=<id>``
 _COALITION_RE = re.compile(r"coalition=(\S+)")
-# ``ttl=<n>``
 _TTL_RE = re.compile(r"ttl=([0-9.]+)")
-# ``envelope_active=True/False``
 _ENV_ACTIVE_RE = re.compile(r"envelope_active=(True|False)")
-# ``transfer_out=<n>`` / ``transfer_in=<n>``
 _TRANSFER_OUT_RE = re.compile(r"transfer_out=([0-9.]+)")
 _TRANSFER_IN_RE = re.compile(r"transfer_in=([0-9.]+)")
-# ``cp=<aid>``
 _CP_RE = re.compile(r"\bcp=(\S+)")
-# Cross-sector inversion detected — needs the high/low tiers
+# Cross-sector inversion, with high/low tiers.
 _CSI_RE = re.compile(
     r"cp=(\S+).*?own_sec=(\S+)\s+tier_high=(\d+).*?peer_sec=(\S+)\s+tier_low=(\d+)"
 )
@@ -231,10 +222,9 @@ def cp_setpoint_timeline(
     title: str = "CP sector flows with cross-sector coalition windows",
 ) -> Path:
     """One subplot per CP; per-sector flow as a line.  Each active
-    coalition envelope is overlaid as a translucent shaded band over
-    ``[issued_at, issued_at + ttl_s]`` so the reader can see when the
-    L2.5 layer was holding the CP and how the CP's flow moved during
-    that window.
+    coalition envelope is a translucent band over
+    ``[issued_at, issued_at + ttl_s]``, showing when L2.5 held the CP
+    and how its flow moved during the window.
     """
     events = _load_events(events_json)
     setpoints = _cp_setpoint_rows(events)
@@ -256,7 +246,6 @@ def cp_setpoint_timeline(
             (r for r in setpoints if r.cp_aid == cp),
             key=lambda r: r.t,
         )
-        # Per-sector line.
         sectors_seen = set()
         for r in cp_rows:
             sectors_seen.update(r.flows.keys())
@@ -268,7 +257,7 @@ def cp_setpoint_timeline(
                 go.Scatter(
                     x=xs, y=ys,
                     mode="lines+markers",
-                    name=sec if i == 1 else None,  # legend once
+                    name=sec if i == 1 else None,  # legend entry once
                     showlegend=(i == 1),
                     line=dict(color=color, width=2.0),
                     marker=dict(size=5, color=color, line=dict(width=0.5, color="white")),
@@ -283,9 +272,8 @@ def cp_setpoint_timeline(
                 row=i, col=1,
             )
 
-        # Envelope shading: every coalition for this CP becomes a
-        # translucent band.  Colour cycles through the qualitative
-        # palette so overlapping coalitions are visually separable.
+        # One translucent band per coalition; palette cycles so
+        # overlapping coalitions stay separable.
         cp_envs = [e for e in envelopes if e.cp_aid == cp]
         for j, env in enumerate(cp_envs):
             band_color = _hex_to_rgba(
@@ -330,10 +318,8 @@ def coalition_lifecycle_gantt(
 ) -> Path:
     """One horizontal bar per coalition, spanning the TTL window.
 
-    The bar's y-position is the CP it commits.  Hover text shows the
-    coalition initiator and the transfer magnitudes (in/out).  When
-    multiple coalitions on the same CP stack, the bars are offset
-    vertically inside the CP's swim-lane so they remain distinguishable.
+    Bar y-position is the committed CP; hover shows the initiator and
+    in/out transfer magnitudes.
     """
     events = _load_events(events_json)
     coalitions = _coalition_rows(events)
@@ -350,7 +336,7 @@ def coalition_lifecycle_gantt(
     cp_to_y = {cp: i for i, cp in enumerate(cps)}
 
     fig = go.Figure()
-    # Subtle background rows so each CP's swim lane is visually distinct.
+    # Background row per CP swim lane.
     for cp, y in cp_to_y.items():
         fig.add_shape(
             type="rect",
@@ -362,8 +348,8 @@ def coalition_lifecycle_gantt(
         )
 
     for j, c in enumerate(coalitions):
-        env = env_index.get((c.cp_aid, ""))  # coalition_id often unknown in alloc record
-        # Fallback: use any envelope on this CP near the same time
+        env = env_index.get((c.cp_aid, ""))  # alloc records often lack coalition_id
+        # Fallback: any envelope on this CP near the same time.
         if env is None:
             candidate = [
                 e for e in envelopes
@@ -374,7 +360,7 @@ def coalition_lifecycle_gantt(
         coalition_color = _QUAL_PALETTE[j % len(_QUAL_PALETTE)]
         y = cp_to_y.get(c.cp_aid, 0)
 
-        # Bar: rectangle from t to t+ttl at y.
+        # Bar spanning [t, t+ttl].
         fig.add_trace(go.Bar(
             x=[ttl],
             y=[c.cp_aid],
@@ -397,7 +383,7 @@ def coalition_lifecycle_gantt(
                 "<extra></extra>"
             ),
         ))
-        # Annotate the start with a small marker for visual anchoring.
+        # Start marker for visual anchoring.
         fig.add_trace(go.Scatter(
             x=[c.t], y=[c.cp_aid],
             mode="markers",
@@ -437,13 +423,11 @@ def envelope_clamp_arrows(
     title: str = "CP ADMM output clamped by cross-sector envelope",
     sector_order: tuple[str, ...] = ("electricity", "heat", "gas"),
 ) -> Path:
-    """Slope chart: for each clamp event, draw an arrow from the
-    pre-clamp ADMM result to the post-clamp committed value.
+    """Slope chart: per clamp event, an arrow from the pre-clamp ADMM
+    result to the post-clamp committed value.
 
-    The visual reads at a glance: every event where the L2.5 layer
-    overrode L3's free choice shows up as a divergent arrow; where L3
-    was already inside the envelope, the arrow is short or vertical.
-    Sector colours match the rest of the plot pack.
+    An L2.5 override of L3's choice shows as a divergent arrow; an
+    in-envelope L3 result gives a short/vertical arrow.
     """
     events = _load_events(events_json)
     rows: list[tuple[float, str, list[float], list[float]]] = []
@@ -463,7 +447,7 @@ def envelope_clamp_arrows(
         return _save(_empty_fig("no clamp events recorded", title), out_path)
 
     fig = go.Figure()
-    # x positions: one column per sector, evenly spaced.
+    # One evenly-spaced column per sector.
     x_positions = {sec: i for i, sec in enumerate(sector_order)}
 
     for idx, (t, cp, pre, post) in enumerate(rows):
@@ -472,8 +456,7 @@ def envelope_clamp_arrows(
                 continue
             color = _SECTOR_COLOR.get(sec, _QUAL_PALETTE[idx % len(_QUAL_PALETTE)])
             x = x_positions[sec]
-            # The arrow itself is just a thin segment with a marker
-            # cap at the post-clamp value.
+            # Thin segment with a marker cap at the post-clamp value.
             fig.add_trace(go.Scatter(
                 x=[x - 0.18, x + 0.18],
                 y=[pre[sec_idx], post[sec_idx]],
@@ -537,13 +520,9 @@ def flag_on_off_comparison(
         "cp_setpoint",
     ),
 ) -> Path:
-    """Grouped bar chart of selected event-kind counts.
-
-    The intended use is to point this at the artefacts dropped by
-    ``test_cross_sector_coalition_e2e.test_cross_sector_coalition_side_by_side``
-    (``tmp_path/off/summary.json``, ``tmp_path/on/summary.json``) and
-    inspect the resulting figure — the asymmetry between flag-on and
-    flag-off bars is the headline visual for the ablation.
+    """Grouped bar chart of selected event-kind counts from two
+    ``summary.json`` files; the flag-on/flag-off asymmetry is the
+    headline ablation visual.
     """
     def _read(p: Path) -> dict[str, int]:
         try:
@@ -596,11 +575,9 @@ def cross_sector_transfer_distribution(
     *,
     title: str = "Cross-sector coalition transfer magnitudes",
 ) -> Path:
-    """Two-panel histogram: ``transfer_out`` (output sector) and
-    ``transfer_in`` (input sector) magnitudes across all recorded
-    coalition allocations.  When run over a campaign it surfaces the
-    typical scale of the L2.5 contribution — handy for sanity-checking
-    against the network's rated CP capacity.
+    """Two-panel histogram of ``transfer_out`` and ``transfer_in``
+    magnitudes across all coalition allocations; surfaces the typical
+    scale of the L2.5 contribution.
     """
     events = _load_events(events_json)
     coalitions = _coalition_rows(events)
@@ -661,9 +638,8 @@ def render_all(
 ) -> dict[str, Path]:
     """Render every CP-specific figure for one run directory.
 
-    ``run_dir`` is expected to contain ``events.json`` and
-    ``summary.json`` (the layout the e2e test writes).  Returns a
-    mapping of name → output stem so callers can build an index page.
+    ``run_dir`` must contain ``events.json`` and ``summary.json``.
+    Returns a name -> output-stem mapping for building an index page.
     """
     run_dir = Path(run_dir)
     out_dir = Path(out_dir) if out_dir is not None else run_dir / "plots"
@@ -689,9 +665,7 @@ def render_comparison(
     on_dir: Path,
     out_dir: Path,
 ) -> Path:
-    """Render the flag-on-vs-off bar chart from two side-by-side run
-    directories produced by the e2e test.
-    """
+    """Render the flag-on-vs-off bar chart from two run directories."""
     return flag_on_off_comparison(
         Path(off_dir) / "summary.json",
         Path(on_dir) / "summary.json",

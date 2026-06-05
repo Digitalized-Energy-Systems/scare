@@ -39,7 +39,7 @@ from experiment.hpc.config import (
     TaskSpec,
     task_dir,
 )
-from experiment.restoration import GRIDS  # noqa: PLC0415  — heavy import
+from experiment.restoration import GRIDS  # noqa: PLC0415  heavy import
 
 logger = logging.getLogger(__name__)
 
@@ -61,16 +61,13 @@ def build_tasks(cfg: CampaignConfig) -> list[TaskSpec]:
     Two modes:
 
     1. **Legacy** — top-level ``grids`` list, no ``experiments``: each
-       grid produces ``runs_per_grid`` tasks of variant ``scare`` with
-       no ablation / sweep / scenario customisation.  Identical to the
-       pre-eval behaviour, byte-compatible manifest.
+       grid produces ``runs_per_grid`` scare tasks with no axis
+       customisation. Byte-compatible with the pre-eval manifest.
 
-    2. **Eval** — ``experiments`` list, each entry contributes a
-       Cartesian product across (grids × seeds × variants × ablations
-       × sweeps × scenarios).  Empty ``grids`` on an experiment marks
-       it as a TODO placeholder and emits a metadata note instead of
-       expanding it — this lets the campaign config carry the missing
-       grids' shape so the reviewer sees the gap.
+    2. **Eval** — ``experiments`` list, each contributing the Cartesian
+       product across (grids x seeds x variants x ablations x sweeps x
+       scenarios). Empty ``grids`` marks a TODO placeholder, skipped but
+       noted in metadata so the reviewer sees the gap.
     """
     if cfg.experiments:
         return _build_eval_tasks(cfg)
@@ -120,11 +117,7 @@ def _build_eval_tasks(cfg: CampaignConfig) -> list[TaskSpec]:
                                     + g_idx * 1_000_000
                                     + run_idx
                                 )
-                                # Per-scenario overrides for the
-                                # failure-count machinery.  Targeted
-                                # scenarios (e.g.\ ``concentrated``)
-                                # often need an exact count rather
-                                # than a Poisson draw, so we accept:
+                                # Per-scenario failure-count overrides:
                                 #   - ``n_failures``     exact count, bypasses sampling
                                 #   - ``failure_lambda`` override Poisson lambda
                                 #   - ``max_failures``   override per-grid cap
@@ -230,17 +223,14 @@ def filter_task_ids(
 ) -> list[int]:
     """Pick task IDs whose on-disk status matches ``mode``.
 
-    ``incomplete`` covers both crashed/timed-out and never-started tasks
-    — i.e. anything that isn't ``ok`` — which is the right default for
-    "resubmit what didn't finish".
+    ``incomplete`` is anything that isn't ``ok`` (crashed, timed-out, or
+    never-started) — the right default for "resubmit what didn't finish".
     """
     if mode == "all":
         return [t.task_id for t in tasks]
 
-    # ``claims_failed`` and ``ok`` both completed the simulation; only
-    # ``claims_failed`` carries a chapter-claim violation flag.  Treat
-    # both as "done" for re-run filtering so a claim regression doesn't
-    # cause a wholesale recompute.
+    # Both ``ok`` and ``claims_failed`` completed the sim; treat both as
+    # "done" so a claim failure doesn't trigger a wholesale recompute.
     completed = ("ok", "claims_failed")
     out: list[int] = []
     for t in tasks:
@@ -313,9 +303,8 @@ def _write_metadata(campaign_dir: Path, cfg: CampaignConfig, n_tasks: int) -> No
 
 
 def prebuild_grids(grid_names: list[str]) -> None:
-    """Build each grid factory once locally to warm caches before submission.
-
-    Avoids 32 array tasks racing on a first-time simbench download.
+    """Build each grid factory once to warm caches before submission,
+    so array tasks don't race on a first-time simbench download.
     """
 
     for g in grid_names:

@@ -1,14 +1,10 @@
 """Integration tests for the tier-1 hard-constraint pre-step.
 
 The L1 leader hard-locks every tier-1 load at ``regulation = 1`` before
-the gossip QP runs, provided the community's generator pool can cover
-the total tier-1 demand.  When pool < tier-1 demand the trivial
-allocation kicks in: pro-rata pool across tier-1 loads, zero out the
-lower tiers, skip the QP.
-
-This test exercises both branches end-to-end through a real mango
-world + gossip protocol, pattern follows
-``tests/integration/test_gossip_convergence.py``.
+the gossip QP runs, provided the generator pool covers total tier-1
+demand. When pool < tier-1 demand, the trivial allocation kicks in:
+pro-rata pool across tier-1 loads, zero the lower tiers, skip the QP.
+Both branches are exercised end-to-end through a real mango world.
 """
 
 import pytest
@@ -61,18 +57,16 @@ def _last_factor(behavior: MockBehavior, aid: str) -> float | None:
 
 
 def _has_reason(behavior: MockBehavior, aid: str, reason_substr: str) -> bool:
-    """Did ``aid`` ever get a regulate call?  (MockBehavior doesn't record
-    the ``reason`` kwarg, so we use the presence of a call as a proxy for
-    the pre-step having engaged on this aid.)"""
+    """Did ``aid`` ever get a regulate call? MockBehavior doesn't record
+    the ``reason`` kwarg, so a call's presence proxies for the pre-step
+    having engaged on this aid."""
     return any(
         entry[0] == aid and entry[1] == "regulate"
         for entry in behavior.action_log
     )
 
 
-# ---------------------------------------------------------------------------
-# Feasible branch — tier 1 demand ≤ pool
-# ---------------------------------------------------------------------------
+# Feasible branch: tier-1 demand <= pool.
 
 
 @pytest.mark.asyncio
@@ -95,31 +89,26 @@ async def test_tier1_feasible_locked_at_one_qp_runs_for_lower_tiers():
 
     f_t1 = _last_factor(behavior, "load-1")
     f_t3 = _last_factor(behavior, "load-3")
-    # Tier 1 must end at exactly 1.0 — the pre-step's apply_regulate
-    # is the last write on tier-1 in this scenario because the QP that
-    # follows sees tier-1 with QP weight 0.
+    # Tier-1 ends at exactly 1.0: the pre-step is the last write since
+    # the QP that follows sees tier-1 with QP weight 0.
     assert f_t1 is not None and abs(f_t1 - 1.0) < 1e-9, (
         f"tier-1 must be hard-locked at 1.0, got {f_t1}"
     )
-    # Tier 3 should have been regulated by the QP.  Pool left after
-    # tier-1 = 1.0; tier-3 demand = 1.0 → fully serveable.  Box-clamp
-    # + QP convergence noise means we accept any factor ≥ 0.5.
+    # Tier-3 fully serveable from residual pool; box-clamp + QP noise
+    # means we accept any factor >= 0.5.
     assert f_t3 is not None and f_t3 >= 0.5, (
         f"tier-3 should be partially or fully served by the residual QP, got {f_t3}"
     )
 
 
-# ---------------------------------------------------------------------------
-# Infeasible branch — tier 1 demand > pool
-# ---------------------------------------------------------------------------
+# Infeasible branch: tier-1 demand > pool.
 
 
 @pytest.mark.asyncio
 async def test_tier1_infeasible_pro_rata_lower_tiers_zero_no_qp():
     """Pool 0.5 MW, tier-1 demand 1.0 MW (two tier-1 loads at 0.5 each),
-    tier-3 demand 1.0 MW.  Infeasible: each tier-1 load gets factor
-    pool_share / cap = (0.5 × 0.5 / 1.0) / 0.5 = 0.5; tier-3 is shed
-    to factor 0; the gossip QP does not run.
+    tier-3 demand 1.0 MW. Infeasible: each tier-1 load gets factor 0.5;
+    tier-3 is shed to factor 0; the gossip QP does not run.
     """
     behavior = MockBehavior()
     world, _agents, roles = _build_group(behavior, [
@@ -137,9 +126,7 @@ async def test_tier1_infeasible_pro_rata_lower_tiers_zero_no_qp():
     f_t1a = _last_factor(behavior, "load-1a")
     f_t1b = _last_factor(behavior, "load-1b")
     f_t3 = _last_factor(behavior, "load-3")
-    # Pro-rata share = pool / total_tier1_unmet = 0.5 / 1.0 = 0.5.
-    # Each tier-1 load gets new_sp = 0 + 0.5 × (0.5/1.0) = 0.25.
-    # Factor = 0.25 / 0.5 = 0.5.
+    # Pro-rata: each tier-1 load gets new_sp 0.25 / cap 0.5 = factor 0.5.
     assert f_t1a is not None and abs(f_t1a - 0.5) < 1e-6, (
         f"tier-1 pro-rata: expected ~0.5, got {f_t1a}"
     )
@@ -152,16 +139,13 @@ async def test_tier1_infeasible_pro_rata_lower_tiers_zero_no_qp():
     )
 
 
-# ---------------------------------------------------------------------------
-# No-deficit branch — pool >> demand
-# ---------------------------------------------------------------------------
+# No-deficit branch: pool >> demand.
 
 
 @pytest.mark.asyncio
 async def test_tier1_no_deficit_all_loads_served():
-    """Pool 10 MW, tier-1 demand 1 MW, tier-3 demand 1 MW.  Massive
-    surplus.  Tier-1 pre-locked at 1.0; tier-3 served by the QP up to
-    full demand.
+    """Pool 10 MW, tier-1 demand 1 MW, tier-3 demand 1 MW. Surplus:
+    tier-1 pre-locked at 1.0; tier-3 served by the QP up to full demand.
     """
     behavior = MockBehavior()
     world, _agents, roles = _build_group(behavior, [

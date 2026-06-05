@@ -60,11 +60,8 @@ class ScareDistributedOptimizationRole(DistributedOptimizationRole):
 
         # Route through mango's scheduler, not bare ``asyncio.create_task``:
         # under discrete-stepping the world only advances tasks the scheduler
-        # knows about; an orphan task would run "on a side track" off the
-        # simulation clock and its sends would be flushed in a later step.
-        # Matches the upstream ``DistributedOptimizationRole._handle_optimization``
-        # pattern (which this subclass would otherwise inherit verbatim if
-        # the message-type allow-list above weren't needed).
+        # knows about; an orphan task would run off the simulation clock and
+        # its sends would be flushed in a later step.
         self.context.schedule_instant_task(
             on_exchange_message(
                 self.algorithm, self._carrier, actual_content, actual_meta

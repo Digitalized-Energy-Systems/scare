@@ -3,14 +3,9 @@
 Usage:
     python scripts/compare_priority_probes.py BASELINE_DIR NEW_DIR
 
-For each task pair (matched by (experiment, ablation)), reports:
-- status / wallclock duration
-- solver_infeasibilities (LP stress)
-- priority_invariant pass/fail + inversion count
-- saturated-vs-free ratio across gossip messages (from run.log)
-- new event counts: regulate_on_stale_obs, regulate_suppressed_by_cooldown,
-  priority_default_fallback
-- per-tier served fraction (heat sector) for a quick visual check
+For each task pair (matched by (experiment, ablation)), reports status/duration,
+solver infeasibilities, priority_invariant pass/fail + inversion count, gossip
+saturated-vs-free ratio, diagnostic event counts, and per-tier served fraction.
 """
 
 from __future__ import annotations
@@ -42,10 +37,8 @@ def _load_json(path: Path) -> dict | None:
 
 
 def _count_gossip_saturation(run_log: Path) -> tuple[int, int]:
-    """Return (saturated_count, free_count) by scanning the gossip
-    ledger lines in run.log.  Counts the ``True)`` / ``False)`` literals
-    that appear in stringified ledger tuples — same heuristic the
-    pre/post fix analysis used.
+    """Return (saturated_count, free_count) by scanning gossip ledger lines in
+    run.log, counting the ``True)`` / ``False)`` literals in stringified tuples.
     """
     if not run_log.exists():
         return 0, 0
@@ -121,7 +114,7 @@ def main() -> None:
     new = Path(sys.argv[2])
     base_man = _load_manifest(base)
     new_man = _load_manifest(new)
-    # Index by (experiment, ablation_key) so we can compare matched tasks.
+    # Index by (experiment, ablation_key) to compare matched tasks.
     base_idx = {(s["experiment"], _ablation_key(s)): t for t, s in base_man.items()}
     new_idx = {(s["experiment"], _ablation_key(s)): t for t, s in new_man.items()}
     keys = sorted(set(base_idx) | set(new_idx))
@@ -151,8 +144,7 @@ def main() -> None:
 
         print(f"{exp + ' / ' + abl:<60} {_fmt(b):>40}   {_fmt(n):>40}")
 
-    # New-event roll-up across the new campaign only (these counters
-    # don't exist in the baseline runs).
+    # Roll up diagnostic-event counts across the new campaign only.
     print("\nNew diagnostic events on the post-fix campaign:")
     for kind in (
         "regulate_on_stale_obs",
@@ -165,7 +157,7 @@ def main() -> None:
         print(f"  {kind:<40} {n_total}")
 
     # Detailed served-by-tier diff for matching tasks.
-    print("\nServed-fraction-by-tier diff (heat sector only — was the inverted one):")
+    print("\nServed-fraction-by-tier diff (heat sector only):")
     for key in keys:
         exp, abl = key
         b_t = base_idx.get(key)

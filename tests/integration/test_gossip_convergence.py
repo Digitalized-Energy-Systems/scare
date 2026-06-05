@@ -47,15 +47,13 @@ def _build_group(
         agents.append(agent)
         roles.append(role)
 
-    # Build fully-connected group topology; first agent is leader
+    # Fully-connected group topology; first agent is leader.
     with create_topology(tid="groups") as topo:
         nids = []
         for agent in agents:
             nid = topo.add_node(agent)
             nids.append(nid)
-        # Mark first as leader
         topo.set_characteristic(nids[0], agents[0], "leader")
-        # Fully connect
         for i in range(len(nids)):
             for j in range(i + 1, len(nids)):
                 topo.add_edge(nids[i], nids[j])
@@ -73,13 +71,11 @@ async def test_two_agent_gossip_converges():
     ])
 
     async with world:
-        # Leader triggers negotiation
         roles[0].context.schedule_instant_task(
             roles[0].trigger_balance_negotiation()
         )
         await discrete_step_until(world, max_advance_time_s=5.0)
 
-    # The load should have been regulated (at least one regulate call)
     regulate_calls = [c for c in behavior.action_log if c[0] == "load-0" and c[1] == "regulate"]
     assert len(regulate_calls) >= 1
 
@@ -100,7 +96,6 @@ async def test_three_agent_gossip():
         )
         await discrete_step_until(world, max_advance_time_s=5.0)
 
-    # Both loads should have received regulate calls
     load_0_calls = [c for c in behavior.action_log if c[0] == "load-0" and c[1] == "regulate"]
     load_1_calls = [c for c in behavior.action_log if c[0] == "load-1" and c[1] == "regulate"]
     assert len(load_0_calls) >= 1
@@ -109,12 +104,11 @@ async def test_three_agent_gossip():
 
 @pytest.mark.asyncio
 async def test_priority_ordering():
-    """Higher priority load (lower number) should participate earlier.
+    """Higher-priority (lower-number) load participates earlier.
 
-    Under the 4-tier model the tier-1 load is regulated by the leader's
-    hard-constraint pre-step (regulation = 1) and the tier-4 load is
-    handled by the QP that follows.  Both should still receive at
-    least one regulate call.
+    The tier-1 load is regulated by the leader's hard-constraint
+    pre-step; the tier-4 load by the QP that follows. Both should
+    receive at least one regulate call.
     """
     behavior = MockBehavior()
     world, agents, roles = _build_group(behavior, [
@@ -129,7 +123,6 @@ async def test_priority_ordering():
         )
         await discrete_step_until(world, max_advance_time_s=5.0)
 
-    # Both should be regulated, but high-prio first
     high_calls = [c for c in behavior.action_log if c[0] == "high-prio" and c[1] == "regulate"]
     low_calls = [c for c in behavior.action_log if c[0] == "low-prio" and c[1] == "regulate"]
     assert len(high_calls) >= 1

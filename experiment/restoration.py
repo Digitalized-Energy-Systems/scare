@@ -61,46 +61,35 @@ def create_large_lv_simbench(
 ):
     """Build a simbench LV multi-energy network.
 
-    The grid is constructed with an *unconstrained slack* so the
-    energy-flow LP always converges.  Slack-budget shaping (the
-    operator's import / export target) is a per-scenario policy,
-    applied at ``_apply_scenario`` time via
-    :func:`apply_slack_budget`.  Bake-it-into-the-grid was the
-    pre-refactor approach but it made the LP infeasible whenever a
-    failure shifted the imbalance past the budget — see the slack-
-    handling F1–F3 refactor for the design rationale.
+    The grid uses an unconstrained slack so the energy-flow LP always
+    converges; slack-budget shaping is a per-scenario policy applied via
+    :func:`apply_slack_budget`.
 
     Parameters
     ----------
     density:
-        Coupling-point density passed straight to monee's MES generator
+        Coupling-point density forwarded to monee's MES generator
         (controls how many CHP / P2G / P2H plants are placed).
     simbench_code:
-        simbench network code; the default ``1-LV-rural3--1-no_sw`` is
-        the established ~340-load benchmark, but smaller variants
-        (rural1, semiurb4) are useful for the scaling experiment.
+        simbench network code; default ``1-LV-rural3--1-no_sw`` is the
+        ~340-load benchmark, smaller variants (rural1, semiurb4) are for
+        the scaling experiment.
     backup_lines_per_sector:
-        If ``> 0``, augment the network with that many normally-open
-        backup branches per sector via ``add_backup_lines``.  This is
-        the test fixture for the reconfiguration pillar — without
-        them the grid is purely radial and the GridReconfigurator has
-        no alternative paths to discover.
+        If ``> 0``, add that many normally-open backup branches per
+        sector via ``add_backup_lines`` — the reconfiguration fixture;
+        without them the radial grid has no alternative paths.
     backup_seed:
-        RNG seed for backup placement (reproducible test fixtures).
+        RNG seed for reproducible backup placement.
     cp_size_multiplier:
         Scales every coupling-point's rated output uniformly (1.0 =
-        monee's per-bus default; 2.0 doubles every CP capacity).
-        Larger CPs amplify the cross-sector substitution potential —
-        the headline knob for "how big do CPs need to be before
-        their contribution rises above noise?".
+        monee's per-bus default). Larger CPs amplify cross-sector
+        substitution potential.
     replace_primary_generation:
-        When True (default False), the rated output of every CP is
-        absorbed from the matching primary generation pool, keeping
-        total per-carrier rated production invariant.  This flips the
-        framing from CP-as-redundancy (the additive default) to
-        CP-as-cross-carrier-dependence: losing a CP now disables
-        both the unit and the primary gen it displaced, so cross-
-        sector ADMM coordination becomes load-bearing for resilience.
+        When True, each CP's rated output is absorbed from the matching
+        primary generation pool, keeping total per-carrier rated
+        production invariant. Reframes CP-as-redundancy (additive
+        default) into CP-as-cross-carrier-dependence: losing a CP then
+        disables both the unit and the primary gen it displaced.
     """
 
     def create():
@@ -120,8 +109,8 @@ def create_large_lv_simbench(
             heat_kwargs={"node_based_heat_loads": True},
         )
         mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
-        # McCormick is maybe not necessery here as only energy flow is needed
-        # McCormick can on failures, lead to infeasibles due to envelope bounds
+        # McCormick is unneeded for energy flow and can make failures
+        # infeasible via envelope bounds.
         # mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
 
         if backup_lines_per_sector > 0:
@@ -144,44 +133,37 @@ def apply_microgrid_islanding(
     promote_all_generators: bool = False,
     grid_former_aids: "tuple[str, ...] | list[str] | set[str]" = (),
 ) -> dict[str, int]:
-    """Enable monee's islanding extension on *mes* and (optionally) convert
-    selected generator-class children into their ``GridForming*`` types
-    so that the extension has grid-formers to anchor sub-islands on.
+    """Enable monee's islanding extension on *mes* and optionally convert
+    selected generator-class children into ``GridForming*`` types so the
+    extension has grid-formers to anchor sub-islands on.
 
     Args:
         carriers:
-            Iterable of carrier names that get islanding turned on
-            (``"electricity"``, ``"water"``, ``"gas"``).  monee accepts
-            ``True`` per-carrier for the default ``IslandingMode``; this
-            helper only forwards True/None and does not customise modes.
+            Carrier names to enable islanding on (``"electricity"``,
+            ``"water"``, ``"gas"``). Forwards True/None per carrier;
+            does not customise islanding modes.
         promote_all_generators:
             When True, every eligible generator-class child
-            (PowerGenerator, gas/water Source) is replaced with the
-            corresponding ``GridFormingGenerator`` / ``GridFormingSource``
-            so that any sub-island containing one can be solved as its
-            own island.  When False, only children whose aid matches
-            ``grid_former_aids`` are promoted.
+            (PowerGenerator, gas/water Source) becomes the corresponding
+            ``GridFormingGenerator`` / ``GridFormingSource`` so any
+            sub-island containing one is solvable on its own. When False,
+            only children whose aid is in ``grid_former_aids`` are promoted.
         grid_former_aids:
-            Per-child opt-in.  Aid strings of the form ``"child-{id}"``;
-            ignored when ``promote_all_generators`` is True.
+            Per-child opt-in aids of the form ``"child-{id}"``; ignored
+            when ``promote_all_generators`` is True.
 
     Returns:
-        Dict of ``{carrier: n_promoted}`` reporting how many children
-        were converted in each sector — useful for sanity-checking the
-        scenario.
+        ``{carrier: n_promoted}`` — children converted per sector.
 
     Side effects:
-        Calls :func:`monee.enable_islanding` on *mes*; the resulting
-        ``NetworkIslandingConfig`` is attached to the network and used
-        automatically by every subsequent solve (Pyomo / Gekko both
-        respect it).
+        Calls :func:`monee.enable_islanding`; the resulting
+        ``NetworkIslandingConfig`` is attached and respected by every
+        subsequent solve (Pyomo / Gekko).
 
     Notes:
-        Promotion uses approximate ratings derived from the original
-        child's setpoint magnitude.  This is fine for *eligibility*
-        (the LP needs a leading reference per island, not a precise
-        capacity), and the chapter's CP-coordination claim can build
-        on top with the per-aid ``grid_former_aids`` knob.
+        Promotion uses approximate ratings from the child's setpoint
+        magnitude — sufficient for eligibility (the LP needs a leading
+        reference per island, not a precise capacity).
     """
     carrier_set = frozenset(carriers)
     if not carrier_set:
@@ -209,9 +191,8 @@ def apply_microgrid_islanding(
             )
             counters["electricity"] += 1
         elif isinstance(m, Source):
-            # Sources live on both gas and water nodes; route by the
-            # parent node's grid so the right carrier counter advances
-            # and the right islanding mode anchors the conversion.
+            # Sources live on both gas and water nodes; route by parent
+            # grid so the right carrier is counted and anchored.
             mass_max = max(1e-6, abs(float(getattr(m, "mass_flow", 0.0) or 0.0)))
             if "gas" in grid_name and "gas" in carrier_set:
                 child.model = GridFormingSource(
@@ -224,8 +205,7 @@ def apply_microgrid_islanding(
                 )
                 counters["water"] += 1
 
-    # Switch on monee's islanding extension.  None per-carrier means
-    # "leave that carrier disabled" (legacy behaviour for that sector).
+    # None per-carrier leaves that carrier's islanding disabled.
     enable_islanding(
         mes,
         electricity=True if "electricity" in carrier_set else None,
@@ -245,25 +225,22 @@ def apply_temporal_extensions(
     """Attach monee's temporal-storage extensions to *mes*.
 
     ``GasLinepack`` (per-pipe ``linepack_kg`` / ``net_pack_kgs`` vars) and
-    ``LumpedThermalCapacitance`` (per-water-junction ρ·V thermal mass) only
-    activate their dynamics inside monee's timeseries solver — the
-    single-step ``energyflow`` used by ``mango_energy_environments`` pins
-    ``net_pack_kgs = 0`` and emits no LTC inertia term.  Attaching them
-    here is therefore a **smoke test** of agent-side compatibility (the
-    LP gains new vars; the agents must not crash on the augmented obs
-    schema) rather than a flexibility benchmark.  Wiring step_state
-    through ``energyflow`` is a separate work item.
+    ``LumpedThermalCapacitance`` (per-water-junction ρ·V thermal mass)
+    only activate their dynamics in monee's timeseries solver; the
+    single-step ``energyflow`` used here pins ``net_pack_kgs = 0`` and
+    emits no LTC inertia term. Attaching them is thus an agent-side
+    compatibility check (agents must tolerate the augmented obs schema),
+    not a flexibility benchmark.
 
-    Returns ``{"linepack_pipes": n, "ltc_junctions": n}`` so the
-    campaign can sanity-check that the extension actually found
-    something to attach to on the chosen grid.
+    Returns ``{"linepack_pipes": n, "ltc_junctions": n}`` so the caller
+    can confirm the extension found something to attach to.
     """
     counters = {"linepack_pipes": 0, "ltc_junctions": 0}
     if linepack:
         ext = GasLinepack()
         mes.add_extension(ext)
-        # ``prepare`` is what materialises the per-branch state; the
-        # solver normally calls it but we want the counter here too.
+        # ``prepare`` materialises per-branch state; call it early for
+        # the counter (the solver also calls it).
         try:
             ext.prepare(mes)
         except Exception:  # noqa: BLE001 — count is best-effort
@@ -286,62 +263,43 @@ def apply_temporal_extensions(
 def apply_slack_budget(mes, fraction: float) -> None:
     """Register the operator's slack budget on the slack agents.
 
-    F3 — the slack budget is now a **soft target the MAS enforces**,
-    not a hard LP bound that can make the energy-flow LP infeasible
-    after a failure shifts the imbalance.  We:
+    The slack budget is a soft target the MAS enforces, not a hard LP
+    bound (which could make the energy-flow LP infeasible after a failure
+    shifts the imbalance). Steps:
 
-    1. Compute the operator's budget per sector from the sum of
-       nominal load magnitudes (same formula as before).
-    2. Set the slack Var bounds to a generous *physical* envelope so the
-       LP can always balance the network (with a high slack draw paying a
-       "natural" price via the load-shedding objective if one is set, or
-       simply being absorbed if no objective constrains it).  The
-       envelope is ``± _SLACK_LP_HEADROOM_FACTOR · max(budget, sector
-       throughput)`` — the throughput term (total load *plus* total
-       generation / source magnitude in the sector) is what keeps the LP
-       feasible on grids where CP / generation flow dwarfs native load.
-       Sizing the envelope off the operator budget alone (the old
-       behaviour) under-sized it on such grids: on ``simbench_lv_small``
-       native gas load is 3e-4 kg/s but the gas sources / CHP push
-       ~1e-2 kg/s through the slack, so the old ``10·budget`` bound
-       (1.35e-3) made the energy-flow LP infeasible on the *intact*
-       network (eval tasks 84/85).  The envelope is purely an LP
-       feasibility guard; the operator policy is the *soft* budget in
-       step 3, which is left unchanged so the MAS target and the
-       ``slack_budget_compliance`` claim are unaffected.
-    3. Stash the budget as the underscore-prefixed attribute
-       ``_scare_slack_budget_mw`` / ``_scare_slack_budget_kgs`` on
-       the slack model so F1's scenario-build hook can register that
-       value as the slack agent's "rating" — which F2 then multiplies
-       by ``slack_target_fraction`` to derive the MAS-level target.
+    1. Compute the operator budget per sector from nominal load (plus
+       injection) magnitudes.
+    2. Set the slack Var bounds to a wide physical envelope so the LP can
+       always balance: ``± _SLACK_LP_HEADROOM_FACTOR · max(budget, sector
+       throughput)``. The throughput term (load + generation/source
+       magnitude) keeps the LP feasible on grids where CP / generation
+       flow dwarfs native load; sizing off the budget alone under-sizes
+       it there. This is purely a feasibility guard; the soft budget in
+       step 3 is the operator policy.
+    3. Stash the budget as ``_scare_slack_budget_mw`` /
+       ``_scare_slack_budget_kgs`` on the slack model; the scenario-build
+       hook registers it as the slack agent's rating, then multiplies by
+       ``slack_target_fraction`` for the MAS-level target.
 
-    Cap is computed per-sector from the sum of nominal load magnitudes
-    in that sector.  ``fraction`` is the share of total demand that
-    the operator wants the external grid to supply (e.g. 0.5 means
-    the slack target is 50 % of nominal demand).  Generators on the
-    network make up the remainder, and the MAS drives toward that
-    distribution.
+    ``fraction`` is the share of total demand the operator wants the
+    external grid to supply (e.g. 0.5 = slack target is 50 % of nominal
+    demand); network generators make up the remainder and the MAS drives
+    toward that distribution.
     """
-    # Aggregate nominal demand per sector.  Heat is excluded — heat-side
-    # ExtHydrGrid imports mass-flow at fixed supply temperature, and
-    # its consumption is constrained by the WaterPipe / HeatExchanger
-    # physics, not by load magnitude.  Cap only the power and gas
-    # external grids since those have no other resource limit.
+    # Aggregate nominal demand per sector. Heat is excluded: heat-side
+    # ExtHydrGrid imports mass-flow at fixed supply temperature, bounded
+    # by WaterPipe / HeatExchanger physics rather than load magnitude.
+    # Cap only power and gas external grids (no other resource limit).
     #
-    # Sinks live on both gas *and* water junctions in monee's MES
-    # convention, so route them by parent-node grid name — counting
-    # heat-side Sinks toward the gas budget would inflate the cap by
-    # roughly 4× and make the constraint inert in practice.
+    # Sinks live on both gas and water junctions, so route by parent-node
+    # grid name — counting heat-side Sinks toward the gas budget would
+    # inflate the cap ~4× and make the constraint inert.
     #
-    # We also track per-sector *injection* magnitude (PowerGenerator for
-    # electricity, gas-side Source for gas).  All demand on the slack is
-    # equal regardless of which device produces it — the operator budget
-    # mirrors physical slack throughput, not just load-shaped demand — so
-    # the budget is sized off load + injection.  Without this, on grids
-    # with gas-fed converters the slack must move load + converter gas
-    # but the load-only budget under-shoots by construction (every
-    # feasible balance breaches; see Issue C trace 2026-05-29).  The
-    # feasibility envelope below uses the same throughput basis.
+    # Also track per-sector injection magnitude (PowerGenerator,
+    # gas-side Source): all slack demand is equal regardless of producer,
+    # so the budget mirrors physical slack throughput (load + injection).
+    # On grids with gas-fed converters a load-only budget under-shoots.
+    # The feasibility envelope below uses the same throughput basis.
     total_p_mw = 0.0
     total_gas_mass_kgs = 0.0
     total_p_gen_mw = 0.0
@@ -365,10 +323,9 @@ def apply_slack_budget(mes, fraction: float) -> None:
                     total_gas_mass_kgs += abs(getattr(m, "mass_flow", 0.0))
                 else:
                     total_gas_source_kgs += abs(getattr(m, "mass_flow", 0.0))
-    # Cross-sector converters that draw gas (CHP) — modeled at the node
-    # level (CHPHGControlNode), not as a Sink/Source child, so the loop
-    # above misses them.  Their gas input is normal demand on the slack:
-    # leaving it out under-sized the budget on cp_heavy grids.
+    # Gas-drawing cross-sector converters (CHP) are modeled at node level
+    # (CHPHGControlNode), not as Sink/Source children, so the loop above
+    # misses them. Their gas input is normal slack demand.
     for node in mes.nodes:
         nm = node.model
         if type(nm).__name__ == "CHPHGControlNode":
@@ -381,10 +338,8 @@ def apply_slack_budget(mes, fraction: float) -> None:
     )
 
     # Feasibility envelope: never below the sector's physical throughput
-    # (load + injection it may have to absorb), so the LP can always
-    # balance regardless of how small the operator budget is relative to
-    # CP / generation flow.  ``max(...)`` makes this a no-op on grids where
-    # the old ``HEADROOM · budget`` envelope already exceeded throughput.
+    # (load + injection it may absorb), so the LP always balances even
+    # when the operator budget is tiny relative to CP / generation flow.
     lp_p_mw = _SLACK_LP_HEADROOM_FACTOR * max(cap_p_mw, total_p_mw + total_p_gen_mw)
     lp_gas_mass_kgs = _SLACK_LP_HEADROOM_FACTOR * max(
         cap_gas_mass_kgs,
@@ -394,12 +349,11 @@ def apply_slack_budget(mes, fraction: float) -> None:
     for child in mes.childs:
         m = child.model
         if isinstance(m, ExtPowerGrid) and hasattr(m, "p_mw") and hasattr(m.p_mw, "min"):
-            # Wide LP envelope so the energy-flow solve stays feasible
-            # under any failure-induced imbalance; the MAS owns the
-            # soft target.
+            # Wide LP envelope keeps the solve feasible under any
+            # failure-induced imbalance; the MAS owns the soft target.
             m.p_mw.min = -lp_p_mw
             m.p_mw.max = lp_p_mw
-            # Soft target the MAS drives toward (F2 reads this).
+            # Soft target the MAS drives toward.
             m._scare_slack_budget_mw = cap_p_mw
         elif isinstance(m, ExtHydrGrid) and hasattr(m, "mass_flow") and hasattr(m.mass_flow, "min"):
             try:
@@ -410,31 +364,24 @@ def apply_slack_budget(mes, fraction: float) -> None:
                 m.mass_flow.min = -lp_gas_mass_kgs
                 m.mass_flow.max = lp_gas_mass_kgs
                 m._scare_slack_budget_kgs = cap_gas_mass_kgs
-            # heat-side ExtHydrGrid intentionally left unbounded
+            # heat-side ExtHydrGrid left unbounded
 
 
 GRIDS: dict[str, Callable[[], "object"]] = {
-    # Slack budget is *not* baked into any grid below — it is a per-
-    # scenario knob (``scenario.slack_budget_pct``) so the same base
-    # grid can be exercised under multiple operator policies without
-    # rebuilding monee networks, and so the energy-flow LP always has
-    # a free slack to converge against.
+    # Slack budget is a per-scenario knob (``scenario.slack_budget_pct``),
+    # not baked into any grid, so one base grid serves multiple operator
+    # policies and the energy-flow LP always has a free slack.
 
-    # Coupling-density variants — only varying axis is the number of
-    # CP plants generated by monee's MES builder.  Mid density (0.5)
-    # is the default used by every pillar that doesn't sweep this
-    # axis explicitly.
+    # Coupling-density variants — vary only the number of CP plants.
     "simbench_lv_low": create_large_lv_simbench(0.1),
     "simbench_lv": create_large_lv_simbench(0.2),
     "simbench_lv_high": create_large_lv_simbench(0.3),
 
-    # Scaling pillar.  Three simbench LV variants giving roughly a
-    # decade of range in node count:
+    # Scaling pillar — three LV variants spanning ~a decade in node count:
     #   small  (~15 buses, 1-LV-rural1)
     #   medium (~44 buses, 1-LV-semiurb4)
     #   large  (~129 buses, 1-LV-rural3 — the default ``simbench_lv``)
-    # All built at the same coupling density; the per-scenario slack
-    # budget makes the operator-policy axis orthogonal.
+    # Same coupling density; slack budget keeps operator policy orthogonal.
     "simbench_lv_small": create_large_lv_simbench(
         0.2, simbench_code="1-LV-rural1--1-no_sw"
     ),
@@ -442,34 +389,26 @@ GRIDS: dict[str, Callable[[], "object"]] = {
         0.2, simbench_code="1-LV-semiurb4--1-no_sw"
     ),
 
-    # Reconfiguration pillar.  The default LV grid plus five backup
-    # branches per sector so the GridReconfigurator has alternative
-    # paths to discover when a primary line trips.  Backup placement
-    # is seeded for reproducibility.
+    # Reconfiguration pillar — default LV grid plus five seeded backup
+    # branches per sector so the GridReconfigurator has alternative paths
+    # when a primary line trips.
     "simbench_lv_reconfig": create_large_lv_simbench(
         0.2, backup_lines_per_sector=5, backup_seed=0,
     ),
 
-    # CP-flexibility pillar.  Three variants exercise the
-    # ``cp_size_multiplier`` and ``replace_primary_generation`` knobs
-    # in monee's MES generator.
-    #
-    # ``cp_heavy``         — additive CPs at 2× rated output.  CPs
-    #   stack on top of primary gen, so removing a CP is recoverable
-    #   by the unchanged primary fleet — but the inflated CP capacity
-    #   makes the cross-sector flex shift large enough to be visible
-    #   in the metric when the CP-ADMM layer engages.
-    # ``cp_dependent``     — CPs at 1× rated output that *replace*
-    #   primary generation.  Total per-carrier rated production stays
-    #   invariant, but losing a CP now disables both the unit and
-    #   the primary gen it displaced.  This is the regime where the
-    #   CP-ADMM layer's cross-sector substitution becomes load-
-    #   bearing for resilience: gossip + islanding alone cannot
-    #   recover a lost CP because the displaced primary is gone.
-    # ``cp_heavy_dependent`` — both knobs maxed.  Maximum cross-
-    #   sector dependence; CPs are big enough that losing one
-    #   produces a deep deficit only solvable by re-routing through
-    #   the surviving CHP / G2P / P2H plants.
+    # CP-flexibility pillar — exercise ``cp_size_multiplier`` and
+    # ``replace_primary_generation``:
+    # ``cp_heavy``           additive CPs at 2× rating; primary fleet can
+    #   still recover a lost CP, but the inflated capacity makes the
+    #   cross-sector flex shift visible when the CP-ADMM layer engages.
+    # ``cp_dependent``       CPs at 1× rating that replace primary gen;
+    #   per-carrier rated production is invariant, but losing a CP also
+    #   loses the displaced primary — the regime where CP-ADMM
+    #   cross-sector substitution is load-bearing (gossip + islanding
+    #   alone cannot recover the lost CP).
+    # ``cp_heavy_dependent`` both knobs maxed: maximum cross-sector
+    #   dependence; losing one CP produces a deep deficit solvable only
+    #   by re-routing through surviving CHP / G2P / P2H plants.
     "simbench_lv_cp_heavy": create_large_lv_simbench(
         0.3, cp_size_multiplier=2.0, replace_primary_generation=False,
     ),
@@ -490,37 +429,31 @@ def add_backup_lines(
 ) -> dict[str, list[tuple]]:
     """Augment ``mes`` with normally-open backup branches in every sector.
 
-    Backup branches are added between pairs of *leaf* nodes (degree 1
-    in the sector subgraph) chosen from opposite halves of the sorted
-    leaf list, so each backup shortcuts a structurally long path
-    through the radial topology — exactly the kind of alternative the
-    ``GridReconfigurator``'s path search is designed to find.
+    Backups connect pairs of leaf nodes (degree 1 in the sector
+    subgraph) from opposite halves of the sorted leaf list, so each
+    shortcuts a structurally long radial path — the alternative the
+    ``GridReconfigurator`` path search looks for.
 
-    Branch parameters are taken from the median of existing branches
-    in the same sector so the backup is physically plausible (not a
-    superconductor, not a hair-thin pipe).  ``on_off`` is set to 0 so
-    the backup is *electrically/hydraulically inert* until the
-    reconfigurator closes the switch via ``behavior.act("switch")``.
-    The PowerLine variant also sets ``backup=True`` so monee's
-    LP-side helpers (``controllable_backup_lines``) can recognise it.
+    Branch parameters use the median of existing branches in the sector
+    for physical plausibility. ``on_off = 0`` keeps the backup inert
+    until the reconfigurator closes the switch via
+    ``behavior.act("switch")``. The PowerLine variant also sets
+    ``backup=True`` so monee's ``controllable_backup_lines`` recognises it.
 
     Parameters
     ----------
     mes:
         A monee multi-energy network.
     n_per_sector:
-        How many backup branches to add per sector.  3 covers a small
-        LV grid; for larger grids, scale roughly linearly with the
-        number of leaves.
+        Backup branches per sector. 3 suits a small LV grid; scale
+        roughly with leaf count for larger grids.
     seed:
-        Optional RNG seed for reproducible backup placement.
+        Optional RNG seed for reproducible placement.
 
     Returns
     -------
     dict
-        ``{sector_name: [branch_id, ...]}`` of the newly added branch
-        ids, useful for downstream analysis (e.g. measuring how many
-        of them the reconfigurator actually closes).
+        ``{sector_name: [branch_id, ...]}`` of newly added branch ids.
     """
     rng = random.Random(seed) if seed is not None else random.Random()
 
@@ -545,7 +478,6 @@ def add_backup_lines(
     added: dict[str, list[tuple]] = {}
 
     for sector, spec in sector_specs.items():
-        # Per-sector node list and edge set.
         sector_node_ids: list = []
         for node in mes.nodes:
             grid_name = str(getattr(node.grid, "name", "") or "").lower()
@@ -567,8 +499,7 @@ def add_backup_lines(
             added[sector] = []
             continue
 
-        # Leaves of the sector subgraph — degree-1 nodes are the
-        # natural candidates for tie-back branches.  Fall back to all
+        # Degree-1 nodes are the tie-back candidates; fall back to all
         # nodes if the topology has no leaves (e.g. a closed loop).
         leaves = sorted(n for n in sector_node_ids if len(adj[n]) <= 1)
         if len(leaves) < 2:
@@ -588,10 +519,9 @@ def add_backup_lines(
 
         params = {a: _median_attr(a) for a in spec["branch_attr"]}
 
-        # Pair the i-th leaf with the (i + n//2)-th — connects the
-        # head of the leaf list to the tail, which on a sorted-by-id
-        # leaf set tends to bridge separate feeder branches.  Skip
-        # pairs that are already directly adjacent.
+        # Pair leaf i with leaf (i + n//2): bridges head-to-tail of the
+        # sorted leaf list, tending to link separate feeders. Skip pairs
+        # already directly adjacent.
         n_leaves = len(leaves)
         offset = max(1, n_leaves // 2)
         candidate_pairs = []
@@ -612,13 +542,12 @@ def add_backup_lines(
             try:
                 bid = _create_backup_branch(spec["creator"], mes, a, b, params, sector)
                 new_ids.append(bid)
-                # Record the branch so subsequent iterations don't
-                # re-pick the same edge.
+                # Record the edge so later iterations don't re-pick it.
                 adj[a].add(b)
                 adj[b].add(a)
             except Exception as exc:
-                # If the underlying constructor rejects the pair (e.g.
-                # incompatible grid attributes), skip and keep going.
+                # Skip pairs the constructor rejects (e.g. incompatible
+                # grid attributes).
                 logger.debug(
                     "Backup branch creation skipped for (%s, %s) in %s: %s",
                     a, b, sector, exc,
@@ -630,9 +559,8 @@ def add_backup_lines(
 
 
 def _create_backup_branch(creator, mes, from_id, to_id, params, sector: str):
-    """Dispatch to the right ``monee.express.create_*`` helper with
-    sensible per-sector parameter defaults.  Marks the resulting
-    branch as ``backup=True`` and ``on_off=0``."""
+    """Dispatch to the per-sector ``monee.express.create_*`` helper,
+    marking the new branch ``backup=True`` and ``on_off=0``."""
     if sector == "electricity":
         bid = creator(
             mes,
@@ -667,10 +595,9 @@ def _create_backup_branch(creator, mes, from_id, to_id, params, sector: str):
     else:
         raise ValueError(f"Unknown sector: {sector!r}")
 
-    # Tag the new branch as backup so monee's LP and any post-run
-    # analysis can identify it.  PowerLine carries a native ``backup``
-    # field; gas/water pipes don't, so we attach the attribute either
-    # way and let downstream code check.
+    # Tag as backup so monee's LP and post-run analysis can identify it.
+    # PowerLine has a native ``backup`` field; gas/water pipes don't, so
+    # attach the attribute either way.
     branch = mes.branch_by_id(bid)
     try:
         branch.model.backup = True
@@ -690,44 +617,34 @@ def assign_load_priorities(
     Tier 1 = critical (hard-locked at the L1 leader pre-step);
     tier 2 = high, tier 3 = medium, tier 4 = sheddable (QP-weighted).
 
-    Returns a ``priorities`` dict keyed by ``child-{id}`` suitable for
-    ``create_restoration_scenario_world(priorities=...)``.  Generators
-    (cap < 0) and CPs are skipped — they default to tier 0 in
-    ``obs_priority``.
+    Returns a ``priorities`` dict keyed by ``child-{id}`` for
+    ``create_restoration_scenario_world(priorities=...)``. Generators
+    (cap < 0) and CPs are skipped (default to tier 0 in ``obs_priority``).
 
     ``distribution`` knobs:
 
-    - ``"uniform"``  — uniform over [1, 4].  Maximally diverse;
-      stress-tests the tier-1 hard-constraint pre-step and the
-      QP weighting on tiers 2-4.
-    - ``"skewed"``    — realistic: 10 % critical (tier 1), 30 % high
-      (tier 2), 40 % medium (tier 3), 20 % curtailable (tier 4).
-      Default; the 10 % tier-1 share keeps the per-community supply
-      pool able to cover hard-locked demand on the smoke grids
-      (avoiding the infeasible-trivial branch in most scenarios)
-      while leaving enough QP-weighted demand to discriminate L2
-      allocation.
-    - ``"by_capacity"`` — large loads get higher priority (tier 1)
-      and small loads lower (tier 4).  Models the "feed the big
-      hospitals first" heuristic.
-    - ``"all_one"``  — everyone tier 1.  Under the new model this
-      will hard-lock every load — typically infeasible, triggering
-      the trivial pro-rata branch.  Preserved as an ablation knob.
+    - ``"uniform"``  — uniform over [1, 4]; maximally diverse.
+    - ``"skewed"``    — realistic 10/30/40/20 % across tiers 1-4
+      (default). The 10 % tier-1 share keeps the per-community supply
+      pool able to cover hard-locked demand while leaving enough
+      QP-weighted demand to discriminate L2 allocation.
+    - ``"by_capacity"`` — large loads to tier 1, small to tier 4
+      ("feed the big hospitals first").
+    - ``"all_one"``  — everyone tier 1; hard-locks every load
+      (typically infeasible, triggers pro-rata branch). Ablation knob.
 
-    ``seed`` makes the random assignments deterministic.
+    ``seed`` makes assignments deterministic.
     """
     rng = random.Random(seed * 7919 + 31)
     P = 4
     out: dict[str, int] = {}
 
     for child in monee_net.childs:
-        # Read capacity directly from the model (no behavior yet); the
-        # sign convention matches obs_capacity downstream.
+        # Capacity straight from the model (no behavior yet).
         obs = dict(child.model.values)
         cap = obs_capacity(obs)
         if cap <= 0:
-            # Generators and unknown — skip; they default to tier 0
-            continue
+            continue  # generators / unknown default to tier 0
         aid = f"child-{child.id}"
         if distribution == "uniform":
             out[aid] = rng.randint(1, P)
@@ -742,8 +659,7 @@ def assign_load_priorities(
             else:
                 out[aid] = 4   # sheddable
         elif distribution == "by_capacity":
-            # Computed below in a second pass since it needs the
-            # global capacity distribution.
+            # Resolved in the second pass (needs the global distribution).
             out[aid] = -1  # sentinel
         elif distribution == "all_one":
             out[aid] = 1
@@ -751,8 +667,7 @@ def assign_load_priorities(
             raise ValueError(f"unknown priority distribution: {distribution}")
 
     if distribution == "by_capacity":
-        # Bin by capacity quantiles — top quartile to tier 1, bottom
-        # quartile to tier 4.
+        # Bin by capacity quartile: top to tier 1, bottom to tier 4.
         items = []
         for child in monee_net.childs:
             obs = dict(child.model.values)
@@ -776,19 +691,16 @@ def apply_cold_day(
 ) -> None:
     """Mutate ``mes`` in place to simulate a cold-day stress scenario.
 
-    Two knobs:
+    Knobs:
 
-    - ``supply_t_k``: the heat-side ``ExtHydrGrid`` slack supply
-      temperature (default ~70 °C, vs the unstressed ~83 °C).  Lower
-      supply temperatures shrink the headroom downstream junctions
-      have against the lower heat bound (60 °C / 333.15 K), so any
-      transport delay or pipe loss can push them into violation.
+    - ``supply_t_k``: heat-side ``ExtHydrGrid`` slack supply temperature
+      (default ~70 °C vs unstressed ~83 °C). Lower supply shrinks the
+      downstream headroom against the 60 °C / 333.15 K lower bound, so
+      transport delay or pipe loss can push junctions into violation.
     - ``heat_load_scale``: multiplier on every ``HeatLoad.q_mw_heat``
-      (default 1.5×).  Makes the heat sector harder to balance against
-      the available generation and thermal-corridor capacity.
+      (default 1.5×); makes the heat sector harder to balance.
 
-    Idempotent in the sense of "build a fresh net then call once" — do
-    not call this twice on the same net or the load scale stacks.
+    Call once on a fresh net — calling twice stacks the load scale.
     """
     for child in mes.childs:
         m = child.model
@@ -811,69 +723,52 @@ def apply_pv_peak(
     slack_vm_pu: float = 1.04,
 ) -> None:
     """Mutate ``mes`` in place to simulate a sunny-midday over-voltage
-    stress scenario — the regime VDE-AR-N 4105 was written for.
+    stress scenario (the VDE-AR-N 4105 regime).
 
-    The realistic LV over-voltage problem has three contributing
-    factors that this helper reproduces in concert:
+    Three concerted factors:
 
-    1. **HV/MV transformer tap is high** to support evening peak.  The
-       slack ``ExtPowerGrid.vm_pu`` is set to ``slack_vm_pu`` (default
-       1.04 pu); the LV feeder therefore sits within ~1 % of the upper
-       bound already, before any PV.
-    2. **PV output near nameplate** — every ``PowerGenerator.p_mw``
-       magnitude is multiplied by ``gen_scale`` (default 1.5×).  The
-       moderate multiplier is deliberate: a 3–4× scale-up creates a
-       trivial imbalance that the LP curtails via ``regulation`` and
-       never produces a voltage swing; a 1.5× scale-up still fits
-       within the slack budget so the LP doesn't bail it out, and the
-       *physical* voltage profile ends up dependent on local Q
-       support.
-    3. **Daytime load trough** — ``PowerLoad.p_mw`` is multiplied by
-       ``load_scale`` (default 0.4×) to mirror residential consumption
-       in mid-day.  Reactive load is left at nominal because the
-       standard targets active-power imbalance.
+    1. High HV/MV transformer tap — slack ``ExtPowerGrid.vm_pu`` set to
+       ``slack_vm_pu`` (default 1.04 pu), so the feeder sits ~1 % below
+       the upper bound before any PV.
+    2. PV near nameplate — every ``PowerGenerator.p_mw`` magnitude ×
+       ``gen_scale`` (default 1.5×). Moderate on purpose: a 3-4× scale
+       trivially imbalances and the LP curtails it away, whereas 1.5×
+       stays within the slack budget so voltage depends on local Q.
+    3. Daytime load trough — ``PowerLoad.p_mw`` × ``load_scale``
+       (default 0.4×). Reactive load left nominal (the standard targets
+       active-power imbalance).
 
-    Idempotent in the sense of "build a fresh net then call once" — do
-    not call this twice on the same net or the scales stack.
+    Call once on a fresh net — calling twice stacks the scales.
     """
-    # Track totals so we can size the slack-budget relaxation.
+    # Totals used to size the slack-budget relaxation below.
     total_gen_p = 0.0
     total_load_p = 0.0
 
     for child in mes.childs:
         m = child.model
         if isinstance(m, PowerGenerator):
-            # PowerGenerator stores p_mw < 0 (load convention).  Scaling
-            # preserves sign; the magnitude grows.
+            # p_mw < 0 (load convention); scaling preserves sign.
             m.p_mw = float(m.p_mw) * gen_scale
             total_gen_p += abs(m.p_mw)
         elif isinstance(m, PowerLoad):
             m.p_mw = float(m.p_mw) * load_scale
             total_load_p += abs(m.p_mw)
 
-    # Relax the slack budget so the LP isn't infeasible.  The
-    # ``constrained_*`` grids cap the slack at a small fraction of
-    # nominal load; under PV peak that cap is far below the reverse
-    # flow and the LP cannot converge.  This scenario is about voltage
-    # behaviour, not slack scarcity — wide the slack so the LP can
-    # always solve, then voltage stress comes from the tap setpoint
-    # and feeder impedance instead of from an artificial slack
-    # constraint.
+    # Widen the slack so the LP stays feasible under reverse flow. This
+    # scenario is about voltage behaviour, not slack scarcity, so stress
+    # should come from the tap setpoint and feeder impedance rather than
+    # an artificial slack cap.
     headroom = max(total_gen_p - total_load_p, total_load_p) + 0.5
     for child in mes.childs:
         m = child.model
         if isinstance(m, ExtPowerGrid):
-            # Tap the upstream slack high.  ``vm_pu`` is a plain
-            # scalar on ExtPowerGrid (it pins the slack bus's voltage
-            # magnitude via the overwrite hook); changing it shifts
-            # the entire feeder profile upward.
+            # ``vm_pu`` pins the slack-bus voltage magnitude; raising it
+            # shifts the whole feeder profile upward.
             try:
                 m.vm_pu = float(slack_vm_pu)
             except Exception:
                 pass
-            # Widen the slack p_mw bounds so the LP has room to absorb
-            # the reverse flow.  ``p_mw`` is a Var on ExtPowerGrid;
-            # update its bounds directly.
+            # Widen the slack p_mw Var bounds to absorb reverse flow.
             try:
                 if hasattr(m.p_mw, "min"):
                     m.p_mw.min = -headroom
@@ -892,31 +787,24 @@ def apply_line_stress(
 ) -> None:
     """Mutate ``mes`` in place to simulate a line-loading stress scenario.
 
-    Designed to exercise the line-loading constraint pipeline added in
-    decision (b) — PowerLine branch agents must observe overload so the
-    monitor fires, the priority-aware home group leader receives a
-    relief-MW ``StartBalanceNegotiation``, and the reconfigurator's
-    6c path-ranking sees meaningful loading variation across candidate
-    paths.
+    Exercises the line-loading pipeline: PowerLine agents observe
+    overload, the home group leader receives a relief-MW
+    ``StartBalanceNegotiation``, and the reconfigurator's path-ranking
+    sees loading variation across candidate paths.
 
-    Three knobs:
+    Knobs:
 
     - ``load_scale`` (default 1.8×): multiplier on every
-      ``PowerLoad.p_mw``.  Higher loads push more current through every
-      feeder; combined with reduced ampacity, this guarantees overload
-      on at least one line after any non-trivial branch failure.
+      ``PowerLoad.p_mw``; combined with reduced ampacity, guarantees an
+      overload after any non-trivial branch failure.
     - ``ampacity_scale`` (default 0.5×): multiplier on every PowerLine
-      ``max_i_ka``.  Halving the ampacity is equivalent to doubling the
-      flow's loading-percent reading at the same currents — the binding
-      constraint shifts from voltage to thermal.
+      ``max_i_ka``; shifts the binding constraint from voltage to
+      thermal.
     - ``affect_branch_fraction`` (default 1.0): fraction of PowerLines
-      to apply ``ampacity_scale`` to, picked deterministically by
-      sorted branch id.  Sweep over this knob to study how concentrated
-      vs distributed ampacity reductions interact with the path-ranking
-      reconfiguration.
+      to reduce, picked deterministically by sorted branch id. Sweep to
+      study concentrated vs distributed reductions.
 
-    Idempotent in the "build fresh net then call once" sense — calling
-    twice stacks the scales.
+    Call once on a fresh net — calling twice stacks the scales.
     """
     for child in mes.childs:
         m = child.model
@@ -924,11 +812,9 @@ def apply_line_stress(
             m.p_mw = float(m.p_mw) * load_scale
 
     if ampacity_scale != 1.0 and affect_branch_fraction > 0.0:
-        # Collect PowerLine branches; reduce ampacity on a deterministic
-        # subset.  Pick branches with the largest ``max_i_ka`` first so
-        # the reduction concentrates the constraint on the originally
-        # most permissive lines — those are the ones the reconfigurator
-        # would otherwise prefer and now must avoid.
+        # Reduce ampacity on the highest-``max_i_ka`` lines first, so the
+        # constraint lands on the lines the reconfigurator would
+        # otherwise prefer.
         powerlines = [
             b for b in mes.branches
             if hasattr(b.model, "max_i_ka")

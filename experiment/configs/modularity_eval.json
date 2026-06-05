@@ -9,7 +9,7 @@
     "    work)",
     "  - failure_lambda=1.5, max_failures=4 (multi-failure burst, exercises the",
     "    dynamic re-partition path simultaneously)",
-    "  - 30 s sim, hebbian_warmup_s=4 so Hebbian reclustering also fires",
+    "  - 30 s sim",
     "Two cells per seed:",
     "  - method=label_propagation (radius-bounded, default)",
     "  - method=modularity        (distributed Louvain Phase 1)",
@@ -35,18 +35,20 @@
   "experiments": [
     {
       "name": "modularity_vs_label_prop",
-      "grids": ["simbench_lv_cp_heavy"],
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {
-          "community_partition_method": "label_propagation",
-          "hebbian_warmup_s": 4.0
+          "community_partition_method": "label_propagation"
         },
         {
           "community_partition_method": "modularity",
-          "community_modularity_resolution": 1.0,
-          "hebbian_warmup_s": 4.0
+          "community_modularity_resolution": 1.0
         }
       ],
       "scenarios": [

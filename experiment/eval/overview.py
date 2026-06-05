@@ -35,9 +35,8 @@ _PLOTLY_CDN = (
     "</script>"
 )
 
-# Style — uses the same fonts as the figures themselves so the page
-# reads as a single document, plus a responsive grid that drops to
-# one column under ~640 px so it stays usable on a laptop.
+# Shared fonts with the figures plus a responsive grid that drops to one
+# column under ~640px.
 _STYLE = """
 <style>
   :root {
@@ -107,10 +106,8 @@ _STYLE = """
 """
 
 
-# Plotly's saved-HTML payload is the `<div id="…" class="plotly-graph-div">`
-# plus the `<script type="text/javascript">…Plotly.newPlot…</script>` that
-# follows it.  The script block ends with `</script>`; both share the same
-# div id so a non-greedy match is unambiguous.
+# Plotly's saved-HTML payload is the `<div class="plotly-graph-div">` plus the
+# `<script>…Plotly.newPlot…</script>` that follows; non-greedy to `</script>`.
 _PLOT_BLOCK_RE = re.compile(
     r'(<div id="[0-9a-f-]+" class="plotly-graph-div"[\s\S]*?</script>)',
     re.IGNORECASE,
@@ -269,19 +266,11 @@ def _top_level_sections(plots_root: Path) -> list[tuple[str, list[Path]]]:
 def _constraints_sections(
     plots_root: Path, experiments: list[str],
 ) -> list[tuple[str, list[Path]]]:
-    """Constraint-handling overview — everything we have on whether the
-    network stayed inside its operating envelope.
-
-    Bundles:
-
-    - The campaign-wide per-sector ``constraint_violation_integral``
-      bar (mean ∫ max(0, util-1) dt by variant) — answers "did the
-      constraint layer succeed on average?".
-    - The functional-baseline representative envelope trajectory —
-      "what does the in-band recovery look like for one task?".
-    - Every per-(experiment, variant) constraint-envelope trajectory
-      written under ``plots/trajectories/<exp>/<variant>/`` — direct
-      side-by-side comparison across variants.
+    """Constraint-handling overview: did the network stay inside its operating
+    envelope?  Bundles the campaign-wide per-sector violation-integral bar, the
+    functional-baseline representative envelope trajectory, and every
+    per-(experiment, variant) envelope trajectory under
+    ``plots/trajectories/<exp>/<variant>/``.
     """
     p = plots_root
     sections: list[tuple[str, list[Path]]] = []
@@ -352,8 +341,8 @@ def write_overview(campaign: CampaignData) -> Path:
     body_sections = _top_level_sections(plots_root)
     body = "".join(_section(t, p) for t, p in body_sections)
 
-    # Per-experiment TOC links — written first so the headline page can
-    # link to each per-experiment overview before we materialise them.
+    # Per-experiment TOC links, so the headline page links to each
+    # per-experiment overview before they are materialised below.
     experiments = campaign.experiments()
     toc_links: list[str] = [
         '<a href="overview_validity.html">validity</a>',

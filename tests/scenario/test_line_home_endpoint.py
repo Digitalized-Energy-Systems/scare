@@ -1,11 +1,10 @@
-"""Unit tests for the priority-aware home-endpoint picker that
-controls which group a PowerLine branch joins (decision 3a in the
-plan).
+"""Unit tests for the priority-aware home-endpoint picker that controls
+which group a PowerLine branch joins.
 
-The picker (``_line_home_endpoint``) sums priority-weighted demand
-``Σ 2^(P − π) · |cap|`` over the loads at each endpoint and returns
-the endpoint with the *lower* sum so an overload-driven shed lands
-on the less-critical side.
+``_line_home_endpoint`` sums priority-weighted demand
+``Σ 2^(P − π) · |cap|`` over the loads at each endpoint and returns the
+endpoint with the lower sum, so an overload-driven shed lands on the
+less-critical side.
 """
 
 from __future__ import annotations
@@ -113,10 +112,8 @@ class TestLineHomeEndpoint:
         assert home == 3
 
     def test_one_side_empty_one_side_loaded(self):
-        # Empty side has pwd = 0 < the loaded side, so home is the
-        # empty endpoint.  This is the "shed on the side with nothing
-        # to shed" degenerate case — protects the loaded side from
-        # spurious StartBalanceNegotiation on local overload.
+        # Empty side has pwd=0 < the loaded side → home is the empty
+        # endpoint (degenerate "nothing to shed" case).
         net = _mk_net(
             {
                 9: [],

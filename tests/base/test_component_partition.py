@@ -1,10 +1,6 @@
 """Unit tests for the ``component_level`` baseline's connected-component
-partition.
-
-The new method drives the baseline's "one community per connected
-component" behaviour: it replaces label propagation's radius-bounded
-balls with a partition that collapses each component to a single
-community, seeded on the lex-smallest node id.
+partition: each connected component collapses to a single community,
+seeded on the lex-smallest node id.
 """
 
 from __future__ import annotations
@@ -50,10 +46,8 @@ def test_isolated_nodes_are_their_own_label() -> None:
 
 
 def test_component_partition_subsumes_label_propagation_on_small_diameter() -> None:
-    # A 3-node path has diameter 2; label propagation at max_radius=2
-    # should also collapse it to a single seed.  Both partitions agree
-    # here, so the connected-component method is a true generalisation
-    # for "as-far-as-physically-reachable" semantics.
+    # A 3-node path has diameter 2; label propagation at max_radius=2 also
+    # collapses it to a single seed, so both partitions agree here.
     g = nx.path_graph(3)
     cc = connected_component_partition(g)
     lp = label_propagation_partition(g, max_radius=2)
@@ -62,10 +56,8 @@ def test_component_partition_subsumes_label_propagation_on_small_diameter() -> N
 
 def test_component_partition_widens_label_propagation_balls() -> None:
     # A 6-node path has diameter 5; label propagation at max_radius=2
-    # fragments it into multiple balls, whereas the connected-component
-    # partition keeps them as one community.  This is the exact
-    # behavioural difference that defines the component_level baseline
-    # against single_level.
+    # fragments it into multiple balls, while the connected-component
+    # partition keeps it as one community.
     g = nx.path_graph(6)
     cc = connected_component_partition(g)
     lp = label_propagation_partition(g, max_radius=2)
@@ -74,9 +66,7 @@ def test_component_partition_widens_label_propagation_balls() -> None:
 
 
 class _FakeTopology:
-    """Minimal stand-in for mango's ``Topology`` — exposes ``.graph``
-    only, so partition_label_by_node can walk it without paying mango's
-    inject() cost."""
+    """Minimal stand-in for mango's ``Topology``: exposes ``.graph`` only."""
 
     def __init__(self, graph: nx.Graph) -> None:
         self.graph = graph

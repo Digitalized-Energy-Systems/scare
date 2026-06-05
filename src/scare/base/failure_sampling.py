@@ -98,8 +98,8 @@ def _sample_concentrated_failures(
             eligible = list(by_node.keys())
         target_node = random.choice(eligible)
     else:
-        # Top-25% by neighbourhood load — keeps seed-variance while
-        # staying in load-rich territory.
+        # Pick from the top 25% by neighbourhood load: keeps seed variance
+        # while staying in load-rich territory.
         ranked = sorted(nbr_load.items(), key=lambda kv: -kv[1])
         top_k = max(1, len(ranked) // 4)
         target_node = random.choice([n for n, _ in ranked[:top_k]])
@@ -163,7 +163,7 @@ def _sample_generator_failures(
                 branch_ids=[component.id],
             ))
             continue
-        comp = component  # bind for closure
+        comp = component  # bind for the closure below
 
         def _deactivate(net, _c=comp) -> None:
             net.deactivate(_c)

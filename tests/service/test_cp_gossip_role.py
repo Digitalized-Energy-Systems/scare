@@ -3,17 +3,13 @@
 Two contract properties are pinned:
 
 1. **Initiator gate** — under stable topology, only one CP per
-   cross-sector connected component fires a round per tick.  The role
-   uses the lowest reachable cp_id as the deterministic initiator.
-
+   cross-sector connected component fires a round per tick, using the
+   lowest reachable cp_id as the deterministic initiator.
 2. **Commit callback** — when the gossip participant resolves a round,
    the role invokes :func:`apply_regulate` exactly once with the CP's
    own factor.
 
-The tests run the role directly against a fake mango context (no agent
-world) — same pattern as ``test_cp_priority_admm_wiring.py`` but with a
-minimal inline ``MockBehavior`` so the suite collects without the
-broken ``from tests.conftest import ...`` line.
+The role runs directly against a fake mango context (no agent world).
 """
 
 from __future__ import annotations
@@ -31,7 +27,7 @@ from scare.service.cp_priority_admm_role import CPPriorityAdmmRole
 
 
 # ---------------------------------------------------------------------------
-# Minimal stubs — no dependency on the broken tests.conftest import path
+# Minimal stubs
 # ---------------------------------------------------------------------------
 
 
@@ -108,14 +104,13 @@ def _make_role(
         capacity_by_sector=capacity_by_sector,
         bridged_sectors=bridged_sectors,
         rebalance_min_gap_s=0.0,
-        priority_weight_base=10.0,
         admm_max_iters=50,
         algorithm="gossip",
     )
     ctx = _FakeContext(cp_id)
     role._context = ctx  # type: ignore[attr-defined]
-    # Populate peer state directly — bypass the gossiped CPSummary path
-    # so the initiator gate can evaluate against a known reachable set.
+    # Populate peer state directly so the initiator gate evaluates
+    # against a known reachable set (bypasses the gossiped CPSummary path).
     for peer_id in peer_addrs:
         role._peer_cps[peer_id] = CPSummary(
             publisher=peer_id,
@@ -175,12 +170,8 @@ def test_only_one_initiator_per_tick_across_a_full_mesh():
 
 
 def test_initiator_handover_when_lowest_cp_dies():
-    """Drop the previous initiator from the peer set and the next-
-    lowest cp_id becomes the new initiator without any handover
-    protocol."""
-    # Role at cp-y; initially cp-x is alive (lower id), so we're a
-    # follower.  Then cp-x dies (drops out of _peer_cps) and we should
-    # become the initiator.
+    """Dropping the previous initiator from the peer set promotes the
+    next-lowest cp_id, with no handover protocol."""
     addrs = {"cp-x": _Addr("cp-x"), "cp-z": _Addr("cp-z")}
     role, _, _ = _make_role(
         "cp-y",
@@ -189,8 +180,7 @@ def test_initiator_handover_when_lowest_cp_dies():
         peer_addrs=addrs,
     )
     assert role._am_gossip_initiator() is False  # cp-x is lower
-    # cp-x dies.
-    role._peer_cps.pop("cp-x")
+    role._peer_cps.pop("cp-x")  # cp-x dies
     role._peer_cp_addrs.pop("cp-x")
     assert role._am_gossip_initiator() is True  # cp-y is now lowest
 
@@ -269,8 +259,8 @@ async def test_run_gossip_round_bumps_round_id():
     from distributed_resource_optimization.algorithm.gossip_lexicographic_cascade.core import (
         create_gossip_cascade_participant,
     )
-    from scare.service.cp_priority_admm_role import _MangoGossipCarrier
-    role._gossip_carrier = _MangoGossipCarrier(role)
+    from scare.service.cp_priority_admm_role import _ReachableCPCarrier
+    role._gossip_carrier = _ReachableCPCarrier(role)
     role._gossip_participant = create_gossip_cascade_participant(
         cp_id="cp-001",
         capacity_by_sector=role.capacity_by_sector,

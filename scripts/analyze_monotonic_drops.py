@@ -1,9 +1,6 @@
-"""For each task that failed monotonic_progress, find the time of the
-biggest drop in each sector's *_balance series and compare it to the
-time of the first failure injection.
-
-If most drops happen BEFORE any failure, they reflect initial dispatch
-toward MAS equilibrium (not a restoration regression).
+"""For each task that failed monotonic_progress, locate the biggest drop in
+each sector's *_balance series and compare its time to the first failure
+injection (drops before any failure reflect initial dispatch, not regression).
 
 Usage:
     python scripts/analyze_monotonic_drops.py <campaign_dir>
@@ -67,7 +64,6 @@ def main():
     print(f"drops pre-failure: {pre_failure}")
     print(f"drops at-or-post-failure: {post_failure}")
     print()
-    # bucketed by t<1s, 1-3s, 3+
     print("drops by time-of-occurrence:")
     buckets = Counter()
     for _, _, t, _, _ in drops:

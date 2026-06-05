@@ -1,10 +1,8 @@
 """Smoke tests for the CP-focused plotting helpers.
 
-The plots themselves are visual artefacts — these tests exercise the
-*plumbing* (JSON parsing, figure construction, file writing) on a
-synthetic event ledger.  Rendering a fully-styled Plotly figure
-requires no headless browser, so the test runs offline and produces
-.html files the human reader can open if curious.
+These exercise the plumbing (JSON parsing, figure construction, file
+writing) on a synthetic event ledger, not the visual output. Rendering
+needs no headless browser, so the tests run offline.
 """
 
 from __future__ import annotations
@@ -25,25 +23,10 @@ from experiment.eval.cp_plots import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Synthetic ledger fixtures
-# ---------------------------------------------------------------------------
-
-
 def _synthetic_events() -> list[dict]:
-    """Mock ledger with one coalition life-cycle on one P2H.
-
-    Timeline (sim-seconds):
-      0.0   — failure
-      0.5   — CP setpoint (envelope inactive)
-      1.0   — cross-sector inversion detected
-      1.0   — cross-sector coalition allocation: transfer 0.5 / 1.0
-      1.0   — cp_envelope_set: ttl 4 s
-      1.5   — CP setpoint (envelope active)
-      2.0   — cp_envelope_clamp: pre vs post differ
-      2.0   — CP setpoint (envelope active)
-      5.0   — envelope expired (no explicit event)
-      5.5   — CP setpoint (envelope inactive again)
+    """Mock ledger with one full coalition life-cycle on one P2H:
+    failure, CP setpoints, inversion, coalition allocation, envelope
+    set/clamp, then envelope expiry.
     """
     return [
         {"t": 0.0, "kind": "failure", "aid": "branch", "sector": "", "detail": ""},
@@ -140,7 +123,7 @@ def run_dir(tmp_path) -> Path:
 def off_run_dir(tmp_path) -> Path:
     off_dir = tmp_path / "off"
     off_dir.mkdir()
-    # Off ledger: a few CP setpoints but no cross-sector events.
+    # CP setpoints but no cross-sector events.
     off_events = [
         {"t": 0.0, "kind": "failure", "aid": "branch", "sector": "", "detail": ""},
         {"t": 0.5, "kind": "cp_setpoint", "aid": "p2h-1", "sector": "cp",
@@ -153,11 +136,6 @@ def off_run_dir(tmp_path) -> Path:
     (off_dir / "events.json").write_text(json.dumps(off_events))
     (off_dir / "summary.json").write_text(json.dumps(_synthetic_summary_off()))
     return off_dir
-
-
-# ---------------------------------------------------------------------------
-# Per-plot tests
-# ---------------------------------------------------------------------------
 
 
 class TestPlots:
@@ -216,9 +194,8 @@ class TestComparison:
 
 
 class TestEmptyLedger:
-    """When the ledger is empty or missing, plot helpers must still
-    write a valid placeholder figure (no crash) — the pipeline must
-    survive runs that produced no cross-sector activity.
+    """An empty or missing ledger must still produce a valid placeholder
+    figure rather than crashing.
     """
 
     def test_empty_ledger_does_not_crash(self, tmp_path: Path):

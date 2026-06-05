@@ -1,6 +1,6 @@
 {
   "$comment": [
-    "Full evaluation campaign \u2014 every pillar from the dissertation evaluation plan.",
+    "Full evaluation campaign — every pillar from the dissertation evaluation plan.",
     "Designed for HPC: each task runs independently under SLURM array; aggregator combines.",
     "Most baseline / variant / ablation experiments use simbench_lv_constrained_45 so the slack",
     "budget is tight enough that variant outcomes are actually distinguishable.  Cascading,",
@@ -28,7 +28,7 @@
   },
   "experiments": [
     {
-      "$comment": "Pillar 1 \u2014 Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
+      "$comment": "Pillar 1 — Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
       "name": "functional_baseline",
       "grids": [
         "simbench_lv"
@@ -67,7 +67,7 @@
       ]
     },
     {
-      "$comment": "Pillar 2 \u2014 Optimality gap.  Pairs every scare run with an oracle on the same (grid, seed).",
+      "$comment": "Pillar 2 — Optimality gap.  Pairs every scare run with an oracle on the same (grid, seed).",
       "name": "optimality_gap",
       "grids": [
         "simbench_lv"
@@ -107,7 +107,7 @@
       ]
     },
     {
-      "$comment": "Pillar 3 \u2014 variant comparison: scare vs single-level (gossip only) vs oracle.",
+      "$comment": "Pillar 3 — variant comparison: scare vs single-level (gossip only) vs oracle.",
       "name": "variant_comparison",
       "grids": [
         "simbench_lv"
@@ -138,11 +138,11 @@
     },
     {
       "$comment": [
-        "Pillar 4 \u2014 ablation matrix, split by theme so each flag runs in a",
+        "Pillar 4 — ablation matrix, split by theme so each flag runs in a",
         "scenario that can actually exercise it.  Replaces the original",
         "single-scenario design that left ~14/22 flags inert (their gating",
-        "conditions \u2014 CPs, voltage stress, heat sector, line overload,",
-        "Hebbian warmup, etc. \u2014 never fired in the concentrated-5 LV regime).",
+        "conditions — CPs, voltage stress, heat sector, line overload,",
+        "Hebbian warmup, etc. — never fired in the concentrated-5 LV regime).",
         "Each block names the flag set it tests + the scenario that triggers",
         "them; the {} default in each block is the per-block baseline."
       ],
@@ -194,7 +194,7 @@
       ]
     },
     {
-      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent + generator failures + slack 0.15 means restoration must flow through CPs \u2014 the only regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions all have signal.",
+      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent + generator failures + slack 0.15 means restoration must flow through CPs — the only regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions all have signal.",
       "name": "ablation_cross_sector",
       "grids": [
         "simbench_lv_cp_heavy_dependent"
@@ -235,7 +235,7 @@
       ]
     },
     {
-      "$comment_block": "Line-loading / constraint-aware path.  line_stress (load_scale=1.8, ampacity_scale=0.5) forces lines into overload \u2014 the only regime where line_loading_constraint, constraint_aware_gossip, multihop_constraint, and curtailment_auction all fire.",
+      "$comment_block": "Line-loading / constraint-aware path.  line_stress (load_scale=1.8, ampacity_scale=0.5) forces lines into overload — the only regime where line_loading_constraint, constraint_aware_gossip, multihop_constraint, and curtailment_auction all fire.",
       "name": "ablation_line_stress",
       "grids": [
         "simbench_lv"
@@ -367,36 +367,7 @@
       ]
     },
     {
-      "$comment_block": "Hebbian formation.  Default hebbian_warmup_s=12 s, so any sim_duration_s \u2264 12 leaves the recluster un-fired.  This block overrides warmup to 2 s in BOTH baseline and ablation so the flag actually has signal to ablate against.",
-      "name": "ablation_hebbian",
-      "grids": [
-        "simbench_lv"
-      ],
-      "n_seeds": 15,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {
-          "hebbian_warmup_s": 2.0
-        },
-        {
-          "enable_hebbian_formation": false,
-          "hebbian_warmup_s": 2.0
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "concentrated",
-          "n_failures": 5,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
-        }
-      ]
-    },
-    {
-      "$comment": "Pillar 5a \u2014 packet loss robustness.",
+      "$comment": "Pillar 5a — packet loss robustness.",
       "name": "robustness_packet_loss",
       "grids": [
         "simbench_lv"
@@ -440,7 +411,7 @@
       ]
     },
     {
-      "$comment": "Pillar 5b \u2014 latency jitter.",
+      "$comment": "Pillar 5b — latency jitter.",
       "name": "robustness_latency",
       "grids": [
         "simbench_lv"
@@ -481,7 +452,7 @@
       ]
     },
     {
-      "$comment": "Pillar 6 \u2014 multi-failure / cascading.",
+      "$comment": "Pillar 6 — multi-failure / cascading.",
       "name": "cascading",
       "grids": [
         "simbench_lv"
@@ -521,8 +492,8 @@
     },
     {
       "$comment": [
-        "Voltage-stress pillar \u2014 VDE-AR-N 4105 operating point.  Sunny midday: PV runs near nameplate while residential load drops to the morning trough, reversing feeder power flow.  ``vm_pu`` drifts toward the upper bound; without the Q-V droop the constraint monitor must shed real-power injection to recover (lost served energy).  With the droop, local Q absorption keeps voltage in deadband and full PV output is preserved.",
-        "Two-row ablation in a single experiment: scare-with-droop vs scare-without-droop on identical (grid, seed, scenario) \u2014 direct attribution of the droop's contribution."
+        "Voltage-stress pillar — VDE-AR-N 4105 operating point.  Sunny midday: PV runs near nameplate while residential load drops to the morning trough, reversing feeder power flow.  ``vm_pu`` drifts toward the upper bound; without the Q-V droop the constraint monitor must shed real-power injection to recover (lost served energy).  With the droop, local Q absorption keeps voltage in deadband and full PV output is preserved.",
+        "Two-row ablation in a single experiment: scare-with-droop vs scare-without-droop on identical (grid, seed, scenario) — direct attribution of the droop's contribution."
       ],
       "name": "voltage_stress",
       "grids": [
@@ -548,7 +519,7 @@
     },
     {
       "$comment": [
-        "Line-loading stress pillar \u2014 exercises the line-thermal constraint pipeline.  Loads are scaled up 1.8x and every PowerLine's ampacity is halved, guaranteeing overload after a single branch failure redirects flow.  Three-row ablation in one experiment: full pipeline vs monitor-off vs reconfig-ranking-off \u2014 direct attribution of each new mechanism.",
+        "Line-loading stress pillar — exercises the line-thermal constraint pipeline.  Loads are scaled up 1.8x and every PowerLine's ampacity is halved, guaranteeing overload after a single branch failure redirects flow.  Three-row ablation in one experiment: full pipeline vs monitor-off vs reconfig-ranking-off — direct attribution of each new mechanism.",
         "With the full pipeline: branch-mode monitor fires on overload, sends StartBalanceNegotiation to the lower-priority endpoint group, the reconfigurator's 6c ranking avoids the most-loaded restoration path.",
         "Monitor-off baseline shows what the system does when line overload is silent (the legacy behaviour).  Ranking-off baseline tests whether the priority-aware shedding alone is enough without changing reconfiguration choices."
       ],
@@ -582,7 +553,7 @@
       ]
     },
     {
-      "$comment": "Cold-day thermal stress \u2014 narrows heat sector against its lower bound; CP plants matter when they can convert gas/power to extra heat output.",
+      "$comment": "Cold-day thermal stress — narrows heat sector against its lower bound; CP plants matter when they can convert gas/power to extra heat output.",
       "name": "cold_day_stress",
       "grids": [
         "simbench_lv",
@@ -622,7 +593,7 @@
       ]
     },
     {
-      "$comment": "Generator-class failures \u2014 the historical CP-flexibility scenario.  Compares branch / generator / mixed contingency populations.",
+      "$comment": "Generator-class failures — the historical CP-flexibility scenario.  Compares branch / generator / mixed contingency populations.",
       "name": "generator_failure",
       "grids": [
         "simbench_lv"
@@ -660,10 +631,10 @@
     },
     {
       "$comment": [
-        "Pillar 7 \u2014 Scaling.  Three simbench LV variants spanning roughly a decade of node count:",
-        "  small  \u2248   36 nodes (1-LV-rural1)",
-        "  medium \u2248  137 nodes (1-LV-semiurb4)",
-        "  large  \u2248  396 nodes (1-LV-rural3, the established benchmark)",
+        "Pillar 7 — Scaling.  Three simbench LV variants spanning roughly a decade of node count:",
+        "  small  ≈   36 nodes (1-LV-rural1)",
+        "  medium ≈  137 nodes (1-LV-semiurb4)",
+        "  large  ≈  396 nodes (1-LV-rural3, the established benchmark)",
         "All run with the same 45 % slack budget so the only varying axis is grid size."
       ],
       "name": "scaling",
@@ -696,7 +667,7 @@
     },
     {
       "$comment": [
-        "Pillar 8 \u2014 Reconfiguration.  Uses simbench_lv_reconfig: the constrained LV grid",
+        "Pillar 8 — Reconfiguration.  Uses simbench_lv_reconfig: the constrained LV grid",
         "augmented with 5 normally-open backup branches per sector (15 total).  Failures",
         "bias toward branches because the reconfiguration pathway only fires on",
         "BranchFailureEvent; generator failures don't test reconfiguration."
@@ -728,7 +699,7 @@
     },
     {
       "$comment": [
-        "Pillar 9 \u2014 CP flexibility shift.  The headline experiment for the cross-sector ADMM",
+        "Pillar 9 — CP flexibility shift.  The headline experiment for the cross-sector ADMM",
         "layer.  Uses three new grid variants built with monee's cp_size_multiplier and",
         "replace_primary_generation knobs:",
         "  cp_heavy_45            : CP rated output 2x, additive (loss of CP recoverable)",
@@ -736,7 +707,7 @@
         "                            disables BOTH the unit and the displaced primary gen)",
         "  cp_heavy_dependent_45  : both knobs combined (maximum cross-carrier dependence)",
         "On the dependent variants, gossip + local-gen fallback alone cannot recover from a CP",
-        "failure because the displaced primary gen is gone \u2014 the cross-sector ADMM is",
+        "failure because the displaced primary gen is gone — the cross-sector ADMM is",
         "the only path to compensate.",
         "Failures: generator-class so CPs themselves are part of the failure population."
       ],
@@ -934,7 +905,7 @@
       ]
     },
     {
-      "$comment": "CP-size sweep \u2014 measures how PWSF varies with CP rated output on the dependent variant.  Replaces the old todo for sizing studies.",
+      "$comment": "CP-size sweep — measures how PWSF varies with CP rated output on the dependent variant.  Replaces the old todo for sizing studies.",
       "name": "cp_size_sweep",
       "grids": [
         "simbench_lv_cp_dependent",
@@ -958,7 +929,7 @@
     },
     {
       "$comment": [
-        "Agent dropout robustness pillar \u2014 pending a mango scheduling hook for",
+        "Agent dropout robustness pillar — pending a mango scheduling hook for",
         "mid-sim agent unregister.  Empty grids keep this entry as a placeholder."
       ],
       "name": "robustness_dropout_TODO",

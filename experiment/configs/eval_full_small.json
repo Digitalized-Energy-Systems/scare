@@ -25,345 +25,636 @@
     {
       "$comment": "Pillar 1 — functional restoration quality.  Single mid-tight slack (0.45) keeps the deficit interesting without saturating.",
       "name": "functional_baseline",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 2 — optimality gap.  Pairs scare with oracle on identical (grid, seed).",
       "name": "optimality_gap",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare", "oracle"],
+      "variants": [
+        "scare",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 3 — variant comparison: scare vs single_level vs component_level vs oracle.  All four variants kept because the comparison IS the pillar.",
       "name": "variant_comparison",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare", "single_level", "component_level", "oracle"],
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 4, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 4a — holonic / QP-gossip / priority core ablations, trimmed to baseline + the three highest-impact flags.",
       "name": "ablation_core",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_holonic": false, "enable_cp_admm": false},
-        {"enable_qp_gossip": false},
-        {"enable_priority_holon_allocation": false}
+        {
+          "enable_holonic": false,
+          "enable_cp_admm": false
+        },
+        {
+          "enable_qp_gossip": false
+        },
+        {
+          "enable_priority_holon_allocation": false
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "concentrated", "n_failures": 5, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 4b — cross-sector / CP-layer ablations.  Keeps baseline + CP-ADMM-off + xs-coalitions-off (the two flags that carry the L2.5 mesh).",
       "name": "ablation_cross_sector",
-      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_cp_admm": false},
-        {"enable_cross_sector_coalitions": false}
+        {
+          "enable_cp_admm": false
+        },
+        {
+          "enable_cross_sector_coalitions": false
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "generator", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.15}
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
       ]
     },
     {
       "$comment": "Pillar 4c — line-loading / constraint-aware path.  Baseline + monitor-off captures the headline effect.",
       "name": "ablation_line_stress",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_line_loading_constraint": false}
+        {
+          "enable_line_loading_constraint": false
+        }
       ],
       "scenarios": [
-        {"kind": "line_stress", "load_scale": 1.8, "ampacity_scale": 0.5, "max_failures": 2, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 4d — voltage support.  Two rows: with vs without Q-V droop on pv_peak.",
       "name": "ablation_voltage",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_qv_droop": false}
+        {
+          "enable_qv_droop": false
+        }
       ],
       "scenarios": [
-        {"kind": "pv_peak", "max_failures": 1, "priority_assignment": "skewed"}
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
       ]
     },
     {
       "$comment": "Pillar 4e — thermal stress.  Baseline + the three heat-control mechanisms toggled off (temperature-frontier controller, tier-aware priority-waterfall gate, heat->CP supply link) on cold_day.  Replaces the retired enable_heat_recovery flag.",
       "name": "ablation_thermal",
-      "grids": ["simbench_lv_cp_heavy"],
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_heat_frontier": false},
-        {"enable_heat_priority_waterfall": false},
-        {"enable_heat_cp_supply": false}
+        {
+          "enable_heat_frontier": false
+        },
+        {
+          "enable_heat_priority_waterfall": false
+        },
+        {
+          "enable_heat_cp_supply": false
+        }
       ],
       "scenarios": [
-        {"kind": "cold_day", "supply_t_k": 343.15, "heat_load_scale": 1.5, "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 4f — reconfiguration ranking ablation.",
       "name": "ablation_reconfig",
-      "grids": ["simbench_lv_reconfig"],
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_reconfig_feasibility_ranking": false}
+        {
+          "enable_reconfig_feasibility_ranking": false
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "branch", "max_failures": 4, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
-      ]
-    },
-    {
-      "$comment": "Pillar 4g — Hebbian formation.  Warmup forced to 2 s so the flag fires inside a 10 s sim.",
-      "name": "ablation_hebbian",
-      "grids": ["simbench_lv"],
-      "n_seeds": 2,
-      "variants": ["scare"],
-      "ablations": [
-        {"hebbian_warmup_s": 2.0},
-        {"enable_hebbian_formation": false, "hebbian_warmup_s": 2.0}
-      ],
-      "scenarios": [
-        {"kind": "clean", "failure_type": "concentrated", "n_failures": 5, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 5a — packet-loss robustness.  Three points (0, 10, 50 %) instead of five.",
       "name": "robustness_packet_loss",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "sweeps": [
-        {"comms_packet_loss_pct": 0.0},
-        {"comms_packet_loss_pct": 10.0},
-        {"comms_packet_loss_pct": 50.0}
+        {
+          "comms_packet_loss_pct": 0.0
+        },
+        {
+          "comms_packet_loss_pct": 10.0
+        },
+        {
+          "comms_packet_loss_pct": 50.0
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 5b — latency jitter.  Three points (0, 200, 1000 ms).",
       "name": "robustness_latency",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "sweeps": [
-        {"comms_latency_jitter_ms": 0.0},
-        {"comms_latency_jitter_ms": 200.0},
-        {"comms_latency_jitter_ms": 1000.0}
+        {
+          "comms_latency_jitter_ms": 0.0
+        },
+        {
+          "comms_latency_jitter_ms": 200.0
+        },
+        {
+          "comms_latency_jitter_ms": 1000.0
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 6 — cascading.  Endpoints (1 failure, 5 failures) only.",
       "name": "cascading",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "scenarios": [
-        {"kind": "clean", "n_failures": 1, "priority_assignment": "skewed", "slack_budget_pct": 0.45},
-        {"kind": "clean", "n_failures": 5, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "n_failures": 1,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Voltage-stress pillar — Q-V droop attribution on pv_peak.",
       "name": "voltage_stress",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_qv_droop": false}
+        {
+          "enable_qv_droop": false
+        }
       ],
       "scenarios": [
-        {"kind": "pv_peak", "max_failures": 1, "priority_assignment": "skewed"}
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
       ]
     },
     {
       "$comment": "Line-stress pillar — single grid (simbench_lv), full vs monitor-off.",
       "name": "line_stress",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "ablations": [
         {},
-        {"enable_line_loading_constraint": false}
+        {
+          "enable_line_loading_constraint": false
+        }
       ],
       "scenarios": [
-        {"kind": "line_stress", "load_scale": 1.8, "ampacity_scale": 0.5, "max_failures": 2, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Cold-day stress — cp_heavy grid only, all three variants.",
       "name": "cold_day_stress",
-      "grids": ["simbench_lv_cp_heavy"],
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
       "n_seeds": 2,
-      "variants": ["scare", "single_level", "oracle"],
+      "variants": [
+        "scare",
+        "single_level",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "cold_day", "supply_t_k": 343.15, "heat_load_scale": 1.5, "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Generator-class failures — all three failure_type values, all three variants.",
       "name": "generator_failure",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare", "single_level", "oracle"],
+      "variants": [
+        "scare",
+        "single_level",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "generator", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 7 — scaling.  All three sizes kept because the scaling axis IS the pillar.",
       "name": "scaling",
-      "grids": ["simbench_lv_small", "simbench_lv_medium", "simbench_lv"],
+      "grids": [
+        "simbench_lv_small",
+        "simbench_lv_medium",
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare", "oracle"],
+      "variants": [
+        "scare",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 8 — reconfiguration.  Single (max_failures=4) scenario.",
       "name": "reconfiguration",
-      "grids": ["simbench_lv_reconfig"],
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "branch", "max_failures": 4, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Pillar 9 — CP flexibility.  cp_heavy_dependent (the most demanding variant) only.",
       "name": "cp_flexibility",
-      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
       "n_seeds": 2,
-      "variants": ["scare", "single_level", "oracle"],
+      "variants": [
+        "scare",
+        "single_level",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "generator", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Concentrated imbalance — cp_heavy_dependent only, single (n_failures=4) scenario.",
       "name": "concentrated_imbalance",
-      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
       "n_seeds": 2,
-      "variants": ["scare", "single_level", "oracle"],
+      "variants": [
+        "scare",
+        "single_level",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "concentrated", "n_failures": 4, "priority_assignment": "skewed", "slack_budget_pct": 0.3}
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
       ]
     },
     {
       "$comment": "Cooldown sweep — three points (0, 0.1, 1.0 s).",
       "name": "cooldown_sweep",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "sweeps": [
-        {"cooldown_s": 0.0},
-        {"cooldown_s": 0.1},
-        {"cooldown_s": 1.0}
+        {
+          "cooldown_s": 0.0
+        },
+        {
+          "cooldown_s": 0.1
+        },
+        {
+          "cooldown_s": 1.0
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "TTL sweep — three points (1, 3, 10 hops).",
       "name": "ttl_sweep",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "sweeps": [
-        {"ttl_hops": 1},
-        {"ttl_hops": 3},
-        {"ttl_hops": 10}
+        {
+          "ttl_hops": 1
+        },
+        {
+          "ttl_hops": 3
+        },
+        {
+          "ttl_hops": 10
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Holon-size sweep — endpoints (2, 16).",
       "name": "holon_size_sweep",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "sweeps": [
-        {"holon_max_size": 2},
-        {"holon_max_size": 16}
+        {
+          "holon_max_size": 2
+        },
+        {
+          "holon_max_size": 16
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "Partition-method sweep — both branches of community_partition_method.",
       "name": "partition_method_sweep",
-      "grids": ["simbench_lv"],
+      "grids": [
+        "simbench_lv"
+      ],
       "n_seeds": 2,
-      "variants": ["scare"],
+      "variants": [
+        "scare"
+      ],
       "sweeps": [
-        {"community_partition_method": "label_propagation"},
-        {"community_partition_method": "modularity"}
+        {
+          "community_partition_method": "label_propagation"
+        },
+        {
+          "community_partition_method": "modularity"
+        }
       ],
       "scenarios": [
-        {"kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
-      ]
-    },
-    {
-      "$comment": "Holon-ADMM mode sweep — supply vs demand code paths.",
-      "name": "holon_admm_mode_sweep",
-      "grids": ["simbench_lv"],
-      "n_seeds": 2,
-      "variants": ["scare"],
-      "sweeps": [
-        {"holon_admm_mode": "supply"},
-        {"holon_admm_mode": "demand"}
-      ],
-      "scenarios": [
-        {"kind": "clean", "failure_type": "concentrated", "n_failures": 4, "priority_assignment": "skewed", "slack_budget_pct": 0.3}
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     },
     {
       "$comment": "CP-size sweep — cp_heavy_dependent only (the variant that actually depends on CP capacity).",
       "name": "cp_size_sweep",
-      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
       "n_seeds": 2,
-      "variants": ["scare", "oracle"],
+      "variants": [
+        "scare",
+        "oracle"
+      ],
       "scenarios": [
-        {"kind": "clean", "failure_type": "generator", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45}
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
       ]
     }
   ],

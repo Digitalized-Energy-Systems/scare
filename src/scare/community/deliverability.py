@@ -1,29 +1,22 @@
 """Per-actor deliverability caps for the coalition supply-priority ADMM.
 
-The base supply-priority ADMM (see :mod:`scare.community.supply_priority_admm`)
-treats each actor's supply as fungible across all (sector, tier) cells
-where that actor has supply in the sector.  That assumption holds for
-the parent holon — its chunk-mates are all on the same connected
-subgraph at scenario build time — but fails for the L2.5 coalition,
-which spans the full sector mesh and may include leaders whose home
-nodes are physically partitioned from each other after a branch
-failure.
+The base supply-priority ADMM treats each actor's supply as fungible
+across all (sector, tier) cells where it has supply.  That holds for the
+parent holon (chunk-mates share a connected subgraph) but fails for the
+L2.5 coalition, which spans the full sector mesh and may include leaders
+physically partitioned from each other after a branch failure.
 
-This module computes, for each coalition member ``g`` and (sector,
-tier) cell, an upper bound on supply that ``g`` could plausibly
-deliver to demand in that cell.  The bound is the sum of tier-t
-demand at nodes physically reachable from ``g``'s home node through
-live same-sector edges.  Supply at ``g`` that cannot reach any
-tier-t demand is capped at zero (1e-6 in practice to keep the solver
-well-conditioned), which prevents the ADMM from allocating
-"impossible" supply that the downstream LP cannot route.
+This module computes, per coalition member ``g`` and (sector, tier) cell,
+an upper bound on supply ``g`` can deliver there: the sum of tier-t demand
+at nodes reachable from ``g``'s home node over live same-sector edges.
+Supply that cannot reach any tier-t demand is capped at zero (1e-6 in
+practice for conditioning), so the ADMM cannot allocate supply the
+downstream LP cannot route.
 
-The caps are *delivery caps*, not *supply caps*: the ADMM still
-enforces ``Σ_t x_g ≤ supply_g`` via the per-actor coupling matrix.
-The cap only narrows the per-cell ub down from raw supply to what's
-physically reachable, so an actor with abundant supply but no live
-path to any demand contributes zero, and the ADMM redistributes the
-target onto reachable actors only.
+These are delivery caps, not supply caps: the ADMM still enforces
+``Σ_t x_g ≤ supply_g`` via the per-actor coupling matrix.  The cap only
+narrows the per-cell ub to what's physically reachable, redistributing the
+target onto reachable actors.
 """
 
 from __future__ import annotations
@@ -86,11 +79,9 @@ def per_actor_deliverable_caps(
     sec_v = sector.value
     n_actors = len(actor_node_ids)
 
-    # Pre-compute, per tier, the global demand-node → demand map.
-    # Aggregating across actors lets each actor's reachability
-    # check sum over all demand locations regardless of who owns
-    # them (supply at actor A can deliver to actor B's demand if
-    # the path is live, and that's exactly what the cap models).
+    # Per-tier global demand-node -> demand map, aggregated across actors:
+    # supply at actor A can serve actor B's demand if the path is live,
+    # which is exactly what the cap models.
     demand_by_tier_nodes: dict[int, dict[Any, float]] = {}
     for actor_map in actor_demand_nodes_by_tier:
         for tier, node_dem in actor_map.items():
@@ -107,10 +98,8 @@ def per_actor_deliverable_caps(
         try:
             reachable = mirror.reachable_from(home_node, sector=sector)
         except Exception:
-            # Defensive: a malformed mirror entry should not crash
-            # the coalition allocation.  Falling back to None means
-            # the ADMM uses raw supply for this actor — same as the
-            # no-deliverability path.
+            # A malformed mirror entry must not crash the allocation;
+            # None falls the ADMM back to raw supply for this actor.
             caps.append(None)
             continue
         actor_caps: dict[tuple[str, int], float] = {}

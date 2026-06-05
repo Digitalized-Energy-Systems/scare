@@ -1,107 +1,60 @@
 """Layer 2.5 — holon-summary mesh + cross-holon coalition formation.
 
-Milestone 1 (detection): every group leader periodically publishes a
+Detection: every group leader periodically publishes a
 :class:`scare.base.channel.HolonSummary` on a sector-wide full-mesh
-topology (``holon_summary_<sector>``) carrying the leader's own
-community per-tier served-MW and demand-MW.  Every leader subscribes
-to the same channel, accumulates the latest summary per peer, and
-runs a local *cross-holon priority inversion* check.
+topology (``holon_summary_<sector>``) carrying its community's per-tier
+served-MW and demand-MW, subscribes to peers' summaries, and runs a
+local cross-holon priority-inversion check.
 
-Milestone 2 (this module): on detection, a deterministically-elected
-initiator forms an ad-hoc coalition with the leaders whose holons
-contribute to the inversion, runs a scoped supply-priority allocation
-over the union of their flex, and broadcasts per-tier service-fraction
-constraints that the coalition members apply as
-``StartBalanceNegotiation(service_fraction_by_sector_priority=...)``
-to their own L1 dispatch.
+Coalition: on detection, a deterministically-elected initiator forms an
+ad-hoc coalition with the contributing leaders, runs a scoped
+supply-priority allocation over the union of their flex, and broadcasts
+per-tier service-fraction constraints the members apply as
+``StartBalanceNegotiation(service_fraction_by_sector_priority=...)`` on
+their own L1 dispatch.
 
-Why this is its own role and not part of :class:`HolonicCommunityRole`:
+Separate from :class:`HolonicCommunityRole` because this layer is
+observability + scoped cooperation only: L2's chunked-clique ADMM keeps
+running on its slow heartbeat and the coalition is additive (TTL-bounded
+constraints honoured by L1). The coalition also observes every
+same-sector leader, a wider scope than L2's chunk-mates.
 
-- This layer is observability + scoped cooperation only.  The
-  underlying chunked-clique ADMM at L2 keeps running on its slow
-  heartbeat; the coalition is *additive*, dictating constraints that
-  the L1 dispatch path honours for the duration of a TTL.  Keeping
-  M2 in a separate role makes the "L2 stays as-is" guarantee
-  structural rather than relying on careful avoidance of method
-  overlap.
-- The coalition operates on *every* same-sector leader's published
-  state, which is a wider observation scope than L2's chunk-mates.
+Detection rule: aggregate all summaries (peers + self), per tier sum
+served/demand, compute ``frac[t] = served / demand`` (1.0 when demand
+is 0). Inversion when a higher-priority tier ``t_h`` has strictly
+smaller ``frac`` than a lower-priority tier ``t_l > t_h`` beyond
+``inversion_tol``. Mirrors the priority-invariant claim in
+``experiment/eval/claims.py`` so detector and claim agree.
 
-Detection rule
---------------
+Initiator election: the lex-smallest publisher with non-empty summary
+state is the unique initiator per round. Stable under eventual
+consistency since membership doesn't change at sub-second rates;
+non-initiators run detection but suppress the event + coalition
+broadcast, collapsing N duplicate detections into one per inversion.
 
-For each (sector, holon-summary-graph) the role aggregates received
-summaries plus its own.  For each tier ``t`` it sums received
-``per_tier_served_mw`` and ``per_tier_demand_mw`` across publishers,
-then computes ``frac[t] = served / demand`` (1.0 when demand is 0).
-An inversion is recorded when a higher-priority tier ``t_h`` has
-strictly smaller ``frac`` than a lower-priority tier ``t_l > t_h``,
-by more than the configured tolerance.  The check mirrors the
-priority-invariant claim in ``experiment/eval/claims.py`` so the
-detector and the claim agree on what counts.
+Coalition lifecycle:
+1. Invitation — initiator sends ``CoalitionInvitation`` to peers whose
+   summary contributed to the inverted tier pair, plus itself.
+2. Acceptance — each invited leader replies with ``CoalitionAcceptance``
+   carrying its per-tier supply/demand slice.
+3. Allocation — after ``accept_window_s`` the initiator runs a
+   supply-priority allocation over the collected acceptances. Supply is
+   fungible within a sector, so the initiator holds the aggregate and
+   the per-actor agreement step L2's ADMM existed for is moot.
+4. Constraint dispatch — initiator sends ``StartBalanceNegotiation`` to
+   each accepting member and records the constraint active locally,
+   re-broadcasting every L2.5 tick while the TTL holds.
 
-Initiator election (M2)
------------------------
+Constraint invalidation:
+- ``now > issued_at + ttl_s``: expiry; control returns to L2's ADMM.
+- ``BranchFailureEvent`` in-sector: topology changed enough that the
+  computed fractions no longer match the live grid; dropping lets the
+  failure-retriggered L2 ADMM redecide.
 
-When an inversion fires, every leader in the sector observes the
-same set of peer summaries (eventual-consistency caveat: some peers
-may be one tick behind, but the lex-smallest publisher is stable
-across that window because membership doesn't change at sub-second
-rates).  The lex-smallest publisher with non-empty summary state is
-the unique coalition initiator for this round.  Non-initiators still
-run the detection and store summaries, but suppress the
-``priority_inversion_detected`` event and the coalition-formation
-broadcast — this collapses what was N duplicate M1 events into one
-per inversion and gives a single owner for the coalition lifecycle.
-
-Coalition lifecycle
--------------------
-
-1. **Invitation** — initiator builds ``member_aids`` from peers whose
-   summary contributed to the inverted tier pair, plus itself, and
-   sends ``CoalitionInvitation`` on the same sector-wide mesh.
-2. **Acceptance** — every invited leader replies with
-   ``CoalitionAcceptance`` carrying its own per-tier supply / demand
-   slice (same shape ``HolonicCommunityRole`` already consumes for
-   its supply-priority ADMM).
-3. **Allocation** — after a short ``accept_window_s`` the initiator
-   runs a centralised priority-weighted greedy allocation over the
-   collected acceptances.  Centralised greedy gives the optimal
-   priority-ordered allocation when supply is fungible within a
-   sector — the parent holon's ADMM only existed because each actor
-   held distinct supply that had to agree; here the initiator
-   already has the aggregate so the agreement step is moot.
-4. **Constraint dispatch** — initiator sends
-   ``StartBalanceNegotiation(service_fraction_by_sector_priority=...)``
-   directly to every accepting member, piggy-backing on the same
-   handler L2 uses.  The initiator also records the constraint as
-   active locally so it can re-broadcast on every L2.5 tick while
-   the TTL is still valid, overriding any out-of-band L2 dispatch
-   that fires between coalitions.
-
-Constraint invalidation
------------------------
-
-A coalition constraint is invalidated by either:
-
-- ``now > issued_at + ttl_s``: natural expiry; control returns to
-  the underlying L2 holon ADMM on the next L2 rebalance tick.
-- ``BranchFailureEvent`` in the same sector: the post-failure
-  topology has changed enough that the recently-computed fractions
-  no longer correspond to the live grid.  Dropping the constraint
-  lets the L2 holon ADMM (which gets re-triggered by the failure)
-  redecide allocations.
-
-Eventual consistency
---------------------
-
-The coalition runs while chunked-clique L2 ADMM rounds are still in
-flight.  No freeze flag, no two-phase commit.  Last-write-wins on
-``StartBalanceNegotiation`` at the L1 leader means a coalition's
-constraint may be briefly overridden by an L2 rebalance that fires
-between coalition ticks; the next coalition tick (default 1 s)
-re-asserts the constraint.  When the TTL expires, L2's allocation
-takes over cleanly.
+Eventual consistency: no freeze flag / two-phase commit. Last-write-wins
+on ``StartBalanceNegotiation`` at L1 means an L2 rebalance between ticks
+may briefly override a coalition constraint; the next tick re-asserts.
+On TTL expiry L2's allocation takes over cleanly.
 """
 
 from __future__ import annotations
@@ -146,14 +99,11 @@ logger = logging.getLogger(__name__)
 class _PendingCoalition:
     """Initiator-side state during the invitation/acceptance window.
 
-    ``acceptances[aid] = CoalitionAcceptance`` collects each peer's
-    reply; the entry for the initiator itself is filled in
-    synchronously when the coalition is opened, since the initiator
-    skips the round-trip.  ``addr_by_aid`` is the back-channel: we
-    need a sendable address to dispatch the constraint after
-    allocation, so we keep the address used to send the invitation
-    keyed by aid.  ``run`` flips True once the allocation has been
-    computed so a late-arriving acceptance doesn't re-trigger it.
+    ``acceptances[aid]`` collects each peer's reply; the initiator's own
+    entry is filled synchronously since it skips the round-trip.
+    ``addr_by_aid`` keeps a sendable address per aid for constraint
+    dispatch after allocation. ``run`` flips True once allocated so a
+    late acceptance doesn't re-trigger it.
     """
 
     coalition_id: str
@@ -170,11 +120,10 @@ class _PendingCoalition:
 class _ActiveCoalition:
     """Initiator-side TTL record of an allocated coalition.
 
-    Re-asserted on every ``_tick`` until ``issued_at + ttl_s`` has
-    passed or a same-sector ``BranchFailureEvent`` invalidates it
-    early.  ``member_addrs`` is the dispatch list — only members that
-    actually accepted are included so a declining peer is not
-    over-written by a fraction it did not opt in to.
+    Re-asserted every ``_tick`` until ``issued_at + ttl_s`` passes or a
+    same-sector ``BranchFailureEvent`` invalidates it early.
+    ``member_addrs`` holds only accepting members, so a declining peer
+    is never overwritten by a fraction it didn't opt into.
     """
 
     coalition_id: str
@@ -190,8 +139,8 @@ def _xs_registry(
 ) -> dict[Sector, dict[str, HolonSummary]]:
     """Per-behavior shared registry of latest HolonSummary by sector.
 
-    Lazy-init.  Reads + writes are single-process; for distributed
-    deployments a real cross-sector publish path would replace this.
+    Lazy-init, single-process; a distributed deployment would replace
+    this with a real cross-sector publish path.
     """
     store = getattr(behavior, "_scare_xs_summaries", None)
     if store is None:
@@ -204,12 +153,10 @@ def _xs_registry(
 class _ActiveCrossSectorCoalition:
     """Initiator-side TTL record of an allocated cross-sector coalition.
 
-    Distinct from :class:`_ActiveCoalition` because the dispatch fan-out
-    spans multiple sectors AND includes CP commitments — the per-tick
-    re-assert has to fire each piece on the right channel.  Sector-keyed
-    service fractions go to the matching leaders; CP commitments are
-    dispatched to the CPs' own addresses with the directional flows
-    each CP must hold for the TTL window.
+    Distinct from :class:`_ActiveCoalition` because the dispatch spans
+    multiple sectors AND includes CP commitments, each fired on its own
+    channel per re-assert: sector-keyed service fractions to matching
+    leaders; directional flows to each CP's address for the TTL window.
     """
 
     coalition_id: str
@@ -236,12 +183,12 @@ class _CoalitionAggregate(NamedTuple):
 
 class HolonSummaryRole(Role):
     """Periodic publisher + subscriber for cross-holon priority
-    observability, plus M2 coalition formation.
+    observability, plus coalition formation.
 
     Installed on every group leader (next to
-    :class:`HolonicCommunityRole`).  Non-leaders silently drop into a
-    quiescent state — their ``setup`` runs but no publish ever fires
-    because the leader-check at the top of ``_tick`` returns early.
+    :class:`HolonicCommunityRole`). Non-leaders stay quiescent: ``setup``
+    runs but the leader-check at the top of ``_tick`` returns early, so
+    no publish fires.
     """
 
     def __init__(
@@ -273,24 +220,20 @@ class HolonSummaryRole(Role):
         self.sector = sector
         self.period_s = period_s
         # Heat→L3 link: heat's normal summary triggers (L1 gossip finish /
-        # L2 dispatch) are off under ``enable_heat_mw_balance=False``, so a
-        # heat leader's served/demand vector would otherwise stay frozen at
-        # the pre-failure publish until the 30 s watchdog (never inside a
-        # short run).  Refresh it on this faster cadence so the delivered-
-        # heat deficit reaches the CP-ADMM.  Heat-scoped.
+        # L2 dispatch) are off (MW-balance deactivated), so a heat leader's
+        # served/demand vector would freeze until the watchdog. Refresh on
+        # this faster cadence so the delivered-heat deficit reaches the
+        # CP-ADMM. Heat-scoped.
         self.enable_heat_cp_supply = bool(enable_heat_cp_supply)
         self.heat_refresh_s = float(heat_refresh_s)
-        # Watchdog cadence: even when nothing has moved, re-run the
-        # publish + invariant check + coalition re-assert at this
-        # slow interval so a peer joining late still sees the current
-        # version frontier and an active coalition stays renewed
-        # while its TTL is alive.  All meaningful work is event-driven
-        # (see setup()); the watchdog is purely a safety net.
+        # Slow safety-net cadence to re-run publish + invariant check +
+        # coalition re-assert even when nothing moved, so a late-joining
+        # peer sees the current version frontier and an active coalition
+        # stays renewed. The dominant trigger is event-driven (see setup).
         self.watchdog_s = watchdog_s
-        # Cached last-published vectors so the event-driven publisher
-        # can skip when nothing material has moved.  ``inversion_tol``
-        # defines "material" so detection and publication agree on
-        # what counts as change.
+        # Cached last-published vectors so the event-driven publisher can
+        # skip when nothing moved by more than ``inversion_tol`` (the same
+        # "material change" threshold detection uses).
         self._last_published_served: dict[int, float] = {}
         self._last_published_demand: dict[int, float] = {}
         self.inversion_tol = inversion_tol
@@ -301,39 +244,33 @@ class HolonSummaryRole(Role):
         self.admm_max_iters = admm_max_iters
         self.admm_abs_tol = admm_abs_tol
         # Spatial wiring for deliverability-aware coalition allocation.
-        # ``my_node_id`` is this leader's monee node; ``member_node_ids``
-        # maps each owned member's aid to its monee node (used for the
-        # per-tier demand-location map in the acceptance payload).
-        # ``mirror`` is the shared :class:`GridTopologyMirror` whose
-        # ``reachable_from(node, sector=...)`` drives the per-actor cap
-        # computation.  Any of these being ``None`` degrades the
-        # coalition to raw-supply ADMM (still better than greedy on
-        # the per-actor coupling, but without deliverability caps).
+        # ``my_node_id``: this leader's monee node. ``member_node_ids``:
+        # owned-member aid → monee node (for the per-tier demand-location
+        # map in the acceptance payload). ``mirror``: shared
+        # :class:`GridTopologyMirror` whose ``reachable_from`` drives the
+        # per-actor cap. Any being None degrades to raw-supply ADMM
+        # (no deliverability caps).
         self._my_node_id = my_node_id
         self._member_node_ids: dict[str, Any] = dict(member_node_ids or {})
         self._mirror = mirror
-        # Shared store between L2.5 (writer) and L2 (reader) on the
-        # same leader.  None ⇒ no constraint binding — the coalition
-        # still dispatches its StartBalanceNegotiation, but L2's
-        # subsequent rounds will overwrite per-tier without checking
-        # for active coalitions (the pre-store M2 behaviour).
+        # Shared store between L2.5 (writer) and L2 (reader) on the same
+        # leader. None ⇒ no binding: the coalition still dispatches its
+        # StartBalanceNegotiation, but L2's later rounds overwrite per-tier
+        # without checking for active coalitions.
         self._constraint_store = constraint_store
         self._version = MonotonicVersion()
-        # Most-recent ``HolonSummary`` per publisher; addr-book is
-        # populated from incoming summary metadata for direct dispatch.
+        # Most-recent ``HolonSummary`` per publisher; addr-book populated
+        # from incoming summary metadata for direct dispatch.
         self._peer_summaries: dict[str, HolonSummary] = {}
         self._peer_addrs: dict[str, Any] = {}
-        # Inversion cooldown — one emit per window prevents event spam.
-        # Set to ``period_s`` so a persistent inversion gets re-detected
-        # (and a fresh coalition) on the very next tick instead of after
-        # 5 s.  The previous floor of 5 s left at most 1–2 coalitions per
-        # 10 s smoke run, far below what the per-component priority-
-        # invariant needs to converge when the L2 holon rebalance is on
-        # its slow 60 s heartbeat.
+        # Inversion cooldown (one emit per window, prevents event spam).
+        # ``period_s`` so a persistent inversion is re-detected (fresh
+        # coalition) on the next tick — needed for the per-component
+        # priority-invariant to converge while L2's rebalance is on its
+        # slow heartbeat.
         self._last_inversion_emit_t: float = -1e9
         self._inversion_cooldown_s: float = period_s
-        # M2 coalitions keyed by id so multiple parallel coalitions can
-        # coexist (rare in practice).
+        # Coalitions keyed by id so parallel coalitions can coexist.
         self._pending_coalitions: dict[str, _PendingCoalition] = {}
         self._active_coalitions: dict[str, _ActiveCoalition] = {}
         self._coalition_counter: int = 0
@@ -374,9 +311,8 @@ class HolonSummaryRole(Role):
             lambda msg, meta: isinstance(msg, HolonSummary)
             and msg.sector == self.sector,
         )
-        # Coalition control-plane subscriptions.  Both filter on
-        # sector so a leader in one sector never gets pulled into
-        # another sector's coalition.
+        # Coalition control-plane subscriptions, sector-filtered so a
+        # leader is never pulled into another sector's coalition.
         self.context.subscribe_message(
             self,
             _wrap(self._on_invitation),
@@ -389,24 +325,20 @@ class HolonSummaryRole(Role):
             lambda msg, meta: isinstance(msg, CoalitionAcceptance)
             and msg.sector == self.sector,
         )
-        # Inbound coalition constraints from other initiators.  Stored
-        # locally so this leader's L2 ADMM consults them before
-        # dispatching its own service fractions (coalition wins per
-        # (sector, tier) cell while the TTL is still valid).
+        # Inbound coalition constraints from other initiators, stored so
+        # this leader's L2 ADMM consults them before dispatching its own
+        # fractions (coalition wins per (sector, tier) cell while TTL valid).
         self.context.subscribe_message(
             self,
             _wrap(self._on_constraint),
             lambda msg, meta: isinstance(msg, CoalitionConstraint)
             and msg.sector == self.sector,
         )
-        # Event-driven publish: a leader's per-tier served/demand
-        # vector only moves when L1 gossip converges on a fresh
-        # setpoint or L2 dispatches a new allocation.  Subscribing
-        # to NegotiationFinishedEvent (same-agent emit from L1 gossip
-        # finish) and StartBalanceNegotiation (incoming L2 dispatch
-        # message) covers both.  ``_publish`` itself short-circuits
-        # when the new vector matches the cached last-published one,
-        # so even bursts of events don't republish identical state.
+        # Event-driven publish: the per-tier vector only moves on L1
+        # gossip convergence (NegotiationFinishedEvent) or L2 dispatch
+        # (StartBalanceNegotiation), so subscribe to both. ``_publish``
+        # short-circuits on unchanged state, so event bursts don't
+        # republish identical vectors.
         self.context.subscribe_event(
             self, NegotiationFinishedEvent, self._on_local_state_change
         )
@@ -415,19 +347,16 @@ class HolonSummaryRole(Role):
             _wrap(self._on_l2_dispatch),
             lambda msg, meta: isinstance(msg, StartBalanceNegotiation),
         )
-        # Schedule an immediate first publish so peer summaries are
-        # already in flight by the time the L2 holon ADMM lands its
-        # initial allocation (~ t=0.08 s reactive on holon formation).
+        # Immediate first publish so peer summaries are in flight before
+        # the L2 holon ADMM lands its initial allocation.
         self.context.schedule_instant_task(self._tick())
-        # Watchdog: low-cadence re-run of publish + invariant check +
-        # coalition re-assert.  The dominant trigger is event-driven
-        # above; the watchdog catches missed events (peer joining
-        # late, coalition TTL needing renewal during a silent window).
+        # Watchdog: low-cadence safety net for missed events (late peer,
+        # coalition TTL renewal during a silent window).
         self.context.schedule_periodic_task(self._tick, delay=self.watchdog_s)
-        # Heat→L3 refresh: heat has no event-driven publish trigger under
-        # ``enable_heat_mw_balance=False``, so drive a faster delta-gated
-        # republish for heat leaders.  Keeps the delivered-heat vector the
-        # CP-ADMM reads current within a short run.
+        # Heat→L3 refresh: heat has no event-driven publish trigger
+        # (MW-balance deactivated), so drive a faster delta-gated
+        # republish to keep the delivered-heat vector the CP-ADMM reads
+        # current.
         if self.sector == Sector.HEAT and self.enable_heat_cp_supply:
             self.context.schedule_periodic_task(
                 self._publish_and_check, delay=self.heat_refresh_s
@@ -437,7 +366,7 @@ class HolonSummaryRole(Role):
         if topology_characteristic(self, tid="groups") != "leader":
             return
         # Watchdog path: bypass the delta gate so the version frontier
-        # advances even when nothing has moved.
+        # advances even when nothing moved.
         await self._publish(force=True)
         self._check_invariants()
         if self.enable_cross_sector_coalitions:
@@ -447,9 +376,8 @@ class HolonSummaryRole(Role):
     def _on_local_state_change(
         self, event: NegotiationFinishedEvent, _src: Any
     ) -> None:
-        """Local L1 gossip just converged — the leader's per-tier
-        served/demand vector may have moved, so attempt a delta-gated
-        publish and re-check invariants.
+        """L1 gossip converged — the per-tier vector may have moved, so
+        attempt a delta-gated publish and re-check invariants.
         """
         if event.sector != self.sector:
             return
@@ -460,9 +388,8 @@ class HolonSummaryRole(Role):
     async def _on_l2_dispatch(
         self, message: StartBalanceNegotiation, meta: dict
     ) -> None:
-        """L2 just dispatched a fresh allocation to this leader's
-        community — the per-tier served/demand may shift once members
-        apply the override.  Trigger a delta-gated publish + check.
+        """L2 dispatched a fresh allocation — the per-tier vector may
+        shift once members apply it. Trigger a delta-gated publish + check.
         """
         if topology_characteristic(self, tid="groups") != "leader":
             return
@@ -483,8 +410,8 @@ class HolonSummaryRole(Role):
         """True iff the new per-tier vectors differ from the cached
         last-published ones on any tier by more than ``inversion_tol``.
 
-        Comparison is over the union of tiers so a tier that drops
-        out (becomes 0) is detected as change.
+        Compares over the union of tiers so a tier dropping to 0 counts
+        as change.
         """
         if not self._last_published_served and not self._last_published_demand:
             return True  # first publish
@@ -514,7 +441,7 @@ class HolonSummaryRole(Role):
         per_tier_served: dict[int, float] = {}
         per_tier_demand: dict[int, float] = {}
         supply_total: float = 0.0
-        slack_budget_total: float = 0.0  # slack-only, used to cap CP input draw
+        slack_budget_total: float = 0.0  # slack-only; caps CP input draw
         try:
             member_aids = [self.context.aid] + [
                 addr.aid for addr in topology_neighbors(self, tid="groups")
@@ -532,16 +459,14 @@ class HolonSummaryRole(Role):
                 continue
             cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
             if cap < 0:
-                # Generator / slack injector — contributes to the
-                # community's supply pool, which L3's CP-ADMM reads off
-                # this mesh as its per-sector ``base_supply``.  For a
-                # *slack* advertise its operator budget (the SlackBudget
-                # Monitor's loss-compensated *effective* budget when set,
-                # else the nominal one) rather than the raw ``|cap|`` —
-                # mirrors ``EnergyBalanceNegotiator._handle_ask_flex`` so
-                # the L2→L3 supply matches the L1/L2 pool and the CP draw
-                # is actually capped at the budget (without this the
-                # tightened budget never reached L3 and gas over-drew).
+                # Generator / slack injector — contributes to the supply
+                # pool L3's CP-ADMM reads as per-sector ``base_supply``.
+                # A slack advertises its operator budget (effective,
+                # loss-compensated, when set, else nominal) not raw
+                # ``|cap|`` — mirrors
+                # ``EnergyBalanceNegotiator._handle_ask_flex`` so the
+                # L2→L3 supply matches the L1/L2 pool and the CP draw is
+                # capped at the budget.
                 if lookup_slack(self.behavior, aid) is not None:
                     eff = lookup_slack_eff_budget(self.behavior, aid)
                     v = float(eff) if eff is not None else abs(cap)
@@ -557,17 +482,15 @@ class HolonSummaryRole(Role):
             per_tier_demand[tier] = per_tier_demand.get(tier, 0.0) + abs(cap)
             per_tier_served[tier] = per_tier_served.get(tier, 0.0) + abs(sp)
 
-        # Delta gate: skip the publish + version bump when the per-tier
-        # vectors haven't moved by more than ``inversion_tol`` on any
-        # tier.  The watchdog tick passes ``force=True`` to keep the
-        # version frontier advancing for peers that joined late.
+        # Delta gate: skip publish + version bump when no tier moved by
+        # more than ``inversion_tol``. The watchdog passes ``force=True``
+        # to keep the version frontier advancing for late-joining peers.
         if not force and not self._summary_changed(
             per_tier_served, per_tier_demand
         ):
             return
 
-        # Cache for the next delta comparison — must run before
-        # ``send_message`` so a re-entrant publish triggered by a
+        # Cache before ``send_message`` so a re-entrant publish from a
         # downstream event sees the most recent baseline.
         self._last_published_served = dict(per_tier_served)
         self._last_published_demand = dict(per_tier_demand)
@@ -600,15 +523,13 @@ class HolonSummaryRole(Role):
             slack_budget_by_sector=slack_budget_by_sector,
             home_node_id=self._my_node_id,
         )
-        # Record our own latest summary too — the invariant check
-        # treats self as just another publisher.
+        # Record our own summary too — the invariant check treats self
+        # as just another publisher.
         self._peer_summaries[str(self.context.aid)] = summary
-        # Cross-sector visibility (additive): mirror the summary into
-        # a shared per-sector registry on the behavior.  Other-sector
-        # roles read from this registry during cross-sector detection
-        # without requiring a new topology mesh — fine for the
-        # single-process simulation, will need a real publish path if
-        # the runtime ever spans hosts.
+        # Cross-sector visibility (additive): mirror into a shared
+        # per-sector registry that other-sector roles read during
+        # cross-sector detection, avoiding a new topology mesh.
+        # Single-process only; needs a real publish path across hosts.
         _xs_registry(self.behavior).setdefault(self.sector, {})[
             str(self.context.aid)
         ] = summary
@@ -621,28 +542,22 @@ class HolonSummaryRole(Role):
         sender = mango_sender_addr(meta)
         if sender is None:
             return
-        # Normalise the key to the bare aid string so it matches the
-        # ``str(self.context.aid)`` key used in ``_publish`` for the
-        # self-entry.  Otherwise the dict ends up with mixed keys
-        # ("child-0" for self, "AgentAddress(..., aid='child-1')" for
-        # peers) and the lex-smallest election picks the
-        # "AgentAddress(..." prefix every time — silently disabling
-        # the initiator path on the actual lex-smallest aid.
+        # Normalise to the bare aid string to match the
+        # ``str(self.context.aid)`` self-key from ``_publish``. Mixed keys
+        # would make the lex-smallest election always pick the
+        # "AgentAddress(..." prefix, disabling the initiator path on the
+        # actual lex-smallest aid.
         key = getattr(sender, "aid", None) or str(sender)
         prior = self._peer_summaries.get(key)
         if prior is not None and message.version <= prior.version:
             return  # stale
         self._peer_summaries[key] = message
-        # Remember the full address — used for sending coalition
-        # messages back to this peer.
+        # Full address for sending coalition messages back to this peer.
         self._peer_addrs[key] = sender
-        # Mirror into the shared cross-sector registry so cross-sector
-        # detection sees this peer too (same rationale as _publish).
+        # Mirror into the shared cross-sector registry (as in _publish).
         _xs_registry(self.behavior).setdefault(message.sector, {})[key] = message
-        # Now that the peer view has shifted, re-run inversion
-        # detection immediately — the watchdog runs only every
-        # ``watchdog_s`` so without this trigger M1 detection would
-        # lag a fresh peer summary by the full watchdog interval.
+        # Peer view shifted — re-run detection now rather than lag it by
+        # the full watchdog interval.
         if topology_characteristic(self, tid="groups") == "leader":
             self._check_invariants()
             if self.enable_cross_sector_coalitions:
@@ -653,16 +568,14 @@ class HolonSummaryRole(Role):
     # ------------------------------------------------------------------
 
     def _is_elected_initiator(self) -> bool:
-        """Return True when this leader is the lex-smallest publisher
-        with non-empty summary state.
+        """True when this leader is the lex-smallest publisher with
+        non-empty summary state.
 
-        Election is deterministic across leaders that see the same
-        ``_peer_summaries`` snapshot.  Under eventual consistency
-        some leaders may be one tick behind; the election can briefly
-        flip if a previously-silent leader publishes for the first
-        time, but the resulting double-fire is absorbed by the
-        ``last-write-wins`` semantics at the L1 dispatch.  Worst case:
-        one extra coalition message exchange — no deadlock.
+        Deterministic across leaders sharing a ``_peer_summaries``
+        snapshot. Under eventual consistency the election can briefly
+        flip when a previously-silent leader first publishes; the
+        double-fire is absorbed by last-write-wins at L1 dispatch (worst
+        case one extra message exchange, no deadlock).
         """
         if not self._peer_summaries:
             return False
@@ -673,17 +586,14 @@ class HolonSummaryRole(Role):
         """Aggregate peer summaries by tier, detect inversions, and
         (on the elected initiator) open a coalition.
 
-        Both the diagnostic emit and the coalition formation are
-        gated on initiator election so we get one event + one
-        coalition per inversion cohort, instead of N of each.
+        Emit and coalition formation are both gated on initiator election
+        to yield one event + one coalition per inversion cohort, not N.
         """
         if topology_characteristic(self, tid="groups") != "leader":
             return
-        # Need at least one peer summary in addition to our own to
-        # call an inversion "cross-holon".  The first L2.5 tick fires
-        # before any peer summaries have arrived through the
-        # messaging layer; deferring lets the second tick reason on
-        # real cross-holon state.
+        # Need a peer summary besides our own to call an inversion
+        # "cross-holon". The first tick fires before peer summaries
+        # arrive; deferring lets the next tick reason on real state.
         if len(self._peer_summaries) < 2:
             return
         if not self._is_elected_initiator():
@@ -720,17 +630,13 @@ class HolonSummaryRole(Role):
             return
 
         emitted = False
-        # Open a coalition for the *worst* inversion (largest fraction
-        # gap) each tick.  We don't bundle every inverted pair into
-        # one multi-tier coalition because the resulting one-shot
-        # redistribution is too aggressive — the supply-priority ADMM
-        # priority-waterfalls across the whole tier set in a single
-        # broadcast, dropping mid-priority tiers in lockstep, which
-        # produces a large step in the aggregate-regulation series and
-        # legitimate-but-jarring shed cascades.  With the cooldown set
-        # to ``period_s`` (one inversion check per tick), successive
-        # worst-gap targets address every persistent inversion within
-        # a few seconds and the drops stay small per tick.
+        # Open a coalition for the worst inversion (largest fraction gap)
+        # per tick. Bundling every inverted pair into one multi-tier
+        # coalition is too aggressive: the supply-priority ADMM waterfalls
+        # the whole tier set in one broadcast, dropping mid tiers in
+        # lockstep and producing jarring shed cascades. With the
+        # per-tick cooldown, successive worst-gap targets clear every
+        # persistent inversion within seconds while drops stay small.
         worst_pair: tuple[int, int] | None = None
         worst_gap: float = 0.0
         for i in range(1, len(tiers_sorted)):
@@ -763,9 +669,8 @@ class HolonSummaryRole(Role):
                 {t: round(f, 3) for t, f in fracs.items()},
             )
             if self.enable_coalition and worst_pair is not None:
-                # Schedule the coalition open as an instant task so
-                # the check itself stays synchronous and the rest of
-                # the tick (re-assert) still runs.
+                # Open as an instant task so the check stays synchronous
+                # and the rest of the tick (re-assert) still runs.
                 self.context.schedule_instant_task(
                     self._open_coalition(worst_pair, dict(demand_at_tier))
                 )
@@ -778,14 +683,12 @@ class HolonSummaryRole(Role):
         """Detect cross-sector priority inversions across CP-bridged
         sector pairs.
 
-        For each CP in ``_cp_meta`` whose bridged sector pair contains
-        ``self.sector``, look at the *other* sector's most recent
-        summaries (read from the shared cross-sector registry) and
-        flag the case where a higher-priority tier on one side is
-        served at a lower fraction than a lower-priority tier on the
-        other side.  When such an inversion is found and the elected
-        initiator (lex-smallest aid across both sectors' active
-        publishers) is this role, open a cross-sector coalition.
+        For each CP in ``_cp_meta`` bridging ``self.sector``, compare the
+        other sector's latest summaries (from the shared registry) and
+        flag where a higher-priority tier on one side is served at a
+        lower fraction than a lower-priority tier on the other. If found
+        and this role is the elected initiator (lex-smallest aid across
+        both sectors' publishers), open a cross-sector coalition.
         """
         if not self._cp_meta:
             return
@@ -815,9 +718,8 @@ class HolonSummaryRole(Role):
                 if pair is None:
                     continue
                 t_own_high, t_peer_low, frac_own, frac_peer = pair
-                # Initiator election: lex-smallest aid across the
-                # union of publishers from both sides.  Skip if we're
-                # not it — the elected initiator runs the coalition.
+                # Initiator election: lex-smallest aid across the union
+                # of both sides' publishers. Skip if we're not it.
                 union_aids = sorted(
                     set(own_summaries.keys()) | set(peer_summaries.keys())
                 )
@@ -852,7 +754,7 @@ class HolonSummaryRole(Role):
                         t_peer_low=t_peer_low,
                     )
                 )
-                return  # one coalition per tick is enough
+                return  # one coalition per tick
 
     def _find_inversion_pair(
         self,
@@ -860,12 +762,11 @@ class HolonSummaryRole(Role):
         peer_summaries: dict[str, HolonSummary],
     ) -> tuple[int, int, float, float] | None:
         """Return ``(t_own_high, t_peer_low, frac_own, frac_peer)`` if a
-        cross-sector inversion exists, or None.
+        cross-sector inversion exists, else None.
 
-        Definition: there exists ``t_own_high`` on the own-sector side
-        with strict priority over ``t_peer_low`` on the peer side
-        (lower tier number is higher priority) AND the own side's
-        fraction is at least ``inversion_tol`` below the peer's.
+        Inversion: some own-side tier with strict priority over a peer
+        tier (lower tier number = higher priority) is served at a
+        fraction at least ``inversion_tol`` below the peer's.
         """
         own_dem, own_ser = self._aggregate_tier(own_summaries)
         peer_dem, peer_ser = self._aggregate_tier(peer_summaries)
@@ -877,7 +778,7 @@ class HolonSummaryRole(Role):
             f_own = own_ser.get(t_own, 0.0) / own_dem[t_own]
             for t_peer in sorted(peer_dem.keys()):
                 if t_peer <= t_own:
-                    continue  # not an inversion (peer not lower-priority)
+                    continue  # peer not lower-priority
                 if peer_dem[t_peer] <= 1e-9:
                     continue
                 f_peer = peer_ser.get(t_peer, 0.0) / peer_dem[t_peer]
@@ -909,15 +810,10 @@ class HolonSummaryRole(Role):
     ) -> None:
         """Build a cross-sector allocation and dispatch it immediately.
 
-        No invitation round in this first cut — we rely on the
-        scenario-build-time ``_cp_meta`` for the CP's rated capacity
-        and coupling, and on the cross-sector summary registry for
-        the leaders' current per-tier state.  Skipping the round-trip
-        keeps the latency low and the implementation surface small;
-        if future work needs per-CP capacity that varies at runtime
-        (e.g. a CP that publishes its own beacon), the invitation/
-        acceptance handshake can be added without changing the
-        dispatch path.
+        No invitation round: relies on build-time ``_cp_meta`` for CP
+        rated capacity + coupling and on the cross-sector registry for
+        leaders' current per-tier state. A handshake could be added for
+        runtime-varying CP capacity without changing the dispatch path.
         """
         meta = self._cp_meta.get(cp_aid)
         if meta is None:
@@ -928,15 +824,13 @@ class HolonSummaryRole(Role):
         if cp_addr is None:
             return
 
-        # Determine direction.  Coupling is keyed by (in_sec_v, out_sec_v).
-        # We need the CP to push *into* own_sec (raise own's deficit-side
-        # service) and draw *from* peer_sec.
+        # Direction: CP pushes into own_sec (raising its deficit-side
+        # service) and draws from peer_sec. Coupling keyed (in, out).
         key = (peer_sec.value, own_sec.value)
         eta = float(coupling.get(key, 0.0))
         cp_cap_out = float(rated.get(own_sec.value, 0.0))
         if eta <= 0.0 or cp_cap_out <= 0.0:
-            # CP cannot push into own_sec in this direction — skip.
-            return
+            return  # CP can't push into own_sec this direction
 
         registry = _xs_registry(self.behavior)
         own_summaries = registry.get(own_sec, {})
@@ -947,11 +841,11 @@ class HolonSummaryRole(Role):
 
         deficit_own_high = max(0.0, own_dem.get(t_own_high, 0.0) - own_ser.get(t_own_high, 0.0))
         served_peer_low = peer_ser.get(t_peer_low, 0.0)
-        # Peer-side freeable supply (in own-sec MW after η): how much
-        # can the CP produce in own_sec by drawing peer's tier_low served?
+        # Own-sec MW the CP can produce (after η) by drawing peer's
+        # tier_low served.
         peer_freeable_own = served_peer_low * eta
 
-        # Transfer is bounded by deficit, peer's available served, and CP rated.
+        # Bounded by deficit, peer's available served, and CP rated.
         transfer_out = min(deficit_own_high, peer_freeable_own, cp_cap_out)
         if transfer_out <= 1e-6:
             logger.info(
@@ -962,7 +856,6 @@ class HolonSummaryRole(Role):
             return
         transfer_in = transfer_out / eta
 
-        # Compute new service fractions.
         new_ser_own = own_ser.get(t_own_high, 0.0) + transfer_out
         own_total = own_dem.get(t_own_high, 0.0)
         new_frac_own = min(1.0, new_ser_own / own_total) if own_total > 1e-9 else 1.0
@@ -979,10 +872,9 @@ class HolonSummaryRole(Role):
             cp_aid: {own_sec.value: +transfer_out, peer_sec.value: -transfer_in}
         }
 
-        # Resolve leader addresses for both sectors.  ``own_sec`` uses
-        # our own peer book (populated by intra-sector summaries +
-        # _peer_addrs); ``peer_sec`` uses the scenario-supplied
-        # ``_peer_leader_addrs`` map.
+        # Resolve leader addresses: ``own_sec`` from our peer book
+        # (intra-sector summaries → _peer_addrs); ``peer_sec`` from the
+        # scenario-supplied ``_peer_leader_addrs`` map.
         own_addrs: list[Any] = []
         for aid in own_summaries:
             if aid == str(self.context.aid):
@@ -997,7 +889,6 @@ class HolonSummaryRole(Role):
             if addr is not None:
                 peer_addrs.append(addr)
 
-        # Issue identifiers + coalition state.
         self._coalition_counter += 1
         coalition_id = f"xs:{self.context.aid}#{self._coalition_counter}"
         now = float(self.context.current_timestamp)
@@ -1016,8 +907,7 @@ class HolonSummaryRole(Role):
         )
         self._active_xs_coalitions[coalition_id] = active
 
-        # Persist into the shared constraint store so L2 (per-sector
-        # ADMM) and L3 (CP ADMM) both see the commitment.
+        # Persist so L2 (per-sector ADMM) and L3 (CP ADMM) see it.
         if self._constraint_store is not None:
             self._constraint_store.set(
                 coalition_id=coalition_id,
@@ -1026,8 +916,8 @@ class HolonSummaryRole(Role):
                 issued_at=now,
                 ttl_s=float(self.coalition_constraint_ttl_s),
             )
-            # Use a distinct id for the peer-side record so it's not
-            # overwritten by the own-side set above.
+            # Distinct id so the peer-side record isn't overwritten by
+            # the own-side set above.
             self._constraint_store.set(
                 coalition_id=f"{coalition_id}/peer",
                 sector=peer_sec,
@@ -1061,11 +951,10 @@ class HolonSummaryRole(Role):
     async def _dispatch_active_xs_coalition(
         self, active: _ActiveCrossSectorCoalition
     ) -> None:
-        """Send one ``StartBalanceNegotiation`` per sector to its
-        leaders + one ``CPCommitment`` per CP.  Idempotent — the same
-        helper is used for the initial fire and every re-assert tick.
+        """Send one ``StartBalanceNegotiation`` per sector to its leaders
+        + one ``CPCommitment`` per CP. Idempotent: shared by the initial
+        fire and every re-assert tick.
         """
-        # Per-sector leader dispatch.
         for sec_v, addrs in active.leader_addrs_by_sector.items():
             tier_map = active.service_fraction_by_sector_tier.get(sec_v, {})
             if not tier_map:
@@ -1075,7 +964,7 @@ class HolonSummaryRole(Role):
             )
             for addr in addrs:
                 await self.context.send_message(payload, receiver_addr=addr)
-        # Self-dispatch on own sector so own L1 dispatches the fraction too.
+        # Self-dispatch so own L1 applies the fraction too.
         own_v = self.sector.value
         own_tier_map = active.service_fraction_by_sector_tier.get(own_v, {})
         if own_tier_map:
@@ -1087,7 +976,6 @@ class HolonSummaryRole(Role):
                     ),
                     receiver_addr=own_addr,
                 )
-        # CP commitments.
         for cp_aid, flows in active.cp_targets_mw.items():
             cp_addr = active.cp_addrs.get(cp_aid)
             if cp_addr is None:
@@ -1115,20 +1003,11 @@ class HolonSummaryRole(Role):
     ) -> None:
         """Build the coalition member list and broadcast invitations.
 
-        Members are publishers whose latest summary has non-zero
-        demand in *any* of the target tiers — those are the leaders
-        whose dispatch will actually be affected by a service-fraction
-        change at those tiers.  Adding peers with zero demand at the
-        targets would just inflate message volume.
-
-        Self is always a member: the initiator's own holon will also
-        be re-allocated by the coalition's fractions.
-
-        ``target_tiers`` carries every tier the detector flagged in
-        this round — a single multi-tier coalition redistributes all
-        of them in one supply-priority ADMM pass rather than leaving
-        the higher-priority inversions for a later (potentially
-        never-firing) round.
+        Members are publishers with non-zero demand in any target tier
+        (the only leaders whose dispatch a fraction change there
+        affects); zero-demand peers would just inflate message volume.
+        Self is always a member. ``target_tiers`` carries every flagged
+        tier so one ADMM pass redistributes all of them.
         """
         if not target_tiers:
             return
@@ -1154,9 +1033,8 @@ class HolonSummaryRole(Role):
             member_aids=tuple(member_aids),
             started_at=now,
         )
-        # Pre-seed the initiator's own acceptance from a local
-        # observe — it would loop back to us through the messaging
-        # layer anyway, and we already know our own state.
+        # Pre-seed the initiator's own acceptance from a local observe
+        # (we already know our own state; skip the round-trip).
         own_acc = self._local_acceptance(coalition_id, target_tiers)
         if own_acc is not None:
             pending.acceptances[str(self.context.aid)] = own_acc
@@ -1194,18 +1072,16 @@ class HolonSummaryRole(Role):
             self.context.aid, coalition_id, target_tiers,
             len(member_aids), n_sent,
         )
-        # Schedule the allocation pass after the acceptance window.
+        # Allocate after the acceptance window.
         try:
             self.context.schedule_timestamp_task(
                 self._close_and_allocate(coalition_id),
                 timestamp=now + float(self.coalition_accept_window_s),
             )
         except Exception:
-            # Defensive: if the scheduler does not accept absolute
-            # timestamps in this build, fall back to an instant task
-            # — coalitions will use whatever acceptances have already
-            # arrived (which is fine; absent peers simply don't
-            # contribute).
+            # Scheduler lacks absolute timestamps: fall back to instant,
+            # using whatever acceptances have arrived (absent peers just
+            # don't contribute).
             self.context.schedule_instant_task(
                 self._close_and_allocate(coalition_id)
             )
@@ -1215,10 +1091,8 @@ class HolonSummaryRole(Role):
     ) -> None:
         """Reply with an acceptance when included in the member list.
 
-        We do not gate on "this leader has flex at the target tiers"
-        — the initiator already pre-filtered to such leaders, and a
-        no-flex member just contributes zeros which the centralised
-        allocator handles cleanly.
+        No flex-at-target gate: the initiator already pre-filtered, and a
+        no-flex member just contributes zeros the allocator handles.
         """
         own_aid = str(self.context.aid)
         if own_aid not in message.member_aids:
@@ -1238,15 +1112,13 @@ class HolonSummaryRole(Role):
         target_tiers_in: tuple[int, ...],
     ) -> CoalitionAcceptance | None:
         """Build this leader's acceptance payload from a fresh observe
-        pass over its own community.
+        over its own community.
 
-        Mirrors :class:`HolonicCommunityRole._build_flex_answer` in
-        spirit — we want per-(sector, tier) demand and per-sector
-        supply so the initiator can run the same arbitration logic.
-        We restrict demand to ``target_tiers_in`` (every tier flagged
-        by the detector this round) to keep the payload small; supply
-        is reported across all sectors because the LP downstream may
-        route freed supply through CPs.
+        Like :class:`HolonicCommunityRole._build_flex_answer`: per-(sector,
+        tier) demand + per-sector supply for the initiator's arbitration.
+        Demand is restricted to ``target_tiers_in`` to keep the payload
+        small; supply spans all sectors since the LP may route freed
+        supply through CPs.
         """
         try:
             member_aids = [self.context.aid] + [
@@ -1260,12 +1132,10 @@ class HolonSummaryRole(Role):
         supply_by_sector: dict[str, float] = {}
         demand_by_sector_priority: dict[str, dict[int, float]] = {}
         served_by_sector_priority: dict[str, dict[int, float]] = {}
-        # ``demand_nodes_by_tier[tier][node_id] = mw``: the spatial
-        # demand footprint the initiator uses to compute per-actor
-        # reachability via the shared mirror.  Aggregating by node
-        # (not aid) means the initiator does not need a global
-        # aid → node_id map; each acceptance carries the slice that
-        # belongs to the replying leader.
+        # ``demand_nodes_by_tier[tier][node_id] = mw``: spatial demand
+        # footprint for per-actor reachability via the mirror. Keyed by
+        # node (not aid) so the initiator needs no global aid→node map;
+        # each acceptance carries its own leader's slice.
         demand_nodes_by_tier: dict[int, dict[Any, float]] = {}
         for aid in member_aids:
             try:
@@ -1278,8 +1148,8 @@ class HolonSummaryRole(Role):
             cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
             sec_v = sec.value
             if cap < 0:  # generator-class — register supply
-                # Slack advertises its (effective) operator budget, not
-                # its raw |cap| — see the publish path above.
+                # Slack advertises its (effective) budget, not raw |cap|
+                # (see publish path).
                 if lookup_slack(self.behavior, aid) is not None:
                     eff = lookup_slack_eff_budget(self.behavior, aid)
                     add = float(eff) if eff is not None else abs(float(cap))
@@ -1290,10 +1160,7 @@ class HolonSummaryRole(Role):
             if cap <= 0:  # slack / passive — skip
                 continue
             if sec != self.sector:
-                # Other-sector demand isn't part of this coalition's
-                # arbitration (sector-scoped invariant).  Skip it
-                # entirely so the payload stays focused.
-                continue
+                continue  # sector-scoped invariant: skip other-sector demand
             tier = obs_priority(obs, behavior=self.behavior, aid=aid)
             if target_tiers and tier not in target_tiers:
                 continue
@@ -1329,14 +1196,11 @@ class HolonSummaryRole(Role):
     async def _on_constraint(
         self, message: CoalitionConstraint, meta: dict
     ) -> None:
-        """Persist an incoming coalition constraint into the shared
-        store so this leader's L2 ADMM consults it on dispatch.
+        """Persist an incoming coalition constraint so this leader's L2
+        ADMM consults it on dispatch.
 
-        We trust the initiator's TTL.  Late-arriving messages with a
-        ``coalition_id`` already in the store overwrite by latest
-        version (Decision.version comparison handled by the caller —
-        the store treats each ``set`` as authoritative for now;
-        out-of-order would just briefly enforce a stale fraction).
+        Trusts the initiator's TTL. Each ``set`` is authoritative;
+        out-of-order arrivals would briefly enforce a stale fraction.
         """
         if self._constraint_store is None:
             return
@@ -1371,23 +1235,14 @@ class HolonSummaryRole(Role):
         demand_by_tier: dict[int, float],
         served_by_tier: dict[int, float],
     ) -> int:
-        """Historically capped each tier's allocated fraction at the
-        observed served fraction to "stay inside the LP's current
-        feasibility envelope".  That formed a self-reinforcing
-        feedback loop: once the LP delivered only X% to a tier,
-        future ADMM rounds were locked at ≤X%, even for high-priority
-        tiers — so the L2.5 coalition could not raise allocation
-        above the current degenerate operating point, and the per-
-        component priority_invariant claim systematically inverted.
-        Total-supply budgeting is now handled by ``budget_scale`` on
-        the *supply* side of the ADMM (see allocator setup above);
-        the box constraints inside the ADMM already prevent
-        over-allocation past the available supply, so this per-cell
-        cap is redundant *and* harmful.  Kept as a no-op shim so
-        callers that read its return value (diagnostics) remain
-        compatible.
+        """No-op shim kept for callers that read its return value.
+
+        Capping each tier's fraction at the observed served fraction
+        formed a self-reinforcing loop that locked tiers at their
+        degenerate operating point. Supply budgeting now lives in
+        ``budget_scale`` and the ADMM box constraints, making this cap
+        redundant and harmful.
         """
-        # Intentional no-op — see docstring.
         return 0
 
     def _aggregate_coalition_supply_demand(
@@ -1470,23 +1325,16 @@ class HolonSummaryRole(Role):
             return
 
         # Observed-served budget cap: when total_observed_served <
-        # total_demand the LP is bottlenecked; scale each actor's
-        # effective supply by the *delivery efficiency* so the ADMM's
-        # per-actor coupling binds at the realistic ceiling — but no
-        # tighter.  No-op when the LP isn't bottlenecked.
+        # total_demand the LP is bottlenecked; scale each actor's supply
+        # by the delivery efficiency so the ADMM's per-actor coupling
+        # binds at the realistic ceiling. No-op when not bottlenecked.
         #
-        # The denominator is ``min(total_supply, total_demand_sector)``,
-        # i.e. the natural achievable-delivery ceiling: whichever of
-        # supply-nameplate or demand is binding.  Dividing by raw
-        # nameplate alone (as a previous version did) produced absurd
-        # scales whenever supply >> demand — typical for heat, where
-        # CHP / HeatGenerator nameplate is many times the active heat
-        # load — and locked the coalition into a self-reinforcing
-        # curtailment spiral: observed_served small ⇒ scaled supply
-        # tiny ⇒ ADMM allocates almost nothing ⇒ loads further shed ⇒
-        # observed_served drops further.  Capping the denominator at
-        # demand keeps the scale interpretable as "fraction of the
-        # achievable delivery we are currently realising".
+        # Denominator ``min(total_supply, total_demand_sector)`` is the
+        # achievable-delivery ceiling (whichever of nameplate or demand
+        # binds). Dividing by raw nameplate alone explodes the scale when
+        # supply >> demand (typical for heat) and spirals into curtailment;
+        # capping at demand keeps the scale as "fraction of achievable
+        # delivery currently realised".
         total_demand_sector = sum(demand_by_tier.values())
         budget_scale = 1.0
         if (
@@ -1496,8 +1344,8 @@ class HolonSummaryRole(Role):
             and total_observed_served < total_demand_sector - 1e-9
         ):
             denom = max(min(total_supply, total_demand_sector), 1e-9)
-            # Cap at 1.0 so generous delivery never inflates supply
-            # past raw nameplate (the per-cell ub still uses raw).
+            # Cap at 1.0 so delivery never inflates supply past raw
+            # nameplate (the per-cell ub still uses raw).
             budget_scale = min(1.0, total_observed_served / denom)
             for supply_map in actor_supplies:
                 if sector_str in supply_map:
@@ -1505,11 +1353,10 @@ class HolonSummaryRole(Role):
                         float(supply_map[sector_str]) * budget_scale
                     )
 
-        # Deliverability caps: each actor's per-(sector, tier) ub is
-        # narrowed to the reachable-demand sum at that tier, so supply
-        # at a stranded actor cannot be committed to demand it cannot
-        # physically reach.  ``mirror=None`` makes the helper return
-        # all-None entries and the ADMM falls back to raw supply caps.
+        # Deliverability caps: narrow each actor's per-(sector, tier) ub
+        # to its reachable-demand sum so a stranded actor's supply isn't
+        # committed to demand it can't reach. ``mirror=None`` ⇒ all-None
+        # entries and the ADMM falls back to raw supply caps.
         try:
             actor_ub_overrides = per_actor_deliverable_caps(
                 actor_node_ids=actor_node_ids,
@@ -1551,9 +1398,8 @@ class HolonSummaryRole(Role):
                 sector=self.sector.value,
                 detail=f"id={coalition_id} exc={exc!r}",
             )
-            # Safety net: priority-greedy on the aggregate pool.  Same
-            # behaviour as the pre-ADMM milestone-2 allocator, so we
-            # never lose the coalition entirely on a solver hiccup.
+            # Safety net: priority-greedy on the aggregate pool so a
+            # solver hiccup never loses the coalition entirely.
             remaining_supply = max(total_supply, 0.0)
             fractions = {}
             for tier in tiers_for_admm:
@@ -1597,16 +1443,14 @@ class HolonSummaryRole(Role):
             {t: round(v, 3) for t, v in sorted(fractions.items())},
         )
 
-        # Record the active coalition so the next ``_tick`` cycle re-
-        # asserts the constraint until TTL expiry.  Dispatching the
-        # initial StartBalanceNegotiation also happens through the
-        # same helper, so both the initial fire and the re-fires take
-        # the identical path.
+        # Record the active coalition so each ``_tick`` re-asserts the
+        # constraint until TTL expiry. The initial dispatch and re-fires
+        # share the same helper.
         addrs: list[Any] = []
         for acc in accepting:
             aid = acc.publisher
             if aid == str(self.context.aid):
-                continue  # the initiator dispatches to itself separately
+                continue  # initiator dispatches to itself separately
             addr = pending.addr_by_aid.get(aid)
             if addr is not None:
                 addrs.append(addr)
@@ -1621,13 +1465,9 @@ class HolonSummaryRole(Role):
         )
         self._active_coalitions[coalition_id] = active
 
-        # Persist on the initiator's own store + broadcast a
-        # CoalitionConstraint to every accepting member so their L2
-        # ADMM consults the same fractions in subsequent rounds.
-        # Without this, last-write-wins between L2 and L2.5 lets L2
-        # overwrite per-tier whenever it rebalances; with this, L2
-        # merges the active coalition fractions into its dispatch
-        # for the TTL window.
+        # Persist locally + broadcast a CoalitionConstraint so every
+        # member's L2 ADMM merges the same fractions for the TTL window
+        # instead of overwriting them on its next rebalance.
         if self._constraint_store is not None:
             self._constraint_store.set(
                 coalition_id=coalition_id,
@@ -1646,15 +1486,11 @@ class HolonSummaryRole(Role):
             service_fraction_by_tier=dict(fractions),
             ttl_s=float(self.coalition_constraint_ttl_s),
         )
-        # Broadcast to every same-sector peer leader, not just
-        # accepting members.  Holon chunks span the full leader set,
-        # so a chunk initiator that wasn't in the coalition would
-        # otherwise dispatch un-merged L2 fractions to coalition
-        # members in its chunk — overriding the coalition's
-        # per-tier decision.  Filling every leader's store ensures
-        # any L2 dispatch in the sector merges the coalition's
-        # fractions before sending.  Cheap: one extra small message
-        # per same-sector peer.
+        # Broadcast to every same-sector peer leader, not just accepting
+        # members: a chunk initiator outside the coalition could
+        # otherwise dispatch un-merged L2 fractions to coalition members
+        # in its chunk. Filling every store makes any L2 dispatch merge
+        # the coalition fractions first. Cheap: one small message per peer.
         broadcast_targets = set()
         for addr in active.member_addrs:
             broadcast_targets.add(addr)
@@ -1662,13 +1498,10 @@ class HolonSummaryRole(Role):
             if aid == str(self.context.aid):
                 continue
             broadcast_targets.add(addr)
-        # Self-loop the constraint so the initiator's own
-        # ``HolonicCommunityRole`` reacts the same way as peers: the
-        # subscribe_message handler triggers an L2 rebalance, merging
-        # the new coalition fractions with the holon's own ADMM
-        # result.  Without this loop the initiator's L2 only re-runs
-        # on its slow heartbeat (default 60 s) while every peer
-        # rebalances within ms of receiving the message.
+        # Self-loop so the initiator's own ``HolonicCommunityRole`` reacts
+        # like peers: the handler triggers an L2 rebalance merging the new
+        # fractions. Without it the initiator's L2 only re-runs on its slow
+        # heartbeat while peers rebalance within ms.
         own_addr = getattr(self.context, "addr", None)
         if own_addr is not None:
             broadcast_targets.add(own_addr)
@@ -1681,8 +1514,7 @@ class HolonSummaryRole(Role):
         self, active: _ActiveCoalition
     ) -> None:
         """Send the constraint as a StartBalanceNegotiation to every
-        accepting member, including self via a self-message so the L1
-        handler runs through its normal path.
+        accepting member, plus self so the L1 handler runs its normal path.
         """
         service_fraction_by_sector_priority = {
             active.sector.value: dict(active.service_fraction_by_tier),
@@ -1691,12 +1523,11 @@ class HolonSummaryRole(Role):
             service_fraction_by_sector_priority=
                 service_fraction_by_sector_priority,
         )
-        # Dispatch to peers.
         for addr in active.member_addrs:
             await self.context.send_message(payload, receiver_addr=addr)
-        # Dispatch to self.  Using ``self.context.addr`` ensures the
-        # message lands on this leader's own EnergyBalanceNegotiator
-        # via the same handler path as messages from L2.
+        # Self via ``self.context.addr`` so the message lands on this
+        # leader's own EnergyBalanceNegotiator through the same handler
+        # path L2 messages use.
         own_addr = getattr(self.context, "addr", None)
         if own_addr is not None:
             await self.context.send_message(payload, receiver_addr=own_addr)
@@ -1704,15 +1535,13 @@ class HolonSummaryRole(Role):
     async def _reassert_active_coalitions(self) -> None:
         """Per-tick TTL pruning + re-broadcast.
 
-        Re-broadcasting on every tick is what makes the coalition's
-        constraint actually "hold" against the underlying L2 ADMM:
-        if L2 fires between ticks and overwrites the service-fraction
-        at the L1 level, the next tick re-asserts the coalition's
-        fraction within ``period_s`` seconds.
+        Re-broadcasting each tick is what makes a coalition constraint
+        hold against L2: if L2 overwrites the L1 fraction between ticks,
+        the next tick re-asserts it within ``period_s``.
         """
         now = float(self.context.current_timestamp)
-        # Prune expired records in the shared store so L2's merge
-        # only sees still-valid coalition fractions.  Idempotent.
+        # Prune expired store records so L2's merge sees only valid
+        # fractions. Idempotent.
         if self._constraint_store is not None:
             self._constraint_store.prune(now)
         if self._active_coalitions:
@@ -1751,16 +1580,11 @@ class HolonSummaryRole(Role):
     def on_branch_failure(self, branch_id: tuple) -> None:
         """Drop all active coalition constraints for this sector.
 
-        Wired by the scenario builder via
-        ``behavior_in(world, _trigger, on_global_event=BranchFailureEvent,
-        role_types=HolonSummaryRole)``.  We do not check whether the
-        failed branch is in this sector — the conservative choice is
-        to invalidate on any failure event the role receives, since
-        cross-sector dependencies can make a coupling-point failure
-        relevant to every sector's allocation.  The next L2 ADMM
-        round (triggered by the same failure through the existing
-        path) will produce a fresh allocation that's grounded in the
-        post-failure topology.
+        Wired by the scenario builder on ``BranchFailureEvent``. Doesn't
+        check whether the failed branch is in-sector — invalidates on any
+        failure since cross-sector coupling can make a CP failure relevant
+        everywhere. The failure-retriggered L2 ADMM produces a fresh
+        allocation grounded in the post-failure topology.
         """
         n_active = len(self._active_coalitions)
         n_pending = len(self._pending_coalitions)
@@ -1773,9 +1597,8 @@ class HolonSummaryRole(Role):
             return
         self._active_coalitions.clear()
         self._pending_coalitions.clear()
-        # Cross-sector coalitions invalidate on any branch failure
-        # in any of their bridged sectors — conservative, but cheap.
-        # We can't filter precisely here because the store-level
+        # Cross-sector coalitions invalidate on any branch failure —
+        # conservative; can't filter precisely since the store-level
         # clear above already dropped same-sector envelopes.
         self._active_xs_coalitions.clear()
         logger.info(

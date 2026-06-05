@@ -1,48 +1,21 @@
 """Defensive per-solve time-limit guard for energyflow MISOCP solves.
 
-Why this exists
----------------
+The energyflow path invokes ``monee.solver.pyo.PyomoSolver.solve``, which
+seeds the solver from ``PER_SOLVER_OPTIONS``.  Some monee builds ship no
+time limit for SCIP, so a hard MISOCP solve can run unbounded.  That
+matters because the runner's ``asyncio.wait_for`` cancellation is
+cooperative: a synchronous solve holds the interpreter and cannot be
+preempted until the next ``await``, letting a task overrun its timeout.
 
-``mango_energy_environments.base.monee.energyflow`` ultimately invokes
-``monee.solver.pyo.PyomoSolver.solve``, which constructs the Pyomo
-solver and seeds it from ``PER_SOLVER_OPTIONS``.  Newer monee builds
-include ``TimeLimit: 300`` for Gurobi; older builds (the one currently
-pinned in the HPC ``cmres_env`` that drove eval_full_small_20260526-
-165742) include nothing for ``scip``, so a single SCIP MISOCP solve on
-a hard problem (``voltage_stress`` / ``cp_heavy_dependent``) can run
-for an unbounded number of wall-clock seconds.
+:func:`install_solver_time_limit` patches ``PER_SOLVER_OPTIONS`` so every
+subsequent solve seeds the right per-vendor time-limit option (SCIP
+``limits/time``, Gurobi ``TimeLimit``, HiGHS ``time_limit``, CBC
+``seconds``, ...).  Default is 60 s per solve — well above the typical
+sub-second solve, so it only trips on genuine divergence.  Override via
+``limit_s`` or ``SCARE_SOLVER_TIMELIMIT_S``.
 
-That matters because ``asyncio.wait_for(..., timeout=task_timeout_s)``
-in :func:`experiment.hpc.runner._run_simulation` is cooperative: a
-synchronous solve holds the Python interpreter and the cancellation
-fired by the timer cannot land until the next ``await``.  Eight of the
-138 tasks in the campaign exited as ``killed`` at exactly the SLURM
-wall (2700 s ≈ ``00:45:00``) rather than at the configured
-``task_timeout_s=1500`` because the cancellation could not preempt a
-SCIP solve that had already exceeded the runner timeout.
-
-What this module does
----------------------
-
-:func:`install_solver_time_limit` patches the relevant entry in
-``monee.solver.pyo.PER_SOLVER_OPTIONS`` so every subsequent
-``PyomoSolver.solve`` call seeds the solver with the right per-vendor
-time-limit option:
-
-* SCIP — ``limits/time`` (seconds)
-* Gurobi — ``TimeLimit`` (seconds)
-* HiGHS — ``time_limit`` (seconds)
-* CBC — ``seconds`` (seconds)
-
-The default is conservative (60 s per solve): even on the LV-50 grid
-the typical Gurobi MISOCP solve is well under a second, so 60 s only
-trips when the solver is genuinely diverging.  Callers can override
-via the ``limit_s`` argument or the ``SCARE_SOLVER_TIMELIMIT_S`` env
-var.
-
-The patch is idempotent and additive: it never lowers an existing
-limit a downstream library has chosen, so a newer monee that already
-ships ``TimeLimit: 300`` keeps its value.
+The patch is idempotent and additive: it never lowers a limit a
+downstream library already chose.
 """
 
 from __future__ import annotations
@@ -54,16 +27,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# Default per-solve wall-clock cap.  60 s is plenty for LV-50 with
-# Gurobi (~0.5 s typical, ~5 s for hard MISOCPs) and bounds the
-# worst-case SCIP solve to a value asyncio.wait_for can preempt
-# around.
+# Default per-solve wall-clock cap.  60 s far exceeds the typical
+# sub-second MISOCP solve and bounds the worst case for asyncio.wait_for.
 _DEFAULT_LIMIT_S: float = 60.0
 
 
-# Per-solver option name carrying the seconds-of-wall-clock budget.
-# These follow each solver's native option naming, which is what
-# Pyomo's ``solver.options[k] = v`` forwards to the underlying CLI.
+# Per-solver option name for the wall-clock budget, in each solver's native
+# naming as forwarded by Pyomo's ``solver.options[k] = v``.
 _TIME_LIMIT_OPTION: dict[str, str] = {
     "scip": "limits/time",
     "gurobi": "TimeLimit",
@@ -128,8 +98,8 @@ def install_solver_time_limit(limit_s: float | None = None) -> None:
             existing[option_key] = seconds
             applied.append((solver_name, option_key, seconds))
             continue
-        # Never raise a limit downstream already chose — but never let
-        # an absent / disabled one (0, None) override our floor either.
+        # Never raise a limit downstream already chose, but treat an
+        # absent / disabled one (<= 0) as overridable by our floor.
         try:
             current_f = float(current)
         except (TypeError, ValueError):

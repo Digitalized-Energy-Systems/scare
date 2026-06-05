@@ -1,12 +1,8 @@
-"""Regression test for the diary ``started == Σ terminals`` invariant
-under overlapping negotiation triggers.
+"""Diary ``started == Σ terminals`` invariant under overlapping triggers.
 
-The eval_full_small_20260527-015015 run leaked one ``started`` record
-per slack child (e.g. child-118): a slack-budget override gossip and a
-balance-round gossip raced, and the second ``_start_gossip`` overwrote
-``self._gossip`` for the first originator gossip without recording a
-terminal.  ``_start_gossip`` now retires any in-flight originator gossip
-as ``abandoned`` before overwriting it.
+When a second ``_start_gossip`` overwrites an in-flight originator gossip
+(e.g. an override gossip racing a balance-round gossip), the first must be
+retired as ``abandoned`` so its ``started`` record does not leak.
 """
 
 from __future__ import annotations

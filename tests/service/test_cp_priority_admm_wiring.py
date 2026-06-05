@@ -7,9 +7,7 @@ wiring side that drives the kernel from the gossiped peer view and
 commits the local CP's regulation factor.
 
 These tests exercise the role directly against a fake mango context
-(no agent world spin-up), mirroring the
-``tests/community/test_cross_sector_coalition.py`` pattern.  They lock
-in three contract properties of the post-cutover design:
+(no agent world spin-up).  They lock in three contract properties:
 
 1. The role publishes its own :class:`CPSummary` on setup so peer CPs
    can include it in their replicated view from the first kernel run.
@@ -121,7 +119,6 @@ def _make_role(
             )
         ],
         rebalance_min_gap_s=rebalance_min_gap_s,
-        priority_weight_base=10.0,
         admm_max_iters=200,
     )
     ctx = _FakeContext(cp_id)
@@ -167,22 +164,17 @@ def _inject_holon_summary(
 
 
 def test_config_flag_is_present_and_on_by_default() -> None:
-    """``enable_cp_priority_admm`` is the default L3 path on the
-    ``scare`` variant: the replicated kernel runs in place of the
-    legacy Option-B coordinator-elected path.  ``enable_cp_admm`` stays
-    at its True default for ablation reachability; the install chain
-    in ``scenario.restoration`` shadows the legacy path when the new
-    flag is on.
+    """``enable_cp_priority_admm`` is the default L3 path: the replicated
+    kernel runs in place of the legacy coordinator-elected path, which the
+    install chain in ``scenario.restoration`` shadows when the flag is on.
+    Both flags default True; set ``enable_cp_priority_admm=False`` to opt
+    back into the legacy coordinator path.
     """
     from scare.base.config import RestorationConfiguration
 
     cfg = RestorationConfiguration()
     assert hasattr(cfg, "enable_cp_priority_admm")
     assert cfg.enable_cp_priority_admm is True
-    # Both default True — the install chain at the four call sites in
-    # ``_populate_children`` resolves the precedence, with the new
-    # path winning.  Set ``enable_cp_priority_admm=False`` to opt back
-    # into the legacy coordinator path.
     assert cfg.enable_cp_admm is True
 
 
@@ -538,11 +530,11 @@ def test_heat_base_supply_uses_slack_when_flag_off():
 
 
 def test_deficit_mode_caps_electricity_input_at_served_plus_slack_budget():
-    """Issue A fix: with ``heat_supply_from_deficit`` set, the CP-input
-    sectors (electricity, gas) use ``base_supply = Σ served + slack
-    eff_budget`` instead of the aggregate supply pool — so a CP
-    consuming from that sector is bounded by the binding slack's
-    operator budget, not the (uncapped) non-slack |cap| sum."""
+    """With ``heat_supply_from_deficit`` set, the CP-input sectors
+    (electricity, gas) use ``base_supply = Σ served + slack eff_budget``
+    instead of the aggregate supply pool — so a CP consuming from that
+    sector is bounded by the binding slack's operator budget, not the
+    (uncapped) non-slack |cap| sum."""
     role, _, _ = _make_role(
         "p2h-A", capacity_by_sector={"heat": -0.05, "electricity": 0.05},
         bridged_sectors=[Sector.HEAT, Sector.ELECTRICITY],

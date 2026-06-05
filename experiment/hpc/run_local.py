@@ -45,10 +45,9 @@ def run_campaign(
             failures += int(code != 0)
             logger.info("Task %d → exit=%d", tid, code)
     else:
-        # Recycle workers periodically so Gurobi / Pyomo C-extension
-        # heap state can return to the OS between tasks.  Without this,
-        # peak memory grows unboundedly across the campaign and any
-        # heavy task (CP-heavy / scaling grids) hits OOM.
+        # Recycle workers periodically so Gurobi / Pyomo C-extension heap
+        # returns to the OS between tasks; otherwise peak memory grows
+        # unboundedly and heavy tasks (CP-heavy / scaling grids) hit OOM.
         with ProcessPoolExecutor(
             max_workers=workers,
             max_tasks_per_child=max_tasks_per_child,
@@ -79,9 +78,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    # Pin the hash seed (re-exec once) before the worker pool is created,
-    # so every worker — spawned or in-process — has reproducible
-    # set/frozenset ordering.  See ``ensure_deterministic_hashing``.
+    # Pin the hash seed (re-exec once) before the worker pool is created
+    # so every worker has reproducible set/frozenset ordering.
     ensure_deterministic_hashing()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
     args = _parse_args()

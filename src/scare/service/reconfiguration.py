@@ -36,26 +36,22 @@ class GridReconfigurator(Role):
         super().__init__()
         self.behavior = behavior
         self.node_id = node_id
-        # search_id → sentinel marking an in-flight search initiated by
-        # this agent.  In legacy mode the result handler drops the
-        # sentinel on first arrival; in ranking mode it stays until the
-        # window closes.
+        # search_id → sentinel for an in-flight search this agent
+        # initiated. Legacy mode drops it on first result; ranking mode
+        # keeps it until the window closes.
         self._pending_searches: dict[str, Any] = {}
-        # search_id → set of already-asked AgentAddresses on the
-        # originator.  Kept symmetrical with ``_pending_searches``.
+        # search_id → set of already-asked addresses on the originator.
         self._asked_by_search: dict[str, set] = {}
-        # search_id values this agent has already forwarded — prevents
-        # exponential message blowup when the BFS fan-out re-enters the
-        # same node from multiple ancestors.  In legacy mode this is a
-        # set (forward at most once); in ranking mode it stores the
-        # lowest max_loading_percent we have forwarded so far, and we
-        # allow re-forward when a strictly better path arrives.
+        # Per-search forwarding dedup, preventing exponential blowup when
+        # the BFS fan-out re-enters a node from multiple ancestors.
+        # Legacy: set, forward at most once. Ranking: lowest forwarded
+        # max_loading_percent, re-forwarding on a strictly better path.
         self._forwarded_searches: set[str] = set()
         self._forwarded_loading: dict[str, float] = {}
-        # 6c — path-feasibility ranking state.
+        # Path-feasibility ranking state.
         self.enable_ranking = enable_ranking
         self.window_s = window_s
-        # search_id → buffered candidate results awaiting window close.
+        # search_id → candidate results buffered until window close.
         self._search_results: dict[str, list[GridPathResult]] = {}
 
     def setup(self) -> None:
@@ -89,14 +85,11 @@ class GridReconfigurator(Role):
     async def _start_path_search(self, from_node_id: Any, to_node_id: Any) -> None:
         """Broadcast a path-search request to all reachable grid neighbours.
 
-        Fire-and-forget: this coroutine returns once the broadcast is
-        sent.  The result is handled asynchronously by
-        ``_handle_path_result`` (which closes tie switches and records
-        the reconfiguration event).  Awaiting the result here would keep
-        this task in a running-but-not-sleeping state and deadlock
-        mango's ``tasks_complete_or_sleeping`` barrier — the simulation
-        step-loop only advances when every active task is sleeping or
-        done.
+        Fire-and-forget: returns once the broadcast is sent; the result
+        is handled asynchronously by ``_handle_path_result``. Awaiting
+        the result here would deadlock mango's
+        ``tasks_complete_or_sleeping`` barrier — the step-loop only
+        advances when every active task is sleeping or done.
         """
         grid_neighbours = self._reachable_grid_neighbours()
 
@@ -107,14 +100,13 @@ class GridReconfigurator(Role):
             return
 
         search_id = str(uuid4())
-        # Mark the search as in-flight so ``_handle_path_result`` can
-        # accept its result.  Stored as a sentinel rather than a future.
+        # Mark the search in-flight so ``_handle_path_result`` accepts
+        # its result.
         self._pending_searches[search_id] = True
         self._asked_by_search[search_id] = {self.context.addr}
         if self.enable_ranking:
             self._search_results[search_id] = []
-            # Close the ranking window after ``window_s`` and act on the
-            # best buffered result.
+            # Close the ranking window after ``window_s``.
             deadline = self.context.current_timestamp + self.window_s
             self.context.schedule_timestamp_task(
                 self._finalise_ranked_search(search_id),
@@ -143,10 +135,9 @@ class GridReconfigurator(Role):
         already_asked = set(message.asked_agents) | {my_addr}
         incoming_max_loading = float(getattr(message, "max_loading_percent", 0.0) or 0.0)
 
-        # Termination by node_id: any agent whose local node_id matches
-        # the target is a valid terminator, even if it's not currently
-        # reachable as a direct grid neighbour of the initiator (the
-        # failed branch normally severs that direct edge).
+        # Termination by node_id: any agent whose node_id matches the
+        # target terminates, even if not a direct grid neighbour of the
+        # initiator (the failed branch usually severs that edge).
         if (
             message.target_node_id is not None
             and self.node_id == message.target_node_id
@@ -160,11 +151,9 @@ class GridReconfigurator(Role):
             await self.context.send_message(result, receiver_addr=message.source_addr)
             return
 
-        # Per-search dedup.
-        # Legacy mode: forward each search_id at most once per agent.
-        # Ranking mode: re-forward only when a strictly better
-        # (lower max_loading) copy arrives — bounded by the loading
-        # monotone, so the search still terminates.
+        # Per-search dedup. Legacy: forward each search_id at most once.
+        # Ranking: re-forward only on a strictly-lower max_loading copy
+        # — monotone-bounded, so the search still terminates.
         if message.search_id:
             if self.enable_ranking:
                 prev_best = self._forwarded_loading.get(message.search_id)
@@ -187,10 +176,9 @@ class GridReconfigurator(Role):
             if self._is_uncertain_connection(addr):
                 new_uncertain.append((my_addr, addr))
 
-            # Update the running max_loading from the line we are about
-            # to traverse (my_addr → addr).  Failure to read the branch
-            # observation is treated as zero — better to under-attribute
-            # loading than to refuse to forward.
+            # Carry the running max_loading across the line we are about
+            # to traverse. An unreadable branch observation counts as
+            # zero — under-attribute loading rather than refuse to forward.
             branch_loading = self._branch_loading_percent(addr)
             new_max_loading = max(incoming_max_loading, branch_loading)
 
@@ -205,15 +193,13 @@ class GridReconfigurator(Role):
                 max_loading_percent=new_max_loading,
             )
             await self.context.send_message(fwd, receiver_addr=addr)
-        # Dead-end branches stay silent — the initiator's timeout handles
-        # the case where no path exists; sending empty results caused the
-        # initiator to prematurely abandon searches that other branches
-        # would have completed.
+        # Dead-end branches stay silent — the initiator's timeout covers
+        # the no-path case. Sending empty results would make the
+        # initiator abandon searches other branches could complete.
 
     def _branch_loading_percent(self, neighbour_addr: Any) -> float:
-        """Read the loading of the branch between this node and a grid
-        neighbour, normalised to the percent convention used by
-        SECTOR_CONSTRAINTS (see ``obs_constraint_values``).
+        """Loading of the branch to a grid neighbour, in the percent
+        convention of SECTOR_CONSTRAINTS (see ``obs_constraint_values``).
         """
         branch_aid = _branch_aid_from_addrs(self.context.addr, neighbour_addr)
         obs = self.behavior.observe(branch_aid)
@@ -225,9 +211,9 @@ class GridReconfigurator(Role):
     async def _handle_path_result(self, message: GridPathResult, meta: dict) -> None:
         if not message.path:
             return
-        # Accept only results that match an in-flight search this agent
-        # initiated (or, for legacy senders without a search_id, any
-        # currently-pending search).
+        # Accept only results matching an in-flight search this agent
+        # initiated (legacy senders without a search_id match any
+        # pending search).
         if message.search_id and message.search_id not in self._pending_searches:
             return
         if not message.search_id and not self._pending_searches:
@@ -235,8 +221,8 @@ class GridReconfigurator(Role):
         target_search = message.search_id or next(iter(self._pending_searches))
 
         # Ranking mode: buffer and let the window-close handler pick the
-        # best.  Don't pop the sentinel here so subsequent results from
-        # alternative paths are still accepted within the window.
+        # best. Keep the sentinel so later alternative-path results are
+        # still accepted within the window.
         if self.enable_ranking and target_search in self._search_results:
             self._search_results[target_search].append(message)
             logger.debug(
@@ -249,24 +235,21 @@ class GridReconfigurator(Role):
             )
             return
 
-        # Legacy mode: first-arrival wins; close switches immediately.
+        # Legacy mode: first arrival wins; close switches immediately.
         self._pending_searches.pop(target_search, None)
         self._asked_by_search.pop(target_search, None)
 
         await self._act_on_path_result(message)
 
     async def _finalise_ranked_search(self, search_id: str) -> None:
-        """Close the ranking window for ``search_id`` and act on the best
-        buffered candidate (lowest peak ``max_loading_percent``; among
-        ties, shortest path).  Times out silently when no candidate
-        arrived — falls back to the legacy timeout-handles-it behaviour.
+        """Close the ranking window and act on the best buffered
+        candidate (lowest peak ``max_loading_percent``; ties broken by
+        shortest path). Silent when no candidate arrived.
         """
         candidates = self._search_results.pop(search_id, None)
         self._pending_searches.pop(search_id, None)
         self._asked_by_search.pop(search_id, None)
-        # Forwarders' loading state can also be flushed; bounded growth
-        # is the only correctness property, leaks across searches are
-        # cosmetic.
+        # Flush forwarder loading state; cross-search leaks are harmless.
         self._forwarded_loading.pop(search_id, None)
 
         if not candidates:
@@ -309,8 +292,8 @@ class GridReconfigurator(Role):
                 aid=self.context.aid,
                 detail=f"switches={len(message.uncertain_connections)}",
             )
-            # mango raises KeyError if no role subscribed; the diagnostics
-            # ledger entry above is the load-bearing signal, so swallow.
+            # mango raises KeyError if no role subscribed; the
+            # diagnostics ledger entry above is the load-bearing signal.
             try:
                 self.context.emit_event(
                     ReconfigurationCompletedEvent(
@@ -320,14 +303,11 @@ class GridReconfigurator(Role):
             except KeyError:
                 pass
 
-            # The scenario-level ``behavior_in(on_global_event=
-            # ReconfigurationCompletedEvent, _trigger_balance, ...)`` hook
-            # never fires because emits are role-local — see audit P0-4.
-            # Reach the balance leaders the only way available to us from
-            # a role context: send each grid-topology neighbour an
-            # explicit ``StartBalanceNegotiation``.  Leaders trigger their
-            # negotiation; non-leaders ignore the message.  This is how
-            # newly-reachable load shifts through after a tie switch
+            # Role-local emits don't reach the scenario-level
+            # ReconfigurationCompletedEvent hook, so reach balance
+            # leaders directly: send each grid-topology neighbour a
+            # ``StartBalanceNegotiation``. Leaders trigger; non-leaders
+            # ignore. This shifts newly-reachable load after a tie switch
             # closes.
             grid_neighbours = topology_neighbors(self, tid="grid")
             for addr in grid_neighbours:
@@ -342,12 +322,10 @@ class GridReconfigurator(Role):
                     )
 
     def _reachable_grid_neighbours(self) -> list:
-        """Return grid neighbours reachable via either a live edge
-        (``State.NORMAL``) or a normally-open backup edge
-        (``State.INACTIVE``).  Backups must be included so the path
-        search can discover and close them; ``BROKEN`` edges (failed
-        branches) are excluded — they're the very topology break that
-        triggered this search.
+        """Grid neighbours reachable via a live edge (``State.NORMAL``)
+        or a normally-open backup (``State.INACTIVE``). Backups are
+        included so the search can discover and close them; ``BROKEN``
+        (failed) edges are excluded.
         """
         normal = topology_neighbors(self, tid="grid", state=State.NORMAL)
         inactive = topology_neighbors(self, tid="grid", state=State.INACTIVE)

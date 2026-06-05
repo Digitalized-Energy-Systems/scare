@@ -1,6 +1,6 @@
 {
   "$comment": [
-    "Smoke variant of eval_full \u2014 every experiment / scenario combination at",
+    "Smoke variant of eval_full — every experiment / scenario combination at",
     "n_seeds=1 so we get through every test case once without paying the full",
     "campaign's wallclock cost.  Used to validate the full eval pipeline end-to-end:",
     "every grid, every scenario kind, every variant, every ablation, and every",
@@ -11,10 +11,9 @@
     "enable_* flag on RestorationConfiguration including the L2.5 mesh",
     "(holon_summary, holon_coalition, cross_sector_coalitions), Concept-C dynamic",
     "topology (dynamic_holon_topology, dynamic_cp_topology), tier-stratified ADMM,",
-    "Hebbian formation, line-loading constraint, and reconfig feasibility ranking.",
-    "Two additional sweep blocks cover the community_partition_method (label",
-    "propagation vs distributed-Louvain modularity) and the holon_admm_mode",
-    "(supply vs demand) code paths so the ablation branches are exercised too."
+    "line-loading constraint, and reconfig feasibility ranking.  An additional",
+    "sweep covers community_partition_method (label propagation vs",
+    "distributed-Louvain modularity) so that branch is exercised too."
   ],
   "name": "eval_full_smoke_60s",
   "out_root": "experiment/_runs/eval",
@@ -170,7 +169,7 @@
       ]
     },
     {
-      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent grid with generator failures and tight slack (0.15) is the regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions matter \u00e2\u20ac\u201d the only restoration path is through the CP layer.",
+      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent grid with generator failures and tight slack (0.15) is the regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions matter â€” the only restoration path is through the CP layer.",
       "name": "ablation_cross_sector",
       "grids": [
         "simbench_lv_cp_heavy_dependent"
@@ -247,7 +246,7 @@
       ]
     },
     {
-      "$comment_block": "Voltage support.  pv_peak scenario pushes vm_pu past the 1.03 pu deadband so the Q-V droop role actually fires \u00e2\u20ac\u201d concentrated load failures never trigger it.",
+      "$comment_block": "Voltage support.  pv_peak scenario pushes vm_pu past the 1.03 pu deadband so the Q-V droop role actually fires â€” concentrated load failures never trigger it.",
       "name": "ablation_voltage",
       "grids": [
         "simbench_lv"
@@ -271,7 +270,7 @@
       ]
     },
     {
-      "$comment_block": "Thermal stress.  cold_day scenario on cp_heavy grid forces heat-sector deficit (supply_t_k=343, heat_load_scale=1.5) so heat_recovery and clpu_ramp have signal \u00e2\u20ac\u201d both are heat-sector / ramp-rate gated and never fire on pure electricity failures.",
+      "$comment_block": "Thermal stress.  cold_day scenario on cp_heavy grid forces heat-sector deficit (supply_t_k=343, heat_load_scale=1.5) so heat_recovery and clpu_ramp have signal â€” both are heat-sector / ramp-rate gated and never fire on pure electricity failures.",
       "name": "ablation_thermal",
       "grids": [
         "simbench_lv_cp_heavy"
@@ -327,38 +326,9 @@
       ]
     },
     {
-      "$comment_block": "Hebbian formation.  Default hebbian_warmup_s=12 exceeds simulation_duration_s=10, so the recluster never fires.  This block overrides warmup to 2 s in BOTH baseline and ablation so the flag actually has signal to ablate against.",
-      "name": "ablation_hebbian",
-      "grids": [
-        "simbench_lv"
-      ],
-      "n_seeds": 1,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {
-          "hebbian_warmup_s": 2.0
-        },
-        {
-          "enable_hebbian_formation": false,
-          "hebbian_warmup_s": 2.0
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "concentrated",
-          "n_failures": 5,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
-        }
-      ]
-    },
-    {
       "$comment": [
         "Cross-sector coalition pillar (L2.5).  Mirrors cp_coalition_eval's headline",
-        "ablation on simbench_lv_cp_heavy_dependent \u00e2\u20ac\u201d CPs replace primary generation, so",
+        "ablation on simbench_lv_cp_heavy_dependent â€” CPs replace primary generation, so",
         "losing a CP is unrecoverable by intra-sector gossip + local-gen fallback alone.  Tight",
         "slack budget (15%) + generator-class failures make the cross-sector layer the",
         "only path to recovery.  Three rows: full stack vs xs-off vs all-coalitions-off",
@@ -817,7 +787,7 @@
       ]
     },
     {
-      "$comment": "Community-partition method ablation \u00e2\u20ac\u201d label_propagation (radius-bounded) vs distributed-Louvain modularity.  Smoke must exercise both branches because the partition shape drives every downstream topology.",
+      "$comment": "Community-partition method ablation â€” label_propagation (radius-bounded) vs distributed-Louvain modularity.  Smoke must exercise both branches because the partition shape drives every downstream topology.",
       "name": "partition_method_sweep",
       "grids": [
         "simbench_lv"
@@ -840,34 +810,6 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
-        }
-      ]
-    },
-    {
-      "$comment": "Holon ADMM mode \u00e2\u20ac\u201d supply (Route A default) vs demand (legacy/ablation).  Smoke exercises both code paths so a regression in the ablation branch is caught before eval_full.",
-      "name": "holon_admm_mode_sweep",
-      "grids": [
-        "simbench_lv"
-      ],
-      "n_seeds": 1,
-      "variants": [
-        "scare"
-      ],
-      "sweeps": [
-        {
-          "holon_admm_mode": "supply"
-        },
-        {
-          "holon_admm_mode": "demand"
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "concentrated",
-          "n_failures": 4,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.3
         }
       ]
     },

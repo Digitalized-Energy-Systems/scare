@@ -1,7 +1,7 @@
-"""Targeted unit tests for the priority-dispatch fixes (F1/F2/F4/F7/F-new).
-
-Validates the contract of each fix in isolation so that a regression
-shows up immediately rather than as a campaign-level priority inversion.
+"""Targeted unit tests for the priority-dispatch behaviours: tier-aware
+clamp, priority-aware cooldown bypass, stale-observation detection,
+heat-sink and slack-class curtailment guards, and dual normalisation
+over unsaturated entries only.
 """
 
 from __future__ import annotations
@@ -34,16 +34,14 @@ def _disarm():
 
 
 # ---------------------------------------------------------------------------
-# F1: tier-aware clamp
+# Tier-aware clamp
 # ---------------------------------------------------------------------------
 
 
 class TestTierAwareClamp:
     def test_critical_tier_skips_clamp_at_moderate_util(self):
-        # vm_pu=1.04 → util=0.8.  Tier 1 is immune (clamp no-ops).
-        # Tier 4 deadband 0.85 ⇒ util 0.8 < 0.85 ⇒ no clamp.  Both
-        # should leave the setpoint unchanged at the moderate-stress
-        # regime.
+        # vm_pu=1.04 → util=0.8.  Tier 1 is immune; tier-4 deadband 0.85 >
+        # 0.8 ⇒ no clamp either. Both leave the setpoint unchanged.
         obs = {"p_mw": 10.0, "vm_pu": 1.04}
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1) == 5.0
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=4) == 5.0
@@ -65,13 +63,9 @@ class TestTierAwareClamp:
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY) == 5.0
 
     def test_tier1_immune_even_under_extreme_stress(self):
-        # Tier 1 hard-immunity dominates the soft clamp.  At
-        # vm_pu=1.0499 (util ≈ 0.998), a tier-2 load would clamp to
-        # near zero, but tier 1 still passes through unmodified — the
-        # leader's pre-step has hard-locked it at regulation=1 and the
-        # clamp must not break that invariant.  A real grid violation
-        # would surface via ``ConstraintViolation`` instead and the
-        # next negotiation re-evaluates feasibility.
+        # At vm_pu=1.0499 (util ≈ 0.998) a tier-2 load clamps to near zero,
+        # but tier-1 immunity dominates the soft clamp and passes through
+        # unmodified.
         obs = {"p_mw": 10.0, "vm_pu": 1.0499}
         tier1 = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
         tier2 = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=2)
@@ -80,7 +74,7 @@ class TestTierAwareClamp:
 
 
 # ---------------------------------------------------------------------------
-# F7: priority-aware apply_regulate cooldown
+# Priority-aware apply_regulate cooldown
 # ---------------------------------------------------------------------------
 
 
@@ -150,7 +144,7 @@ class TestCooldownBypass:
 
 
 # ---------------------------------------------------------------------------
-# F-new (H13): stale-observation detector
+# Stale-observation detector
 # ---------------------------------------------------------------------------
 
 
@@ -292,7 +286,7 @@ class TestHeatSinkGuard:
 # the moment the network needs more headroom than the clamped fraction.
 # The guard blocks every such write; the gossip-side _apply_setpoint
 # has a parallel class-check because it bypasses ``apply_regulate``
-# entirely (see balance.py:2031).
+# entirely.
 
 
 class TestSlackClassGuard:
@@ -389,18 +383,15 @@ class TestHeatSinkUpstreamSkip:
 
 
 # ---------------------------------------------------------------------------
-# F8: default-fallback priority diagnostic
+# Default-fallback priority diagnostic
 # ---------------------------------------------------------------------------
 
 
 class TestSaturationFilteredDual:
-    """F2: the dual normalisation must divide by Σ a_j over *unsaturated*
-    entries only.  Failing tests would indicate the saturation filter
-    has regressed and saturated agents are still slowing the dual step
-    for free agents.
-
-    Replicates the dual update formula in EnergyBalanceNegotiator
-    without spinning up mango — just verifies the formula chosen.
+    """The dual normalisation must divide by Σ a_j over *unsaturated*
+    entries only, so saturated agents don't slow the dual step for free
+    agents. Replicates EnergyBalanceNegotiator's dual update formula
+    without spinning up mango.
     """
 
     @staticmethod
@@ -413,12 +404,10 @@ class TestSaturationFilteredDual:
 
     def test_saturated_entries_excluded_from_normaliser(self):
         # Synthetic ledger: five tier-2 saturated entries (huge weight
-        # 1e8) plus one tier-4 unsaturated entry (small weight 1).
-        # Without the F2 fix Σ a_j ≈ 5 × 1e8 + 1; with the fix it is
-        # just 1.  Tier 1 isn't used here because under the 4-tier
-        # model tier-1's QP weight is 0 (hard-locked off-QP) — using
-        # tier 1 would zero out the saturated contribution entirely
-        # and trivialise the test.
+        # 1e8) plus one tier-4 unsaturated entry (small weight 1). The
+        # unfiltered Σ a_j ≈ 5 × 1e8 + 1; filtered to unsaturated it is
+        # just 1. Tier 1 is avoided here because its QP weight is 0
+        # (hard-locked off-QP), which would trivialise the test.
         memory = {
             "a": (0.0, 10, 2, True),   # saturated tier-2 (weight 1e8)
             "b": (0.0, 10, 2, True),
@@ -450,8 +439,8 @@ class TestSaturationFilteredDual:
         assert step_free_only > step_all_entries * 100
 
     def test_filter_with_no_saturated_entries_matches_legacy(self):
-        # If nobody is saturated the two formulas must coincide
-        # exactly so the F2 fix is a no-op in the healthy regime.
+        # If nobody is saturated, the filtered and unfiltered sums must
+        # coincide exactly (the filter is a no-op in the healthy regime).
         memory = {
             "a": (0.0, 10, 2, False),
             "b": (0.0, 10, 3, False),

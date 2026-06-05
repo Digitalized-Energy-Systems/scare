@@ -1,23 +1,19 @@
 """Unit tests for the L2.5 cross-sector coalition extension.
 
-Drives :class:`HolonSummaryRole`'s cross-sector detection +
-allocation path with a stub mango context (no agent world).  The
-goal is to demonstrate the *effect* of the
-``enable_cross_sector_coalitions`` knob in isolation:
+Drives :class:`HolonSummaryRole`'s cross-sector detection + allocation
+path with a stub mango context to verify the
+``enable_cross_sector_coalitions`` knob:
 
-* With the flag *off*, an injected cross-sector priority inversion
-  (e.g. electricity tier-1 served at 30 % while heat tier-5 is at
-  100 %, with a P2H between the two sectors) produces no
-  ``CPCommitment`` and no cross-sector ``StartBalanceNegotiation``.
-* With the flag *on*, the same inversion produces exactly one
-  ``CPCommitment`` to the P2H plus the corresponding service-
-  fraction commits — both registered in the shared
-  :class:`CoalitionConstraintStore` so the L3 CP envelope and the
-  L2 per-tier merge both see them.
+* Flag off: an injected cross-sector inversion (electricity tier-1 at
+  30 % while heat tier-5 is at 100 %, with a P2H between them) produces
+  no ``CPCommitment`` and no cross-sector ``StartBalanceNegotiation``.
+* Flag on: the same inversion produces one ``CPCommitment`` to the P2H
+  plus the per-sector service-fraction commits, both registered in the
+  shared :class:`CoalitionConstraintStore` so L2/L3 see them.
 
-No real ADMM solve is exercised — the cross-sector path uses the
-greedy priority-aware allocator that returns a deterministic
-transfer based on the CP's rated capacity + coupling ratio.
+No real ADMM solve runs — the path uses the greedy priority-aware
+allocator (deterministic transfer from CP rated capacity + coupling
+ratio).
 """
 
 from __future__ import annotations
@@ -40,9 +36,8 @@ from scare.community.summary import HolonSummaryRole, _xs_registry
 
 
 # ---------------------------------------------------------------------------
-# Fake mango context: just records outbound messages + carries an aid
-# and a sim-clock.  No scheduler — async role methods are driven
-# manually via ``asyncio.run``.
+# Fake mango context: records outbound messages, carries an aid + sim
+# clock. No scheduler — async role methods are driven via asyncio.run.
 # ---------------------------------------------------------------------------
 
 
@@ -68,20 +63,12 @@ class _FakeContext:
         self.addr = _Addr(aid)
         self.current_timestamp = t
         self.sent: list[_SentMessage] = []
-        # The role calls ``subscribe_message`` / ``schedule_periodic_task``
-        # / ``schedule_instant_task`` during ``setup``; we don't run
-        # ``setup`` in these tests, but the attributes exist for
-        # defensive symmetry with the real context.
 
     async def send_message(self, payload: Any, *, receiver_addr: Any) -> None:
         self.sent.append(_SentMessage(payload=payload, receiver_addr=receiver_addr))
 
-    # Used by ``_open_cross_sector_coalition`` to fan the dispatch into
-    # an instant task — we just await it inline so the test is
-    # deterministic.
+    # Capture the instant task so the test can await it deterministically.
     def schedule_instant_task(self, coro: Any) -> None:
-        # Capture so the test can choose to await it; here we run it
-        # directly via the event loop the test is using.
         self._pending = coro
 
     def schedule_periodic_task(self, *_args, **_kwargs) -> None:  # pragma: no cover
@@ -136,18 +123,15 @@ def _build_role(
         peer_leader_addrs=peer_leader_addrs or {},
     )
     role._context = _FakeContext(aid)
-    # Force cooldown into the past so the first tick is allowed to fire.
+    # Force cooldown into the past so the first tick may fire.
     role._last_xs_inversion_emit_t = -1e9
     role._inversion_cooldown_s = 0.0
     return role
 
 
 def _inject_inversion(behavior: Any) -> None:
-    """Populate the shared registry so the electricity-side detector
-    sees: electricity tier-1 at 30 % served, heat tier-5 at 100 %.
-
-    With a P2H between them, this is exactly the inversion the
-    cross-sector coalition is supposed to fix.
+    """Populate the shared registry: electricity tier-1 at 30 % served,
+    heat tier-5 at 100 % — the inversion the coalition should fix.
     """
     registry = _xs_registry(behavior)
     registry[Sector.ELECTRICITY] = {
@@ -167,21 +151,15 @@ def _inject_inversion(behavior: Any) -> None:
 
 
 def _p2h_meta(cp_addr: _Addr) -> dict[str, dict[str, Any]]:
-    """Single P2H bridging electricity (input) → heat (output) at η=0.9.
-
-    For the inversion above we need heat→electricity routing, so we
-    advertise the reverse direction too.  The role picks the direction
-    that pushes into the under-served sector (electricity), which
-    means η is keyed by ``(heat, electricity)``.  In reality a P2H is
-    one-directional; for the test we use a CHP-like CP that can drive
-    electricity from gas, but we keep the aid ``p2h-1`` for brevity.
+    """Single CP bridging heat → electricity. The role picks the
+    direction that pushes into the under-served sector (electricity), so
+    the coupling ratio is keyed ``(heat, electricity)``. η = 0.5 keeps
+    the expected transfer round-numbered.
     """
     return {
         "p2h-1": {
             "sectors": [Sector.ELECTRICITY, Sector.HEAT],
-            # Keyed (in_sec_v, out_sec_v): we want to be able to push
-            # *into* electricity, drawing *from* heat.  η = 0.5 chosen
-            # so the test's expected transfer is round-numbered.
+            # Keyed (in_sector, out_sector): push into electricity from heat.
             "coupling_ratios": {("heat", "electricity"): 0.5},
             "rated_capacity_mw": {"electricity": 1.0, "heat": 1.0},
             "addr": cp_addr,
@@ -195,10 +173,8 @@ def _p2h_meta(cp_addr: _Addr) -> dict[str, dict[str, Any]]:
 
 
 class TestCrossSectorCoalitionFlagDisabled:
-    """When ``enable_cross_sector_coalitions=False`` the same inversion
-    produces no cross-sector dispatch — only the legacy intra-sector
-    detector runs (which sees no inversion here because each sector
-    has just one tier in its registry).
+    """Flag off: the inversion produces no cross-sector dispatch; only
+    the intra-sector detector runs (and sees no inversion here).
     """
 
     def test_no_dispatch_when_disabled(self) -> None:
@@ -214,29 +190,20 @@ class TestCrossSectorCoalitionFlagDisabled:
             cp_meta=_p2h_meta(cp_addr),
             constraint_store=store,
         )
-        # Drive the synchronous detection path directly.  When the
-        # flag is False, ``_tick`` skips the cross-sector branch.
-        # We exercise the same code path explicitly here.
+        # _tick skips the cross-sector branch when the flag is False.
         if role.enable_cross_sector_coalitions:
             role._check_cross_sector_invariants()
-        # Nothing scheduled, nothing sent.
         assert not role.context.sent
         assert not role._active_xs_coalitions
         assert not store._cp_envelopes
 
 
 class TestCrossSectorCoalitionFlagEnabled:
-    """With the flag on, the same inversion fires a coalition.  We
-    assert on:
-    * The CPCommitment is dispatched to the P2H's address.
-    * Its ``target_flows_mw`` reflect the greedy allocation
-      (transfer bounded by demand, peer headroom, and CP rated cap).
-    * Two ``StartBalanceNegotiation`` payloads carry the per-sector
-      service fractions (one for electricity tier-1 raised, one for
-      heat tier-5 reduced).
-    * The shared :class:`CoalitionConstraintStore` carries both the
-      per-sector tier records AND the CP envelope so L2/L3 see the
-      commitment.
+    """Flag on: the inversion fires a coalition. Asserts the
+    CPCommitment is dispatched to the P2H with greedy-allocated
+    ``target_flows_mw``, two per-sector ``StartBalanceNegotiation``
+    payloads carry the raised/reduced fractions, and the shared store
+    carries both the tier records and the CP envelope.
     """
 
     def test_dispatch_when_enabled(self) -> None:
@@ -244,8 +211,7 @@ class TestCrossSectorCoalitionFlagEnabled:
         _inject_inversion(behavior)
         cp_addr = _Addr("p2h-1")
         store = CoalitionConstraintStore()
-        # Provide the peer-sector leader address so the heat-side
-        # StartBalanceNegotiation has somewhere to go.
+        # Peer-sector leader address for the heat-side dispatch.
         peer_addrs = {
             Sector.HEAT: {"leader-heat-1": _Addr("leader-heat-1")},
         }
@@ -258,10 +224,8 @@ class TestCrossSectorCoalitionFlagEnabled:
             peer_leader_addrs=peer_addrs,
             constraint_store=store,
         )
-        # The cross-sector detector schedules an instant task that the
-        # fake context captures rather than runs.  Drive the captured
-        # coroutine to completion synchronously here so the test
-        # observes the dispatched messages.
+        # The detector schedules an instant task; the fake context
+        # captures it. Drive it to completion to observe the dispatches.
         role._check_cross_sector_invariants()
         pending = getattr(role.context, "_pending", None)
         assert pending is not None, "cross-sector detector did not schedule a task"
@@ -291,8 +255,7 @@ class TestCrossSectorCoalitionFlagEnabled:
             m for m in role.context.sent
             if isinstance(m.payload, StartBalanceNegotiation)
         ]
-        # Expected dispatches: heat leader, own electricity leader.
-        # Each carries one sector's tier fraction.
+        # One dispatch per sector (heat leader + own electricity leader).
         sectors_dispatched = set()
         for m in sb_msgs:
             frac_map = m.payload.service_fraction_by_sector_priority or {}
@@ -313,18 +276,15 @@ class TestCrossSectorCoalitionFlagEnabled:
         assert heat_frac == pytest.approx(0.0)
 
         # ---- Coalition store written ----------------------------------
-        # The CP envelope is keyed by cp_id.
         env = store.cp_envelope_for("p2h-1", now=100.0)
         assert env is not None
         assert env["electricity"] == pytest.approx(0.5)
         assert env["heat"] == pytest.approx(-1.0)
         assert store.has_active_cp_envelope("p2h-1", now=100.0)
-        # After TTL the envelope is gone — confirms the barrier is
-        # time-bounded, which is what stops oscillation between the
-        # coalition and the underlying L2/L3 paths.
+        # Envelope is time-bounded — gone after TTL, which stops
+        # oscillation against the underlying L2/L3 paths.
         assert not store.has_active_cp_envelope("p2h-1", now=200.0)
 
-        # ---- Active coalition recorded for re-assertion ---------------
         assert len(role._active_xs_coalitions) == 1
 
     def test_branch_failure_invalidates(self) -> None:
@@ -358,9 +318,8 @@ class TestCrossSectorCoalitionFlagEnabled:
 
 
 class TestCrossSectorCoalitionFlagSideBySide:
-    """The two paths must produce *different* observable behaviour for
-    the *same* inputs — this is the headline knob the evaluation
-    campaigns will compare.
+    """The flag must produce different observable behaviour for the same
+    inputs.
     """
 
     def test_flag_changes_dispatch_count(self) -> None:

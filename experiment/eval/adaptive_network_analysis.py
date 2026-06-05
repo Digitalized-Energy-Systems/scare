@@ -1,32 +1,27 @@
-"""Adaptive-network analysis bundle for SCARE eval runs.
+"""Adaptive-network post-hoc analysis bundle for SCARE eval runs.
 
-Implements three of the post-hoc analysis tools from
-``docs/algorithms.tex`` §1.10 (Roadmap: Co-Evolutionary Network
-Dynamics):
+Co-evolutionary network dynamics tools, decoupled from the simulator:
 
-* **C.2 + C.3** — :func:`fit_mean_field_reduction` and
+* **C.2 + C.3** — :func:`fit_mean_field_reduction` /
   :func:`continue_bifurcation`: collapse a sweep of run trajectories
   into a low-dimensional ODE for the order parameter $\\bar\\eta(t)$
   and continue its equilibrium across a parameter axis to detect
   saddle-node / Hopf bifurcations.
 * **C.5** — :func:`cluster_synchronisation`: cluster the per-device
   regulation trajectories $\\{r_i(t)\\}$ by Pearson correlation and
-  compare the resulting partition against the static topology.
+  compare against the static topology.
 * **C.7** — :func:`fit_critical_exponents`: fit power laws
   $\\bar\\eta_\\infty \\sim |p - p_c|^{\\beta}$ and
-  $\\sigma^2 \\sim |p - p_c|^{-\\gamma}$ near a candidate critical
-  point.
+  $\\sigma^2 \\sim |p - p_c|^{-\\gamma}$ near a candidate critical point.
 
-The script reads SCARE's standard eval task layout (one folder per
-task with ``timeseries.csv``, ``served.csv``, ``events.csv``,
-``config.json``).  It is fully decoupled from the simulator and
-runs as a post-processing pass.
+Reads the standard eval task layout: one folder per task with
+``timeseries.csv``, ``served.csv``, ``events.csv``, ``config.json``.
 
 CLI examples
 ============
 
   python -m experiment.eval.adaptive_network_analysis \\
-      --eval-root experiment/_runs/eval/eval_quick_20260508-131411 \\
+      --eval-root experiment/_runs/eval/<run> \\
       --sweep-axis topo_rate_hz                                 \\
       --output experiment/_runs/analysis_adaptive
 
@@ -60,7 +55,7 @@ class TaskRun:
     task_id: str
     task_dir: Path
     config: dict
-    # 2-D matrix [time x quantity]; first column is time_s.
+    # 2-D matrix [time x quantity]; column 0 is time_s.
     timeseries: np.ndarray
     timeseries_columns: list[str]
     served: list[dict]
@@ -74,8 +69,6 @@ class TaskRun:
         if name not in self.timeseries_columns:
             return None
         return self.timeseries[:, self.timeseries_columns.index(name)]
-
-    # Simple per-run aggregates used by every analysis below ---------
 
     def served_fraction(self) -> float:
         if not self.served:
@@ -93,9 +86,8 @@ class TaskRun:
             total_srv += s
         return total_srv / total_dem if total_dem > 0 else 0.0
 
-    # Event kinds that signify a topology mutation (branch trip, tie
-    # switch closing, post-reconfiguration acknowledgement).  Names
-    # match the strings used by ``scare.base.diagnostics.record_event``.
+    # Event kinds signifying a topology mutation; names match
+    # ``scare.base.diagnostics.record_event``.
     _TOPOLOGY_EVENT_KINDS = frozenset({
         "line_failure",
         "branch_failure",
@@ -164,10 +156,9 @@ def load_eval_root(eval_root: Path) -> list[TaskRun]:
 def discover_axes(runs: Iterable[TaskRun], *, max_depth: int = 2) -> dict[str, set]:
     """Return dotted-path config keys whose value differs across runs.
 
-    Helps the user pick a sweep axis when they don't know the campaign
-    layout: anything with ≥2 distinct values is a candidate.  Returns
-    a ``{dotted_key: set_of_values}`` mapping; values are coerced to
-    str for hashability.
+    Candidate sweep axes: anything with >=2 distinct values.  Returns
+    ``{dotted_key: set_of_values}``; values are str-coerced for
+    hashability.
     """
     seen: dict[str, set] = defaultdict(set)
 
@@ -184,7 +175,7 @@ def discover_axes(runs: Iterable[TaskRun], *, max_depth: int = 2) -> dict[str, s
 
     for r in runs:
         walk("", r.config, 0)
-    # Drop keys with only one distinct value (those are constants, not axes).
+    # Single-valued keys are constants, not axes.
     return {k: v for k, v in seen.items() if len(v) >= 2}
 
 
@@ -194,10 +185,9 @@ def filter_runs(
     """Stratify a run set by ``key=value`` predicates.
 
     ``filter_spec`` is a comma-separated list, e.g.
-    ``"variant=scare,grid=simbench_lv_constrained_45"``.  Empty / None
-    is the identity.  Dotted keys (``scenario.kind=clean``) are
-    supported.  Each predicate must match exactly via str-coerced
-    comparison.
+    ``"variant=scare,grid=simbench_lv"``.  Empty/None is the identity.
+    Dotted keys (``scenario.kind=clean``) are supported; each predicate
+    matches exactly via str-coerced comparison.
     """
     runs = list(runs)
     if not filter_spec:
@@ -249,8 +239,7 @@ def _read_csv_dicts(path: Path) -> list[dict]:
 
 
 def _coerce_scalar(s: str):
-    """Robust scalar parser: returns float for numeric / nan / inf,
-    otherwise the original string."""
+    """Return float for numeric/nan/inf tokens, else the original string."""
     sl = s.strip().lower()
     if sl in _NUMERIC_TOKENS:
         return float(sl)
@@ -291,13 +280,9 @@ def fit_mean_field_reduction(
 ) -> MeanFieldFit:
     """Fit the mean-field ODE parameters across a set of runs.
 
-    The order parameter $\\bar\\eta(t)$ is the served-load fraction
-    over time, reconstructed from the per-task ``timeseries`` plus
-    ``served`` aggregates.  Falls back to the
-    ``electrical_balance / max(electrical_balance)`` proxy when
-    served data is unavailable.
-
-    The ODE is fit by linear regression on
+    The order parameter $\\bar\\eta(t)$ is the served-load fraction over
+    time, falling back to a normalised ``electrical_balance`` proxy when
+    served data is unavailable.  Fit by linear regression on
     $\\dot{\\bar\\eta} \\approx -\\gamma_{\\rm eff}\\,(\\bar\\eta - \\eta_\\infty)$,
     a one-parameter compression of the slow-fast joint dynamics.
     """
@@ -305,8 +290,8 @@ def fit_mean_field_reduction(
     if not runs:
         raise ValueError("fit_mean_field_reduction: no runs")
 
-    # Collect (eta(t), eta_dot(t)) pairs across runs.  Auto-pick the
-    # decimation period: aim for ~16 bins per run, never below 0.05 s.
+    # Collect (eta, eta_dot) pairs across runs; decimation aims for
+    # ~16 bins per run, never below 0.05 s.
     pairs_eta: list[float] = []
     pairs_dot: list[float] = []
 
@@ -315,10 +300,9 @@ def fit_mean_field_reduction(
         if eta_series is None or len(eta_series) < 4:
             continue
         t = r.t
-        # Skip flat trajectories — no information to extract.
+        # Flat trajectories carry no information.
         if float(np.std(eta_series)) < 1e-9:
             continue
-        # Auto-pick a per-run period if the caller didn't specify one.
         period = sample_period_s
         if period is None:
             span = float(t[-1] - t[0])
@@ -332,7 +316,6 @@ def fit_mean_field_reduction(
         # Forward differences for eta_dot.
         dt = np.diff(td)
         eta_dot = np.diff(eta) / np.where(dt > 0, dt, 1.0)
-        # Pair eta(t) with eta_dot(t)
         pairs_eta.extend(eta[:-1].tolist())
         pairs_dot.extend(eta_dot.tolist())
 
@@ -345,8 +328,7 @@ def fit_mean_field_reduction(
     eta_arr = np.asarray(pairs_eta, dtype=float)
     dot_arr = np.asarray(pairs_dot, dtype=float)
 
-    # Linear regression: eta_dot = -gamma * (eta - eta_inf)
-    # Reparameterise: eta_dot = a * eta + b, with a = -gamma, b = gamma * eta_inf
+    # Fit eta_dot = a*eta + b, where a = -gamma, b = gamma*eta_inf.
     A = np.vstack([eta_arr, np.ones_like(eta_arr)]).T
     coef, residuals, _, _ = np.linalg.lstsq(A, dot_arr, rcond=None)
     a, b = float(coef[0]), float(coef[1])
@@ -355,7 +337,7 @@ def fit_mean_field_reduction(
     pred = a * eta_arr + b
     rms = float(np.sqrt(np.mean((dot_arr - pred) ** 2)))
 
-    # nu_topo proxy: average topology dirtiness across runs.
+    # nu_topo proxy: mean topology dirtiness across runs.
     nu_topo = float(np.mean([r.topology_dirtiness() for r in runs]))
 
     return MeanFieldFit(
@@ -368,14 +350,13 @@ def fit_mean_field_reduction(
 
 
 def _eta_series(run: TaskRun, *, served_col: str | None = None) -> np.ndarray | None:
-    """Construct an estimate of the served-load fraction over time.
+    """Estimate the served-load fraction over time.
 
-    Tries (in order): explicit ``served_col`` if provided;
-    ``electrical_balance``; ``gas_balance``; ``heat_balance``.  The
-    first column with non-zero variance wins.  All three balance
-    columns are normalised so that an initially imbalanced system
-    starts at $\\eta = 0$ and converges toward $\\eta = 1$ as the
-    imbalance is absorbed.
+    Tries (in order) ``served_col``, ``electrical_balance``,
+    ``gas_balance``, ``heat_balance``; first column with non-zero
+    variance wins.  Balance columns are normalised so an initially
+    imbalanced system starts at $\\eta = 0$ and converges toward
+    $\\eta = 1$ as the imbalance is absorbed.
     """
     candidates: list[str] = []
     if served_col is not None:
@@ -445,12 +426,10 @@ def continue_bifurcation(
 ) -> BifurcationContinuation:
     """Continue the equilibrium $\\bar\\eta_\\infty(p)$ along a swept axis $p$.
 
-    ``axis`` is read from each run's ``config.json`` (e.g.
-    ``"topo_rate_hz"``, ``"gamma_s"``).  Runs are bucketed into
-    ``bin_count`` quantile bins on the axis; for each bin we record
-    mean and variance of the run-end served fraction.  Bins where
-    variance jumps abruptly relative to neighbours flag candidate
-    bifurcation points.
+    ``axis`` is read from each run's ``config.json``.  Runs are bucketed
+    into ``bin_count`` quantile bins on the axis; each bin records mean
+    and variance of the run-end served fraction.  Bins where variance
+    jumps abruptly relative to neighbours flag candidate bifurcations.
     """
     runs = list(runs)
     if not runs:
@@ -498,13 +477,12 @@ def continue_bifurcation(
             )
         )
 
-    # Detect bifurcations.  Use *relative* thresholds so the detector
-    # works whether the order parameter ranges over [0, 1] or [0.95, 1.0]:
-    #   * saddle-node: largest one-step Δη / total η range  > 0.25
-    #   * critical slowing down: variance > 3× the bins-wise median
-    # Skip detection when fewer than 3 bins are populated — with 2 bins
-    # the relative-step detector trivially fires (the only step IS the
-    # range), giving false positives.
+    # Relative thresholds so detection works whether the order parameter
+    # spans [0, 1] or [0.95, 1.0]:
+    #   * saddle-node: largest one-step delta-eta / eta range > 0.25
+    #   * critical slowing down: variance > 3x the bin-wise median
+    # Need >=3 bins: with 2, the only step IS the range, so the
+    # relative-step detector trivially fires.
     detected: list[dict] = []
     if len(points) < 3:
         return BifurcationContinuation(axis=axis, points=points, detected=detected)
@@ -516,7 +494,7 @@ def continue_bifurcation(
     for k in range(len(points)):
         prev = points[k - 1] if k > 0 else None
         nxt = points[k + 1] if k < len(points) - 1 else None
-        # Saddle-node: significant step *into or out of* this bin.
+        # Saddle-node: significant step into or out of this bin.
         steps = []
         if prev is not None:
             steps.append(abs(points[k].eta_eq - prev.eta_eq))
@@ -560,8 +538,8 @@ class ClusterSynchronisationResult:
     n_devices: int
     n_clusters: int
     cluster_assignment: dict[str, int]   # aid -> cluster id
-    static_groups: dict[str, str]        # aid -> static group label (if any)
-    dynamic_vs_static_score: float       # Adjusted Rand-style overlap
+    static_groups: dict[str, str]        # aid -> static group label
+    dynamic_vs_static_score: float       # Rand-style partition overlap
     notes: list[str] = field(default_factory=list)
 
 
@@ -571,15 +549,12 @@ def cluster_synchronisation(
     threshold: float = 0.6,
     aid_traj_csv: Path | None = None,
 ) -> ClusterSynchronisationResult:
-    """Cluster the per-device regulation trajectories by Pearson
-    correlation and compare against the static topology grouping.
+    """Cluster per-device regulation trajectories by Pearson correlation
+    and compare against the static topology grouping.
 
-    Looks for a ``trajectories.csv`` (per-aid time series of
-    regulation factor) in the task folder.  The default
-    ``timeseries.csv`` is per-system, so this analysis only fires
-    when the diagnostics layer has been instrumented to write per-aid
-    trajectories.  If that file is missing, the function returns an
-    empty result with an explanatory note.
+    Requires a per-aid ``trajectories.csv`` in the task folder (the
+    default ``timeseries.csv`` is per-system).  Returns an empty result
+    with a note when that file is missing.
     """
     notes: list[str] = []
     traj_path = aid_traj_csv if aid_traj_csv is not None else (
@@ -588,7 +563,7 @@ def cluster_synchronisation(
 
     if not traj_path.exists():
         notes.append(
-            "trajectories.csv missing — instrument diagnostics.py to log "
+            "trajectories.csv missing; instrument diagnostics.py to log "
             "per-aid r_i(t) for cluster-sync analysis."
         )
         return ClusterSynchronisationResult(
@@ -663,8 +638,7 @@ def cluster_synchronisation(
             next_id += 1
         clusters[aid_cols[ci]] = label_for_root[root]
 
-    # Static groups: read from events ``holon_formed`` records or simply
-    # from a ``static_groups.csv`` if present.
+    # Static groups: read from ``static_groups.csv`` if present.
     static_groups: dict[str, str] = {}
     sg_path = traj_path.parent / "static_groups.csv"
     if sg_path.exists():
@@ -690,11 +664,10 @@ def cluster_synchronisation(
 def _partition_overlap(
     a: dict[str, int], b: dict[str, str]
 ) -> float:
-    """Adjusted Rand-style overlap between two partitions.
+    """Pair-counting Rand index (unadjusted) between two partitions.
 
-    Returns NaN if either partition is empty.  Implementation is a
-    simple pair-counting Rand index (not adjusted) to avoid pulling
-    in scikit-learn for a one-line dependency.
+    Returns NaN if either partition is empty.  Avoids a scikit-learn
+    dependency.
     """
     if not a or not b:
         return float("nan")
@@ -733,7 +706,7 @@ class CriticalExponentFit:
     parameter_axis: str
     p_critical: float
     beta: float            # eta ~ |p - p_c|^beta
-    gamma: float           # var(eta) ~ |p - p_c|^(-gamma)
+    gamma: float           # var(eta) ~ |p - p_c|^-gamma
     rms_eta: float
     rms_var: float
     n_points: int
@@ -782,21 +755,20 @@ def fit_critical_exponents(
     eta = np.array([p.eta_eq for p in sub])
     var = np.array([max(p.eta_var, 1e-9) for p in sub])
 
-    # eta ~ A * dp^beta + b   →  log(|eta - inf|) = log(A) + beta*log(dp)
+    # log(|eta - inf|) = log(A) + beta*log(dp)
     eta_inf = float(np.median(eta))
     eta_dev = np.abs(eta - eta_inf) + 1e-9
     log_dp = np.log(dp)
     log_eta = np.log(eta_dev)
     log_var = np.log(var)
 
-    # Linear regression in log-log
+    # Log-log linear regression.
     A = np.vstack([log_dp, np.ones_like(log_dp)]).T
     beta_coef, *_ = np.linalg.lstsq(A, log_eta, rcond=None)
     gamma_coef, *_ = np.linalg.lstsq(A, log_var, rcond=None)
     beta = float(beta_coef[0])
     gamma = float(-gamma_coef[0])
 
-    # RMS residuals
     pred_eta = beta_coef[0] * log_dp + beta_coef[1]
     pred_var = gamma_coef[0] * log_dp + gamma_coef[1]
     rms_eta = float(np.sqrt(np.mean((log_eta - pred_eta) ** 2)))
@@ -821,9 +793,8 @@ def fit_critical_exponents(
 def _try_import_matplotlib():
     """Return ``(plt, mpl)`` or ``(None, None)`` if matplotlib is missing.
 
-    Uses the Agg backend so plots can be generated headlessly (no
-    display) and saved to disk.  Importing is wrapped in try/except so
-    the rest of the analysis still works when the dependency is absent.
+    Uses the Agg backend for headless rendering; the analysis still runs
+    when matplotlib is absent.
     """
     try:
         import matplotlib  # noqa: F401
@@ -879,7 +850,7 @@ def plot_mean_field(
         eta_arr = np.asarray(pairs_eta)
         dot_arr = np.asarray(pairs_dot)
         ax1.scatter(eta_arr, dot_arr, s=8, alpha=0.4)
-        # Fitted line: dot = -gamma (eta - eta_inf)
+        # Fitted line: dot = -gamma*(eta - eta_inf).
         xs = np.linspace(np.min(eta_arr), np.max(eta_arr), 50)
         ys = -fit.gamma * (xs - fit.eta_infinity)
         ax1.plot(xs, ys, "r-", lw=2,
@@ -922,7 +893,7 @@ def plot_bifurcation(
     eta = np.asarray([pt.eta_eq for pt in cont.points])
     var = np.asarray([pt.eta_var for pt in cont.points])
     n = np.asarray([pt.n_runs for pt in cont.points])
-    sem = np.sqrt(var / np.where(n > 0, n, 1))  # standard error of mean
+    sem = np.sqrt(var / np.where(n > 0, n, 1))  # standard error of the mean
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
     ax1.errorbar(p, eta, yerr=sem, fmt="o-", lw=1.5, capsize=3)
@@ -1159,7 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.filter:
         print(f"Filter '{args.filter}' kept {len(runs)} runs.")
 
-    # Auto-pick a sweep axis if the user didn't specify one.
+    # Auto-pick a sweep axis when unspecified.
     if args.sweep_axis is None:
         args.sweep_axis = _pick_sweep_axis(runs)
         if args.sweep_axis is None:
@@ -1267,7 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
                     "dynamic_vs_static": cs.dynamic_vs_static_score,
                     "notes": cs.notes,
                 })
-                # Plot the first 3 tasks that have non-empty trajectories.
+                # Plot the first 3 tasks with non-empty trajectories.
                 if do_plots and cs.n_devices > 0 and plotted_examples < 3:
                     out_png = plots_dir / f"cluster_sync_{r.task_id}.png"
                     if plot_cluster_synchronisation(r, cs, output=out_png):
@@ -1301,22 +1272,16 @@ def _is_numeric_str(s: str) -> bool:
         return False
 
 
-# Nuisance axes that look like sweep candidates but aren't: per-run
-# identifiers and reproducibility seeds.  Excluded from auto-detection.
+# Per-run identifiers and seeds: look like sweep candidates but aren't.
 _AXIS_NUISANCE = frozenset({"task_id", "seed", "base_seed"})
 
 
 def _pick_sweep_axis(runs: list[TaskRun]) -> str | None:
     """Choose the most plausible numeric sweep axis automatically.
 
-    Preference order:
-      1. Numeric axes with 3–12 distinct values (the "sweep sweet spot");
-      2. Numeric axes with ≥2 distinct values;
-      3. Otherwise: nothing.
-
-    Excludes ``task_id``, ``seed``, ``base_seed`` because those are
-    nuisance variables that vary by construction without representing
-    a meaningful sweep.
+    Prefers numeric axes with 3-12 distinct values, then any with >=2;
+    otherwise returns None.  Excludes the nuisance axes in
+    ``_AXIS_NUISANCE``.
     """
     axes = discover_axes(runs)
     candidates: list[tuple[str, int]] = []
@@ -1328,7 +1293,7 @@ def _pick_sweep_axis(runs: list[TaskRun]) -> str | None:
             candidates.append((k, len(numeric)))
     if not candidates:
         return None
-    # Score: prefer 3..12 distinct values; penalise too many or too few.
+    # Prefer 3..12 distinct values; penalise too many or too few.
     def score(item):
         _, n = item
         if 3 <= n <= 12:

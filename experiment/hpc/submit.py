@@ -87,9 +87,8 @@ def _aggregator_command(campaign_dir: Path, slurm: SlurmConfig, after_job: str, 
         f"exec {shlex.quote(py)} -m experiment.hpc.aggregate "
         f"--campaign-dir {shlex.quote(str(campaign_dir))}"
     )
-    # Aggregator is single-task and lightweight: bypass the heavy slurm
-    # flags but keep partition/account/nodelist so it lands on the same
-    # cluster slice the user is allowed to use.
+    # Aggregator is lightweight: bypass the heavy slurm flags but keep
+    # partition/account/nodelist so it lands on the user's cluster slice.
     light_flags = ["--cpus-per-task=1", "--mem=2G", "--time=00:10:00"]
     for k in ("partition", "account", "qos", "nodelist", "exclude"):
         v = getattr(slurm, k)

@@ -1,17 +1,14 @@
 """Display-only alias loader for the plotting + report layer.
 
-The runtime pipeline (runner / aggregator) keeps the canonical long
-names like ``simbench_lv_constrained_45``; only the figure / markdown
-stitching layer translates to the short labels defined in
-``experiment/configs/display_aliases.json``.  Missing entries pass
-through unchanged.
+The runtime pipeline keeps canonical long names (e.g.
+``simbench_lv_constrained_45``); only the figure / markdown layer translates
+to the short labels in ``experiment/configs/display_aliases.json``.  Missing
+entries pass through unchanged.
 
-Scenario aliasing is rule-based rather than table-based, because the
-scenario keys are flat ``a=b;c=d`` strings produced by the aggregator
-and writing them out long-hand for every campaign would be tedious.
-``alias_scenario`` parses the key and produces a tight label like
-``conc-5;skewed`` or ``cold-day;1.5x`` so the report tables stay
-readable without a config entry per scenario combination.
+Scenario aliasing is rule-based, not table-based: scenario keys are flat
+``a=b;c=d`` strings, and ``alias_scenario`` parses them into compact labels
+(e.g. ``conc-5;skewed``, ``cold-day;1.5x``) without a config entry per
+combination.
 """
 from __future__ import annotations
 

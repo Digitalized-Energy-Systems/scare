@@ -1,50 +1,30 @@
 """L3 priority-cascaded sharing ADMM role — replicated, coordinator-free.
 
-Per-CP role that holds the wiring side of the L3 redesign whose
-compute kernel lives in :mod:`scare.service.cp_priority_admm`.  The
-role runs that kernel locally on a gossiped peer view and commits
-*only* its own regulation factor via :func:`apply_regulate`.  There is
-no coordinator election, no per-component fan-out, and no `CPAllocation`
-envelope — every CP that holds a quorum-fresh view reaches the same
+Per-CP wiring around the compute kernel in
+:mod:`scare.service.cp_priority_admm`. The role runs that kernel locally on a
+gossiped peer view and commits *only* its own regulation factor via
+:func:`apply_regulate`. No coordinator election, no per-component fan-out, no
+CPAllocation envelope — every CP with a quorum-fresh view reaches the same
 allocation independently because the kernel is deterministic.
 
-Mesh
-----
+Mesh: the role observes two channels. :class:`HolonSummary` from every leader in
+every bridged sector (via ``holon_summary_<sector>`` overlays), from which
+per-sector demand/supply is aggregated across the latest summary per leader; and
+:class:`CPSummary` from every other CP in the cross-sector component (via a
+global ``cp_summary`` full-mesh), published event-driven with a delta gate + a
+watchdog so peers can build their replicated view.
 
-Each role observes two channels of typed summaries:
+Lifecycle: on install the role publishes its initial CPSummary and schedules a
+watchdog that re-publishes capacity unconditionally every ``watchdog_s`` (30 s
+default) so late joiners see the frontier. Each incoming HolonSummary flips a
+``dirty`` flag; the next min-gap-throttled tick runs the kernel on the current
+view and commits the CP's horizon-0 factor (no further messages — peers pick up
+the effect on the next L2 summary round). Branch failures invalidate the
+reachable-peer set via the shared :class:`GridTopologyMirror`, so the next
+kernel run excludes islanded peers automatically.
 
-- :class:`HolonSummary` from every leader in every sector this CP
-  bridges, sourced from the existing
-  ``holon_summary_<sector>`` overlays.  The CP joins those topologies
-  at scenario build time.  Demand / supply per sector is reconstructed
-  from these by aggregating across the latest summary per leader.
-- :class:`CPSummary` from every other CP in the cross-sector component,
-  sourced from a new global ``cp_summary`` full-mesh topology.  Each
-  CP publishes its own summary event-driven (with a delta gate and a
-  long watchdog) so peers can build their replicated view.
-
-Lifecycle
----------
-
-* On install, the role publishes its initial :class:`CPSummary` and
-  schedules a watchdog tick that re-publishes the current capacity
-  unconditionally every ``watchdog_s`` (default 30 s) so late-joining
-  peers always observe the frontier.
-* Each incoming :class:`HolonSummary` flips a ``dirty`` flag; the
-  next minimum-gap-throttled tick consumes it and runs
-  :func:`solve_cp_priority_admm` on the current replicated view.
-* The kernel returns this CP's regulation factor for the horizon-0
-  step; the role commits it via ``apply_regulate(...,
-  sector="cp", reason="cp_priority_admm")``.  No further messages are
-  sent — peers will pick up the implied effect on the next round of
-  L2 summaries.
-* Branch failures invalidate the CP's reachable-peer set via the
-  shared :class:`~scare.base.topology_mirror.GridTopologyMirror`.  The
-  next kernel run automatically excludes islanded peers because the
-  role consults the mirror when filtering ``_peer_summaries``.
-
-Receding-horizon support is reserved on the kernel side (``H``-axis
-in every input array); the role's MVP runs at ``H = 1``.
+Receding-horizon support is reserved on the kernel side (``H`` axis); the role's
+MVP runs at H = 1.
 """
 
 from __future__ import annotations
@@ -68,56 +48,44 @@ from distributed_resource_optimization.algorithm.gossip_lexicographic_cascade.co
     create_gossip_cascade_participant,
     create_gossip_cascade_start,
 )
+from distributed_resource_optimization.carrier.mango import MangoCarrier
 
 from scare.service.cp_priority_admm import (
     CPSpec,
     SectorDemand,
-    solve_cp_priority_admm,
 )
 
 
 # ---------------------------------------------------------------------------
-# Minimal Carrier adapter wrapping a mango role context.
+# Carrier: the standard DRO MangoCarrier, specialised only in its peer set.
 # ---------------------------------------------------------------------------
 
 
-class _MangoGossipCarrier:
-    """Thin :class:`Carrier`-shaped adapter the
-    :class:`~distributed_resource_optimization.algorithm.gossip_lexicographic_cascade.core.GossipParticipant`
-    can drive from inside a mango role.
+class _ReachableCPCarrier(MangoCarrier):
+    """The standard DRO :class:`MangoCarrier`, with the gossip broadcast set
+    restricted to the CP peers currently reachable across the cross-sector graph
+    (post-failure) instead of the static mango topology.
 
-    Only implements the two methods the gossip participant uses
-    (:meth:`send_to_other` and :meth:`others`); the rest of the
-    :class:`Carrier` interface is intentionally omitted because the
-    gossip protocol is fire-and-forget — no awaitable replies, no
-    request/response matching.
+    This reachability-scoped ``others`` is scare's *only* carrier customisation;
+    every other part of the Carrier contract — send/reply, request-reply
+    futures, ``spawn``, and the simulation-clock ``now``/``sleep`` domain — is
+    inherited from ``MangoCarrier`` (the canonical DRO↔mango integration), so
+    scare no longer hand-maintains a partial, drift-prone reimplementation.
     """
 
     def __init__(self, role: "CPPriorityAdmmRole") -> None:
+        super().__init__(role)
         self._role = role
 
-    def send_to_other(self, content: Any, receiver: Any, meta: Any = None) -> None:
-        # Fire-and-forget; we don't need the task handle.  Routes
-        # through the role's mango context.
-        try:
-            self._role.context.schedule_instant_task(
-                self._role.context.send_message(content, receiver_addr=receiver)
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "[%s] gossip send failed to %r: %s",
-                self._role.cp_id, receiver, exc,
-            )
-
     def others(self, participant_id: str) -> list[Any]:
-        # Restrict to reachable peers — the topology-mirror filter
-        # naturally bounds the broadcast set.  Falls back to every
+        # Restrict the broadcast set to reachable peers; falls back to every
         # known peer if the mirror isn't injected (test contexts).
         reachable = self._role._reachable_peer_cp_ids()
         return [
             addr for cp_id, addr in self._role._peer_cp_addrs.items()
             if cp_id in reachable
         ]
+
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -141,8 +109,6 @@ class CPPriorityAdmmRole(Role):
         rebalance_min_gap_s: float = 0.5,
         horizon: int = 1,
         rho: float = 1.0,
-        priority_weight_base: float = 1.0e4,
-        r_damping: float = 0.3,
         admm_max_iters: int = 200,
         admm_abs_tol: float = 1e-3,
         algorithm: str = "lexicographic",
@@ -154,17 +120,14 @@ class CPPriorityAdmmRole(Role):
         self.cp_id = cp_id
         self.capacity_by_sector = dict(capacity_by_sector)
         self.bridged_sectors = list(bridged_sectors)
-        # When set, the heat sector's L3 base supply is the *delivered*
-        # heat (Σ served) rather than the (unbounded) heat-slack budget,
-        # so the unmet heat demand drives heat-producing CPs to ramp.
+        # When set, heat's L3 base supply is the *delivered* heat (Σ served), not
+        # the unbounded heat-slack budget, so unmet heat demand drives heat CPs to ramp.
         self.heat_supply_from_deficit = bool(heat_supply_from_deficit)
         self.home_node_id = home_node_id
         self.watchdog_s = watchdog_s
         self.rebalance_min_gap_s = rebalance_min_gap_s
         self.horizon = int(horizon)
         self.rho = float(rho)
-        self.priority_weight_base = float(priority_weight_base)
-        self.r_damping = float(r_damping)
         self.admm_max_iters = int(admm_max_iters)
         self.admm_abs_tol = float(admm_abs_tol)
         self.algorithm = str(algorithm)
@@ -188,12 +151,10 @@ class CPPriorityAdmmRole(Role):
         self._peer_cp_addrs: dict[str, Any] = {}
         self._peer_cp_node_ids: dict[str, Any] = {}
 
-        # Gossip mode state — populated lazily in :meth:`setup` so the
-        # participant captures ``self`` (for the on_commit callback) and
-        # the carrier adapter has the role context to send through.
-        # Stays unused in the replicated modes.
+        # Gossip-mode state, populated lazily in :meth:`setup`. Unused in the
+        # replicated modes.
         self._gossip_participant = None
-        self._gossip_carrier: _MangoGossipCarrier | None = None
+        self._gossip_carrier: _ReachableCPCarrier | None = None
         self._gossip_round_id: int = 0
 
     # ------------------------------------------------------------------
@@ -207,9 +168,8 @@ class CPPriorityAdmmRole(Role):
         peer_cp_addrs: dict[str, Any],
         peer_cp_node_ids: dict[str, Any],
     ) -> None:
-        """Inject the cross-sector reachability mirror plus the
-        address book of every CP in the world.  Mirrors
-        :meth:`EnergyConverterRole.wire_multi_sector_l3` so the
+        """Inject the cross-sector reachability mirror plus the address book of
+        every CP. Mirrors :meth:`EnergyConverterRole.wire_multi_sector_l3` so the
         scenario builder can wire either L3 path with the same data.
         """
         self._topology_mirror = topology_mirror
@@ -244,12 +204,9 @@ class CPPriorityAdmmRole(Role):
             ),
         )
 
-        # Gossip mode subscriptions — route Init and Iter messages to
-        # the gossip participant.  Installed unconditionally so flipping
-        # ``self.algorithm`` between modes never strands an in-flight
-        # round.  No-op for the replicated modes (participant is None).
+        # Gossip-mode subscriptions: route Init/Iter to the gossip participant.
         if self.algorithm == "gossip":
-            self._gossip_carrier = _MangoGossipCarrier(self)
+            self._gossip_carrier = _ReachableCPCarrier(self)
             self._gossip_participant = create_gossip_cascade_participant(
                 cp_id=self.cp_id,
                 capacity_by_sector=self.capacity_by_sector,
@@ -261,12 +218,11 @@ class CPPriorityAdmmRole(Role):
                 lambda msg, meta: isinstance(msg, (GossipCascadeInit, GossipIter)),
             )
 
-        # Initial publish: announce our existence and capacity so peer
-        # CPs can include us in their replicated view from the first
-        # kernel run.
+        # Initial publish: announce capacity so peer CPs include us from their
+        # first kernel run.
         self.context.schedule_instant_task(self._publish(force=True))
-        # Watchdog: periodically re-publish (so a peer that joins late
-        # eventually sees us) and run a kernel pass.
+        # Watchdog: periodically re-publish (so late joiners see us) and run a
+        # kernel pass.
         try:
             self.context.schedule_periodic_task(
                 coroutine_creator=self._tick, delay=self.watchdog_s,
@@ -281,15 +237,13 @@ class CPPriorityAdmmRole(Role):
     # ------------------------------------------------------------------
 
     async def _publish(self, *, force: bool = False) -> None:
-        """Send a fresh :class:`CPSummary` to every peer CP we know
-        about.  Delta-gated on capacity changes; ``force=True`` bypasses
-        the gate (used on first publish, on watchdog tick, and after a
-        post-rebalance state shift).
+        """Send a fresh :class:`CPSummary` to every known peer CP. Delta-gated on
+        capacity changes; ``force=True`` bypasses the gate (first publish,
+        watchdog tick, post-rebalance shift).
         """
         if not self._peer_cp_addrs and not force:
             return
-        # Delta gate: skip when capacity hasn't materially shifted.
-        # Capacity rarely moves in steady state; the gate keeps the
+        # Delta gate: skip when capacity hasn't materially shifted, keeping the
         # mesh quiet between failures.
         if not force and not self._capacity_changed():
             return
@@ -325,8 +279,8 @@ class CPPriorityAdmmRole(Role):
     async def _on_holon_summary(
         self, message: HolonSummary, meta: dict
     ) -> None:
-        """Cache the latest summary per (sector, leader) and mark the
-        kernel as dirty so the next throttled tick re-runs it.
+        """Cache the latest summary per (sector, leader) and mark dirty so the
+        next throttled tick re-runs the kernel.
         """
         sender = mango_sender_addr(meta)
         leader_aid = getattr(sender, "aid", None) or str(sender)
@@ -350,9 +304,9 @@ class CPPriorityAdmmRole(Role):
         await self._maybe_rebalance()
 
     async def _tick(self) -> None:
-        """Watchdog: refresh our published summary and re-evaluate.
-        Set ``_dirty`` so :meth:`_maybe_rebalance` runs even when no
-        peer summary has arrived during the last interval.
+        """Watchdog: refresh our published summary and re-evaluate. Sets
+        ``_dirty`` so :meth:`_maybe_rebalance` runs even when no peer summary
+        arrived this interval.
         """
         await self._publish(force=True)
         self._dirty = True
@@ -379,12 +333,10 @@ class CPPriorityAdmmRole(Role):
         )
 
     def _reachable_peer_cp_ids(self) -> set[str]:
-        """CPs reachable through the live cross-sector subgraph.
-
-        Without the mirror (test contexts) we assume every announced
-        peer is reachable.  With the mirror, we BFS from our own node
-        through same-sector edges and CP bridges and admit only peers
-        whose host node is in the reachable set.
+        """CPs reachable through the live cross-sector subgraph. Without the
+        mirror (test contexts) every announced peer is assumed reachable; with
+        it, BFS from our node through same-sector edges and CP bridges and admit
+        only peers whose host node is in the reachable set.
         """
         if self._topology_mirror is None or self.home_node_id is None:
             return set(self._peer_cps.keys())
@@ -403,11 +355,8 @@ class CPPriorityAdmmRole(Role):
 
     def _build_demands(self) -> list[SectorDemand]:
         """Aggregate the latest HolonSummary per leader into one
-        :class:`SectorDemand` per bridged sector.  Sectors with no
-        observed summaries yet contribute an empty demand (zero
-        supply, no demand) — the kernel handles this gracefully and
-        the CP simply stays at its current factor until summaries
-        arrive.
+        :class:`SectorDemand` per bridged sector. Sectors with no summaries yet
+        are skipped; the CP stays at its current factor until they arrive.
         """
         H = self.horizon
         demands: list[SectorDemand] = []
@@ -419,35 +368,28 @@ class CPPriorityAdmmRole(Role):
             heat_deficit_mode = (
                 self.heat_supply_from_deficit and sec_v == Sector.HEAT.value
             )
-            # Input-sector capping: when the heat→L3 mode is active, the
-            # CP-input sectors (electricity, gas) also use the delivered-
-            # supply reframe so a CP's draw is bounded by the binding per-
-            # slack operator budget (`slack_budget_by_sector`) rather than
-            # the aggregate generator pool.  Without this, B_el is a
-            # phantom sum of every electricity leader's |cap| (≈100× the
-            # child-118 budget on cp_heavy) and the kernel constraint
-            # never binds on the P2H electricity draw — see Issue A.
+            # Input-sector capping: under heat→L3 mode the CP-input sectors
+            # (electricity, gas) also use the delivered-supply reframe so a CP's
+            # draw is bounded by the binding slack_budget_by_sector rather than
+            # the aggregate generator pool. Without it B_el is a phantom sum of
+            # every leader's |cap| and the kernel never binds the P2H draw.
             input_capped_mode = (
                 self.heat_supply_from_deficit
                 and sec_v in (Sector.ELECTRICITY.value, Sector.GAS.value)
             )
             for summary in bucket.values():
                 if heat_deficit_mode:
-                    # Heat delivery is temperature-limited, not MW-limited:
-                    # the unbounded heat slack would otherwise report an
-                    # effectively-infinite pool and L3 would never ramp a
-                    # heat CP.  Use the *delivered* heat (Σ served) as the
-                    # base supply so the unmet demand (nominal − delivered)
-                    # becomes the gap the reachable CHP/P2H units fill.
+                    # Heat delivery is temperature-limited, not MW-limited: the
+                    # unbounded heat slack reads as an infinite pool so L3 never
+                    # ramps a heat CP. Use delivered heat (Σ served) as base
+                    # supply so unmet demand becomes the gap CHP/P2H units fill.
                     served_map = (summary.served_by_sector_priority or {}).get(sec_v, {})
                     agg_supply += sum(float(v) for v in served_map.values())
                 elif input_capped_mode:
-                    # B_s = currently delivered + binding slack's eff_budget.
-                    # The first term keeps existing load service feasible
-                    # in the kernel; the second is the additional draw the
-                    # operator allows through the slack, so a CP consuming
-                    # from this sector is capped at the slack budget rather
-                    # than the unbounded non-slack |cap| pool.
+                    # B_s = currently delivered + binding slack's eff_budget. The
+                    # first term keeps existing load service feasible; the second
+                    # is the extra draw the operator allows, capping a consuming
+                    # CP at the slack budget rather than the unbounded |cap| pool.
                     served_map = (summary.served_by_sector_priority or {}).get(sec_v, {})
                     agg_supply += sum(float(v) for v in served_map.values())
                     slack_map = summary.slack_budget_by_sector or {}
@@ -460,16 +402,10 @@ class CPPriorityAdmmRole(Role):
                     agg_demand[int(tier)] = agg_demand.get(int(tier), 0.0) + float(val)
             if not agg_demand and agg_supply == 0.0:
                 continue
-            # The kernel works in MW across every dimension: a CP's
-            # ``capacity_by_sector`` is MW (gas is converted via
-            # ``kgps_to_mw`` in ``_cp_signed_capacity_by_sector``).  The
-            # ``HolonSummary`` it consumes, however, carries gas supply
-            # and demand in the sector's native kg/s.  Convert the gas
-            # dimension here so ``base_supply``/``demand`` are unit-
-            # consistent with the CP capacity they are netted against
-            # (``supply_net = base_supply − Σ r·c``, hard budget cap
-            # ``≤ Bₛ``); without this the ~55× HHV factor makes the gas
-            # budget and served-demand waterfall wrong.
+            # The kernel works in MW across every dimension, but HolonSummary
+            # carries gas supply/demand in native kg/s. Convert gas here so
+            # base_supply/demand are unit-consistent with the CP capacity they
+            # net against; without it the ~55× HHV factor breaks the gas waterfall.
             if sec_v == Sector.GAS.value:
                 agg_supply = kgps_to_mw(agg_supply)
                 agg_demand = {t: kgps_to_mw(v) for t, v in agg_demand.items()}
@@ -489,12 +425,10 @@ class CPPriorityAdmmRole(Role):
     # ------------------------------------------------------------------
 
     def _am_gossip_initiator(self) -> bool:
-        """Lowest-cp_id among self + currently-reachable peers wins the
-        initiator slot for the next round.  Deterministic, requires no
-        election, re-evaluates per tick — so initiator death naturally
-        hands the slot to the next-lowest CP without any handover
-        protocol.  The chapter's "only one negotiation at a time"
-        requirement is enforced by this gate plus the participant's
+        """Lowest cp_id among self + reachable peers wins the initiator slot.
+        Deterministic, no election, re-evaluated per tick, so initiator death
+        hands the slot to the next-lowest CP with no handover protocol. "Only one
+        negotiation at a time" follows from this gate plus the participant's
         per-(initiator_cp_id, round_id) dedup.
         """
         reachable = self._reachable_peer_cp_ids() | {self.cp_id}
@@ -513,10 +447,9 @@ class CPPriorityAdmmRole(Role):
     def _on_gossip_commit(
         self, r: np.ndarray, converged: bool, iterations: int,
     ) -> None:
-        """End-of-round callback fired by the gossip participant on
-        every CP (initiator and responders alike).  Issues the
-        :func:`apply_regulate` for this CP's own row of the answer.
-        Synchronous — the participant calls us from inside its run
+        """End-of-round callback fired by the gossip participant on every CP
+        (initiator and responders). Issues :func:`apply_regulate` for this CP's
+        own row of the answer. Synchronous: called from the participant's run
         coroutine.
         """
         if r.size == 0:
@@ -539,13 +472,11 @@ class CPPriorityAdmmRole(Role):
         )
 
     async def _run_gossip_round(self) -> None:
-        """Kick off a new gossip round IF we're the current initiator.
+        """Kick off a new gossip round iff we're the current initiator.
 
-        Non-initiator CPs are pure responders — their participant
-        receives :class:`GossipCascadeInit` from the initiator's
-        broadcast and runs the cascade locally without us doing
-        anything here.  This keeps "only one negotiation at a time"
-        guaranteed by the deterministic initiator-election rule.
+        Non-initiator CPs are pure responders: their participant receives the
+        initiator's :class:`GossipCascadeInit` broadcast and runs the cascade
+        locally without action here.
         """
         if self._gossip_participant is None or self._gossip_carrier is None:
             return
@@ -556,15 +487,9 @@ class CPPriorityAdmmRole(Role):
             return
         participants = sorted(self._reachable_peer_cp_ids() | {self.cp_id})
         self._gossip_round_id += 1
-        # Timeouts: the gossip cascade converges in the same iteration
-        # count as the replicated kernel (verified to match within 0.02
-        # at N=28 in the in-process kernel test), but each iteration is
-        # N broadcasts + N async event-loop hops over mango's message
-        # queue.  In SimpleCarrier the wallclock is ~125 ms at N=28;
-        # production mango adds 10–100× overhead per message, putting
-        # the realistic round wallclock at 1–13 s for the cp_heavy
-        # grids.  ``round_timeout_s`` is sized to comfortably absorb
-        # that tail; ``iter_timeout_s`` should catch the per-iter
+        # Timeouts: each iteration is N broadcasts + N async event-loop hops over
+        # mango's queue, so a round can take seconds on large grids.
+        # round_timeout_s absorbs that tail; iter_timeout_s catches the per-iter
         # broadcast median without forcing premature hold-overs.
         start = create_gossip_cascade_start(
             round_id=self._gossip_round_id,
@@ -605,39 +530,20 @@ class CPPriorityAdmmRole(Role):
             cps.append(CPSpec(cp_id=aid, capacity_by_sector=dict(s.capacity_by_sector)))
 
         try:
-            if self.algorithm == "lexicographic":
-                # Distributed lexicographic-cascade sharing ADMM: Π
-                # rounds (one per priority tier, highest first), each
-                # maximising served demand subject to the hard
-                # ``σ + Σ_i r_i·c_{i,s} ≤ B_s − θ`` constraint.  Since
-                # ``B`` folds in the slack budget, this hard-caps the
-                # CPs' cross-sector draw at the operator budget — the
-                # formally-correct replacement for the penalty kernel's
-                # soft over-draw marginal (which limit-cycles / offsets).
-                # SCARE's ``CPSpec`` / ``SectorDemand`` duck-type onto the
-                # DRO kernel (it reads only ``.cp_id`` /
-                # ``.capacity_by_sector`` and ``.sector`` /
-                # ``.demand_by_tier`` / ``.base_supply``).
-                result = solve_cp_distributed_lexicographic_cascade(
-                    cps=cps,
-                    demands=demands,
-                    horizon=self.horizon,
-                    rho=self.rho,
-                    inner_iters_max=self.admm_max_iters,
-                    inner_abs_tol=self.admm_abs_tol,
-                    r_regularization=self.r_regularization,
-                )
-            else:
-                result = solve_cp_priority_admm(
-                    cps=cps,
-                    demands=demands,
-                    horizon=self.horizon,
-                    rho=self.rho,
-                    max_iters=self.admm_max_iters,
-                    abs_tol=self.admm_abs_tol,
-                    priority_weight_base=self.priority_weight_base,
-                    r_damping=self.r_damping,
-                )
+            # Lexicographic-cascade sharing ADMM: one round per priority tier
+            # (highest first), each maximising served demand subject to the hard
+            # σ + Σ_i r_i·c_{i,s} ≤ B_s − θ constraint. Since B folds in the slack
+            # budget, this caps the CPs' cross-sector draw at the operator budget.
+            # SCARE's CPSpec/SectorDemand duck-type onto the DRO kernel.
+            result = solve_cp_distributed_lexicographic_cascade(
+                cps=cps,
+                demands=demands,
+                horizon=self.horizon,
+                rho=self.rho,
+                inner_iters_max=self.admm_max_iters,
+                inner_abs_tol=self.admm_abs_tol,
+                r_regularization=self.r_regularization,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[%s] cp L3 kernel (%s) failed: %s",

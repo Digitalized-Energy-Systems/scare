@@ -44,12 +44,10 @@ class NodeObserver(Role):
 class GenerationController(Role):
     """Apply the local agent's gossip-decided setpoint as a regulate action.
 
-    Subscribes to ``NegotiationFinishedEvent`` (emitted from the same
-    agent's own ``_handle_negotiation_finished_msg``) and converts the
-    new per-agent setpoint into a clamped factor.  Honours the CLPU
-    ramp + restoration monotonic floor from the active scenario config
-    so this side-channel doesn't bypass the safety nets the gossip
-    layer applies on its own ``_apply_setpoint`` path.
+    Subscribes to the agent's own ``NegotiationFinishedEvent`` and converts
+    the new setpoint into a clamped factor.  Honours the CLPU ramp and
+    restoration monotonic floor from the scenario config so this path does
+    not bypass the safety nets gossip applies in ``_apply_setpoint``.
     """
 
     def __init__(
@@ -58,9 +56,8 @@ class GenerationController(Role):
         super().__init__()
         self.behavior = behavior
         self.sector = sector
-        # Track the last applied factor + timestamp so the CLPU ramp can
-        # bound increases at ``convergence_rate`` per sim-second, matching
-        # the rate the gossip layer applies inside ``_apply_setpoint``.
+        # Last applied factor + timestamp; lets the CLPU ramp bound
+        # increases at ``convergence_rate`` per sim-second.
         self._last_factor: float | None = None
         self._last_t: float | None = None
         self._floor: float = 0.0
@@ -84,11 +81,10 @@ class GenerationController(Role):
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         if cap == 0.0:
             return
-        # Both load (cap>0, sp∈[0,cap]) and generator (cap<0, sp∈[cap,0])
-        # produce ``new_setpoint / cap ∈ [0,1]`` when the gossip honoured
-        # its own box constraints.  Keep the abs() as a defensive clamp
-        # against a degenerate ``new_setpoint`` of opposite sign — but
-        # log it so the bug shows up instead of being silently swallowed.
+        # Both load (cap>0, sp in [0,cap]) and generator (cap<0, sp in
+        # [cap,0]) give ``new_setpoint / cap`` in [0,1] when gossip honoured
+        # its box constraints.  abs() defensively clamps an opposite-sign
+        # setpoint, but log it so the bug surfaces rather than being hidden.
         raw_factor = event.new_setpoint / cap
         if (cap > 0 and event.new_setpoint < -1e-9) or (
             cap < 0 and event.new_setpoint > 1e-9
@@ -103,19 +99,15 @@ class GenerationController(Role):
             raw_factor = abs(raw_factor)
         factor = max(0.0, min(1.0, raw_factor))
 
-        # Read the active scenario config (stashed on behavior by the
-        # scenario builder).  Honour the same safety nets the gossip
-        # layer applies in ``_apply_setpoint`` so the stability path
-        # can't bypass them — without this, child-418 (heat) was seen
-        # jumping from 1.0 → 0.0 in one tick via the stability reason.
+        # Honour the same safety nets gossip applies in ``_apply_setpoint``
+        # so the stability path can't jump a factor in one tick.
         cfg = getattr(self.behavior, "_scare_config", None)
         enable_floor = getattr(cfg, "enable_monotonic_floor", True)
         enable_ramp = getattr(cfg, "enable_clpu_ramp", True)
 
         now = self.context.current_timestamp
         # CLPU ramp: bound ramp-up to ``convergence_rate`` per sim-second.
-        # Decreases pass through immediately — shedding under stress
-        # cannot wait for the ramp budget.
+        # Decreases pass through immediately — shedding can't wait.
         if (
             enable_ramp
             and self._last_factor is not None
@@ -126,10 +118,9 @@ class GenerationController(Role):
             dt = max(0.0, now - self._last_t)
             factor = min(factor, self._last_factor + rate * dt)
 
-        # Monotonic restoration floor for loads: once restored to a given
-        # factor, the stability path may not regress unless a constraint
-        # violation is actively pulling it back.  Generators (cap < 0)
-        # are exempt — they ramp both directions to balance.
+        # Monotonic restoration floor for loads: once restored to a factor,
+        # the stability path may not regress below it.  Generators (cap < 0)
+        # are exempt — they ramp both ways to balance.
         if enable_floor and cap > 0 and factor < self._floor:
             factor = self._floor
         if cap > 0:

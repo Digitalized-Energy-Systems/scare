@@ -1,19 +1,17 @@
-"""Central physical-grid mirror for the dynamic-topology layer (Concept C).
+"""Central physical-grid mirror for the dynamic-topology layer.
 
-A small, query-only data structure that mirrors the *physical* live-edge
-state of the multi-energy grid.  Built once at scenario time from the
-monee network, updated when ``BranchFailureEvent`` (or future
-``BranchRestoredEvent``) fires, and queried by the per-layer dynamic
-roles (L1/L2/L3) to decide which peers are still reachable through live
+A query-only data structure mirroring the physical live-edge state of the
+multi-energy grid.  Built once at scenario time from the monee network,
+updated on branch failure/restoration, and queried by the per-layer
+dynamic roles (L1/L2/L3) to decide which peers are reachable through live
 infrastructure.
 
-This is the *only* centralised piece in the dynamic-topology design.
-The reasoning is that the physical grid state has a single authoritative
-source — the simulator — so mirroring it once and sharing the mirror by
-reference is cleaner than having every dynamic role rebuild its own
-adjacency table.  All *cyber-organisational* decisions (who's in which
-community, who leads, who participates in ADMM) stay local to the
-affected agent: the mirror only answers reachability questions.
+This is the only centralised piece in the dynamic-topology design: the
+physical grid state has a single authoritative source (the simulator), so
+mirroring it once and sharing by reference beats rebuilding an adjacency
+table per role.  All cyber-organisational decisions (community membership,
+leadership, ADMM participation) stay local; the mirror only answers
+reachability questions.
 
 Two reachability flavours are exposed:
 
@@ -42,35 +40,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# LivePeerFilter — protocol used by host roles to consult a sibling
-# dynamic-topology role for peer liveness.
-# ---------------------------------------------------------------------------
-
-
 class LivePeerFilter(Protocol):
-    """Tiny query interface a dynamic-topology role exposes to its
-    co-located host role.  ``addr`` is any object accepted by mango's
-    addressing layer (carries an ``aid`` attribute).
+    """Query interface a dynamic-topology role exposes to its co-located
+    host role.  ``addr`` is any mango address (carries an ``aid``).
 
-    Both ``DynamicHolonRole`` (L2) and ``DynamicConnectorRole`` (L3)
-    implement this so the host role (``HolonicCommunityRole`` /
-    ``EnergyConverterRole``) can filter peers symmetrically.  An
-    explicit ``None`` filter at the host side preserves the legacy
-    static-topology behaviour, so the dynamic layer is purely additive.
+    Implemented by ``DynamicHolonRole`` (L2) and ``DynamicConnectorRole``
+    (L3) so the host role can filter peers.  A ``None`` filter at the host
+    side preserves static-topology behaviour, making the dynamic layer
+    purely additive.
     """
 
     def is_live(self, addr: Any) -> bool:
         ...
 
 
-# ---------------------------------------------------------------------------
-# GridTopologyMirror — physical-state truth shared by all dynamic roles.
-# ---------------------------------------------------------------------------
-
-# Sentinel sector for a cross-sector coupling-point branch.  Stored as a
-# string so the dict keys stay hashable and JSON-serialisable for
-# diagnostics; ``Sector`` enum values are reserved for actual sectors.
+# Sentinel sector tag for a cross-sector coupling-point branch.  A string
+# (not a ``Sector`` enum value, which are reserved for real sectors) so the
+# dict keys stay hashable and JSON-serialisable for diagnostics.
 _CP_BRIDGE: str = "cp"
 
 
@@ -102,23 +88,20 @@ class GridTopologyMirror:
         either a :class:`Sector` value ("electricity"/"heat"/"gas") for
         same-sector edges, or the sentinel ``"cp"`` for cross-sector
         coupling-point branches.  Branches with an unknown sector are
-        omitted (they would otherwise become non-traversable, which the
-        BFS already treats correctly, but admitting them just clutters
-        the live set).
+        omitted (they would be non-traversable anyway, so admitting them
+        only clutters the live set).
         """
-        # All edges, regardless of sector.  Lookup-by-id stays cheap.
         self._endpoints: dict[tuple, tuple[Any, Any]] = dict(branches)
         # branch_id -> sector tag ("electricity" / "heat" / "gas" / "cp").
         self._sector_tag: dict[tuple, str] = dict(branch_sector)
-        # Live set: every branch that hasn't been marked broken.
+        # Live set: every branch not marked broken.
         self._live: set[tuple] = {
             bid for bid in self._endpoints if bid in self._sector_tag
         }
         self._broken: set[tuple] = set()
-        # Pre-bucket adjacency by sector for fast reachable_from() — one
-        # dict per sector and one for CP bridges.  ``rebuild_adjacency``
-        # refreshes these when the live set changes; we batch the rebuild
-        # because failures arrive sparsely.
+        # Per-sector (plus CP-bridge) adjacency for fast reachable_from().
+        # Rebuilt in full on each live-set change; failures arrive sparsely
+        # so an O(E) rebuild beats incremental-update bookkeeping.
         self._adj_by_sector: dict[str, dict[Any, list[Any]]] = {}
         self._rebuild_adjacency()
 
@@ -129,9 +112,7 @@ class GridTopologyMirror:
     def mark_broken(self, branch_id: tuple) -> None:
         """Record a physical branch as broken.  Idempotent."""
         if branch_id not in self._sector_tag:
-            # Defensive: a CP-related edge whose sector we couldn't
-            # determine at construction is treated as non-traversable
-            # already.  Nothing to update.
+            # An edge with no known sector is already non-traversable.
             return
         if branch_id in self._broken:
             return
@@ -185,23 +166,20 @@ class GridTopologyMirror:
         sector reachability inside a single sector cannot cross a CP).
         """
         if sector is not None and allow_cp_bridges:
-            # Combined modes don't compose: a sector-bounded query is
-            # by definition within one sector graph.  Reject loudly to
-            # surface programmer error rather than return a confusing
-            # result.
+            # A sector-bounded query is within one sector graph and cannot
+            # cross a CP; reject the contradictory combination loudly.
             raise ValueError(
                 "reachable_from: allow_cp_bridges only makes sense when "
                 "sector is None (got sector=%r)" % sector
             )
 
-        # Pick the right adjacency view.
         if sector is not None:
             adj = self._adj_by_sector.get(sector.value, {})
         else:
             adj = self._merged_adjacency(include_cp=allow_cp_bridges)
 
         if start_node not in adj:
-            # A node with no live incident edges is its own component.
+            # No live incident edges: the node is its own component.
             return {start_node}
 
         seen: set[Any] = {start_node}
@@ -258,13 +236,7 @@ class GridTopologyMirror:
     # ------------------------------------------------------------------
 
     def _rebuild_adjacency(self) -> None:
-        """Refresh the per-sector adjacency buckets from the live set.
-
-        Called after each ``mark_broken`` / ``mark_restored``.  Failure
-        events arrive sparsely (debounced by the scheduling layer), so
-        an O(E) rebuild is fine and avoids the bookkeeping complexity
-        of an incremental update.
-        """
+        """Rebuild the per-sector adjacency buckets from the live set."""
         buckets: dict[str, dict[Any, list[Any]]] = {}
         for bid in self._live:
             tag = self._sector_tag.get(bid)
@@ -277,11 +249,8 @@ class GridTopologyMirror:
         self._adj_by_sector = buckets
 
     def _merged_adjacency(self, *, include_cp: bool) -> dict[Any, list[Any]]:
-        """Union of all per-sector adjacency buckets (optionally CP).
-
-        Built on demand; this is the cross-sector reachability view L3
-        needs.  Same allocation cost as the per-bucket rebuild, only
-        triggered on cross-sector queries.
+        """Union of all per-sector adjacency buckets (optionally CP),
+        built on demand for L3's cross-sector reachability view.
         """
         merged: dict[Any, list[Any]] = {}
         for tag, adj in self._adj_by_sector.items():
@@ -290,12 +259,6 @@ class GridTopologyMirror:
             for node, neighs in adj.items():
                 merged.setdefault(node, []).extend(neighs)
         return merged
-
-
-# ---------------------------------------------------------------------------
-# Factory: build a mirror from a monee network and a per-branch sector
-# resolver supplied by the scenario builder.
-# ---------------------------------------------------------------------------
 
 
 def mirror_from_monee(

@@ -1,7 +1,6 @@
-"""Side-by-side: claim's per-component aggregation vs SCARE's per-holon
-priority decisions.  Shows when an apparent "priority inversion" at the
-component level is actually two holons each making priority-correct
-decisions internally.
+"""Side-by-side: claim's per-component aggregation vs SCARE's per-holon priority
+decisions. Shows when an apparent component-level "priority inversion" is really
+two holons each making priority-correct decisions internally.
 
 Usage:
     python scripts/show_priority_aggregation.py <task_dir>
@@ -23,7 +22,6 @@ def _parse_holon_alloc(detail: str) -> dict[str, dict[int, float]]:
     ``{'heat:tier4': {'T': 0.012, 'weight': 128, 'sum_x': 0.012, 'service_frac': 0.457}, ...}``
     """
     out: dict[str, dict[int, float]] = defaultdict(dict)
-    # match cells like 'sector:tierN': {..., 'service_frac': F, ...}
     pat = re.compile(
         r"'([a-z]+):tier(\d+)'\s*:\s*\{[^}]*'service_frac'\s*:\s*([0-9.e+-]+)"
     )
@@ -37,7 +35,7 @@ def main():
     task_dir = Path(sys.argv[1])
     sector = sys.argv[2] if len(sys.argv) > 2 else "heat"
 
-    # 1. Per-component view (what the claim sees)
+    # Per-component view (what the claim sees)
     print(f"=== {task_dir.name}  sector={sector}  ===\n")
     print("## Per-component aggregate (priority_invariant claim's view)\n")
     by_comp_tier: dict[tuple[str, int], dict[str, float]] = {}
@@ -69,7 +67,7 @@ def main():
             )
             prev_frac, prev_tier = frac, tier
 
-    # 2. Per-holon view (what SCARE designed for)
+    # Per-holon view (what SCARE designed for)
     print()
     print("## Per-holon allocations (SCARE's design — priority enforced PER holon)\n")
     leaders_seen: set[str] = set()

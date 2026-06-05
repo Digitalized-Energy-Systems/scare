@@ -1,10 +1,10 @@
 """Run a single restoration evaluation task end-to-end.
 
-Designed to be invoked once per Slurm array task — but runs identically
-without Slurm. Reads the campaign config + manifest, runs the task, and
-writes all per-task artefacts under ``<campaign_dir>/tasks/<task_id>/``:
+Invoked once per Slurm array task, but runs identically without Slurm.
+Reads the campaign config + manifest, runs the task, and writes all
+per-task artefacts under ``<campaign_dir>/tasks/<task_id>/``:
 
-    config.json        copy of the TaskSpec (the seed, grid, n_failures)
+    config.json        copy of the TaskSpec (seed, grid, n_failures)
     failures.json      resolved branch_ids + delays the simulation saw
     result.json        scalar metrics extracted from the world
     status.json        ok|error|timeout, duration, solver-warning count
@@ -97,31 +97,19 @@ LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
 
 class _SolverFailureCounter(logging.Filter):
-    """Counts solver-status escalations across the Pyomo/monee stack so
-    we can report solver health per task without grepping logs.
+    """Count solver-status escalations across the Pyomo/monee stack to
+    report solver health per task without grepping logs.
 
-    Two paths produce a "model was infeasible" signal:
+    Two log paths signal an infeasible solve, firing as a pair:
+    monee's ``classify_solve_result`` ERROR and pyomo.core's
+    ``load_solutions`` WARNING. The counter listens on both (either may
+    be silent) and dedupes matches within ``_DEDUPE_WINDOW_S``, since
+    distinct solves are spaced by at least the energy-flow cooldown plus
+    solve time (typically >= 100 ms).
 
-    1. ``monee.solver.pyo._classify_solve_result`` logs ERROR with
-       ``"Pyomo solve infeasible (status=warning, termination=...)"``.
-    2. Pyomo itself logs WARNING on ``pyomo.core`` of the shape
-       ``"Loading a SolverResults object with a warning status …
-       termination condition: infeasible"`` whenever ``load_solutions=
-       True`` accepts a non-OK result.
-
-    The two paths fire as a pair on every infeasible solve.  The
-    counter dedupes by collapsing matches that arrive within
-    ``_DEDUPE_WINDOW_S`` of each other (the pair is always ~tens of
-    ms apart; back-to-back distinct solves are spaced by at least the
-    environment ``energy_flow_cooldown_s`` plus the Gurobi solve time,
-    typically ≥ 100 ms).  Listening on both loggers means we still
-    catch the infeasibility when, for whatever reason, only one of
-    the two emit (observed in ``eval_smoke_20260518`` where the monee
-    ERROR was silent while the pyomo.core WARNING fired).
-
-    Also catches Gurobi / Pyomo exception strings (license errors,
-    host-id mismatches, env initialization failures) so the aggregator
-    can distinguish solver environment issues from algorithm bugs.
+    Also catches Gurobi / Pyomo exception strings (license, host-id,
+    env-init) so the aggregator can tell solver-environment issues apart
+    from algorithm bugs.
     """
 
     _SOLVER_ERROR_MARKERS: tuple[str, ...] = (
@@ -142,9 +130,8 @@ class _SolverFailureCounter(logging.Filter):
         # monee.solver.pyo ERROR path (paired classify_solve_result).
         if "infeasible (status=" in msg or "Pyomo solve infeasible" in msg:
             return True
-        # pyomo.core load_solutions WARNING path; the multi-line message
-        # carries both substrings on the same record (Pyomo formats them
-        # via ``\n  - termination condition: …``).
+        # pyomo.core load_solutions WARNING path; both substrings land on
+        # the same multi-line record.
         if (
             "Loading a SolverResults object" in msg
             and "termination condition: infeasible" in msg
@@ -165,9 +152,8 @@ class _SolverFailureCounter(logging.Filter):
             self.warning_count += 1
             self.count += 1
         elif any(marker in msg for marker in self._SOLVER_ERROR_MARKERS):
-            # Gurobi env / license / host-id errors do not go through the
-            # monee.solver.pyo "infeasible" pathway, but they are solver
-            # failures from the campaign's POV.
+            # Gurobi env / license / host-id errors bypass the monee
+            # "infeasible" pathway but are still solver failures.
             self.warning_count += 1
             self.count += 1
         return True
@@ -180,24 +166,22 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    # Drop pre-existing handlers so we don't double-log to stderr from
-    # any earlier basicConfig() call (e.g. the manifest CLI).
+    # Drop pre-existing handlers to avoid double-logging from an earlier
+    # basicConfig() call (e.g. the manifest CLI).
     for h in list(root.handlers):
         root.removeHandler(h)
     root.addHandler(handler)
 
-    # Keep WARN+ visible on stderr too so Slurm captures show-stopper events
-    # in the (otherwise empty) per-array stderr file.
+    # Keep WARN+ on stderr so Slurm captures show-stopper events in the
+    # per-array stderr file.
     stderr = logging.StreamHandler(sys.stderr)
     stderr.setLevel(logging.WARNING)
     stderr.setFormatter(logging.Formatter(LOG_FORMAT))
     root.addHandler(stderr)
 
-    # Suppress third-party DEBUG/INFO chatter — mango.agent.core alone
-    # emits ~60k lines per 30 s sim (one per envelope ack), and pyomo /
-    # gurobipy / simbench grid loaders pile on hundreds more.  Suppress
-    # at the package root so new submodules don't reintroduce noise;
-    # WARN+ still surfaces genuine solver / framework failures.
+    # Suppress third-party DEBUG/INFO chatter (mango emits ~60k lines per
+    # 30 s sim; pyomo / gurobipy / simbench add more). Suppress at the
+    # package root so new submodules stay quiet; WARN+ still surfaces.
     for noisy in (
         "pyomo",
         "gurobipy",
@@ -208,10 +192,8 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     counter = _SolverFailureCounter()
-    # Listen on both emitters of the infeasibility signal — monee's
-    # classify_solve_result ERROR and pyomo.core's load_solutions
-    # WARNING.  The counter dedupes the pair internally so a single
-    # infeasible solve is counted once.
+    # Listen on both emitters of the infeasibility signal; the counter
+    # dedupes the pair so one infeasible solve is counted once.
     for logger_name in ("monee.solver.pyo", "pyomo.core"):
         logging.getLogger(logger_name).addFilter(counter)
     return handler, counter
@@ -225,42 +207,36 @@ def _seed_everything(seed: int) -> None:
 def ensure_deterministic_hashing(seed: str = "0") -> None:
     """Pin ``PYTHONHASHSEED`` so the campaign is reproducible.
 
-    ``random`` / ``np.random`` are seeded per task (``_seed_everything``),
-    but Python's *hash* randomisation is fixed at interpreter start and is
-    left random by default.  That makes ``set`` / ``frozenset`` iteration
-    order over agent-id strings vary per worker process, which perturbs
-    async message scheduling and the per-round ADMM actor sets — enough to
-    flip the priority-invariant pass/fail and swing the measured inversion
-    gap run-to-run for the *same* ``(grid, seed, scenario)`` task (eval
-    reproducibility audit, 2026-05-28: task-88 gave gap 0.0 / 0.20 / 0.27
-    on three identical runs; pinning the hash seed made it identical).
+    ``random`` / ``np.random`` are seeded per task, but Python's hash
+    randomisation is fixed at interpreter start and left random by
+    default. That makes ``set`` / ``frozenset`` iteration order over
+    agent-id strings vary per worker, perturbing async message scheduling
+    and the per-round ADMM actor sets — enough to flip results for the
+    same ``(grid, seed, scenario)`` task.
 
-    Hash randomisation can only be disabled before the interpreter starts,
-    so we set the env var and re-exec the process once.  Spawned / forked
-    workers then inherit the pinned value from this process's environment.
-    A user-supplied ``PYTHONHASHSEED`` (anything other than the disabled
-    sentinel ``"random"``) is respected and never overridden.  No-op once
-    pinned, so the re-exec happens at most once.
+    Hash randomisation can only be disabled before the interpreter
+    starts, so set the env var and re-exec once; spawned/forked workers
+    inherit the pinned value. A user-supplied ``PYTHONHASHSEED`` (other
+    than the sentinel ``"random"``) is respected. No-op once pinned.
     """
     current = os.environ.get("PYTHONHASHSEED")
     if current is not None and current != "random":
         return
     os.environ["PYTHONHASHSEED"] = seed
-    # ``sys.orig_argv`` (3.10+) preserves the exact invocation, including
-    # ``-m experiment.hpc.<launcher>`` so package imports keep working.
+    # ``sys.orig_argv`` (3.10+) preserves the exact invocation so
+    # ``-m experiment.hpc.<launcher>`` package imports keep working.
     os.execv(sys.executable, sys.orig_argv)
 
 
 def _resolve_failures(monee_net: Any, plan: RuntimePlan, task: TaskSpec) -> list[Any]:
     """Draw the failure scenario for this task.
 
-    The ``scenario`` dict on the TaskSpec can override the default
-    "branch"-only sampling:
+    The ``scenario`` dict can override the default "branch"-only sampling:
 
-    - ``failure_type``   — ``"branch"`` / ``"generator"`` / ``"mixed"``
-                           (default: ``"branch"``)
-    - ``generator_share`` — for ``mixed``, fraction of the draw that
-                            is generators (default 0.5)
+    - ``failure_type``    — ``"branch"`` / ``"generator"`` / ``"mixed"``
+                            (default ``"branch"``)
+    - ``generator_share`` — for ``mixed``, generator fraction of the draw
+                            (default 0.5)
     """
     scenario = task.scenario or {}
     failure_type = scenario.get("failure_type", "branch")
@@ -280,9 +256,8 @@ def _serialize_failures(failures: list[Any]) -> list[dict[str, Any]]:
     """JSON-serialise the failure list for ``failures.json``.
 
     Captures ``branch_ids`` for branch-style failures and ``custom_id``
-    for generator-style ones (the underlying ``Failure.custom``
-    callable isn't JSON-able, but the id we stamp on it identifies
-    the deactivated component).
+    for generator-style ones (the ``Failure.custom`` callable isn't
+    JSON-able, but its stamped id identifies the deactivated component).
     """
     out = []
     for f in failures:
@@ -349,35 +324,29 @@ async def _run_simulation(
     *,
     out_dir: Path | None = None,
 ):
-    """Build and run one scare-variant simulation.  Returns (world,
-    failures, net) so the caller can extract metrics + run the
-    end-of-sim recordings (e.g. served breakdown via the behavior).
+    """Build and run one scare-variant simulation.
 
-    ``out_dir`` is the task artefact directory; when provided, the
-    root-cause infeasibility-capture writes its one-shot snapshot
-    there as ``infeasibility_snapshot.json``.
+    Returns (world, failures, net) so the caller can extract metrics and
+    run end-of-sim recordings. When ``out_dir`` is given, the one-shot
+    infeasibility capture writes ``infeasibility_snapshot.json`` there.
     """
     if task.grid not in GRIDS:
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
 
-    # Cap any single energyflow MISOCP at a small fraction of the
-    # task wall-clock budget.  Without this guard, ``asyncio.wait_for``
-    # cannot preempt a synchronous solve that exceeds ``task_timeout_s``
-    # — the cancellation only fires at the next ``await`` — and the
-    # task drifts past the configured timeout until SLURM SIGTERMs it.
-    # Floored at 30s so even hard MISOCPs get a chance to finish; capped
-    # at 60s so a misconfigured solver (e.g. no time-limit option known)
-    # still yields to the asyncio scheduler frequently.
+    # Cap each energyflow MISOCP well under the task budget so
+    # ``asyncio.wait_for`` can preempt at the next ``await`` (it cannot
+    # interrupt a synchronous solve, which would otherwise drift past the
+    # timeout until SLURM SIGTERMs it). Floored at 30s so hard MISOCPs
+    # can finish; capped at 60s so it yields frequently.
     per_solve_cap = max(30.0, min(plan.task_timeout_s / 4.0, 60.0))
     install_solver_time_limit(per_solve_cap)
 
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s", task.grid)
-    # Factory applies the MISOCP electricity formulation and leaves the
-    # district-heating physics in its nonlinear form (McCormick-DHS is
-    # intentionally off for the live simulation — it can hit envelope-
-    # bound infeasibilities on failures).  The oracle re-enables DHS
-    # linearisation for its own LP only; see ``run_oracle``.
+    # Factory applies the MISOCP electricity formulation and leaves DHS
+    # physics nonlinear (McCormick-DHS is off for the live sim — it can
+    # hit envelope-bound infeasibilities on failures). The oracle
+    # re-enables DHS linearisation for its own LP only.
     net = factory()
     _apply_scenario(net, task, logger)
 
@@ -392,8 +361,8 @@ async def _run_simulation(
                 task.variant, task.ablation or {}, task.sweep or {})
 
     priorities = _resolve_priorities(net, task, logger)
-    # Stash on the net so the post-sim metric writers can pick it up
-    # without an extra parameter through ``_run_simulation``.
+    # Stash on the net so post-sim metric writers can pick it up without
+    # threading an extra parameter through ``_run_simulation``.
     net._scare_priorities = priorities
 
     world = create_restoration_scenario_world(
@@ -402,12 +371,9 @@ async def _run_simulation(
         simulation_duration_s=plan.simulation_duration_s,
         config=cfg,
     )
-    # Root-cause hunt for the energyflow-infeasibility cascade that
-    # silently freezes every observation column (see plots.py
-    # ``_stale_data_segment``).  Arm a one-shot capture so the very
-    # first failed solve in this task drops a JSON snapshot next to
-    # the other artefacts; the runner ``disarm``-s after the task
-    # finishes so the next task gets its own capture window.
+    # Arm a one-shot capture so the first failed solve drops a JSON
+    # snapshot next to the other artefacts; disarmed after the task so
+    # the next task on this worker gets its own capture window.
     if out_dir is not None:
         snapshot_path = out_dir / "infeasibility_snapshot.json"
         arm_infeasibility_capture(
@@ -421,11 +387,10 @@ async def _run_simulation(
             timeout=plan.task_timeout_s,
         )
     except asyncio.TimeoutError:
-        # Wallclock timeout fires while the simulation coroutine is
-        # cancelled; ``start_restoration_simulation`` never reaches
-        # ``_flush_pending_negotiations``, so any in-flight gossips
-        # would be silently lost from the diary.  Drain them here so
-        # the started == Σ terminals invariant holds even on timeouts.
+        # On timeout the sim coroutine is cancelled before reaching its
+        # own ``_flush_pending_negotiations``, so in-flight gossips would
+        # be lost from the diary. Drain them here so the
+        # started == Σ terminals invariant holds.
         try:
             _flush_pending_negotiations(world)
         except Exception as flush_exc:  # noqa: BLE001
@@ -442,17 +407,17 @@ def _run_oracle(
     *,
     baseline_served: dict[str, Any] | None = None,
 ):
-    """Build the network, draw the same failures the scare variant
-    would, and solve monee's minimal-load-shedding LP.  Returns
+    """Build the network, draw the same failures the scare variant would,
+    and solve monee's minimal-load-shedding LP. Returns
     (net, failures, result_payload) — no world, no agents.
     """
     if task.grid not in GRIDS:
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s (oracle)", task.grid)
-    # Factory applies MISOCP (electricity) and leaves DHS nonlinear;
-    # ``run_oracle`` (via ``compose_oracle_result``) adds the McCormick-DHS
-    # heat linearisation for the oracle LP.
+    # Factory applies MISOCP and leaves DHS nonlinear;
+    # ``compose_oracle_result`` adds the McCormick-DHS heat linearisation
+    # for the oracle LP.
     net = factory()
     _apply_scenario(net, task, logger)
     failures = _resolve_failures(net, plan, task)
@@ -480,17 +445,13 @@ def _resolve_priorities(
     """Build the per-load priority dict from the scenario's
     ``priority_assignment`` knob.
 
-    Default is ``"skewed"`` so the priority machinery (QP weights,
-    tier-aware ADMM, priority-weighted served fraction) is exercised
-    by default.  monee observations don't carry a per-load priority
-    field, so without this default the obs_priority fallback returned
-    tier 1 for every load and the priority-aware behaviour was
-    degenerate (audit P1-7).
+    Default ``"skewed"`` exercises the priority machinery (QP weights,
+    tier-aware ADMM, priority-weighted served fraction); monee
+    observations carry no per-load priority field, so without it every
+    load falls back to tier 1 and priority-aware behaviour is degenerate.
 
-    Recognised values for ``priority_assignment``:
-    ``"uniform"``, ``"skewed"``, ``"by_capacity"``, ``"all_one"``.
-    Set ``"all_one"`` explicitly to recover the legacy degenerate
-    behaviour.
+    Recognised values: ``"uniform"``, ``"skewed"``, ``"by_capacity"``,
+    ``"all_one"``. Set ``"all_one"`` for the degenerate single-tier case.
     """
     scenario = task.scenario or {}
     distribution = scenario.get("priority_assignment", "skewed")
@@ -512,46 +473,35 @@ def _resolve_priorities(
 def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
     """Apply scenario-kind mutations to the freshly-built network.
 
-    Scenario kinds are stored on ``task.scenario["kind"]``:
+    Scenario kind comes from ``task.scenario["kind"]``:
 
     - ``"clean"`` (default) — no mutation.
-    - ``"cold_day"`` — lower the heat slack supply temperature and
-      scale heat loads up (see ``experiment.restoration.apply_cold_day``).
-      Tunables: ``supply_t_k`` (default 343.15 K) and
-      ``heat_load_scale`` (default 1.5×).
-    - ``"pv_peak"`` — sunny-midday over-voltage stress: scale up every
-      ``PowerGenerator.p_mw`` and scale down every ``PowerLoad.p_mw``
-      so the feeder runs reverse-power and ``vm_pu`` drifts toward the
-      upper bound.  Targets the VDE-AR-N 4105 operating point.
-      Tunables: ``gen_scale`` (default 3×) and ``load_scale`` (default
-      0.3×).
-    - ``"line_stress"`` — line-thermal stress: scale loads up and
-      reduce PowerLine ``max_i_ka`` so loading_percent rises into
-      overload after a single branch failure.  Exercises the branch-
-      mode constraint monitor, the priority-aware home group
-      assignment, and the 6c path-ranking reconfigurator.
-      Tunables: ``load_scale`` (default 1.8×), ``ampacity_scale``
-      (default 0.5×), ``affect_branch_fraction`` (default 1.0).
+    - ``"cold_day"`` — lower heat slack supply temperature and scale heat
+      loads up. Tunables: ``supply_t_k`` (default 343.15 K),
+      ``heat_load_scale`` (default 1.5x).
+    - ``"pv_peak"`` — over-voltage stress: scale generation up and load
+      down so the feeder runs reverse-power and ``vm_pu`` drifts toward
+      the upper bound (VDE-AR-N 4105 operating point). Tunables:
+      ``gen_scale`` (default 3x), ``load_scale`` (default 0.3x).
+    - ``"line_stress"`` — thermal stress: scale loads up and reduce
+      ``max_i_ka`` so loading_percent overloads after a branch failure.
+      Tunables: ``load_scale`` (1.8x), ``ampacity_scale`` (0.5x),
+      ``affect_branch_fraction`` (1.0).
 
-    Other kinds are silently passed through so future scenario types
-    can be wired without changing existing behaviour.
+    Unknown kinds pass through (warned) so future kinds can be wired in.
 
-    The scenario may also carry ``slack_budget_pct`` independently of
-    ``kind``: when set, ``experiment.restoration.apply_slack_budget``
-    is called *after* any kind-specific mutation, so the budget
-    reflects the (possibly scaled) post-mutation demand.  The grid
-    factory itself never bakes the slack budget in — the LP needs an
-    unconstrained slack to converge, and the budget is an operator
-    policy that varies by scenario, not a physical grid attribute.
+    Independent of ``kind``, ``slack_budget_pct`` (if set) applies
+    ``apply_slack_budget`` *after* any kind mutation so the budget
+    reflects post-mutation demand. The factory never bakes the budget in
+    — the LP needs an unconstrained slack to converge, and the budget is
+    a per-scenario operator policy, not a physical grid attribute.
     """
     scenario = task.scenario or {}
     kind = scenario.get("kind", "clean")
     _KNOWN_KINDS = {"clean", "cold_day", "pv_peak", "line_stress", "microgrid"}
     if kind not in _KNOWN_KINDS:
-        # Silently passing unknown kinds through used to be the rule —
-        # but a typo (``cold day`` vs ``cold_day``) then produced a
-        # clean run with no warning.  Surface it so the campaign author
-        # can correct the config.
+        # Warn on unknown kinds so a typo (``cold day`` vs ``cold_day``)
+        # doesn't silently produce a clean run.
         logger.warning(
             "Unknown scenario kind %r (known: %s) — falling through to "
             "no-mutation behaviour.  Check the campaign config for typos.",
@@ -582,13 +532,11 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         apply_line_stress(net, **kwargs)
         logger.info("Applied line_stress scenario: %s", kwargs or "<defaults>")
     elif kind == "microgrid":
-        # Microgrid / islanding scenario.  Opt in to monee's islanding
-        # extension AND promote eligible generator-class children to
-        # ``GridForming*`` so the LP has reference units to anchor sub-
-        # islands on when the main slack is unreachable.  Without
-        # promotion, ``enable_islanding`` is a no-op on stock simbench
-        # nets (no native GridFormingMixin children); promotion is
-        # the practical way to make the extension exercise something.
+        # Opt in to monee's islanding extension AND promote eligible
+        # generator-class children to ``GridForming*`` so the LP has
+        # reference units to anchor sub-islands on when the main slack is
+        # unreachable. Without promotion, ``enable_islanding`` is a no-op
+        # on stock simbench nets (no native GridFormingMixin children).
         carriers = scenario.get(
             "carriers", ("electricity", "water", "gas")
         )
@@ -605,15 +553,11 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
             list(carriers), promote_all, counts,
         )
 
-    # Operator slack-budget policy — orthogonal to ``kind`` so any
-    # scenario kind can carry one.  Applied AFTER any kind-specific
-    # mutation so the budget reflects the (possibly scaled) demand
-    # in the post-mutation network.  ``apply_slack_budget`` widens
-    # the LP Var bounds to ``±10·budget`` (keeps the LP feasible)
-    # and stamps the budget as the slack agents' rating that the MAS
-    # then drives toward via ``slack_target_fraction``.  The grid
-    # factory itself never bakes a slack budget in — see the
-    # ``GRIDS`` dict comment for the design rationale.
+    # Operator slack-budget policy, orthogonal to ``kind``. Applied after
+    # any kind mutation so the budget reflects post-mutation demand.
+    # ``apply_slack_budget`` widens LP Var bounds to ±10·budget (keeps the
+    # LP feasible) and stamps the budget as the slack agents' rating that
+    # the MAS drives toward via ``slack_target_fraction``.
     slack_budget_pct = scenario.get("slack_budget_pct")
     if slack_budget_pct is not None:
         apply_slack_budget(net, float(slack_budget_pct))
@@ -622,12 +566,10 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
             slack_budget_pct,
         )
 
-    # Temporal-storage extensions — also orthogonal to ``kind``.  Attaches
-    # monee's GasLinepack / LumpedThermalCapacitance.  In the current
-    # single-step ``energyflow`` integration these only add vars (no
-    # temporal dynamics); the campaign uses them as a SCARE-side
-    # compatibility smoke test, not a flex benchmark.  See
-    # ``apply_temporal_extensions``.
+    # Temporal-storage extensions, also orthogonal to ``kind``. Attaches
+    # monee's GasLinepack / LumpedThermalCapacitance. In the single-step
+    # energyflow integration these only add vars (no temporal dynamics);
+    # used as a compatibility smoke test, not a flex benchmark.
     linepack = bool(scenario.get("linepack", False))
     ltc = bool(scenario.get("ltc", False))
     if linepack or ltc:
@@ -646,8 +588,8 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
 
 def _config_from_task(task: TaskSpec):
     """Compose a ``RestorationConfiguration`` from the task's variant,
-    ablation, and sweep dictionaries.  Variant maps to a base preset;
-    ablation / sweep are field overrides applied on top.
+    ablation, and sweep dicts. Variant maps to a base preset; ablation /
+    sweep are field overrides applied on top.
     """
     if task.variant == "single_level":
         base = RestorationConfiguration(
@@ -656,22 +598,18 @@ def _config_from_task(task: TaskSpec):
         )
     elif task.variant == "component_level":
         # One community per connected component of each per-sector
-        # subgraph (``community_partition_method="connected_component"``)
-        # — global decision making at L1 without a hierarchy on top.
-        # CPs join the communities they bridge as normal members; their
-        # legacy CP-ADMM is replaced by ``MultiCommunityCPRole``'s
-        # EMA + deadband + cooldown guard so a CP sitting in two
-        # communities reconciles conflicting asks instead of
-        # ping-ponging.
+        # subgraph — global decision making at L1 with no hierarchy on
+        # top. CPs join the communities they bridge; their legacy CP-ADMM
+        # is replaced by ``MultiCommunityCPRole``'s EMA + deadband +
+        # cooldown guard so a CP in two communities reconciles conflicting
+        # asks instead of ping-ponging.
         #
-        # ``enable_multihop_constraint=False`` is mandatory here: the
-        # connected_component partition collapses the whole sector into
-        # one ``tid="groups"`` group, so multi-hop ConstraintState
-        # forwarding fans out O(N²) per hop and OOM-kills the worker
-        # (observed: 8.5 M log lines in 9 min on simbench_lv with
-        # N≈300, task 11 of eval_full_smoke_20260524-170808).  Direct
-        # neighbour visibility plus per-agent caching still gives the
-        # global picture because the local group already is global.
+        # ``enable_multihop_constraint=False`` is mandatory: the
+        # connected_component partition collapses the sector into one
+        # ``tid="groups"`` group, so multi-hop ConstraintState forwarding
+        # fans out O(N^2) per hop and OOM-kills the worker. Direct
+        # neighbour visibility still gives the global picture because the
+        # local group already is global.
         base = RestorationConfiguration(
             enable_holonic=False,
             enable_cp_admm=False,
@@ -721,21 +659,14 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 os.environ.get("HOSTNAME") or platform.node())
 
     _seed_everything(task.seed)
-    # Toggle per-aid trajectory logging for the whole task run; off by
-    # default because the log can grow large.  Enabled by setting
-    # ``write_trajectories: true`` in the campaign config; consumed by
-    # the C.5 cluster-synchronisation analysis.
-    # Reset every per-run diagnostics log so this task's result.json
-    # event counts reflect only this task — workers reuse the same Py
-    # process across tasks, so without an explicit arm() the
-    # ``_event_log`` / ``_negotiation_log`` / action ring buffer carry
-    # over from whichever task ran on this worker before.
+    # Reset per-run diagnostics so this task's counts reflect only this
+    # task — workers reuse the same process across tasks, so without
+    # arm() the event/negotiation logs and action ring buffer carry over.
     _diag.arm()
+    # Per-aid trajectory logging (off by default; the log can grow large).
     _diag.set_trajectory_logging(getattr(plan, "write_trajectories", False))
     # Drop any stale exception.json from a prior failed run so the
-    # aggregator's exception counts reflect only the *current* status.
-    # Without this, a re-run that succeeds still shows a count in
-    # ``Exception breakdown`` because the old crash file persists.
+    # aggregator's exception counts reflect only the current status.
     stale_exc = out_dir / "exception.json"
     if stale_exc.exists():
         try:
@@ -757,11 +688,10 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     exit_code = EXIT_ERROR
     claims: dict[str, Any] | None = None
 
-    # SIGTERM handler — converts the signal into a Python exception so the
-    # ``finally`` block below runs and writes ``status.json``.  Without
-    # this, ``timeout`` (SIGTERM) + grace + SIGKILL leaves no trace of the
-    # task, and the aggregator silently drops it.  SIGKILL is uncatchable
-    # by design but we honour the SIGTERM grace window.
+    # Convert SIGTERM into a Python exception so the ``finally`` block
+    # still writes ``status.json`` (otherwise SIGTERM + grace + SIGKILL
+    # leaves no trace and the aggregator drops the task). SIGKILL is
+    # uncatchable, but we honour the SIGTERM grace window.
     _prev_term = signal.getsignal(signal.SIGTERM)
     def _on_sigterm(signum, frame):
         raise KeyboardInterrupt("SIGTERM received — emergency shutdown")
@@ -771,21 +701,17 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         # Not main thread or otherwise restricted — best-effort only.
         _prev_term = None
 
-    # Pre-failure baseline.  Solve the no-failure LP on a fresh build
-    # of this grid + scenario; result.json's ``outcomes.restoration``
-    # then expresses post-restoration served as a ratio of this
-    # baseline, surfacing absolute load lost despite the restoration
-    # rather than the priority-weighted fraction alone.
+    # Pre-failure baseline: solve the no-failure LP on a fresh build of
+    # this grid + scenario. result.json's ``outcomes.restoration`` then
+    # expresses post-restoration served as a ratio of this baseline,
+    # surfacing absolute load lost, not just the priority-weighted view.
     baseline_served = None
     try:
         if task.grid in GRIDS:
-            # Priorities are deterministic in (grid, seed, scenario),
-            # so we build a throwaway net just to enumerate loads,
-            # then release it BEFORE the heavy simulation/oracle phase
-            # — otherwise base_net + its Pyomo model state stay alive
-            # alongside the simulation's own fresh net and double peak
-            # RAM (~1-3 GB on CP-heavy grids).  Factory already applies
-            # MISOCP + McCormick.
+            # Priorities are deterministic in (grid, seed, scenario), so
+            # build a throwaway net just to enumerate loads, then release
+            # it before the heavy sim/oracle phase — otherwise base_net +
+            # its Pyomo state double peak RAM (~1-3 GB on CP-heavy grids).
             base_net = GRIDS[task.grid]()
             _apply_scenario(base_net, task, logger)
             base_priorities = _resolve_priorities(base_net, task, logger)
@@ -828,11 +754,10 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
             )
             behavior = world.environment.behavior
             # End-of-sim measurement boundary: force a fresh energy flow
-            # so observers report post-agent-action state instead of the
-            # cooldown-cached previous solve.  Without this the served
-            # breakdown reflects an older regulation value and the
-            # priority-invariant claim hallucinates intra-component
-            # inversions.
+            # so observers report post-agent-action state, not the
+            # cooldown-cached previous solve. Otherwise the served
+            # breakdown is stale and the priority-invariant claim
+            # hallucinates intra-component inversions.
             try:
                 behavior.flush_energy_flow()
             except AttributeError:
@@ -871,20 +796,18 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                     write_trajectories_csv(out_dir / "trajectories.csv")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to write trajectories.csv: %s", exc)
-            # Claims validation: consume the artefacts we just wrote and
-            # fold pass/fail into result.json so the aggregator can roll
-            # them up.
+            # Claims validation: consume the artefacts just written and
+            # fold pass/fail into result.json for the aggregator.
             try:
                 claims = evaluate_task(out_dir)
                 payload["claims"] = claims
                 write_result_json(out_dir / "result.json", payload)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Claims validation failed: %s", exc)
-        # ``ok`` means the task didn't crash.  If any *fatal* claim
-        # failed (priority_invariant + monotonic_progress by default),
-        # escalate to ``claims_failed`` so the aggregator stops treating
-        # silent priority inversions as successful runs.  Callers can
-        # override the fatal set per-campaign via plan.fatal_claims.
+        # ``ok`` means the task didn't crash. If any fatal claim failed,
+        # escalate to ``claims_failed`` so silent priority inversions
+        # aren't counted as successful runs. Override the fatal set
+        # per-campaign via plan.fatal_claims.
         fatal_claims = tuple(
             getattr(plan, "fatal_claims",
                     ("priority_invariant", "monotonic_progress"))
@@ -915,8 +838,8 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         exit_code = EXIT_TIMEOUT
 
     except KeyboardInterrupt as exc:
-        # SIGTERM (or Ctrl-C) — record an explicit ``killed`` status so the
-        # aggregator can distinguish wallclock kill from ordinary error.
+        # SIGTERM (or Ctrl-C) — record ``killed`` so the aggregator can
+        # tell a wallclock kill from an ordinary error.
         logger.error("Task killed: %s", exc)
         status["status"] = "killed"
         (out_dir / "exception.json").write_text(json.dumps({
@@ -937,9 +860,8 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         exit_code = EXIT_ERROR
 
     finally:
-        # Release the per-task infeasibility-capture window — the next
-        # task on this worker gets a fresh slate.  Best-effort: the
-        # module is optional, so swallow ImportError if it's not on path.
+        # Release the per-task infeasibility-capture window so the next
+        # task on this worker gets a fresh slate. Best-effort.
         try:
             disarm_infeasibility_capture()
         except Exception:  # noqa: BLE001

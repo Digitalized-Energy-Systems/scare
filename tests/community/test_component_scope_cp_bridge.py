@@ -1,34 +1,13 @@
-"""Regression test for the L2 component-scope vs priority-invariant
-metric mismatch surfaced by eval_full_small task 88.
+"""Regression tests for the L2 component-scope vs priority-invariant
+metric mismatch.
 
-Bug (proven against the run artefacts at
-``experiment/_runs/eval_full_small_20260529-181310/tasks/000088/``):
-
-* Failures (14,5), (22,16), (106,94) split the simbench_lv_medium
-  electricity feeder into multiple electricity-only components.
-* ``experiment/eval/metrics.py:_active_node_components`` builds a graph
-  from *all* active branches — including CP coupling branches that
-  monee models as ``branch.model.is_cp() == True`` (see
-  ``src/scare/scenario/restoration.py:124-142`` for the sector resolver
-  that tags those as ``"cp"``).  So electricity-only-split nodes still
-  share a single monee component index via the surviving CP→heat→CP
-  chain.
-* ``src/scare/community/holonic.py:2452`` (``_resolve_component_peer_addrs``)
-  queries the topology mirror with ``sector=Sector.ELECTRICITY`` —
-  electricity-only edges, NO CP bridges (the mirror explicitly rejects
-  ``allow_cp_bridges`` when ``sector is not None``; see
-  ``src/scare/base/topology_mirror.py:187``).
-* Result: two coordinators (lex-smallest aid per electricity-only
-  component) decide independently; the gating
-  ``priority_invariant`` claim (``experiment/eval/claims.py:269``)
-  groups loads by the monee full-graph index and reports a tier
-  inversion across the coordinator boundary.
-
-This test sets up the minimal grid that triggers the mismatch and
-asserts the property the priority_invariant claim requires
-(ONE coordinator across the merged-graph component).  It is expected
-to FAIL until the L2 scope and the metric scope are aligned (see
-the bug report for the two proposed fixes).
+The metric's full-graph component index admits CP coupling branches, so
+electricity-only-split nodes can still share one component via a
+CP->heat->CP chain — while L2 coordinator election queries the topology
+mirror per-sector (no CP bridges). The mismatch lets the
+priority_invariant claim aggregate loads across a coordinator boundary
+and report a spurious tier inversion. The fix aligns the metric scope
+with L2's per-sector election scope.
 """
 
 from __future__ import annotations
@@ -61,11 +40,7 @@ class _StubContext:
     def __init__(self, aid: str) -> None:
         self.aid = aid
         self.addr = _StubAddr(aid)
-        # Some HolonicCommunityRole paths (e.g.
-        # ``_on_leader_emerged``'s diagnostic ``record_event`` call)
-        # touch the sim clock; mango sets this on real RoleContexts
-        # but our stub has no scheduler.  0.0 is the natural default
-        # for unit tests that drive the role directly.
+        # Some role paths read the sim clock; the stub has no scheduler.
         self.current_timestamp = 0.0
 
 
@@ -77,14 +52,7 @@ def _make_leader_role(
     mirror: GridTopologyMirror,
 ) -> HolonicCommunityRole:
     """Construct a HolonicCommunityRole stub wired with the bits the
-    component-scope path actually reads.
-
-    The role's `_resolve_sector_peer_addrs` walks
-    `topology_neighbors(self, tid=...)` — without a mango runtime that
-    raises and the method falls back to ``{self.context.aid: self.context.addr}``.
-    We force the unfiltered baseline by populating ``_holon_member_addrs``-
-    independent data via a monkeypatch below.
-    """
+    component-scope path reads."""
     role = HolonicCommunityRole(
         sector=Sector.ELECTRICITY,
         my_node_id=my_node_id,
@@ -92,21 +60,18 @@ def _make_leader_role(
         topology_mirror=mirror,
         admm_scope="component",
     )
-    role._context = _StubContext(aid)  # mango.agent.role.Role.context is a property over _context
+    role._context = _StubContext(aid)  # Role.context is a property over _context
     return role
 
 
 def _patch_sector_peers(role: HolonicCommunityRole, peer_addrs: dict[str, _StubAddr]) -> None:
-    """Force the unfiltered sector-peer set.  In the live system this is
-    built from the holon_summary_<sector> mesh; in the test we inject it
-    directly so the topology mirror filter is the only variable.
-    """
+    """Inject the unfiltered sector-peer set directly so the topology
+    mirror filter is the only variable under test."""
     role._resolve_sector_peer_addrs = lambda: dict(peer_addrs)  # type: ignore[method-assign]
 
 
 # ---------------------------------------------------------------------------
-# Fixture: 2 electricity islands joined by a CP bridge.
-# Mirrors the task-88 topology in miniature.
+# Fixture: 2 electricity islands joined only by a CP/heat bridge.
 # ---------------------------------------------------------------------------
 #
 #   Electricity island A:  el-1 --a1-- el-2  (leader-A at el-1)
@@ -119,10 +84,9 @@ def _patch_sector_peers(role: HolonicCommunityRole, peer_addrs: dict[str, _StubA
 #                                              |
 #   Electricity island B:  el-20 --a2-- el-21  (leader-B at el-20)
 #
-# After: no electricity-only path connects {el-1, el-2} and {el-20, el-21};
-# but a path through the CP/heat chain joins all of them, so monee's
-# full-graph metric (which admits every branch including CP) sees ONE
-# component.
+# No electricity-only path connects the two islands, but the CP/heat
+# chain joins them, so the full-graph metric (CP branches included) sees
+# ONE component.
 # ---------------------------------------------------------------------------
 
 
@@ -146,14 +110,9 @@ def _two_island_grid() -> tuple[GridTopologyMirror, dict[str, int]]:
     return mirror, leader_node_ids
 
 
-# ---------------------------------------------------------------------------
-# Sanity: mirror semantics match the bug.
-# ---------------------------------------------------------------------------
-
-
 def test_mirror_electricity_only_view_is_split() -> None:
+    """Electricity-only reachability isolates each island."""
     mirror, _ = _two_island_grid()
-    # Electricity-only reachability: each island is isolated.
     reach_A = mirror.reachable_from(1, sector=Sector.ELECTRICITY)
     reach_B = mirror.reachable_from(20, sector=Sector.ELECTRICITY)
     assert reach_A == {1, 2}
@@ -162,22 +121,13 @@ def test_mirror_electricity_only_view_is_split() -> None:
 
 
 def test_metrics_active_components_legacy_full_graph_merges_via_cp_bridge() -> None:
-    """Replay the LEGACY ``_active_node_components`` behaviour
-    (``sector=None``, the original full-graph mode): every active branch
+    """Legacy full-graph mode (``sector=None``): every active branch
     contributes an edge, CP couplings included, so the two electricity
-    islands collapse to one component.
-
-    This is the property that made the priority_invariant claim
-    aggregate leader-A's and leader-B's loads as one (sector,
-    component) group while L2 had split them into independent
-    coordinators.  Kept here as the regression bookend — see the next
-    test for the post-fix per-sector behaviour.
+    islands collapse to one component — the property that let the
+    priority_invariant claim aggregate the two coordinators' loads as a
+    single group. Regression bookend for the per-sector test below.
     """
     mirror, _ = _two_island_grid()
-    # ``_active_node_components`` iterates ``monee_net.branches`` and adds
-    # an edge for every active branch.  CP branches in monee carry
-    # ``branch.model.is_cp() == True`` but still appear in ``branches``;
-    # the legacy helper added them unconditionally.
     g = nx.Graph()
     for (bid_endpoints, _) in [
         ((1, 2), "electricity"),
@@ -197,24 +147,17 @@ def test_metrics_active_components_legacy_full_graph_merges_via_cp_bridge() -> N
 
 
 def test_metrics_active_components_per_sector_splits_electricity() -> None:
-    """Post-fix behaviour of ``_active_node_components(monee_net,
-    sector="electricity")``: CP couplings are excluded, so the two
-    electricity islands stay split — matching the L2 coordinator-
-    election scope.  ``served_by_load`` now stamps each row's
-    ``component`` from this sector-specific map, so the
-    ``priority_invariant`` aggregator groups loads by the same scope
-    L2 actually arbitrates over.
-
-    Uses a stub network that mirrors the simbench_lv_medium task-88
-    topology (two electricity islands + a CP/heat bridge).
+    """``_active_node_components(net, sector="electricity")`` excludes CP
+    couplings, so the two electricity islands stay split — matching the
+    L2 coordinator-election scope the priority_invariant aggregator now
+    groups by. Stub network = two electricity islands + a CP/heat bridge.
     """
     # pylint: disable=import-outside-toplevel
     from experiment.eval.metrics import _active_node_components
 
     class _StubGrid:
         def __init__(self, name: str) -> None:
-            # ``sector_from_grid`` reads ``grid.name`` (lower-cased) and
-            # picks ELECTRICITY/GAS/HEAT by substring.
+            # sector_from_grid picks the sector from grid.name by substring.
             self.name = name
 
     class _StubNode:
@@ -238,7 +181,6 @@ def test_metrics_active_components_per_sector_splits_electricity() -> None:
 
     class _StubNet:
         def __init__(self) -> None:
-            # Electricity grid -> Sector.ELECTRICITY via sector_from_grid.
             self.nodes = [
                 _StubNode(1, "power_grid"),
                 _StubNode(2, "power_grid"),
@@ -263,12 +205,11 @@ def test_metrics_active_components_per_sector_splits_electricity() -> None:
     legacy = _active_node_components(net)               # sector=None
     per_el = _active_node_components(net, sector="electricity")
 
-    # Legacy: one big component (CP bridges merge everything).
+    # Legacy: CP bridges merge everything into one component.
     assert len(set(legacy.values())) == 1, (
         f"legacy full-graph view should merge via CP; got {legacy}"
     )
-    # Per-sector electricity: nodes 1,2 form one component;
-    # 20,21 another.  Heat-only nodes (10,11) appear as singletons.
+    # Per-sector electricity: {1,2} and {20,21} split; heat nodes singletons.
     el_comps_for_loads = {legacy_node: per_el[legacy_node] for legacy_node in (1, 2, 20, 21)}
     assert per_el[1] == per_el[2], (
         f"island A nodes 1 and 2 must share a component; got {per_el}"
@@ -282,19 +223,11 @@ def test_metrics_active_components_per_sector_splits_electricity() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# The actual regression: L2 elects 2 coordinators across the merged-graph
-# component.  This is what the priority_invariant claim cannot tolerate.
-# ---------------------------------------------------------------------------
-
-
 def test_component_allocation_carries_monotone_version_field() -> None:
-    """``ComponentAllocation`` must expose a ``version`` integer (default
-    ``0``) and ``ComponentAdmmReport`` must expose a
-    ``last_applied_allocation_version`` integer (default ``-1``).
-    Together they implement the implicit-ACK retry channel that turns
-    fire-and-forget broadcasts into reliable dispatches under packet
-    loss — see ``channel.ComponentAllocation`` docstring (task 52).
+    """``ComponentAllocation`` exposes ``version`` (default 0) and
+    ``ComponentAdmmReport`` exposes ``last_applied_allocation_version``
+    (default -1) — the implicit-ACK retry channel that makes
+    fire-and-forget broadcasts reliable under packet loss.
     """
     # pylint: disable=import-outside-toplevel
     from scare.base.channel import ComponentAdmmReport, ComponentAllocation
@@ -309,7 +242,7 @@ def test_component_allocation_carries_monotone_version_field() -> None:
     assert isinstance(alloc.version, int)
     assert alloc.version == 0
 
-    # Set explicit version — ensure the field round-trips.
+    # Explicit version round-trips.
     alloc2 = ComponentAllocation(
         publisher="coord-A",
         sector=Sector.ELECTRICITY,
@@ -335,14 +268,9 @@ def test_component_allocation_carries_monotone_version_field() -> None:
 
 def test_leader_emerged_registers_promoted_orphan_aid() -> None:
     """``LeaderEmerged`` updates ``_leader_node_ids`` so the
-    coordinator-election scope (``_resolve_component_peer_addrs``)
-    admits the promoted orphan leader.
-
-    Pre-fix manifestation: in task 88, ``community_repartitioned``
-    spawns a new leader ``child-25`` that never appears as ``leader=``
-    in any ``component_report_sent`` because no leader knows its aid;
-    the slack-budget override routed to it has no L2/L3 escalation
-    path and the breach plateaus 10.6% over budget.
+    coordinator-election scope admits a promoted orphan leader. Without
+    it, a repartition-spawned leader is unknown to every other leader
+    and slack-budget overrides routed to it have no escalation path.
     """
     # pylint: disable=import-outside-toplevel
     from scare.base.model import LeaderEmerged
@@ -363,8 +291,7 @@ def test_leader_emerged_registers_promoted_orphan_aid() -> None:
     ))
     assert role._leader_node_ids.get("orphan-leader") == 42
 
-    # Idempotent: re-applying the same emergence (e.g. a retransmit)
-    # is a no-op and doesn't double-fire the diagnostic event.
+    # Idempotent: re-applying the same emergence is a no-op.
     role._on_leader_emerged(LeaderEmerged(
         leader_aid="orphan-leader",
         leader_addr=_StubAddr("orphan-leader"),
@@ -384,15 +311,9 @@ def test_leader_emerged_registers_promoted_orphan_aid() -> None:
 
 
 def test_resend_allocation_targets_only_stale_leader() -> None:
-    """``_resend_allocation_if_stale`` re-sends to a leader whose
+    """``_resend_allocation_if_stale`` re-sends only to a leader whose
     echoed ``applied_version`` is behind the coordinator's latest
-    counter, and skips leaders that are caught up.  The retry
-    targets only the stale leader (not a fresh broadcast), so a
-    benign duplicate doesn't cost full O(N) under high
-    coordinator-side report churn.
-
-    Driven directly against ``HolonicCommunityRole`` to avoid the
-    mango runtime.  Records the message sends on a stub context.
+    counter, and skips leaders that are caught up (no O(N) re-broadcast).
     """
     # pylint: disable=import-outside-toplevel
     import asyncio
@@ -412,12 +333,10 @@ def test_resend_allocation_targets_only_stale_leader() -> None:
         sent.append((msg, receiver_addr))
 
     role._context.send_message = _send  # type: ignore[attr-defined]
-    # Diagnostics event recorder shim: HolonicCommunityRole's
-    # ``_record_event`` calls ``record_event``, which writes to the
-    # behavior — irrelevant for this test; intercept it.
+    # Stub out the diagnostics recorder, irrelevant here.
     role._record_event = lambda *args, **kwargs: None  # type: ignore[assignment]
 
-    # Pre-populate coordinator state as if we'd dispatched version 3.
+    # Coordinator state as if version 3 had been dispatched.
     role._allocation_version_counter = 3
     role._last_dispatched_allocation = ComponentAllocation(
         publisher="leader-A",
@@ -458,27 +377,12 @@ def test_resend_allocation_targets_only_stale_leader() -> None:
 
 
 def test_l2_splits_two_coordinators_on_cp_bridged_islands() -> None:
-    """Documents the L2 coordinator-election behaviour on a CP-bridged
-    grid.
-
-    Each leader queries ``mirror.reachable_from(my_node,
-    sector=Sector.ELECTRICITY)`` — electricity only.  When two
-    electricity islands are bridged ONLY by a CP/heat chain, this
-    returns two disjoint peer sets and **two coordinators are
-    elected** (each leader picks itself as lex-smallest in its own
-    peer set).
-
-    This is the EXPECTED L2 behaviour after Bug 1 is fixed in the
-    metric: the priority_invariant claim now aggregates per
-    (sector, *sector-subgraph* component) so two coordinators making
-    independent per-tier decisions is correct and does not surface as
-    a spurious tier inversion.  Before the fix, the metric merged the
-    two sub-areas via the CP chain, and the divergent per-tier
-    fractions of the two coordinators looked like a priority order
-    violation.
-
-    Live-system manifestation (pre-fix):
-    ``experiment/_runs/eval_full_small_20260529-181310/tasks/000088``.
+    """L2 elects two coordinators on a grid where two electricity
+    islands are bridged ONLY by a CP/heat chain: each leader queries
+    ``reachable_from(my_node, sector=ELECTRICITY)``, gets a disjoint peer
+    set, and picks itself (lex-smallest). This is correct once the metric
+    aggregates per (sector, sector-subgraph component) rather than
+    merging the islands via the CP chain.
     """
     mirror, leader_node_ids = _two_island_grid()
 
@@ -500,8 +404,7 @@ def test_l2_splits_two_coordinators_on_cp_bridged_islands() -> None:
     coord_A = role_A._component_coordinator_aid()
     coord_B = role_B._component_coordinator_aid()
 
-    # Each leader is the lex-smallest in its own (sector-only) peer
-    # set; the two coordinators are intentionally distinct.
+    # Each leader is lex-smallest in its own sector-only peer set.
     assert coord_A == "leader-A"
     assert coord_B == "leader-B"
     assert coord_A != coord_B

@@ -1,11 +1,9 @@
 """Tests for the end-of-sim hard-bound feasibility scan in
 :mod:`experiment.eval.metrics`.
 
-``constraint_violations_final`` is the accurate counterpart to
-``constraint_violation_integral`` (which only sees per-sector *averages*) and
-the basis for the ``constraint_compliance`` claim that gates the compliant
-PWSF mean.  These tests cover the violation classifier in isolation and an
-end-to-end scan over a real monee grid with an injected breach.
+``constraint_violations_final`` backs the ``constraint_compliance`` claim.
+Covers the violation classifier in isolation and an end-to-end scan over a
+real monee grid with an injected breach.
 """
 
 from __future__ import annotations
@@ -59,8 +57,7 @@ class TestViolationClassifier:
         assert r["overshoot"] > 1.0  # deeply cold
 
     def test_overshoot_uncapped_unlike_utilization(self):
-        # _bound_overshoot must grow past 1.0 so the worst breach can be
-        # ranked (constraint_utilization saturates at 1.0 at the bound).
+        # _bound_overshoot grows past 1.0 so the worst breach can be ranked.
         assert _bound_overshoot(1.20, 0.95, 1.05, one_sided=False) == pytest.approx(3.0)
         assert _bound_overshoot(1.00, 0.95, 1.05, one_sided=False) == 0.0
 

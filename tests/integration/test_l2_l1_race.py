@@ -1,18 +1,11 @@
 """Regression test for the L2 supply-priority allocation being silently
 dropped while an L1 gossip is in flight.
 
-The bug: ``EnergyBalanceNegotiator._handle_start_balance`` checks
-``self._active`` and silently ``return``s if a gossip round is still
-running.  The supply-priority dispatch path doesn't actually need to
-gossip — it just calls ``apply_regulate`` on the leader's group — so
-this check loses authoritative L2 priority decisions whenever they
-collide with an L1 curtailment gossip triggered by, e.g., a thermal
-constraint violation.
-
-Reproduces the eval_full_small_20260526-165742 task 89 inversion where
-child-146 (tier-2 heat) was shed to factor=0 by a curtail gossip at
-t=5.08 and never restored because the L2 ``service_fraction={2: 1.0}``
-arriving at t=5.32 was silently dropped.
+``EnergyBalanceNegotiator._handle_start_balance`` returns early when
+``self._active`` is True. The supply-priority dispatch path doesn't
+gossip (it just calls ``apply_regulate`` on the leader's group), so that
+guard lost authoritative L2 priority decisions whenever they collided
+with an in-flight L1 curtailment gossip.
 """
 
 from __future__ import annotations
@@ -69,27 +62,19 @@ def _build_leader_with_two_loads(behavior: MockBehavior, *, comm_delay_s: float 
 @pytest.mark.asyncio
 async def test_l2_supply_priority_lands_while_gossip_active():
     """L2's supply-priority dispatch must reach the leader's regulate
-    even when an L1 gossip is in flight.
-
-    Without the fix, ``_handle_start_balance`` silently drops the
-    ``StartBalanceNegotiation(service_fraction_by_sector_priority=...)``
-    message because ``self._active`` is True from the in-flight gossip,
-    and the L2 priority decision is lost.
+    even when an L1 gossip is in flight (else the StartBalanceNegotiation
+    is dropped because ``self._active`` is True).
     """
     behavior = MockBehavior()
     world, agents, roles = _build_leader_with_two_loads(behavior)
     leader = roles[0]
 
     async with world:
-        # 1. Force the leader's ``_active`` flag to True to simulate an
-        #    in-flight L1 gossip (the eval-task-89 sequence: heat
-        #    constraint violation → curtail gossip on the leader at
-        #    t=5.04 → leader sheds its own load to factor 0 → L2 ADMM
-        #    arrives at t=5.32 while gossip has not yet stalled).
+        # Simulate an in-flight L1 gossip on the leader.
         leader._active = True
 
-        # 2. Deliver an L2 supply-priority allocation to the leader.
-        #    The dispatch must shed both tier-2 loads to factor=0.0.
+        # Deliver an L2 supply-priority allocation; the dispatch must
+        # shed both tier-2 loads to factor=0.0 despite _active.
         await leader.context.send_message(
             StartBalanceNegotiation(
                 service_fraction_by_sector_priority={
@@ -100,8 +85,8 @@ async def test_l2_supply_priority_lands_while_gossip_active():
         )
         await discrete_step_until(world, max_advance_time_s=2.0)
 
-    # Both tier-2 loads should have received an apply_regulate(factor≈0.0)
-    # from the L2 dispatch — independent of the in-flight gossip.
+    # Both tier-2 loads should have been shed to factor ~0.0 by the L2
+    # dispatch, independent of the in-flight gossip.
     def shed_calls(aid: str):
         return [
             c for c in behavior.action_log

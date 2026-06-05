@@ -1,15 +1,7 @@
-"""Regression tests for the claim-check helpers in
-:mod:`experiment.eval.claims` that were previously unguarded:
+"""Tests for the claim-check helpers in :mod:`experiment.eval.claims`.
 
-- :func:`_check_diary_invariant`
-- :func:`_check_monotonic_progress`
-- :func:`_check_slack_budget`
-
-Recent commits ("fixing monotonic claim", "fixing infeasibilities by
-protecting slack regulation") cite fixes to these very paths; without
-unit coverage a future refactor can re-break them silently.  The tests
-here build minimal CSV artefacts on-disk to exercise the helpers
-without spinning up a full simulation.
+Build minimal CSV artefacts on-disk to exercise the helpers without
+spinning up a full simulation.
 """
 
 from __future__ import annotations
@@ -25,8 +17,6 @@ from experiment.eval.claims import (
     _check_monotonic_progress,
     _check_priority_invariant,
     _check_slack_budget,
-    _holon_admm_mode,
-    _is_priority_aware,
     evaluate_task,
 )
 
@@ -54,9 +44,8 @@ def _write_served_by_load(path: Path, loads: list[dict]) -> Path:
         served = ld["served"]
         rows.append({
             "aid": ld.get("aid", "x"),
-            # Default to a checked sector: heat is excluded from the
-            # priority-ordering claim (locally temperature-governed), so
-            # the mechanics tests (throttle/strand) use electricity.
+            # Heat is excluded from the priority-ordering claim, so default
+            # to electricity for the mechanics tests (throttle/strand).
             "sector": ld.get("sector", "electricity"),
             "tier": ld["tier"],
             "node_id": ld.get("node_id", 0),
@@ -68,11 +57,6 @@ def _write_served_by_load(path: Path, loads: list[dict]) -> Path:
             "constraint_allowed": ld.get("constraint_allowed", 1.0),
         })
     return _write_csv(path, _SBL_COLS, rows)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _write_csv(path: Path, cols: tuple[str, ...], rows: list[dict]) -> Path:
@@ -109,14 +93,9 @@ def _write_timeseries(
     return path
 
 
-# ---------------------------------------------------------------------------
-# _check_diary_invariant
-# ---------------------------------------------------------------------------
-
-
 class TestDiaryInvariant:
     def test_balanced_started_and_terminals_passes(self, tmp_path):
-        # 3 started, 3 terminals (mix of finished / timed_out / cancelled).
+        # Mix of terminal kinds (finished / timed_out / cancelled).
         diary = _write_diary(
             tmp_path / "diary.csv",
             ["started", "started", "started", "finished", "timed_out", "cancelled"],
@@ -127,7 +106,7 @@ class TestDiaryInvariant:
         assert res["detail"]["terminals"] == 3
 
     def test_missing_terminal_fails(self, tmp_path):
-        # 3 started, 2 terminals — one negotiation leaked.
+        # One negotiation started but never reached a terminal state.
         diary = _write_diary(
             tmp_path / "diary.csv",
             ["started", "started", "started", "finished", "finished"],
@@ -138,8 +117,7 @@ class TestDiaryInvariant:
         assert res["detail"]["terminals"] == 2
 
     def test_skipped_singleton_does_not_count_as_terminal(self, tmp_path):
-        # ``skipped_singleton`` is emitted without a prior ``started``
-        # — counting it as a terminal would invert the invariant.
+        # ``skipped_singleton`` is emitted without a prior ``started``.
         diary = _write_diary(
             tmp_path / "diary.csv",
             ["skipped_singleton", "skipped_singleton"],
@@ -155,18 +133,12 @@ class TestDiaryInvariant:
         assert res["detail"] == "no diary"
 
     def test_stalled_counts_as_terminal(self, tmp_path):
-        # ``stalled`` is one of the recognized terminal states; if the
-        # check forgot it, started=1 / terminals=0 would falsely fail.
+        # ``stalled`` is a recognized terminal state.
         diary = _write_diary(
             tmp_path / "diary.csv", ["started", "stalled"],
         )
         res = _check_diary_invariant(diary)
         assert res["passed"] is True
-
-
-# ---------------------------------------------------------------------------
-# _check_monotonic_progress
-# ---------------------------------------------------------------------------
 
 
 class TestMonotonicProgress:
@@ -183,8 +155,7 @@ class TestMonotonicProgress:
         assert res["detail"]["per_sector_relative_drop"]["electricity"] < 1e-9
 
     def test_drop_outside_warmup_and_failure_window_fails(self, tmp_path):
-        # Build a series with a big drop at t=5 s — well past warmup,
-        # no failure event to excuse it.
+        # Big drop past warmup with no failure event to excuse it.
         rows = [(t * 0.5, 1.0) for t in range(0, 20)]
         rows.append((10.5, 0.2))  # 80 % aggregate drop
         ts = _write_timeseries(
@@ -196,9 +167,8 @@ class TestMonotonicProgress:
         assert res["detail"]["per_sector_relative_drop"]["electricity"] > 0.5
 
     def test_drop_inside_failure_window_is_excused(self, tmp_path):
-        # Same drop, but a branch_failure at t=10 s opens a 2 s
-        # quiescence window covering t=10.5 s — the drop is physical,
-        # not a SCARE regression.
+        # A branch_failure at t=10 s opens a quiescence window covering
+        # the t=10.5 s drop, excusing it as physical.
         rows = [(t * 0.5, 1.0) for t in range(0, 20)]
         rows.append((10.5, 0.2))
         ts = _write_timeseries(
@@ -212,8 +182,7 @@ class TestMonotonicProgress:
         assert res["passed"] is True
 
     def test_drop_inside_warmup_is_excused(self, tmp_path):
-        # Drop at t=0.5 s is inside the 1 s warmup; everyone starts
-        # at regulation=1.0 and the first MAS dispatch lands here.
+        # Drop at t=0.5 s is inside the 1 s warmup window.
         ts = _write_timeseries(
             tmp_path / "timeseries.csv",
             ("electrical_balance",),
@@ -224,8 +193,8 @@ class TestMonotonicProgress:
         assert res["passed"] is True
 
     def test_constraint_violation_window_excuses_drop(self, tmp_path):
-        # Drop happens during an active electricity-sector constraint
-        # violation — defensive shed, not a regression.
+        # Drop during an active electricity-sector constraint violation
+        # is excused as a defensive shed.
         rows = [(t * 1.0, 1.0) for t in range(0, 6)]
         rows.append((6.0, 0.3))
         ts = _write_timeseries(
@@ -244,11 +213,6 @@ class TestMonotonicProgress:
             tmp_path / "missing.csv", tmp_path / "events.csv",
         )
         assert res["passed"] is True
-
-
-# ---------------------------------------------------------------------------
-# _check_slack_budget
-# ---------------------------------------------------------------------------
 
 
 class TestSlackBudgetCompliance:
@@ -276,8 +240,7 @@ class TestSlackBudgetCompliance:
         assert res["detail"]["n_violations"] == 0
 
     def test_violation_event_fails(self, tmp_path):
-        # A single ``slack_budget_violation`` is enough to fail the
-        # operator-policy claim for the run.
+        # A single ``slack_budget_violation`` fails the run's claim.
         ev = _write_events(
             tmp_path / "events.csv",
             [
@@ -321,8 +284,8 @@ class TestSlackBudgetSteadyState:
         return p, f"slack__{sector}__{aid}"
 
     def test_transient_spike_that_recovers_passes(self, tmp_path):
-        # Over budget early (cold start), recovers under budget by the
-        # settling window → should PASS (the A-type false-positive fix).
+        # Over budget at cold start but recovered under budget by the
+        # settling window → should PASS.
         meta, col = self._slack_meta(tmp_path, budget=10.0)
         ts = _write_timeseries(
             tmp_path / "timeseries.csv", (col,),
@@ -380,9 +343,8 @@ class TestPriorityInvariantConstraintThrottle:
     *below* its physical cap still is."""
 
     def test_throttled_high_tier_excluded_physics_aware(self, tmp_path):
-        # tier-2 load physically capped at 0.0 (constraint_allowed=0),
-        # tier-3 fully served.  Strict sees tier2<tier3 inversion;
-        # physics-aware excludes the throttled tier-2 load.
+        # tier-2 physically capped at 0.0, tier-3 fully served. Strict sees
+        # an inversion; physics-aware excludes the throttled tier-2 load.
         p = _write_served_by_load(tmp_path / "served_by_load.csv", [
             {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.0, "constraint_allowed": 0.0},
             {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
@@ -390,14 +352,13 @@ class TestPriorityInvariantConstraintThrottle:
         ])
         strict = _check_priority_invariant(p, exclude_constraint_throttled=False)
         physical = _check_priority_invariant(p, exclude_constraint_throttled=True)
-        assert strict["passed"] is False           # raw inversion present
-        assert physical["passed"] is True           # throttled tier-2 dropped
+        assert strict["passed"] is False
+        assert physical["passed"] is True
         assert physical["detail"]["n_loads_throttled"] == 1
 
     def test_priority_shed_below_cap_still_counts(self, tmp_path):
-        # tier-2 served 0.2 while its physical cap is 0.9 → shed below
-        # what physics allows ⇒ a real priority/balance shed, kept even
-        # in physics-aware mode; tier-3 fully served ⇒ inversion stands.
+        # tier-2 served 0.2 below its physical cap of 0.9 → a real shed,
+        # kept even in physics-aware mode; tier-3 full ⇒ inversion stands.
         p = _write_served_by_load(tmp_path / "served_by_load.csv", [
             {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 0.9},
             {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
@@ -415,8 +376,8 @@ class TestPriorityInvariantConstraintThrottle:
         assert _check_priority_invariant(p, exclude_constraint_throttled=True)["passed"] is False
 
     def test_legacy_csv_without_column_falls_back(self, tmp_path):
-        # No constraint_allowed column (old artefact) → physics-aware
-        # mode behaves like strict (no exclusion), never crashes.
+        # No constraint_allowed column → physics-aware mode behaves like
+        # strict (no exclusion) and never crashes.
         cols = ("aid", "sector", "tier", "node_id", "component",
                 "demand", "served", "fraction", "disconnected")
         rows = [
@@ -438,8 +399,8 @@ class TestPriorityInvariantHeatExcluded:
     gating priority-ordering claim (``_LOCAL_PHYSICS_SECTORS``)."""
 
     def test_heat_inversion_does_not_fail_claim(self, tmp_path):
-        # A blatant heat inversion (tier-2 shed below tier-3) must NOT
-        # flip the gating claim — heat is skipped by default.
+        # A heat inversion must not flip the gating claim — heat is
+        # skipped by default.
         p = _write_served_by_load(tmp_path / "served_by_load.csv", [
             {"aid": "a", "sector": "heat", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 1.0},
             {"aid": "b", "sector": "heat", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
@@ -462,8 +423,7 @@ class TestPriorityInvariantHeatExcluded:
         assert all(inv["sector"] == "electricity" for inv in res["detail"]["inversions"])
 
     def test_explicit_empty_skip_set_restores_heat_check(self, tmp_path):
-        # Passing skip_sectors=frozenset() opts back into checking heat
-        # (used by the diagnostic / strict-validation callers).
+        # skip_sectors=frozenset() opts back into checking heat.
         p = _write_served_by_load(tmp_path / "served_by_load.csv", [
             {"aid": "a", "sector": "heat", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 1.0},
             {"aid": "b", "sector": "heat", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
@@ -479,9 +439,9 @@ class TestHeatPriorityDiagnostic:
 
     def test_reports_per_tier_feasible_and_flags_inversion(self, tmp_path):
         p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            # tier-1 feasible but shed to 0.3 (controllable error)
+            # tier-1 feasible but shed to 0.3; tier-2 fully served →
+            # controllable inversion against tier-1.
             {"aid": "a", "sector": "heat", "tier": 1, "demand": 1.0, "served": 0.3, "constraint_allowed": 1.0},
-            # tier-2 feasible fully served → inversion vs tier-1
             {"aid": "b", "sector": "heat", "tier": 2, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
         ])
         res = _check_heat_priority(p)
@@ -490,8 +450,8 @@ class TestHeatPriorityDiagnostic:
         assert res["detail"]["per_tier_served_feasible"]["1"] == 0.3
 
     def test_temperature_infeasible_load_excluded_from_feasible(self, tmp_path):
-        # A tier-1 load capped by temperature (constraint_allowed<1) drops
-        # out of the feasible subset → no controllable inversion flagged.
+        # A temperature-capped tier-1 load (constraint_allowed<1) drops out
+        # of the feasible subset → no controllable inversion flagged.
         p = _write_served_by_load(tmp_path / "served_by_load.csv", [
             {"aid": "a", "sector": "heat", "tier": 1, "demand": 1.0, "served": 0.0, "constraint_allowed": 0.0},
             {"aid": "b", "sector": "heat", "tier": 2, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
@@ -508,122 +468,10 @@ class TestHeatPriorityDiagnostic:
         assert res["passed"] is True
 
 
-# ---------------------------------------------------------------------------
-# Mode gate for the priority claims (eval_full_small_20260529-181310 fix).
-#
-# ``holon_admm_mode="demand"`` is an ablation-only formulation (see
-# ``src/scare/base/config.py``).  In pure-load groups the per-actor coupling
-# never binds, so the priority weight only modulates magnitudes — it does
-# NOT order tiers.  Gating an ablation against a claim its design pre-states
-# it cannot satisfy is meaningless; the eval should report a transparent
-# skip instead of a fatal failure on tasks 132/133.
-# ---------------------------------------------------------------------------
-
-
-class TestPriorityModeGate:
-    """``evaluate_task`` must skip the priority-ordering claims when the
-    task's ``holon_admm_mode`` is not the priority-aware production
-    default (``"supply"``).
-    """
-
-    @staticmethod
-    def _write_minimal_task(
-        task_dir: Path,
-        *,
-        admm_mode: str | None,
-        inversion: bool = True,
-    ) -> None:
-        """Materialise the minimal artefact set ``evaluate_task`` reads:
-        ``config.json``, ``served_by_load.csv`` (with an inversion if
-        requested), and an empty events/timeseries.
-        """
-        task_dir.mkdir(parents=True, exist_ok=True)
-        cfg: dict = {
-            "task_id": 99,
-            "variant": "scare",
-            "sweep": {} if admm_mode is None else {"holon_admm_mode": admm_mode},
-        }
-        (task_dir / "config.json").write_text(json.dumps(cfg))
-        if inversion:
-            # Tier 3 served 0.5, tier 4 served 1.0 — classic priority inversion.
-            _write_served_by_load(task_dir / "served_by_load.csv", [
-                {"aid": "a", "sector": "electricity", "tier": 3,
-                 "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
-                {"aid": "b", "sector": "electricity", "tier": 4,
-                 "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-            ])
-        else:
-            _write_served_by_load(task_dir / "served_by_load.csv", [
-                {"aid": "a", "sector": "electricity", "tier": 1,
-                 "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-            ])
-        # Diary + events + timeseries must exist as files for the other
-        # checks ``evaluate_task`` invokes, but can be empty/minimal.
-        _write_diary(task_dir / "diary.csv", ["started", "finished"])
-        _write_events(task_dir / "events.csv", [])
-        _write_timeseries(task_dir / "timeseries.csv", ("dummy",), [(0.0, 0.0)])
-
-    def test_supply_mode_runs_check_and_flags_inversion(self, tmp_path):
-        self._write_minimal_task(tmp_path, admm_mode="supply", inversion=True)
-        out = evaluate_task(tmp_path)
-        assert out["priority_invariant"]["passed"] is False, (
-            "supply-mode tasks must continue to gate on tier inversions"
-        )
-        assert "skipped" not in (out["priority_invariant"]["detail"] or {})
-
-    def test_demand_mode_skips_priority_invariant(self, tmp_path):
-        # Same fixture, but ``holon_admm_mode=demand`` flips the gate.
-        self._write_minimal_task(tmp_path, admm_mode="demand", inversion=True)
-        out = evaluate_task(tmp_path)
-        assert out["priority_invariant"]["passed"] is True
-        assert out["priority_invariant"]["detail"] == {
-            "skipped": "holon_admm_mode='demand'"
-        }
-        assert out["priority_invariant_strict"]["passed"] is True
-        assert out["monotonic_progress"]["passed"] is True
-        # The non-priority claims (diary_invariant, slack_budget,
-        # heat_priority) stay live regardless of mode.
-        assert out["diary_invariant"]["passed"] is True
-
-    def test_default_when_sweep_missing_is_supply(self, tmp_path):
-        # Tasks that don't set ``holon_admm_mode`` (the common case)
-        # default to supply-mode and run the claim normally.
-        self._write_minimal_task(tmp_path, admm_mode=None, inversion=True)
-        out = evaluate_task(tmp_path)
-        assert out["priority_invariant"]["passed"] is False
-
-    def test_missing_config_falls_back_to_supply(self, tmp_path):
-        # No config.json at all → default to supply-mode (don't silently
-        # skip claims because of a missing file).
-        _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "a", "sector": "electricity", "tier": 3,
-             "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
-            {"aid": "b", "sector": "electricity", "tier": 4,
-             "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-        ])
-        _write_diary(tmp_path / "diary.csv", ["started", "finished"])
-        _write_events(tmp_path / "events.csv", [])
-        _write_timeseries(tmp_path / "timeseries.csv", ("dummy",), [(0.0, 0.0)])
-        assert _is_priority_aware(tmp_path) is True
-        assert _holon_admm_mode(tmp_path) == "supply"
-
-    def test_malformed_config_falls_back_to_supply(self, tmp_path):
-        # An unreadable config shouldn't silently disable a gating claim
-        # — fall back to supply-mode (the conservative default).
-        (tmp_path / "config.json").write_text("not json")
-        assert _holon_admm_mode(tmp_path) == "supply"
-        assert _is_priority_aware(tmp_path) is True
-
-
-# ---------------------------------------------------------------------------
-# _check_constraint_compliance
-# ---------------------------------------------------------------------------
-
 
 class TestConstraintCompliance:
     def test_missing_artefact_is_vacuously_true(self, tmp_path):
-        # Older campaigns / grids with no readings: don't fail a run we
-        # can't measure.
+        # No readings: don't fail a run we can't measure.
         res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
         assert res["passed"] is True
 
@@ -667,8 +515,7 @@ class TestConstraintCompliance:
         assert res["detail"]["by_sector"]["gas"]["n_violations"] == 0
 
     def test_wired_into_evaluate_task(self, tmp_path):
-        # A violated row should surface as a failing constraint_compliance
-        # claim through the public entry point.
+        # A violated row surfaces as a failing claim through evaluate_task.
         _write_constraints_final(tmp_path / "constraints_final.csv", [
             {"kind": "node", "id": 1, "sector": "electricity",
              "variable": "vm_pu", "value": 1.08, "lo": 0.95, "hi": 1.05,

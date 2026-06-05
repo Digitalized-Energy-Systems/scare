@@ -13,19 +13,15 @@ Bridges :class:`HolonSummaryRole` (writer) and
   calls :meth:`merge_into` to override per-tier fractions with any
   active coalition fractions for the same sector.
 
-Constraints expire on ``issued_at + ttl_s`` (natural TTL) or on a
-``BranchFailureEvent`` reaching the leader (early invalidation),
-implementing the design directive that failures invalidate
-coalition constraints immediately so the post-failure L2 ADMM
-round is free to redecide allocations.
+Constraints expire on ``issued_at + ttl_s`` or on a
+``BranchFailureEvent`` reaching the leader (early invalidation), so the
+post-failure L2 ADMM round is free to redecide allocations.
 
-The store is local to each leader; coalitions broadcast their
-constraints over the sector-wide ``holon_summary_<sector>`` mesh,
-so every coalition member's store ends up holding the same
-``coalition_id``-keyed record (last-version-wins).  No cross-agent
-shared state — the store lives inside one Python process per
-leader and is shared between the leader's L2.5 and L2 roles via
-construction-time injection.
+The store is local to each leader; coalitions broadcast their constraints
+over the sector-wide ``holon_summary_<sector>`` mesh, so every member's
+store ends up holding the same ``coalition_id``-keyed record
+(last-version-wins).  It is shared between the leader's L2.5 and L2 roles
+via construction-time injection, not across agents.
 """
 
 from __future__ import annotations
@@ -83,10 +79,9 @@ class CoalitionConstraintStore:
 
     def __init__(self) -> None:
         self._records: dict[str, _CoalitionRecord] = {}
-        # cp_id -> envelope record.  Keyed by CP aid (not coalition_id)
-        # because at most one cross-sector coalition can hold a given
-        # CP at a time — second commit overwrites the first, which is
-        # the desired latest-wins behaviour for re-asserted commits.
+        # cp_id -> envelope.  Keyed by CP aid (not coalition_id): at most
+        # one cross-sector coalition holds a CP at a time, so a second
+        # commit overwrites the first (latest-wins on re-assert).
         self._cp_envelopes: dict[str, _CPEnvelopeRecord] = {}
 
     def set(
@@ -243,7 +238,7 @@ class CoalitionConstraintStore:
         """Return the union of tiers covered by non-expired records for
         ``sector``.
 
-        Used by :class:`HolonicCommunityRole._run_tier_stratified_admm`
+        Used by the holon supply-priority dispatch
         to suppress L2 per-tier dispatch for cells the coalition has
         already claimed — the coalition re-asserts its absolute service
         fractions every tick, so an additional L2 incremental delta on

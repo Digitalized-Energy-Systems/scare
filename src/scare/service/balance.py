@@ -51,9 +51,17 @@ from scare.base.util import (
     obs_priority,
     obs_sector,
     obs_setpoint,
-    tier_priority_weight,
 )
 from scare.community.holonic import HolonicCommunityRole
+from scare.service.gossip_math import (
+    compute_lambda_seed,
+    ledger_merge,
+    ledger_sum_responsiveness,
+    ledger_total_delta,
+    qp_primal,
+    qp_priority_weight,
+    step_size,
+)
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -61,36 +69,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_START_THRESHOLD = 1e-4
-# Sector-specific overrides of ``_DEFAULT_START_THRESHOLD``.  All sectors
-# currently share the same threshold (MW magnitudes).
+# Per-sector threshold overrides (currently all sectors share the default).
 _START_THRESHOLD: dict[Sector, float] = {}
 
 # Per-group threshold = max(_THRESHOLD_ABS_FLOOR,
-# _THRESHOLD_CAPACITY_FRACTION · Σ|cap|).  Scales noise tolerance with
-# group capacity so we reject sub-half-percent imbalances.
+# _THRESHOLD_CAPACITY_FRACTION · Σ|cap|): scales noise tolerance with group
+# capacity to reject sub-half-percent imbalances.
 _THRESHOLD_CAPACITY_FRACTION: float = 0.005
 _THRESHOLD_ABS_FLOOR: float = 1e-6
 
-# Heat utilization above which an agent contributes headroom to the
-# group's thermal-deficit target.  Just below the 0.85 proactive
-# warning so warmup/cooldown triggers gossip pre-violation.
+# Heat utilization above which an agent contributes headroom to the group's
+# thermal-deficit target. Below the 0.85 warning so gossip triggers pre-violation.
 _HEAT_CLEAR_FRACTION: float = 0.6
 
 _MAX_HOPS = 100
 
-# Robbins-Monro step decay: gain = gamma_s / (1 + k / k0).  Satisfies
-# Σ γ_k = ∞, Σ γ_k² < ∞.  k0 ≈ typical simbench LV group size.
+# Robbins-Monro step decay: gain = gamma_s / (1 + k / k0); satisfies
+# Σ γ_k = ∞, Σ γ_k² < ∞. k0 ≈ typical LV group size.
 _STEP_DECAY_K0_DEFAULT: int = 20
 
-# P2 stall detection.  When the recent gap window's range falls below
+# P2 stall detection: when the recent gap window's range falls below
 # _STALL_TOL_FRACTION · |T| and the gap still exceeds the per-group
 # threshold, declare stuck and emit LocalGenerationRequest.
 _STALL_WINDOW_FACTOR: int = 2
 _STALL_TOL_FRACTION: float = 0.005
 _STALL_TOL_FLOOR: float = 1e-6
 
-# Base wallclock deadline per sector (heat is slowest due to high
-# decision delay).  Scaled further by group size at use site.
+# Base wallclock deadline per sector (heat slowest); scaled by group size at use.
 _GOSSIP_TIMEOUT_BASE_S: dict[Sector, float] = {
     Sector.ELECTRICITY: 5.0,
     Sector.GAS: 15.0,
@@ -99,20 +104,17 @@ _GOSSIP_TIMEOUT_BASE_S: dict[Sector, float] = {
 _GOSSIP_TIMEOUT_DEFAULT_S = 15.0
 _GOSSIP_TIMEOUT_PER_AGENT_S = 0.5
 
-# Stale-neighbour pruning: how many poll periods of silence count as
-# dead.  Heat tolerates long gaps; electricity does not.
+# Stale-neighbour pruning: poll periods of silence before a peer counts as dead.
 _HEARTBEAT_MAX_AGE_MULTIPLE: float = 8.0
 
 # Intra-sector priority tiers (lower = higher urgency, gossips earlier).
-# 4-tier model: tier 1 = critical (hard-locked at the leader pre-step
-# before the QP runs), tiers 2–4 = QP-weighted with steep exponents
-# (1e8 / 1e4 / 1.0) so the proportional equilibrium is effectively
-# strict.  See ``scare.base.util.tier_priority_weight`` for the
-# canonical schedule shared across L1 / L2 / L3.
+# Tier 1 = critical (hard-locked at the leader pre-step before the QP);
+# tiers 2-4 = QP-weighted with steep exponents (1e8 / 1e4 / 1.0) so the
+# proportional equilibrium is effectively strict. Schedule lives in
+# ``scare.base.util.tier_priority_weight`` (shared across L1/L2/L3).
 _PRIORITY_TIERS = 4
 
-# Byzantine cap: a single participant's delta is clipped to this
-# multiple of the negotiation target magnitude.
+# Byzantine cap: a participant's delta is clipped to this multiple of |target|.
 _BYZANTINE_DELTA_CAP_MULTIPLE: float = 5.0
 
 
@@ -121,13 +123,12 @@ def _start_threshold(sector: Sector) -> float:
 
 
 def _is_slack_class_child(behavior: Any, aid: str) -> bool:
-    """True iff *aid* refers to a monee ``ExtPowerGrid`` or ``ExtHydrGrid``
-    child — the network's slack-class boundary.
+    """True iff *aid* is a monee ``ExtPowerGrid``/``ExtHydrGrid`` child (the
+    network's slack-class boundary).
 
-    Used to suppress regulation writes on slacks; writing
-    ``regulation < 1`` clamps the LP's effective slack envelope and the
-    next energy-flow solve goes infeasible.  Covers both bounded
-    (registered) and unbounded (heat-side) slacks uniformly.
+    Used to suppress regulation writes on slacks: writing ``regulation < 1``
+    clamps the LP's slack envelope and the next solve goes infeasible. Covers
+    both bounded (registered) and unbounded (heat-side) slacks.
     """
     if not aid.startswith("child-"):
         return False
@@ -146,13 +147,10 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
 
 
 def _heat_thermal_deficit_mw(obs: dict) -> float:
-    """Return MW of demand reduction this heat agent should contribute to
-    its group's thermal-deficit target.
-
-    ``max(0, util - ϑ_clear) · |cap|`` with the dominant local
-    constraint utilization.  Only loads (cap > 0) contribute; heat
-    generators are handled by the local-generation fallback.  Caller must
-    restrict invocation to heat sector.
+    """MW of demand reduction this heat agent contributes to its group's
+    thermal-deficit target: ``max(0, util - ϑ_clear) · |cap|`` over the
+    dominant local constraint utilization. Loads only (cap > 0); heat
+    generators go via the local-generation fallback. Heat sector only.
     """
     cap = obs_capacity(obs)
     if cap <= 0:
@@ -171,23 +169,20 @@ def _heat_thermal_deficit_mw(obs: dict) -> float:
 
 
 def _is_saturated(delta: float, dmin: float, dmax: float) -> bool:
-    """True iff *delta* sits within numerical tolerance of either box bound.
+    """True iff *delta* is within tolerance of either box bound.
 
     Tolerance scales with box magnitude (``1e-9 + 1e-6 · max(|dmin|, |dmax|, 1)``)
-    so large-box problems don't reject near-bound primal values as
-    unsaturated due to ADMM solver noise.
+    so large boxes don't reject near-bound values due to solver noise.
     """
     sat_tol = 1e-9 + 1e-6 * max(abs(dmin), abs(dmax), 1.0)
     return delta <= dmin + sat_tol or delta >= dmax - sat_tol
 
 
 def _deterministic_next(neighbours: list, negotiation_id: str, counter: int) -> Any:
-    """Select the next gossip target deterministically.
-
-    Uses a hash of (negotiation_id, counter) to pick a neighbour index.
-    This replaces ``random.choice`` and ensures that two agents competing
-    for the same resource always send in the same order, which is a
-    prerequisite for deterministic conflict resolution.
+    """Pick the next gossip target deterministically via hash of
+    (negotiation_id, counter). Ensures agents competing for the same
+    resource send in the same order (needed for deterministic conflict
+    resolution).
     """
     if not neighbours:
         return None
@@ -199,11 +194,8 @@ def _deterministic_next(neighbours: list, negotiation_id: str, counter: int) -> 
 def _deterministic_sub_round(
     agent_addr: str, negotiation_id: str, tier: int, tier_size: int
 ) -> int:
-    """Compute a deterministic sub-round index for intra-tier ordering.
-
-    Agents within the same priority tier are serialized: each gets a
-    unique sub-round index in [0, tier_size).  The index is stable for
-    a given (agent, negotiation, tier) triple.
+    """Deterministic sub-round index in [0, tier_size) for intra-tier
+    serialization. Stable for a given (agent, negotiation, tier) triple.
     """
     h = hashlib.sha256(
         f"{negotiation_id}:{tier}:{agent_addr}".encode()
@@ -218,72 +210,53 @@ class _GossipState:
     counter: int
     current_delta: float
     starting_setpoint: float
-    # Feasible-δ box, anchored to the *starting* setpoint of the
-    # negotiation.  Recomputing dmin/dmax from ``obs_min_max`` on every
-    # primal step creates a chicken-and-egg loop: when the agent's own
-    # regulate from the previous step flips the LP's reported sp from
-    # cap → 0, the box flips from [−cap, 0] → [0, cap]; the next primal
-    # step then computes ``δ ≈ 0`` (clamped to the new dmax-from-above
-    # side), apply_setpoint(starting + 0) = starting → factor=1.0; sp
-    # flips back to cap, box flips back, δ=−cap → factor=0.  Result is
-    # a 40 ms-period oscillation between full-shed and full-load, with
-    # net gossip progress = 0.  Confirmed root cause of child-194's
-    # bang-bang behaviour on gas in task-0 simbench_lv.  Anchoring to
-    # the starting state turns δ into a true cumulative change and
-    # keeps the per-step box constant across the negotiation.
+    # Feasible-δ box, anchored to the negotiation's *starting* setpoint.
+    # Must NOT be recomputed per step from ``obs_min_max``: the agent's own
+    # regulate flips the LP's reported sp, flipping the box sign each round
+    # and driving a full-shed/full-load oscillation with zero net progress.
+    # Anchoring keeps δ a true cumulative change and the box constant.
     dmin_starting: float = 0.0
     dmax_starting: float = 0.0
-    # Shared ledger of per-agent contributions, merged across received
-    # messages by taking the entry with the highest counter per agent.
-    # This replaces the aggregate digest that double-counted in cycles.
+    # Per-agent contribution ledger, merged across messages by keeping the
+    # highest-counter entry per agent (avoids cyclic double-counting).
     # addr_str -> (delta, counter_when_set, priority, saturated_flag).
-    # The saturated flag (P1) is True when the agent's last applied
-    # delta hit dmin or dmax within tolerance; ``_n_free()`` excludes
-    # such entries from the equal-share denominator so the per-visit
-    # contraction does not collapse as the boundary set grows.
+    # saturated_flag (P1) is True when the last delta hit a box bound;
+    # saturated entries are excluded from the equal-share denominator so
+    # per-visit contraction doesn't collapse as the boundary set grows.
     memory: dict[str, tuple[float, int, int, bool]] = field(default_factory=dict)
-    # True only for the negotiator that *originated* the gossip via
-    # ``_start_gossip``.  Peers that receive a gossip message and create
-    # a local state from it set this False.  Used by the diagnostics
-    # diary so terminal events ("finished", "timed_out", "cancelled",
-    # "abandoned", "stalled") are recorded once per nid (by the
-    # originator), preserving the ``started == Σ terminals`` invariant.
+    # True only for the negotiator that originated the gossip; peers that
+    # build state from a received message set False. Terminal diary events
+    # are recorded once per nid (by the originator), preserving the
+    # ``started == Σ terminals`` invariant.
     is_originator: bool = False
-    # P2: rolling window of post-update gap values for stall detection.
-    # Sized at ``_STALL_WINDOW_FACTOR · n_active`` rounds; when the
-    # range across the window is below threshold and the gap still
-    # exceeds the per-group threshold, the originator emits
-    # LocalGenerationRequest and finishes with terminal "stalled".
+    # P2: rolling window of post-update gaps, sized
+    # ``_STALL_WINDOW_FACTOR · n_active``. When its range is below threshold
+    # and the gap still exceeds the per-group threshold, the originator
+    # emits LocalGenerationRequest and finishes with terminal "stalled".
     gap_window: list[float] = field(default_factory=list)
-    # P6: scalar dual variable for the primal-dual QP gossip.  At the
-    # KKT optimum, ``dual_lambda`` equals the unique scarcity price
-    # such that ``Σ clamp(a_i · λ, dmin_i, dmax_i) = T``.  Gossiped
-    # along with the ledger; the receiving agent does both a primal
-    # update (its own ``δ_i = clamp(a_i · λ, dmin_i, dmax_i)``) and a
-    # dual update (``λ ← λ + γ_k · (T − Σ_a Δ_a)``).
+    # P6: scalar dual variable for the primal-dual QP gossip. At the KKT
+    # optimum it is the scarcity price λ* with
+    # ``Σ clamp(a_i · λ, dmin_i, dmax_i) = T``. Gossiped with the ledger;
+    # the receiver does a primal update (``δ_i = clamp(a_i · λ, dmin_i, dmax_i)``)
+    # and a dual update (``λ ← λ + γ_k · (T − Σ_a Δ_a)``).
     dual_lambda: float = 0.0
 
 
 class EnergyBalanceNegotiator(Role):
     """Gossip-based energy balance negotiation with:
 
-    - **Priority-ordered participation**: agents join the gossip at a
-      round determined by their priority tier, ensuring high-priority
-      loads are restored first (or shed last).
-    - **Monotonic progress**: once a load's regulation factor has been
-      increased during a restoration (target > 0), it will not be
-      decreased below that floor unless a hard constraint violation
-      forces it (improvements.txt §5 MUST "no-regret switching").
-    - **Deterministic conflict resolution**: gossip forwarding uses a
-      hash-based deterministic selector instead of ``random.choice``,
-      and when two agents compete for the same headroom the
-      higher-priority agent wins (improvements.txt §5 MUST "conflict
-      resolution mechanism").
-    - **Constraint-aware clamping**: setpoints are clamped using the
-      local constraint utilization, so agents near voltage/pressure/
-      temperature bounds automatically contribute less.
-    - **Sector time-scale awareness**: convergence rate defaults to the
-      sector-specific value from ``SECTOR_TIMESCALE``.
+    - Priority-ordered participation: agents join at a round set by their
+      priority tier, so high-priority loads restore first / shed last.
+    - Monotonic progress: during restoration (target > 0) a load's
+      regulation factor never drops below its established floor unless a
+      hard constraint violation forces it ("no-regret switching").
+    - Deterministic conflict resolution: hash-based next-hop selection;
+      on contention for headroom the higher-priority agent wins.
+    - Constraint-aware clamping: setpoints clamped by local constraint
+      utilization, so agents near voltage/pressure/temperature bounds
+      contribute less.
+    - Sector time-scale awareness: convergence rate defaults to the
+      sector value from ``SECTOR_TIMESCALE``.
     """
 
     def __init__(
@@ -302,7 +275,7 @@ class EnergyBalanceNegotiator(Role):
         step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
         enable_qp_gossip: bool = True,
         enable_l2_priority_floor: bool = True,
-        enable_heat_mw_balance: bool = True,
+        enable_actuated_ledger_writeback: bool = True,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -313,30 +286,25 @@ class EnergyBalanceNegotiator(Role):
         self.constraint_aware = constraint_aware
         self.enable_monotonic_floor = enable_monotonic_floor
         self.enable_clpu_ramp = enable_clpu_ramp
-        # L2 priority-floor: clamp gossip ``balance`` sheds up to the
-        # component ADMM's per-load allocation (relaxed by local
-        # constraints).  Blocks the L2→L1 override that inverts tiers
-        # (eval task-88); see ``_apply_setpoint``.
+        # L2 priority-floor: clamp gossip sheds up to the component ADMM's
+        # per-load allocation (relaxed by local constraints), blocking the
+        # L2->L1 tier inversion. See ``_apply_setpoint``.
         self.enable_l2_priority_floor = enable_l2_priority_floor
-        # When False (the default for heat), both MW-balance layers are
-        # suppressed for this sector: the holon supply-priority dispatch is
-        # ignored AND the L1 gossip negotiation does not run.  Heat is then
-        # coordinated solely by the frontier controller + curtailment auction.
-        # See config ``enable_heat_mw_balance`` (multi-seed: net difference is
-        # within noise; we keep heat MW off as the simpler, understood design).
-        self.enable_heat_mw_balance = enable_heat_mw_balance
+        # Write the PHYSICALLY-actuated (constraint-clamped / floored) delta
+        # back into the gossip ledger after ``_apply_setpoint`` so the dual sees
+        # a constrained load's true (smaller) contribution and reallocates the
+        # freed supply to unconstrained loads. Without it the ledger keeps the
+        # unclamped requested delta and the freed supply is never re-served.
+        self.enable_actuated_ledger_writeback = enable_actuated_ledger_writeback
         self.max_hops = max_hops
         self.step_decay_k0 = max(1, int(step_decay_k0))
-        # P6: when True, run the primal-dual QP gossip; when False the
-        # historical equal-share update is used.  Both routes share the
-        # same ledger, Byzantine cap, heartbeat liveness, deterministic
-        # next-hop, P1 saturation flag, P2 stall detection, P3 step
-        # decay, and termination logic — only the per-agent update rule
-        # differs.  Exposed as an ablation flag so the evaluation
-        # harness can run head-to-head comparisons.
+        # When True run the primal-dual QP gossip, else the equal-share
+        # update. Both share ledger, Byzantine cap, heartbeat liveness,
+        # next-hop, saturation flag, stall detection, step decay, and
+        # termination — only the per-agent update rule differs. Ablation flag.
         self.enable_qp_gossip = enable_qp_gossip
 
-        # Apply sector-specific convergence rate if not overridden.
+        # Sector-specific convergence rate unless overridden.
         ts = SECTOR_TIMESCALE.get(sector, {})
         self.convergence_rate = (
             convergence_rate if convergence_rate is not None
@@ -345,49 +313,40 @@ class EnergyBalanceNegotiator(Role):
 
         self._active: bool = False
         self._gossip: _GossipState | None = None
-        # State for the setpoint-gathering phase before gossip starts
+        # Setpoint-gathering phase state, before gossip starts.
         self._trigger_nid: str | None = None
         self._trigger_responses: dict[str, float] = {}
         self._trigger_expected: int = 0
 
-        # Total absolute capacity across this leader's group (refreshed
-        # each ``trigger_balance_negotiation``).  Drives the per-group
-        # threshold so noise scales with group size.
+        # Total |cap| across this leader's group (refreshed each
+        # ``trigger_balance_negotiation``); drives the per-group threshold.
         self._group_capacity_abs: float = 0.0
 
-        # --- Monotonic progress floor ---
-        # Tracks the highest regulation factor this agent has applied
-        # during restoration.  The factor may only decrease if a hard
-        # constraint violation is active.
+        # Monotonic progress floor: highest regulation factor applied during
+        # restoration; may only decrease while a hard constraint violation is
+        # active.
         self._restoration_floor: float = 0.0
         self._constraint_violation_active: bool = False
 
-        # --- Cold-load pickup rate limiter ---
-        # Post-outage inrush is 2-6x steady state for the first minutes.
-        # Loads cap how fast their regulation factor can grow; decreases
-        # (shedding) are unrestricted.  Ramp rate scales with sector
-        # convergence_rate so heat (slow) ramps gentler than electricity.
+        # Cold-load pickup rate limiter: post-outage inrush is 2-6x steady
+        # state. Caps how fast the regulation factor can grow (decreases /
+        # sheds unrestricted); ramp scales with sector convergence_rate.
         self._last_regulate_timestamp: float | None = None
         self._last_regulate_factor: float = 0.0
         self._clpu_ramp_per_s: float = self.convergence_rate
 
-        # --- Neighbour liveness (heartbeat) ---
-        # Maps str(neighbour_addr) -> timestamp of last inbound message.
-        # A neighbour absent for longer than HEARTBEAT_MAX_AGE is pruned
-        # from gossip forwarding.  Bootstrap: address enters the map the
-        # first time we attempt contact (touch), so an unresponsive node
-        # ages out rather than remaining ghost-alive forever.
+        # Neighbour liveness: str(addr) -> timestamp of last inbound message.
+        # A peer silent longer than HEARTBEAT_MAX_AGE is pruned from gossip.
+        # An address enters the map on first contact attempt so unresponsive
+        # nodes age out rather than staying ghost-alive forever.
         self._neighbour_last_seen: dict[str, float] = {}
         poll = ts.get("poll_period_s", 1.0)
         self._heartbeat_max_age_s: float = poll * _HEARTBEAT_MAX_AGE_MULTIPLE
 
-        # --- B.1: continuous coupling weights K_ij(t) ---
-        # Each known neighbour carries a continuous trust score in [0, 1]
-        # that biases gossip forwarding and tightens the liveness gate.
-        # Refined heartbeat: the binary "have we heard recently?" check
-        # is replaced by K >= liveness_threshold.  Decay rate scales with
-        # the sector poll period so heat (slow polling) doesn't pessimise
-        # K too aggressively.
+        # B.1: continuous coupling weights K_ij(t) in [0, 1] per neighbour,
+        # biasing forwarding and gating liveness (K >= liveness_threshold
+        # replaces the binary heartbeat). Decay scales with poll period so
+        # slow-polling heat doesn't pessimise K too fast.
         self._trust = TrustLedger(
             TrustParams(
                 decay_rate_per_s=1.0 / max(poll * _HEARTBEAT_MAX_AGE_MULTIPLE, 1.0),
@@ -397,38 +356,28 @@ class EnergyBalanceNegotiator(Role):
             )
         )
 
-        # --- Local proactive constraint utilization ---
-        # Populated by the co-located GridConstraintMonitor's
-        # ConstraintWarning events.  Keyed by variable name; value is the
-        # last-reported utilization in [0, 1].  Used to throttle the
-        # gossip step so an agent close to a hard bound contributes less.
+        # Local proactive constraint utilization: variable -> last-reported
+        # utilization in [0, 1], from the co-located GridConstraintMonitor's
+        # ConstraintWarning events. Throttles the gossip step near a bound.
         self._proactive_util: dict[str, float] = {}
 
     def setup(self) -> None:
-        # Register this aid as "gossip-capable" so other group members
-        # can route ``EnergyNegotiationMessage`` only to peers that will
-        # actually process it.  The registry lives on the shared
-        # ``behavior`` (sector → set of aids) and is consulted by
-        # ``_gossip_neighbours``.  PowerLine branch agents are joined
-        # to the same electricity groups for flex-query and line-
-        # overload-relief routing, but they do not have an
-        # EnergyBalanceNegotiator — without this filter the gossip
-        # token's deterministic next-hop frequently forwarded to a
-        # branch monitor that silently dropped the message, killing
-        # the gossip after one or two hops (see scenario-trace audit:
-        # ~60 % of failed gossips were token deaths at branches).
+        # Register this aid as gossip-capable (shared ``behavior`` registry,
+        # sector -> set of aids; read by ``_gossip_neighbours``) so peers
+        # route ``EnergyNegotiationMessage`` only to agents that process it.
+        # PowerLine branch agents share the electricity groups but have no
+        # EnergyBalanceNegotiator; without this filter the token's next-hop
+        # forwards to a branch monitor that drops it, killing the gossip.
         store = getattr(self.behavior, "_scare_gossip_capable", None)
         if store is None:
             store = {}
             self.behavior._scare_gossip_capable = store
         store.setdefault(self.sector, set()).add(self.context.aid)
 
-        # Mango's handle_message dispatches synchronously, so async handlers
-        # must be wrapped to schedule themselves via the agent scheduler.
-        # This ensures the simulation's termination detection can track them.
-        # Every inbound message also stamps the sender's heartbeat so
-        # neighbour liveness tracking stays up to date without explicit
-        # heartbeats.
+        # Mango dispatches handle_message synchronously, so async handlers are
+        # wrapped to schedule themselves via the agent scheduler (keeps them
+        # tracked by termination detection). Each inbound message also stamps
+        # the sender's heartbeat for liveness tracking.
         def _wrap(coro_fn):
             def _sync(msg, meta):
                 self._record_sender(meta)
@@ -481,22 +430,17 @@ class EnergyBalanceNegotiator(Role):
         self.context.subscribe_event(
             self, ConstraintWarning, self._on_constraint_warning
         )
-        # Mango requires at least one local subscriber per emitted event
-        # type.  LocalGenerationFallbackRole is attached only to group
-        # leaders, so non-leader members that hit the singleton-fallback
-        # path would crash mango.emit_event without this no-op safety
-        # net.  The actual fallback logic still lives on the leader;
-        # this handler just satisfies the dispatch path.
+        # Mango needs >=1 local subscriber per emitted event type.
+        # LocalGenerationFallbackRole is leader-only, so a non-leader hitting
+        # the singleton-fallback path would crash emit_event without this
+        # no-op. Real fallback logic stays on the leader.
         self.context.subscribe_event(
             self, LocalGenerationApproval, self._on_local_gen_approval_noop
         )
-        # Same defensive pattern for NegotiationFinishedEvent: in the
-        # production scenario every child also hosts ``GenerationController``
-        # which subscribes to it, but in unit tests / minimal compositions
-        # the negotiator may be the only role on the agent.  P2's early
-        # stall termination can fire ``_finish_negotiation`` before any
-        # external listener is wired, so a noop here keeps the dispatch
-        # path safe without changing production behaviour.
+        # Same no-op pattern for NegotiationFinishedEvent: production agents
+        # also host ``GenerationController`` (a subscriber), but in minimal
+        # compositions the negotiator may be alone and stall termination can
+        # fire ``_finish_negotiation`` with no external listener wired.
         self.context.subscribe_event(
             self, NegotiationFinishedEvent, self._on_finished_noop
         )
@@ -508,25 +452,21 @@ class EnergyBalanceNegotiator(Role):
     def _on_local_gen_approval_noop(
         self, _event: LocalGenerationApproval, _src: Any
     ) -> None:
-        # Intentionally empty — see setup() for the rationale.  The
-        # leader's LocalGenerationFallbackRole handles the actual
-        # response.
+        # No-op; the leader's LocalGenerationFallbackRole handles the
+        # response. See setup() for why this subscriber exists.
         return
 
     def _on_finished_noop(
         self, _event: NegotiationFinishedEvent, _src: Any
     ) -> None:
-        # Intentionally empty — production runs always have a
-        # GenerationController subscribing to NegotiationFinishedEvent
-        # and acting on it; this noop keeps mango's dispatch path safe
-        # in minimal compositions where no external listener is wired.
+        # No-op; production agents have a GenerationController subscribing to
+        # NegotiationFinishedEvent. Keeps dispatch safe in minimal compositions.
         return
 
     def _on_constraint_warning(self, event: ConstraintWarning, _src: Any) -> None:
-        # Co-located monitor reports proximity to a bound; record the
-        # latest utilization so the gossip step can throttle this agent's
-        # contribution.  Other-sector warnings are ignored — sector
-        # coupling is handled at the holon / CP level, not in gossip.
+        # Record proximity-to-bound utilization so the gossip step can
+        # throttle this agent. Other-sector warnings ignored (sector coupling
+        # is handled at the holon/CP level, not in gossip).
         if event.sector != self.sector:
             return
         self._proactive_util[event.variable] = float(event.utilization)
@@ -534,11 +474,9 @@ class EnergyBalanceNegotiator(Role):
     def _on_constraint_violation(self, event: ConstraintViolation, _src: Any) -> None:
         if event.sector == self.sector:
             self._constraint_violation_active = True
-            # Cancel any active gossip: the constraint landscape has changed,
-            # so continuing to converge on a stale target is wasteful and may
-            # push the system further into violation.  The BalanceProblem
-            # event emitted by GridConstraintMonitor will trigger a fresh
-            # negotiation that incorporates updated constraint utilization.
+            # Cancel any active gossip: the constraint landscape changed, so
+            # converging on a stale target may push further into violation.
+            # GridConstraintMonitor's BalanceProblem triggers a fresh round.
             if self._gossip is not None:
                 logger.info(
                     "[%s] cancelling gossip %s due to %s violation",
@@ -581,13 +519,12 @@ class EnergyBalanceNegotiator(Role):
         (``0`` when no gossip is active)."""
         if self._gossip is None:
             return 0.0
-        return sum(v[0] for v in self._gossip.memory.values())
+        return ledger_total_delta(self._gossip.memory)
 
     def _compute_participation_scale(self, obs: dict) -> float:
-        """Constraint-aware throttle ``∈ [0, 1]`` blending local
-        utilization, worst-neighbour utilization, and proactive
-        warnings.  Heat is exempt: thermal violations want stressed
-        loads to shed (handled by priority + clamp), not throttle.
+        """Constraint-aware throttle in [0, 1] blending local, worst-neighbour,
+        and proactive-warning utilization. Heat exempt: thermal violations want
+        stressed loads to shed (via priority + clamp), not throttle.
         """
         if not self.constraint_aware or self.sector == Sector.HEAT:
             return 1.0
@@ -623,15 +560,13 @@ class EnergyBalanceNegotiator(Role):
         key = str(addr)
         now = self.context.current_timestamp
         self._neighbour_last_seen[key] = now
-        # B.1: every received message recovers the K-score multiplicatively.
+        # B.1: each received message recovers the K-score multiplicatively.
         self._trust.on_message_received(key, now)
 
     def _touch_neighbours(self, addrs: list) -> None:
-        """Seed the heartbeat clock for neighbours we have just contacted.
-
-        Keeps an unresponsive node from aging out immediately (grace
-        period equal to the heartbeat timeout) while ensuring that if it
-        never replies, it will still be pruned on the next round.
+        """Seed the heartbeat clock for just-contacted neighbours: grants a
+        grace period (the heartbeat timeout) before an unresponsive node ages
+        out, but still prunes it next round if it never replies.
         """
         now = self.context.current_timestamp
         for addr in addrs:
@@ -642,20 +577,17 @@ class EnergyBalanceNegotiator(Role):
     def _update_gap_window_and_check_stall(
         self, open_gap: float, target: float
     ) -> bool:
-        """P2: append the post-update gap to the rolling window and
-        decide whether the protocol has stalled.
+        """P2: append the post-update gap to the rolling window and decide
+        whether the protocol has stalled.
 
-        A stall is declared when (a) the run is past warm-up, (b) the
-        window is full, (c) the max-min range across the window is
-        below ``max(_STALL_TOL_FRACTION · |T|, _STALL_TOL_FLOOR)``,
-        and (d) the current gap still exceeds the per-group threshold.
+        Stall when: past warm-up, window full, its max-min range is below
+        ``max(_STALL_TOL_FRACTION · |T|, _STALL_TOL_FLOOR)``, and the current
+        gap still exceeds the per-group threshold.
 
-        Warm-up = ``_PRIORITY_TIERS + 1 + window_size`` rounds.  This
-        accounts for the priority-gating delay (generators wait until
-        counter $\\ge P+1$ during restoration) plus a full window's
-        worth of post-warmup gap samples.  Without it the stall
-        detector would fire during the silence before the lowest-tier
-        agents are eligible to act.
+        Warm-up = ``_PRIORITY_TIERS + 1 + window_size`` rounds: covers the
+        priority-gating delay (generators wait until counter >= P+1 during
+        restoration) plus a full window of post-warmup samples, so the
+        detector doesn't fire during the pre-eligibility silence.
         """
         if self._gossip is None:
             return False
@@ -665,9 +597,8 @@ class EnergyBalanceNegotiator(Role):
         win.append(open_gap)
         if len(win) > window_size:
             del win[0]
-        # Warm-up gate: priority tiers and sub-round serialisation can
-        # silence many early rounds; don't decide on stall until the
-        # protocol has had a fair chance to converge.
+        # Warm-up gate: priority tiers and sub-round serialisation silence
+        # many early rounds; don't decide stall before a fair chance to converge.
         warmup = _PRIORITY_TIERS + 1 + window_size
         if self._gossip.counter < warmup:
             return False
@@ -680,16 +611,12 @@ class EnergyBalanceNegotiator(Role):
         return abs(open_gap) > self._per_group_threshold()
 
     async def _finish_negotiation_stalled(self) -> None:
-        """P2: terminate a stalled gossip and escalate to the local-
-        generation fallback.
+        """P2: terminate a stalled gossip and escalate to local-gen fallback.
 
-        Only the originator records the ``stalled`` diary terminal so
-        the ``started == Σ terminals`` invariant remains exact.
-        Emits LocalGenerationRequest with the residual deficit if this
-        agent is the group leader (the same gate as in
-        ``_finish_negotiation``); ``_finish_negotiation`` is then
-        called with ``record_finished=False`` so it does not double-
-        count a ``finished`` terminal.
+        Only the originator records the ``stalled`` terminal (keeps
+        ``started == Σ terminals`` exact). ``_finish_negotiation`` is then
+        called with ``record_finished=False`` to avoid double-counting a
+        ``finished`` terminal; it emits LocalGenerationRequest if leader.
         """
         if self._gossip is None:
             return
@@ -714,110 +641,13 @@ class EnergyBalanceNegotiator(Role):
                 residual=residual,
                 group_size=len(self._gossip.memory),
             )
-        # Suppress the "finished" diary entry — this terminal is "stalled"
+        # Suppress the "finished" entry — this terminal is "stalled".
         await self._finish_negotiation(record_finished=False)
 
-    # ------------------------------------------------------------------
-    # P6: primal-dual QP helpers
-    # ------------------------------------------------------------------
-
-    def _qp_priority_weight(self, target_sign: int) -> float:
-        """Priority cost weight for the QP responsiveness ``a_i``.
-
-        Delegates to ``tier_priority_weight`` (the single source of
-        truth for the 4-tier schedule).  Tier 1 is hard-locked at the
-        leader pre-step, so this returns the defensive weight 1.0 for
-        tier-1 entries that might still reach the QP.  Tiers 2–4 get
-        the 1e8 / 1e4 / 1.0 schedule.  Generators always return 1.0 in
-        either direction — the existing primal-clamp sign handles
-        their participation symmetrically.
-        """
-        return tier_priority_weight(
-            self.priority,
-            regime=int(target_sign),
-            priority_tiers=_PRIORITY_TIERS,
-        )
-
-    def _qp_responsiveness(self, _cap: float, target_sign: int) -> float:
-        """Per-agent QP coefficient ``a_i = w_i`` (priority weight).
-
-        Capacity does not enter ``a_i`` directly — it enters the
-        formulation through the box constraints
-        ``[δ_min, δ_max]`` instead.  Two agents with the same priority
-        but different capacities will move identical ``δ`` values per
-        unit of ``λ``; the smaller-capacity agent saturates earlier
-        because its box is smaller, which is the correct waterfall
-        behaviour.  Putting capacity-squared in ``a_i`` would make
-        the dual scale wildly with grid size and inflate ``λ`` by
-        orders of magnitude for no convergence benefit.
-        """
-        return self._qp_priority_weight(target_sign)
-
-    def _qp_primal(
-        self,
-        a_i: float,
-        lam: float,
-        dmin: float,
-        dmax: float,
-        _target_sign: int,
-        _cap: float,
-    ) -> float:
-        """Closed-form primal update: ``δ_i = clamp(a_i · λ, dmin, dmax)``.
-
-        The sign of ``λ`` matches the sign of the target ``T``, so for
-        restoration (``T > 0``) ``λ`` rises from 0 to ``λ* = T/Σa_j``
-        and pushes every agent's ``δ`` positive (loads up, generators
-        shed); for curtailment (``T < 0``) ``λ`` falls below 0 and
-        pushes every agent's ``δ`` negative (loads shed, generators
-        ramp up).  Box clamping enforces feasibility unconditionally.
-        """
-        return max(dmin, min(dmax, a_i * lam))
-
-    def _compute_lambda_seed(self, target: float, n_neighbours: int) -> float:
-        """Seed λ so the originator's first primal step makes meaningful
-        progress while leaving the dual update room to correct.
-
-        Aims the originator's first-step δ at its fair share
-        ``target / n_seed``, giving ``λ₀ = target / (n_seed · a_self)``.
-        Clamped to ``|target|`` so pathological tier combinations cannot
-        inject an unbounded first step.
-        """
-        target_sign = 1 if target > 0 else (-1 if target < 0 else 0)
-        a_self = max(self._qp_priority_weight(target_sign), 1.0)
-        n_seed = max(2, n_neighbours + 1)
-        lambda_seed = target / (n_seed * a_self)
-        return max(-abs(target), min(abs(target), lambda_seed))
-
-    def _entry_responsiveness(self, prio: int, target_sign: int) -> float:
-        """``a_i`` from a ledger entry's stored priority — used by the
-        receiver to estimate ``Σ a_j`` for dual-step normalisation.
-
-        Mirrors ``_qp_priority_weight`` exactly (same schedule, same
-        source of truth) so the dual update agrees with each agent's
-        own primal step.
-        """
-        return tier_priority_weight(
-            int(prio),
-            regime=int(target_sign),
-            priority_tiers=_PRIORITY_TIERS,
-        )
-
-    def _step_size(self, counter: int) -> float:
-        """Robbins-Monro diminishing step (P3).
-
-        Returns ``gamma_s / (1 + k / k0)``.  Satisfies
-        ``Σ γ_k = ∞`` and ``Σ γ_k² < ∞`` so the gossip dynamics
-        converge almost surely under bounded-variance noise.  At
-        ``counter = 0`` this exactly matches the historical
-        constant-step behaviour, so cold-start dynamics are unchanged.
-        """
-        return self.convergence_rate / (1.0 + max(0, counter) / self.step_decay_k0)
-
     def _per_group_threshold(self) -> float:
-        """Per-negotiation threshold scaled by the leader's snapshot of
-        total group load capacity.  Falls back to the sector default
-        floor only when the leader has no capacity information yet
-        (e.g. before the first ``trigger_balance_negotiation``).
+        """Per-negotiation threshold scaled by the leader's snapshot of total
+        group load capacity. Falls back to the sector default floor when no
+        capacity info exists yet (before the first trigger).
         """
         if self._group_capacity_abs <= 0.0:
             return _start_threshold(self.sector)
@@ -827,37 +657,28 @@ class EnergyBalanceNegotiator(Role):
         )
 
     def _live_neighbours(self) -> list:
-        """Return group neighbours whose continuous trust score K_ij is
-        above the liveness threshold (B.1).
+        """Group neighbours whose trust score K_ij exceeds the liveness
+        threshold (B.1). Unknown neighbours bootstrap optimistically (initial
+        K = 1.0) so first contact succeeds.
 
-        Bootstraps unknown neighbours optimistically (initial K = 1.0 in
-        the ``TrustLedger``), so first contact always succeeds; recovery
-        is multiplicative on every received message and decay is linear
-        in the silence interval scaled by the sector poll period.
-
-        Includes *every* live group neighbour — used for the flex-query
-        round (``AskEnergyMessage``) which branch agents reply to via
-        their stub.  For gossip token routing, use ``_gossip_neighbours``
-        instead so the token only travels among peers that subscribe to
-        ``EnergyNegotiationMessage``.
+        Includes every live group neighbour — for the flex-query round
+        (``AskEnergyMessage``), which branch agents answer. For gossip token
+        routing use ``_gossip_neighbours`` (only peers that subscribe to
+        ``EnergyNegotiationMessage``).
         """
         all_neighbours = topology_neighbors(self, tid="groups")
         now = self.context.current_timestamp
         return [a for a in all_neighbours if self._trust.is_live(str(a), now)]
 
     def _gossip_neighbours(self) -> list:
-        """Live group neighbours that have an ``EnergyBalanceNegotiator``
-        of the same sector — i.e. agents that will actually process an
-        ``EnergyNegotiationMessage``.
+        """Live group neighbours with a same-sector ``EnergyBalanceNegotiator``
+        — agents that actually process an ``EnergyNegotiationMessage``.
 
-        PowerLine branch agents (line-loading-relief feature) are joined
-        to the electricity groups topology for the flex-query and
-        overload-relief routing they participate in, but they have a
-        ``GridConstraintMonitor`` in branch mode only — no
-        ``EnergyBalanceNegotiator``, so the gossip protocol dies on a
-        first-hop forward to them.  Filtering on registered gossip-
-        capable aids (see ``setup()``) keeps them in the community for
-        flex purposes while excluding them from token routing.
+        PowerLine branch agents sit in the electricity groups (for flex-query
+        and overload-relief) but run only a branch-mode ``GridConstraintMonitor``,
+        no negotiator, so the token dies on a forward to them. Filtering on the
+        gossip-capable registry (see ``setup()``) keeps them in the community
+        for flex while excluding them from token routing.
         """
         store = getattr(self.behavior, "_scare_gossip_capable", {})
         capable = store.get(self.sector, set())
@@ -869,14 +690,10 @@ class EnergyBalanceNegotiator(Role):
         return [self._trust.score(str(a), now) for a in neighbours]
 
     def _next_hop(self, neighbours: list, nid: str, counter: int):
-        """B.1: K-weighted deterministic next-hop selection.
-
-        Generalises ``_deterministic_next`` by picking the index in
-        proportion to the trust score K_ij.  Reduces to the uniform
-        SHA256 modulo when all K's are equal, so behaviour matches the
-        legacy path under healthy conditions.  When some neighbours
-        have low K (recent silence, partial outage), the gossip routes
-        around them automatically.
+        """B.1: K-weighted deterministic next-hop. Picks the index in
+        proportion to trust score K_ij; reduces to uniform SHA256-modulo when
+        all K are equal. Low-K neighbours (silence, partial outage) are routed
+        around automatically.
         """
         if not neighbours:
             return None
@@ -890,9 +707,10 @@ class EnergyBalanceNegotiator(Role):
     async def trigger_balance_negotiation(self) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
             return
-        # MW balance deactivated for heat (frontier controller + auction own
-        # it; unbounded slack ⇒ no MW imbalance to resolve).
-        if self.sector == Sector.HEAT and not self.enable_heat_mw_balance:
+        # MW balance is deactivated for heat: the frontier controller +
+        # curtailment auction own it and the unbounded heat slack means no MW
+        # imbalance to resolve. El/gas unaffected.
+        if self.sector == Sector.HEAT:
             return
         if self._active:
             return
@@ -900,13 +718,10 @@ class EnergyBalanceNegotiator(Role):
 
         neighbours = self._live_neighbours()
         self._touch_neighbours(neighbours)
-        # Snapshot the group's absolute capacity so the threshold for
-        # this negotiation scales with what is physically there.  Loads
-        # only (cap > 0): the threshold gates demand-side imbalance, and
-        # large generators in a load-light group shouldn't relax it.
-        # During restoration with target<0 (curtailment) this is also
-        # the right denominator — we want to ignore noise relative to
-        # the demand we are protecting.
+        # Snapshot group |cap| so the threshold scales with what's physically
+        # present. Loads only (cap > 0): the threshold gates demand-side
+        # imbalance, and is also the right denominator for curtailment (T<0) —
+        # ignore noise relative to the demand being protected.
         members = [self.context.aid] + [a.aid for a in neighbours]
         cap_sum = 0.0
         for aid in members:
@@ -949,35 +764,23 @@ class EnergyBalanceNegotiator(Role):
     def _reported_setpoint(self, obs: dict) -> float:
         """Setpoint contribution to the group's negotiation target.
 
-        For electricity / gas this is the raw setpoint (Σ s_i ≈ 0
-        ⇒ balanced).  For heat the setpoint is amplified by this
-        agent's local thermal deficit so a stressed group surfaces a
-        non-zero negative target — the gossip then sheds load via the
-        existing reverse-priority rules in ``_compute_actual_priority``.
+        El/gas: the raw setpoint (Σ s_i ≈ 0 ⇒ balanced). Heat: amplified by
+        the local thermal deficit so a stressed group surfaces a negative
+        target, shedding load via the reverse-priority rules in
+        ``_compute_actual_priority``.
 
-        F2 — Slack target:  if this agent is registered as a slack
-        (``register_slack``), report the *target infeed* rather than
-        the LP's current operating point.  The target is
-        ``slack_target_fraction · rating`` in load convention (positive
-        when the operator wants the slack to import).  This shifts the
-        gossip's imbalance accounting from "everything balances to
-        zero" (which the LP achieves trivially) to "the rest of the
-        group should balance such that the slack only draws its
-        target" — which is the real operator objective.
+        F2 — slack target: if this agent is a registered slack, report the
+        *target infeed* ``slack_target_fraction · rating`` (load convention,
+        positive = import) instead of the LP's current draw. This reframes the
+        imbalance from "balance to zero" (trivial for the LP) to "the rest of
+        the group balances so the slack draws only its target".
 
-        NB: gossip is per-community, but the slack budget is a global
-        property of the connected component.  The gossip target
-        derived from this setpoint only matches the operator's
-        intent when the slack's community spans (most of) the
-        component — which is only true for ``component_level``.
-        For ``single_level`` and the holonic ``scare`` variant the
-        community is small and the gossip target derived here is
-        incoherent with the global budget.  Budget enforcement for
-        those variants happens via
-        :class:`~scare.service.slack_budget.SlackBudgetMonitor` 's
-        signed ``override_target`` (the over-budget magnitude in
-        gossip-target convention), not via the per-community
-        ``-total_sp`` target.
+        Gossip is per-community but the slack budget is a property of the whole
+        connected component, so this target only matches operator intent when
+        the slack's community spans most of the component (``component_level``).
+        For ``single_level`` / holonic ``scare`` the community is small and
+        this target is incoherent with the global budget; budget enforcement
+        there uses ``SlackBudgetMonitor``'s signed ``override_target`` instead.
         """
         slack = lookup_slack(self.behavior, self.context.aid)
         if slack is not None:
@@ -985,9 +788,8 @@ class EnergyBalanceNegotiator(Role):
             fraction = float(
                 getattr(cfg, "slack_target_fraction", 0.0) if cfg is not None else 0.0
             )
-            # ``slack.cap`` is generator-convention (negative); the
-            # *import* target is the positive of that magnitude.  In
-            # load convention an importing slack has positive p_mw.
+            # ``slack.cap`` is generator-convention (negative); the import
+            # target is its magnitude (load convention: importing slack > 0).
             rating = abs(slack.cap)
             sp = fraction * rating
             return sp
@@ -1014,48 +816,33 @@ class EnergyBalanceNegotiator(Role):
             self._trigger_nid = None
             self._trigger_responses = {}
 
-            # Tier-1 hard-constraint pre-step.  Apply ``regulation = 1`` to
-            # every tier-1 load if the community's generator pool can
-            # cover the total tier-1 demand; otherwise distribute the
-            # pool pro-rata across tier-1 and force tiers 2/3/4 to 0
-            # (no QP needed — the trivial allocation is exact).
+            # Tier-1 hard pre-step: lift every tier-1 load to regulation=1 if
+            # the generator pool covers tier-1 demand; else distribute the pool
+            # pro-rata and force tiers 2/3/4 to 0 (trivial allocation, no QP).
             residual_target, skip_gossip = self._pre_apply_tier1_hard(
                 total_sp
             )
             if skip_gossip:
-                # Tier-1 infeasible case OR nothing left to negotiate
-                # after pre-step (residual below threshold).
+                # Tier-1 infeasible, or residual below threshold.
                 self._active = False
                 return
             await self._start_gossip(residual_target)
 
     def _pre_apply_tier1_hard(self, total_sp: float) -> tuple[float, bool]:
-        """Tier-1 hard-constraint pre-step.
+        """Tier-1 hard-constraint pre-step over the leader's group.
 
-        Walks the leader's group members, separates tier-1 loads from
-        tier-2/3/4 loads and generators, and decides between two paths:
+        Feasible (``pool >= tier1_unmet``): lift every tier-1 load to
+        ``regulation = 1`` and return residual ``(-total_sp) - tier1_unmet`` so
+        the QP clears only what's left. Tier-1 loads have ``a_i = 0`` so they
+        sit out the QP.
 
-        **Feasible** (``pool >= tier1_unmet``): lift every tier-1 load
-        to ``regulation = 1`` directly via ``apply_regulate``, then
-        return the residual imbalance ``T_residual = (-total_sp) -
-        tier1_unmet`` so the gossip QP only needs to clear what's left
-        after tier-1 is fully served.  The QP runs over tiers 2/3/4 +
-        generators; tier-1 loads have ``a_i = 0`` (see
-        ``tier_priority_weight``) so they sit out the QP.
+        Infeasible (``pool < tier1_unmet``): distribute the pool pro-rata by
+        per-load unmet demand, force tiers 2/3/4 to ``regulation = 0``, and
+        return ``(0.0, skip_gossip=True)`` (priority-correct by construction).
 
-        **Infeasible** (``pool < tier1_unmet``): distribute the
-        available pool across tier-1 loads pro-rata by per-load unmet
-        demand, force tier-2/3/4 loads to ``regulation = 0``, and
-        return ``(0.0, skip_gossip=True)``.  The trivial allocation is
-        priority-correct by construction; running the QP would only
-        introduce noise.
-
-        ``total_sp`` is the leader's current snapshot of the group's
-        net setpoint (load convention); the legacy gossip target is
-        ``-total_sp``.  The first return value is the residual target
-        for ``_start_gossip``; the second is True iff the gossip
-        should be skipped entirely (infeasible OR residual ≤
-        threshold).
+        ``total_sp`` is the group's net setpoint (load convention); gossip
+        target is ``-total_sp``. Returns (residual target for ``_start_gossip``,
+        skip flag — True iff infeasible OR residual ≤ threshold).
         """
         original_target = -float(total_sp)
         threshold = self._per_group_threshold()
@@ -1089,8 +876,7 @@ class EnergyBalanceNegotiator(Role):
         ]
         tier1_unmet = sum(tier1_unmet_per_load)
 
-        # No tier-1 loads OR no tier-1 deficit → nothing to pre-apply;
-        # the QP runs unchanged over the original imbalance.
+        # No tier-1 loads / no tier-1 deficit: QP runs over the original imbalance.
         if tier1_unmet <= threshold:
             return original_target, abs(original_target) <= threshold
 
@@ -1117,7 +903,7 @@ class EnergyBalanceNegotiator(Role):
             )
             return residual, abs(residual) <= threshold
 
-        # Infeasible: pro-rata pool across tier-1 by unmet; tiers 2-4 → 0.
+        # Infeasible: pro-rata pool across tier-1 by unmet; tiers 2-4 -> 0.
         now = float(self.context.current_timestamp)
         applied_tier1 = 0
         applied_shed = 0
@@ -1162,9 +948,9 @@ class EnergyBalanceNegotiator(Role):
     # ------------------------------------------------------------------
 
     async def _start_gossip(self, target: float) -> None:
-        # MW balance deactivated for heat — also guards the holon
-        # ``override_target`` path that calls here directly.
-        if self.sector == Sector.HEAT and not self.enable_heat_mw_balance:
+        # MW balance deactivated for heat (see ``trigger_balance_negotiation``);
+        # also guards the holon ``override_target`` path that calls here directly.
+        if self.sector == Sector.HEAT:
             return
         threshold = self._per_group_threshold()
         if abs(target) < threshold:
@@ -1185,26 +971,21 @@ class EnergyBalanceNegotiator(Role):
             self._active = False
             return
 
-        # An overlapping trigger (e.g. a slack-budget override arriving
-        # while an AskEnergy round's response is still in flight) can
-        # reach ``_start_gossip`` with a previous originator gossip still
-        # live in ``self._gossip``.  Overwriting it below would drop its
-        # diary terminal — the task-7/22 ``started != Σ terminals`` leak.
+        # An overlapping trigger (e.g. a slack-budget override arriving while
+        # an AskEnergy response is still in flight) can reach here with a live
+        # originator gossip; overwriting it would drop its diary terminal.
         # Retire it as ``abandoned`` first.
         self._close_inflight_originator(
             "abandoned", log_reason="superseded by new gossip"
         )
 
-        # Clear violation flag at the start of each new negotiation so
-        # that the monotonic floor is only breached while a violation is
-        # actively present.
+        # Reset the violation flag so the monotonic floor only yields while a
+        # violation is actively present.
         self._constraint_violation_active = False
 
-        # Gossip-only neighbour list: excludes group members without an
-        # EnergyBalanceNegotiator (e.g. PowerLine branch monitors added
-        # to electricity groups for the overload-relief feature).
-        # Including them as gossip targets kills the token on first
-        # forward — they have no handler for EnergyNegotiationMessage.
+        # Gossip-only neighbours: excludes members without an
+        # EnergyBalanceNegotiator (e.g. branch monitors); forwarding the token
+        # to them kills it (no EnergyNegotiationMessage handler).
         neighbours = self._gossip_neighbours()
         self._touch_neighbours(neighbours)
         nid = str(uuid4())
@@ -1212,16 +993,17 @@ class EnergyBalanceNegotiator(Role):
 
         obs = self.behavior.observe(self.context.aid) or {}
         starting_sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
-        # Anchor the QP δ-box to the starting state for the whole
-        # negotiation — see _GossipState comment.  Recomputing this
-        # box per step from live obs caused a self-driven oscillation
-        # where the box's sign flipped each round the agent regulated
-        # itself.
+        # Anchor the QP δ-box to the starting state for the whole negotiation
+        # (see _GossipState); recomputing it per step causes a self-driven
+        # sign-flip oscillation.
         dmin_start, dmax_start = obs_min_max(
             obs, behavior=self.behavior, aid=self.context.aid
         )
 
-        lambda_seed = self._compute_lambda_seed(target, len(neighbours))
+        lambda_seed = compute_lambda_seed(
+            target, len(neighbours),
+            priority=self.priority, priority_tiers=_PRIORITY_TIERS,
+        )
 
         self._gossip = _GossipState(
             negotiation_id=nid,
@@ -1237,12 +1019,10 @@ class EnergyBalanceNegotiator(Role):
         )
 
         if not neighbours:
-            # Isolated agent: gossip can't help and there is no L2 to
-            # consult (no group, therefore no holon).  Approve the
-            # fallback directly with the full deficit so a co-located
-            # LocalGenerationFallbackRole (or the agent itself) can
-            # activate local DGs.  We also self-dispatch inline for
-            # the common case where the fallback role is absent.
+            # Isolated agent: gossip can't help and there's no L2/holon to
+            # consult. Approve the fallback directly with the full deficit so a
+            # co-located LocalGenerationFallbackRole activates local DGs, and
+            # self-dispatch inline in case that role is absent.
             logger.info(
                 "[%s] gossip skipped: singleton (target=%.4f) — escalating to local-gen fallback",
                 self.context.aid,
@@ -1275,7 +1055,7 @@ class EnergyBalanceNegotiator(Role):
             self._gossip = None
             return
 
-        # Now we are committed to a multi-party gossip; record the start.
+        # Committed to a multi-party gossip; record the start.
         group_size = len(neighbours) + 1
         logger.info(
             "[%s] starting gossip (sector=%s, target=%.4f)",
@@ -1303,23 +1083,19 @@ class EnergyBalanceNegotiator(Role):
             dual_lambda=self._gossip.dual_lambda,
         )
         if self.enable_qp_gossip:
-            # Single-token semantics: the QP dual variable cannot be
-            # consistently averaged across parallel tokens with
-            # different ledger views (Σ a_j differs by orders of
-            # magnitude between tokens that have seen different
-            # peers).  Forward to a single K-weighted next-hop instead,
-            # just like every subsequent round (B.1).
+            # Single-token: the QP dual variable can't be consistently averaged
+            # across parallel tokens with different ledger views (Σ a_j varies
+            # by orders of magnitude). Forward to one K-weighted next-hop.
             next_addr = self._next_hop(neighbours, nid, 0)
             await self.context.send_message(msg, receiver_addr=next_addr)
         else:
-            # Equal-share path is robust to multi-token broadcast at
-            # start because the ledger merge composes correctly.
+            # Equal-share path tolerates multi-token broadcast: the ledger
+            # merge composes correctly.
             for addr in neighbours:
                 await self.context.send_message(msg, receiver_addr=addr)
 
-        # Wallclock timeout: force-finish if gossip hasn't converged
-        # within the deadline.  Adaptive: base per sector + per-agent
-        # scaling so large groups get proportionally more time.
+        # Wallclock timeout: force-finish if gossip hasn't converged. Adaptive:
+        # per-sector base + per-agent scaling for larger groups.
         base = _GOSSIP_TIMEOUT_BASE_S.get(self.sector, _GOSSIP_TIMEOUT_DEFAULT_S)
         timeout = base + len(neighbours) * _GOSSIP_TIMEOUT_PER_AGENT_S
         deadline = self.context.current_timestamp + timeout
@@ -1364,13 +1140,10 @@ class EnergyBalanceNegotiator(Role):
         self_key = str(self.context.addr)
 
         if self._gossip is None or self._gossip.negotiation_id != nid:
-            # Diary closure: if we are the originator of an in-flight
-            # gossip and a different nid arrives, the previous gossip
-            # would otherwise be silently abandoned (its scheduled
-            # wallclock timeout still fires later but sees the new nid
-            # and exits).  Record an explicit ``abandoned`` terminal
-            # for the previous nid before overwriting state, preserving
-            # the started == Σ terminals invariant.
+            # If we originate an in-flight gossip and a different nid arrives,
+            # record an explicit ``abandoned`` terminal for the old nid before
+            # overwriting state (preserves started == Σ terminals; its
+            # scheduled timeout would otherwise see the new nid and exit).
             if (
                 self._gossip is not None
                 and self._gossip.is_originator
@@ -1406,42 +1179,23 @@ class EnergyBalanceNegotiator(Role):
             )
         else:
             self._gossip.counter = counter
-            # P6: λ travels with the message; the receiver always adopts
-            # the latest value.  Concurrency-safe under single-token
-            # gossip because the counter is monotonically increasing
-            # along the token's trajectory.
+            # P6: λ travels with the message; the receiver adopts the latest.
+            # Safe under single-token gossip (counter increases monotonically
+            # along the trajectory).
             self._gossip.dual_lambda = getattr(message, "dual_lambda", self._gossip.dual_lambda)
-            # Merge per-agent ledger: for each agent, keep the entry with
-            # the newest counter.  This prevents the double-counting that
-            # a single aggregate digest suffers in a cyclic gossip graph.
-            #
-            # Byzantine bound: clip each delta to a fixed multiple of the
-            # target magnitude.  A faulty or misbehaving agent reporting
-            # an absurd contribution cannot corrupt total_delta for the
-            # whole group.
+            # Merge per-agent ledger keeping the newest-counter entry (avoids
+            # the double-counting an aggregate digest suffers in cyclic graphs).
+            # Byzantine bound: clip each delta to a multiple of |target| so one
+            # misbehaving agent can't corrupt group total_delta.
             cap_byz = _BYZANTINE_DELTA_CAP_MULTIPLE * max(abs(self._gossip.target), 1.0)
-            for k, v in message.memory.items():
-                local = self._gossip.memory.get(k)
-                if local is None or local[1] < v[1]:
-                    # Tolerate 3-tuple legacy entries (saturated default False)
-                    # so a rolling upgrade can read old in-flight messages.
-                    if len(v) >= 4:
-                        delta, ctr, prio, sat = v[0], v[1], v[2], bool(v[3])
-                    else:
-                        delta, ctr, prio = v[0], v[1], v[2]
-                        sat = False
-                    if delta > cap_byz or delta < -cap_byz:
-                        delta = max(-cap_byz, min(cap_byz, delta))
-                    self._gossip.memory[k] = (delta, ctr, prio, sat)
+            ledger_merge(self._gossip.memory, message.memory, byzantine_cap=cap_byz)
 
         target = self._gossip.target
         obs = self.behavior.observe(self.context.aid) or {}
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
-        # Use the gossip-anchored δ-box (captured at the start of the
-        # negotiation), not a fresh per-step ``obs_min_max``.  The latter
-        # tracks the LP's current sp, which flips after the agent's own
-        # previous regulate — re-reading it caused the self-driven
-        # bang-bang oscillation on child-194 (gas, simbench_lv).
+        # Use the gossip-anchored δ-box, not a fresh per-step ``obs_min_max``:
+        # the latter tracks the LP's current sp, which flips after the agent's
+        # own regulate and drives a self-induced bang-bang oscillation.
         dmin = self._gossip.dmin_starting
         dmax = self._gossip.dmax_starting
 
@@ -1457,85 +1211,72 @@ class EnergyBalanceNegotiator(Role):
         ))
 
         if self.enable_qp_gossip:
-            # --- P6: primal-dual QP closed-form update ---
-            # The receiving agent computes its own primal δ_i directly
-            # from the gossiped dual variable λ:
-            #     δ_i = clamp(a_i · λ, dmin_i, dmax_i)
-            # with a_i = w_i (priority weight from
-            # ``_qp_priority_weight``) and the sign of λ tracking the
-            # sign of the target T.  Priority ordering becomes a
-            # continuous waterfall: as |λ| grows, high-w_i agents
-            # saturate first.  The constraint-aware ``participation_scale``
-            # is folded into a_i so an agent near a hard bound
-            # contributes less per unit λ.  No priority-tier gate or
-            # sub-round serialisation — priority is encoded in a_i.
+            # P6: primal-dual QP closed-form update.
+            # δ_i = clamp(a_i · λ, dmin_i, dmax_i) with a_i = priority weight
+            # and sign(λ) = sign(T). Priority becomes a continuous waterfall:
+            # as |λ| grows, high-a_i agents saturate first. ``participation_scale``
+            # folds into a_i so agents near a bound contribute less per unit λ.
+            # No tier gate / sub-round serialisation — priority is in a_i.
             target_sign = 1 if target > 0 else (-1 if target < 0 else 0)
-            a_i_base = self._qp_responsiveness(cap, target_sign)
-            a_i = a_i_base * self.impact_weight * participation_scale
-            new_delta = self._qp_primal(
-                a_i, self._gossip.dual_lambda, dmin, dmax, target_sign, cap
+            a_i_base = qp_priority_weight(
+                self.priority, target_sign, priority_tiers=_PRIORITY_TIERS,
             )
+            a_i = a_i_base * self.impact_weight * participation_scale
+            new_delta = qp_primal(a_i, self._gossip.dual_lambda, dmin, dmax)
             saturated = _is_saturated(new_delta, dmin, dmax)
             self._gossip.memory[self_key] = (
                 new_delta, counter, self.priority, saturated
             )
             self._gossip.current_delta = new_delta
-            # Dedup gate (QP only).  Without priority/sub-round gating
-            # every visit would call _apply_setpoint and trigger a
-            # monee re-solve.  The QP closed-form δ is monotonic in λ,
-            # so once an agent saturates further visits ask for the
-            # same δ — skip the actuator write to avoid quadratic
-            # solver work on large grids.  The first visit (prev_own
-            # == 0) always applies so factor moves off the initial
-            # state.
+            # Dedup gate (QP only): the closed-form δ is monotonic in λ, so
+            # once saturated further visits request the same δ — skip the
+            # actuator write to avoid quadratic re-solves on large grids. First
+            # visit (prev_own == 0) always applies to move off the initial state.
             delta_step = abs(new_delta - prev_own)
             apply_threshold = 1e-4 * max(abs(cap), 1.0)
             if cap != 0.0 and (delta_step > apply_threshold or prev_own == 0.0):
-                self._apply_setpoint(self._gossip.starting_setpoint + new_delta)
+                applied_sp = self._apply_setpoint(
+                    self._gossip.starting_setpoint + new_delta
+                )
+                # Ledger write-back (before the dual update): record the delta
+                # PHYSICALLY actuated, not the requested one. A constraint-
+                # clamped load thus shows its true (smaller) contribution, the
+                # residual persists, and the dual below raises λ so unconstrained
+                # loads absorb the freed supply — the constraint stays solved
+                # (the clamp at actuation is untouched).
+                self._writeback_actuated_delta(
+                    self_key, applied_sp, new_delta, counter, dmin, dmax,
+                )
 
-            # --- Dual update (gradient on residual) ---
-            # λ ← λ + γ_k · (T − Σ_a memory[a].δ) / Σ_a a_a.
-            # The Σ a_a normalisation makes the per-step change in λ
-            # match the local contribution to the residual: at the
-            # unconstrained KKT optimum λ* = T / Σ a_j, so this update
-            # converges in essentially one step when no agent is
-            # clamped.  γ_k (Robbins-Monro decay) damps oscillations
-            # caused by box-projection noise once agents saturate.
+            # Dual update (gradient on residual):
+            # λ ← λ + γ_k · (T − Σ δ) / Σ a_a. The Σ a_a normalisation makes
+            # the λ step match the local residual contribution: at the
+            # unconstrained KKT optimum λ* = T / Σ a_j, so it converges in ~one
+            # step when nothing is clamped. γ_k (Robbins-Monro) damps box-noise
+            # oscillation once agents saturate.
             total_delta_post = self._gossip_total_delta()
             residual = target - total_delta_post
-            # Normalise the dual step by Σ a_j over *unsaturated* entries
-            # only.  Saturated agents (v[3] == True) sit at a box bound and
-            # contribute zero additional δ for any further change in λ, so
-            # including their priority weight in the denominator inflates
-            # the sum and slows convergence for the agents that can still
-            # move.  Empirically (priority_dispatch_probe task 0) ~54 % of
-            # ledger entries were saturated, contributing a ~20 % artificial
-            # damping on the dual update with no convergence benefit.
-            # Fall back to all entries if every agent is saturated (no one
-            # can move, so the choice of denominator no longer matters for
-            # the algorithm — but a zero denominator would crash).
-            sum_a_est = sum(
-                self._entry_responsiveness(int(v[2]), target_sign)
-                for v in self._gossip.memory.values()
-                if not v[3]
+            # Normalise by Σ a_j over *unsaturated* entries only: saturated
+            # agents sit at a box bound and add no δ for further λ, so counting
+            # them inflates the denominator and slows the agents that can still
+            # move (see ledger_sum_responsiveness for the fallback).
+            sum_a_est = ledger_sum_responsiveness(
+                self._gossip.memory, target_sign, priority_tiers=_PRIORITY_TIERS,
             )
-            if sum_a_est <= 0.0:
-                sum_a_est = sum(
-                    self._entry_responsiveness(int(v[2]), target_sign)
-                    for v in self._gossip.memory.values()
-                ) or 1.0
             self._gossip.dual_lambda += (
-                self._step_size(counter) * residual / sum_a_est
+                step_size(self.convergence_rate, counter,
+                          step_decay_k0=self.step_decay_k0)
+                * residual / sum_a_est
             )
         else:
-            # --- Legacy equal-share step (P1 / P3 only) ---
-            # Each active participant aims for 1/n_free of the remaining
-            # open gap, scaled by Robbins-Monro step + constraint
-            # participation.  Priority and sub-round gating apply.
+            # Equal-share step (P1/P3 only): each active participant aims for
+            # 1/n_free of the open gap, scaled by Robbins-Monro step +
+            # constraint participation. Priority and sub-round gating apply.
             own_change = (
                 (open_gap / n_free)
                 * self.impact_weight
-                * self._step_size(counter)
+                * step_size(self.convergence_rate, counter,
+                            step_decay_k0=self.step_decay_k0)
                 * participation_scale
             )
 
@@ -1559,25 +1300,25 @@ class EnergyBalanceNegotiator(Role):
                 )
                 self._gossip.current_delta = new_delta
                 if cap != 0.0:
-                    self._apply_setpoint(self._gossip.starting_setpoint + new_delta)
+                    applied_sp = self._apply_setpoint(
+                        self._gossip.starting_setpoint + new_delta
+                    )
+                    self._writeback_actuated_delta(
+                        self_key, applied_sp, new_delta, counter, dmin, dmax,
+                    )
 
         # Recompute total after own update
         total_delta = self._gossip_total_delta()
         open_gap = target - total_delta
 
-        # P2: stall detection — append the post-update gap to the window;
-        # if the window range is below tolerance and the gap is still
-        # above the per-group threshold, the protocol has saturated
-        # without converging.  Emit LocalGenerationRequest immediately rather
-        # than spinning to k_max.
+        # P2: stall detection — if the window range is below tolerance and the
+        # gap still exceeds the per-group threshold, the protocol saturated
+        # without converging; escalate now rather than spinning to k_max.
         stalled = self._update_gap_window_and_check_stall(open_gap, target)
 
-        # Next-hop selection over gossip-capable peers only.  A token
-        # forwarded to a member without an EnergyBalanceNegotiator
-        # (e.g. a PowerLine branch monitor in an electricity group) is
-        # silently dropped by mango — the token vanishes, the gossip
-        # times out.  Audit on simbench_lv showed ~60 % of failed
-        # gossips were token deaths at branch hops.
+        # Next-hop over gossip-capable peers only: a token forwarded to a
+        # member without an EnergyBalanceNegotiator (e.g. a branch monitor) is
+        # silently dropped and the gossip times out.
         neighbours = self._gossip_neighbours()
 
         if stalled:
@@ -1623,13 +1364,10 @@ class EnergyBalanceNegotiator(Role):
                 delta,
                 residual,
             )
-            # ``record_finished=False`` suppresses the diary entry when
-            # the caller has already recorded a more specific terminal
-            # event (currently: ``timed_out``).  Only the originator
-            # records — peers that joined via incoming gossip messages
-            # didn't record a "started" so they shouldn't claim a
-            # terminal either; otherwise the ``started == Σ terminals``
-            # invariant inflates.
+            # ``record_finished=False`` when the caller already recorded a more
+            # specific terminal (e.g. ``timed_out``). Only the originator
+            # records: peers never recorded a "started", so a terminal from
+            # them would inflate the ``started == Σ terminals`` invariant.
             if record_finished and self._gossip.is_originator:
                 record_negotiation(
                     t=self.context.current_timestamp,
@@ -1642,13 +1380,10 @@ class EnergyBalanceNegotiator(Role):
                     group_size=len(self._gossip.memory),
                 )
 
-            # Unresolved deficit escalates to the local-generation
-            # fallback, but only via L2 so the holon can attempt to
-            # absorb the residual cross-group before L1 falls back to
-            # local DGs.  Only the group leader escalates —
-            # LocalGenerationFallbackRole is attached only there.
-            # Members converging with residual still surface it via
-            # the normal NegotiationFinishedEvent broadcast.
+            # Unresolved deficit escalates to local-gen fallback via L2 first,
+            # so the holon can absorb the residual cross-group before L1 falls
+            # back to local DGs. Leader-only (LocalGenerationFallbackRole lives
+            # there); members surface residual via the NFE broadcast.
             if (
                 abs(residual) > self._per_group_threshold() * 10
                 and topology_characteristic(self, tid="groups") == "leader"
@@ -1663,13 +1398,10 @@ class EnergyBalanceNegotiator(Role):
                 request = LocalGenerationRequest(
                     sector=self.sector, residual_deficit=residual
                 )
-                # Prefer routing through the L2 holon: the holon role
-                # will trigger an early ADMM rebalance attempt and
-                # reply with a LocalGenerationApproval whose residual
-                # reflects what L2 could not absorb.  If no holon
-                # peers exist (non-holonic config) the originator
-                # approves the request locally so the fallback still
-                # fires.
+                # Route through the L2 holon: it triggers an early ADMM
+                # rebalance and replies with a LocalGenerationApproval whose
+                # residual is what L2 couldn't absorb. With no holon peers
+                # (non-holonic config) approve locally so the fallback fires.
                 try:
                     holon_peers = list(topology_neighbors(self, tid="holons"))
                 except KeyError:
@@ -1691,44 +1423,26 @@ class EnergyBalanceNegotiator(Role):
             NegotiationFinishedEvent(new_setpoint=new_sp, sector=self.sector)
         )
 
-        # Broadcast to gossip-capable peers only — branch monitors have
-        # no NegotiationFinishedEvent handler so sending to them just
-        # wastes a scheduled message that the simulation-termination
-        # tracker has to wait on.
+        # Broadcast convergence to gossip-capable group neighbours so each can
+        # emit its own local event (branch monitors lack an NFE handler and
+        # would just stall the termination tracker). ``new_setpoint`` carries
+        # the leader's converged setpoint so the CP fixed-point gate
+        # (cp.py:_handle_negotiation_finished) can detect setpoint movement; a
+        # hard-coded zero would suppress every CP re-trigger past the first.
+        # Neighbours re-derive their own setpoint via ``starting_sp +
+        # current_delta`` so the value carried here doesn't affect them.
         neighbours = self._gossip_neighbours()
-
-        # Broadcast convergence to all live group neighbours so each can
-        # emit its own local event.  Pruned neighbours are skipped —
-        # sending to an unreachable peer just wastes a scheduled message
-        # that will stall the simulation-termination tracker.
-        # ``new_setpoint`` carries the leader's converged setpoint so the
-        # CP fixed-point gate (cp.py:_handle_negotiation_finished) can
-        # detect setpoint movement.  Earlier versions hard-coded zero;
-        # the gate then compared |0 − 0| < tol on every subsequent
-        # broadcast and suppressed every CP re-trigger past the first.
-        # Neighbours re-derive their own setpoint locally via
-        # ``starting_sp + current_delta`` (see _handle_negotiation_finished_msg)
-        # so they are unaffected by what value travels in this field.
         finished_msg = NegotiationFinishedEvent(new_setpoint=new_sp, sector=self.sector)
         for addr in neighbours:
             await self.context.send_message(finished_msg, receiver_addr=addr)
 
-        # Layer-2 reactive trigger: also notify holon peers.  Only group
-        # leaders are injected into the ``holons`` topology, so this
-        # broadcast naturally targets the right audience — the holon
-        # leader (and its same-sector siblings) sees that this group
-        # has finished its intra-group balance pass and can schedule a
-        # holon-level ADMM round to redistribute any residual.  Without
-        # this notification, ``HolonicCommunityRole._on_member_finished``
-        # never fires reactively (it only listens for send_message
-        # arrivals, and the groups-topology broadcast above never
-        # reaches another group's leader).  The priority-aware payload
-        # the holon needs is re-fetched fresh inside ``_try_rebalance``
-        # via ``AskForAvailableFlex`` so each member's post-gossip
-        # ``demand_by_priority`` / ``served_by_priority`` drives the
-        # cross-group ADMM's S-pull (see holonic._try_rebalance, where
-        # priority_shares becomes the negative cost steering allocation
-        # toward groups with high-priority unserved demand).
+        # Layer-2 reactive trigger: notify holon peers (only leaders are in the
+        # ``holons`` topology). This lets the holon leader schedule a
+        # holon-level ADMM round to redistribute residual; without it
+        # ``HolonicCommunityRole._on_member_finished`` never fires reactively.
+        # The priority-aware payload is re-fetched in ``_try_rebalance`` via
+        # ``AskForAvailableFlex`` so post-gossip demand/served-by-priority
+        # drives the cross-group ADMM's S-pull toward high-priority unserved demand.
         try:
             holon_peers = topology_neighbors(self, tid="holons")
         except KeyError:
@@ -1751,21 +1465,13 @@ class EnergyBalanceNegotiator(Role):
         self._active = False
 
     def flush_pending(self) -> None:
-        """Record any still-active gossip as ``abandoned`` (or ``stalled``
-        when meaningful progress was made) in the diary.
+        """Record any still-active gossip as ``stalled`` (progress made) or
+        ``abandoned`` (no movement) in the diary.
 
-        Called from the scenario-level world teardown so a negotiation
-        that was in flight when the simulation ended doesn't disappear
-        silently from the per-event accounting.  After this call the
-        ledger satisfies ``started == finished + timed_out + cancelled
-        + abandoned + stalled`` for every nid.
-
-        Distinguishing ``stalled`` (progress made but cut short by
-        sim-end) from ``abandoned`` (no movement) is important: the
-        previous behaviour lumped both under ``abandoned``, producing
-        the 87 %-abandonment headline on 5 s smoke runs even though
-        most of those gossips were actively closing the residual when
-        the clock ran out.
+        Called from world teardown so an in-flight negotiation at sim-end
+        still counts in per-event accounting; afterward
+        ``started == finished + timed_out + cancelled + abandoned + stalled``
+        holds for every nid.
         """
         if self._gossip is None:
             return
@@ -1773,10 +1479,8 @@ class EnergyBalanceNegotiator(Role):
             total_delta = self._gossip_total_delta()
             target = self._gossip.target
             residual = target - total_delta
-            # Progress threshold: closed ≥ 30 % of the target's magnitude.
-            # ``stalled`` is a soft terminal that still counts toward the
-            # diary invariant but signals "in-flight at sim-end" rather
-            # than "never started moving".
+            # ``stalled`` (closed >= 30% of |target|) is a soft terminal: counts
+            # toward the invariant but signals "in-flight at sim-end".
             if abs(target) > 1e-12:
                 progress = (abs(target) - abs(residual)) / abs(target)
             else:
@@ -1798,7 +1502,7 @@ class EnergyBalanceNegotiator(Role):
     async def _handle_negotiation_finished_msg(
         self, message: NegotiationFinishedEvent, meta: dict
     ) -> None:
-        """Convergence broadcast from a gossip peer — emit own local NegotiationFinishedEvent."""
+        """Convergence broadcast from a peer; emit own local NegotiationFinishedEvent."""
         starting_sp = (
             self._gossip.starting_setpoint
             if self._gossip
@@ -1846,48 +1550,30 @@ class EnergyBalanceNegotiator(Role):
             cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
             sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
             available = cap - sp  # headroom
-            # Per-sector breakdown for multi-dimensional ADMM
+            # Per-sector breakdown for multi-dimensional ADMM.
             sec_key = sector.value
             flex_by_sector[sec_key] = flex_by_sector.get(sec_key, 0.0) + available
             balance_by_sector[sec_key] = balance_by_sector.get(sec_key, 0.0) + sp
-            # Route-A supply-priority: accumulate generator-class
-            # *deliverable* supply per sector.  Convention: cap < 0 for
-            # generators (load-sign convention).
+            # Route-A supply-priority: accumulate generator-class deliverable
+            # supply per sector (generators have cap < 0).
             #
-            # For non-slack generators we count the **delivered** output
-            # ``|sp|`` (= ``|cap|·regulation``) rather than the rated
-            # ``|cap|``.  Two classes of generator report their full
-            # rated ``|cap|`` via ``obs_capacity`` yet cannot push it:
-            #   * failed generators (``net.deactivate`` → regulation 0);
-            #   * constraint-curtailed generators (line / voltage limits
-            #     hold regulation < 1) — these genuinely *cannot* be
-            #     "regulated up", the network won't accept the power.
-            # Counting their rated value inflates the supply pool with
-            # generation the LP physically can't deliver, so the
-            # supply-priority waterfall over-serves and the slack fills
-            # the undeliverable gap, blowing past the operator budget.
-            # Validated on eval task-25 (el slack 0.101 vs budget 0.056,
-            # +81%): rated 0.170 vs delivered 0.119, a 0.051 phantom gap
-            # = 0.022 failed (5 gens) + 0.029 constraint-curtailed (6
-            # gens); switching to ``|sp|`` cuts the breach to +15%.  A
-            # healthy generator sits at regulation 1 so ``|sp| == |cap|``
-            # — full rated is counted, which is what "the generator can
-            # be regulated up" means: it is already up.  ``|sp|`` thus
-            # self-adapts to failure and curtailment without the duals.
+            # Non-slack generators count *delivered* ``|sp|`` (= |cap|·regulation),
+            # not rated ``|cap|``: failed (regulation 0) and constraint-curtailed
+            # (line/voltage hold regulation < 1) generators report full |cap| but
+            # can't push it, so counting rated would inflate the pool with
+            # undeliverable supply, over-serve the waterfall, and blow the slack
+            # budget. A healthy generator sits at regulation 1 (|sp| == |cap|),
+            # so |sp| self-adapts to failure/curtailment without duals.
             #
-            # Slack agents are the exception: their ``obs_capacity``
-            # returns the *registered budget* (``register_slack`` stamps
-            # ``cap = -budget``) while their ``obs_setpoint`` returns the
-            # LP's actual draw, which is precisely the over-budget value
-            # we must NOT bake into the pool.  Keep slacks at ``|cap|``
-            # (the budgeted rating) so the pool reflects the operator
-            # allowance, not the breach.
+            # Slacks are the exception: ``obs_capacity`` returns the registered
+            # budget (cap = -budget) but ``obs_setpoint`` is the LP's actual
+            # (possibly over-budget) draw, which must NOT enter the pool. Keep
+            # slacks at the budgeted rating so the pool reflects the allowance.
             if cap < 0:
                 if lookup_slack(self.behavior, aid) is not None:
-                    # Slack: advertise its *effective* budget when the
-                    # SlackBudgetMonitor's loss-compensation feedback has
-                    # set one (so the pool targets ``B - losses`` and the
-                    # actual draw lands at ``B``); else the nominal budget.
+                    # Slack: advertise the *effective* budget when
+                    # SlackBudgetMonitor's loss-compensation set one (pool
+                    # targets ``B - losses``, draw lands at ``B``), else nominal.
                     eff = lookup_slack_eff_budget(self.behavior, aid)
                     gen_supply = float(eff) if eff is not None else abs(cap)
                 else:
@@ -1903,9 +1589,8 @@ class EnergyBalanceNegotiator(Role):
                 )
                 demand_by_priority[prio] = demand_by_priority.get(prio, 0.0) + abs(cap)
                 served_by_priority[prio] = served_by_priority.get(prio, 0.0) + abs(sp)
-                # Per-(sector, tier) split for the tier-stratified holon
-                # ADMM.  Same data, just keyed by sector first so the
-                # holon can build a 2D target vector.
+                # Per-(sector, tier) split for the tier-stratified holon ADMM
+                # (same data keyed by sector first for a 2D target vector).
                 demand_by_sector_priority.setdefault(sec_key, {})
                 demand_by_sector_priority[sec_key][prio] = (
                     demand_by_sector_priority[sec_key].get(prio, 0.0) + abs(cap)
@@ -1914,11 +1599,10 @@ class EnergyBalanceNegotiator(Role):
                 served_by_sector_priority[sec_key][prio] = (
                     served_by_sector_priority[sec_key].get(prio, 0.0) + abs(sp)
                 )
-                # Unmet demand: rated cap minus actual sp.  Captures the
-                # silent disconnect-loss case where monee's ``find_ignored_
-                # nodes`` sets regulation=0 on a load that has no path to a
-                # grid-former.  Without this the CP layer cannot see the
-                # cross-sector deficit and skips ADMM with same-sign T.
+                # Unmet demand: rated cap minus actual sp. Captures the silent
+                # disconnect-loss case where monee's ``find_ignored_nodes`` sets
+                # regulation=0 on a load with no path to a grid-former; without
+                # it the CP layer misses the cross-sector deficit.
                 unmet = abs(cap) - abs(sp)
                 if unmet > 1e-12:
                     unmet_by_sector[sec_key] = (
@@ -1948,24 +1632,15 @@ class EnergyBalanceNegotiator(Role):
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
     def _close_inflight_originator(self, event: str, log_reason: str | None = None) -> None:
-        """Record a terminal for the in-flight gossip if this agent is
-        its originator, preserving the ``started == Σ terminals`` diary
-        invariant whenever ``self._gossip`` is about to be overwritten
-        or torn down.
+        """Record a terminal (``event``: ``"abandoned"``/``"cancelled"``) for
+        the in-flight gossip if this agent originated it, preserving the
+        ``started == Σ terminals`` invariant before ``self._gossip`` is
+        overwritten or torn down. No-op for relays (no ``started`` recorded).
 
-        ``event`` is the terminal kind (``"abandoned"`` / ``"cancelled"``).
-        No-op when there is no in-flight gossip or this agent is only a
-        relay (non-originator gossips never recorded a ``started``).
-
-        This consolidates the four sites that retire an active gossip —
-        ``_handle_negotiation_message`` (nid change),
-        ``_on_constraint_violation`` (cancel), ``_yield_to_l2_authority``
-        (L2 pre-emption), and ``_start_gossip`` (overlapping trigger) —
-        so none of them can leak an unterminated ``started``.  The last
-        of these was the eval_full_small task-7/22 diary leak: two
-        negotiation triggers raced (slack-budget override + a balance
-        round) and the second ``_start_gossip`` overwrote the first
-        originator gossip with no terminal.
+        Shared by the four sites that retire an active gossip
+        (``_handle_negotiation_message`` nid change, ``_on_constraint_violation``,
+        ``_yield_to_l2_authority``, ``_start_gossip`` overlapping trigger) so
+        none can leak an unterminated ``started``.
         """
         if self._gossip is None or not self._gossip.is_originator:
             return
@@ -1990,17 +1665,12 @@ class EnergyBalanceNegotiator(Role):
             )
 
     def _yield_to_l2_authority(self, route: str) -> None:
-        """Abandon any in-flight L1 gossip so an arriving L2 directive
-        can land.
+        """Abandon any in-flight L1 gossip so an arriving L2 directive can land.
 
-        The supply-priority / tier-stratified / override-target paths
-        carry the holon's authoritative priority decision; without this
-        yield, ``_active=True`` from a curtailment gossip (e.g. one
-        triggered by a heat-temperature constraint violation) would
-        silently swallow the L2 message and leave high-priority loads
-        stuck at the gossip's saturating shed — the eval_full_small
-        task-89 heat inversion (child-146 tier-2 shed to 0, never
-        restored by the corrective L2 ``{tier 2: 1.0}`` allocation).
+        The supply-priority / tier-stratified / override-target paths carry the
+        holon's authoritative priority decision; without this yield, a
+        curtailment gossip's ``_active=True`` would swallow the L2 message and
+        leave high-priority loads stuck at the gossip's saturating shed.
         """
         if not self._active:
             return
@@ -2016,12 +1686,11 @@ class EnergyBalanceNegotiator(Role):
         if topology_characteristic(self, tid="groups") != "leader":
             return
         # MW balance deactivated for heat: ignore L2/L3 holon supply-priority
-        # overrides (heat is owned by the frontier controller + auction).
-        if self.sector == Sector.HEAT and not self.enable_heat_mw_balance:
+        # overrides (heat owned by the frontier controller + auction).
+        if self.sector == Sector.HEAT:
             return
-        # Route A (supply-priority) takes highest precedence: the
-        # holon-global service fractions are applied directly per
-        # local-load-tier.
+        # Route A (supply-priority) has highest precedence: holon-global service
+        # fractions applied directly per local-load-tier.
         service_frac = getattr(
             message, "service_fraction_by_sector_priority", None
         )
@@ -2032,9 +1701,9 @@ class EnergyBalanceNegotiator(Role):
                 self._dispatch_service_fractions(service_frac)
             )
             return
-        # Package C tier-stratified override takes precedence over the
-        # scalar override.  The per-(sector, tier) map preserves the
-        # holon's priority decision; the scalar collapses it.
+        # Tier-stratified override takes precedence over the scalar one: the
+        # per-(sector, tier) map preserves the holon's priority decision that
+        # the scalar would collapse.
         per_tier = getattr(
             message, "override_targets_by_sector_priority", None
         )
@@ -2047,11 +1716,9 @@ class EnergyBalanceNegotiator(Role):
             return
         override = getattr(message, "override_target", None)
         if override is not None and math.isfinite(override):
-            # Holonic ADMM (Layer 2) computed this leader's share of the
-            # holon-wide imbalance.  Skip the local ask-energy round and
-            # use the ADMM result directly as the gossip target so the
-            # cross-sector optimisation actually drives the per-group
-            # contribution instead of being discarded.
+            # L2 holonic ADMM computed this leader's share of the holon-wide
+            # imbalance: skip the local ask-energy round and use the ADMM result
+            # directly as the gossip target so it drives the per-group contribution.
             self._yield_to_l2_authority("override_target")
             self._active = True
             self.context.schedule_instant_task(self._start_gossip(float(override)))
@@ -2063,18 +1730,12 @@ class EnergyBalanceNegotiator(Role):
     ) -> None:
         """Apply a Route-A supply-priority allocation to local agents.
 
-        ``service_fraction[sector][tier] ∈ [0, 1]`` is the *fraction
-        of demand* the holon has decided to serve at (sector, tier),
-        decided globally across the holon based on supply scarcity
-        and priority weighting.  Each local load at (sec, tier)
-        receives the same fraction as its regulation factor — so a
-        tier-2 cell served at 1.0 globally produces factor=1.0 on
-        every tier-2 load in this group, while a tier-8 cell at 0.0
-        sheds every tier-8 load.
+        ``service_fraction[sector][tier] ∈ [0, 1]`` is the holon-global
+        fraction of demand to serve at (sector, tier); each local load at
+        (sec, tier) gets that fraction as its regulation factor.
 
-        Generators are not touched here — they're already at their
-        rated output; the LP solver downstream routes the freed
-        supply via the grid to satisfy the served demand.
+        Generators are untouched (already at rated output); the LP routes the
+        freed supply to satisfy served demand.
         """
         try:
             members = [self.context.aid]
@@ -2086,7 +1747,7 @@ class EnergyBalanceNegotiator(Role):
             for aid in members:
                 obs = self.behavior.observe(aid) or {}
                 cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
-                if cap <= 0:  # generator-class — leave alone
+                if cap <= 0:  # generator-class: leave alone
                     continue
                 sec = obs_sector(obs, behavior=self.behavior, aid=aid)
                 if sec is None:
@@ -2094,20 +1755,15 @@ class EnergyBalanceNegotiator(Role):
                 prio = obs_priority(obs, behavior=self.behavior, aid=aid)
                 frac = service_fraction.get(sec.value, {}).get(prio)
                 if frac is None:
-                    # No allocation for this (sec, tier) — preserve
-                    # current state.  Could happen if this tier had
-                    # zero demand at holon collection time but a
-                    # load drifted into the tier since.
+                    # No allocation for this (sec, tier): preserve current
+                    # state (tier may have had zero demand at collection time).
                     continue
                 factor = max(0.0, min(1.0, float(frac)))
                 # El/gas: local physical feasibility is a hard ceiling on the
-                # holon's MW+priority allocation (no other temperature-aware
-                # lever guards them).  HEAT is exempt: the frontier controller
-                # owns its temperature (serving each load at its t_k frontier
-                # and locking it so this dispatch defers).  Capping here too
-                # would let a transient t_k dip re-shed a feasible heat load
-                # to 0 (A2 over-shed) — and the heat slack is unbounded, so
-                # there is no MW reason to shed a feasible heat load.
+                # holon allocation (no other temperature-aware lever guards
+                # them). HEAT exempt: the frontier controller owns its
+                # temperature; capping here would let a transient t_k dip
+                # re-shed a feasible heat load (and the heat slack is unbounded).
                 if sec is not Sector.HEAT:
                     factor = min(
                         factor, constraint_allowed_fraction(obs, sec, tier=prio)
@@ -2132,23 +1788,14 @@ class EnergyBalanceNegotiator(Role):
                     {sec: {t: round(v, 3) for t, v in tm.items()}
                      for sec, tm in service_fraction.items()},
                 )
-                # S1 — close the L2→L1→L2 cascade.  Applying factors via
-                # ``apply_regulate`` mutates community state but emits
-                # nothing on its own; without an event the L2 watchdog
-                # short-circuits on ``_rebalance_dirty=False`` and L3
-                # never re-fires either.  Mark dirty + schedule a
-                # rebalance directly on the local HolonicCommunityRole
-                # via ``_maybe_schedule_rebalance``, which already
-                # encapsulates the gate logic (group-leader check,
-                # min-gap throttle).  We deliberately do NOT
-                # ``emit_event(NegotiationFinishedEvent(...))`` here:
-                # the gossip path's NFE carries the leader's converged
-                # setpoint and ``GenerationController`` re-applies
-                # that setpoint as a regulation factor.  Emitting NFE
-                # from the dispatch path with a placeholder setpoint
-                # mis-triggers stability and resets the leader's own
-                # factor to 0.  Direct schedule keeps the cascade
-                # without that side-effect.
+                # S1: close the L2->L1->L2 cascade. ``apply_regulate`` mutates
+                # state but emits nothing, so without a nudge the L2 watchdog
+                # short-circuits on ``_rebalance_dirty=False``. Schedule a
+                # rebalance directly on the local HolonicCommunityRole via
+                # ``_maybe_schedule_rebalance`` (encapsulates the gate logic).
+                # Do NOT emit NegotiationFinishedEvent here: its placeholder
+                # setpoint would mis-trigger stability and reset the leader's
+                # own factor to 0 (the gossip path's NFE carries the real sp).
                 for role in getattr(self.context, "roles", []):
                     if isinstance(role, HolonicCommunityRole):
                         try:
@@ -2167,33 +1814,29 @@ class EnergyBalanceNegotiator(Role):
     ) -> None:
         """Apply a tier-stratified holon allocation to local agents.
 
-        ``per_tier[sector][tier]`` is the holon-decided change in
-        served setpoint for the (sector, tier) sub-population of
-        *this leader's group*.  Each agent in the group with the
-        matching sector + tier gets a regulation update proportional
-        to its share of the tier's total capacity.
+        ``per_tier[sector][tier]`` is the holon-decided change in served
+        setpoint for the (sector, tier) sub-population of this leader's group;
+        each matching agent gets a regulation update proportional to its share
+        of the tier's total capacity.
 
-        This is the L1 honour path for Package C.  Bypasses the
-        gossip QP — the holon already solved the priority allocation
-        globally, and re-running the QP locally would let the local
-        ``_qp_priority_weight`` overrule the holon decision, which is
-        exactly the bug that motivated Package C.  CLPU ramp and
-        monotonic floor still apply: ``apply_regulate`` consults the
-        sector config and clamps regulation increases accordingly.
+        Bypasses the gossip QP: the holon already solved the priority
+        allocation globally, and re-running the QP would let local
+        ``_qp_priority_weight`` overrule it. CLPU ramp and monotonic floor
+        still apply via ``apply_regulate``.
         """
         try:
             members = [self.context.aid]
             for neigh in self._live_neighbours():
                 members.append(neigh.aid)
 
-            # Group members by (sector, tier) so we can split each
-            # tier's target proportionally across its members.
+            # Group members by (sector, tier) to split each tier's target
+            # proportionally across its members.
             per_cell_aids: dict[tuple[str, int], list[str]] = {}
             for aid in members:
                 obs = self.behavior.observe(aid) or {}
                 cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
                 if cap <= 0:
-                    continue  # generators / slacks contribute via setpoint, not tier
+                    continue  # generators/slacks contribute via setpoint, not tier
                 prio = obs_priority(obs, behavior=self.behavior, aid=aid)
                 sec = obs_sector(obs, behavior=self.behavior, aid=aid)
                 if sec is None:
@@ -2206,11 +1849,8 @@ class EnergyBalanceNegotiator(Role):
                     aids = per_cell_aids.get((sec, tier), [])
                     if not aids:
                         continue
-                    # ``tgt`` is the change in served setpoint the holon
-                    # has allocated to this (sector, tier) cell.  In
-                    # gossip's sign convention this is negative when
-                    # we have to import (i.e. raise served sp).  Total
-                    # absorbed = -tgt; split across members by capacity.
+                    # ``tgt`` is the holon-allocated change in served setpoint
+                    # for this cell; split across members by capacity.
                     caps = []
                     for aid in aids:
                         obs = self.behavior.observe(aid) or {}
@@ -2218,12 +1858,8 @@ class EnergyBalanceNegotiator(Role):
                             abs(obs_capacity(obs, behavior=self.behavior, aid=aid))
                         )
                     total_cap = sum(caps) or 1.0
-                    # Compute each agent's new factor.  Sign of tgt:
-                    # negative = absorb (raise factor toward 1), positive
-                    # = shed (lower factor).  The holon ADMM produced
-                    # tgt as -allocation (see _run_tier_stratified_admm
-                    # override construction); so positive tgt means
-                    # "this cell should serve more".
+                    # New factor per agent. Positive tgt = serve more (raise
+                    # factor); negative = shed.
                     for aid, cap in zip(aids, caps):
                         share = cap / total_cap
                         delta_sp = tgt * share  # change in served setpoint
@@ -2235,11 +1871,9 @@ class EnergyBalanceNegotiator(Role):
                         if cap == 0.0:
                             continue
                         factor = max(0.0, min(1.0, new_sp / cap))
-                        # Cap by local feasibility for el/gas — see the
-                        # matching clamp in _dispatch_service_fractions.
-                        # HEAT is exempt (frontier controller owns its
-                        # temperature; capping here would A2-over-shed
-                        # feasible heat loads on transient dips).
+                        # Cap by local feasibility for el/gas (see the matching
+                        # clamp in _dispatch_service_fractions). HEAT exempt:
+                        # frontier controller owns its temperature.
                         try:
                             _sec_enum = Sector(sec)
                         except ValueError:
@@ -2274,31 +1908,22 @@ class EnergyBalanceNegotiator(Role):
     async def _handle_failure_notice(
         self, message: FailureNotice, meta: dict
     ) -> None:
-        # Distributed failure trigger.  ``ProblemDetector`` propagates
-        # this through the physical-grid neighbour graph TTL-bounded;
-        # only children at affected nodes receive it.  Heat sector is
-        # constraint-driven (chapter §3.1 / Gap 1) — heat negotiators
-        # ignore failure notices and react via ConstraintViolation
-        # instead.  Other sectors trigger only when the notice's sector
-        # matches: cross-sector coupling effects propagate physically
-        # but the agent-side response goes through ConstraintViolation,
-        # not this notice.
+        # Distributed failure trigger (``ProblemDetector`` propagates it
+        # TTL-bounded through the physical neighbour graph). Heat is
+        # constraint-driven, so heat negotiators ignore failure notices and
+        # react via ConstraintViolation; other sectors trigger only on a
+        # sector match (cross-sector coupling propagates physically, the
+        # agent-side response goes via ConstraintViolation).
         if message.sector != self.sector:
             return
-        # L2 escalation (all sectors, incl. heat; members too): relay the
-        # topology change to our community leader so it can re-waterfall
-        # the whole component.  The per-component coordinator may be many
-        # physical hops away — beyond this notice's TTL — so a member that
-        # locally detected the failure tells its leader, which fans the
-        # escalation across the component-peer mesh.  This re-cycles the L2
-        # *allocation / component membership* (a topology concern); it is
-        # distinct from the heat L1 *setpoint* trigger below, which stays
-        # constraint-driven.  Route over the ``groups`` topology (the L1
-        # gossip topology, where the leader is reachable) rather than
-        # ``CommunityAssignment.leader_addr`` (not reliably populated for
-        # members): send to every group neighbour, and only the leader
-        # acts (``_handle_l2_recycle`` gates on group-leadership), so
-        # non-leader neighbours harmlessly ignore the relay.
+        # L2 escalation (all sectors, members included): relay the topology
+        # change to the community leader so it can re-waterfall the component.
+        # The component coordinator may be beyond this notice's TTL, so a member
+        # that detected the failure tells its leader, which fans the escalation
+        # across the component mesh. This recycles L2 allocation/membership,
+        # distinct from the heat L1 setpoint trigger below. Route over the
+        # ``groups`` topology (leader reachable there); only the leader acts
+        # (``_handle_l2_recycle`` gates on leadership), so non-leaders ignore it.
         try:
             group_neighbours = list(topology_neighbors(self, tid="groups"))
         except Exception:  # noqa: BLE001
@@ -2306,7 +1931,7 @@ class EnergyBalanceNegotiator(Role):
         escalation = L2RecycleEscalation(sector=self.sector, from_member=True)
         for addr in group_neighbours:
             await self.context.send_message(escalation, receiver_addr=addr)
-        # --- L1 setpoint trigger: sector-specific, leader-only ---------
+        # L1 setpoint trigger: sector-specific, leader-only.
         if self.sector == Sector.HEAT:
             return
         if topology_characteristic(self, tid="groups") != "leader":
@@ -2323,50 +1948,41 @@ class EnergyBalanceNegotiator(Role):
     # Setpoint application with monotonic progress guarantee
     # ------------------------------------------------------------------
 
-    def _apply_setpoint(self, new_setpoint: float) -> None:
+    def _apply_setpoint(self, new_setpoint: float) -> float | None:
+        """Actuate ``new_setpoint`` (after constraint clamp + floors) and return
+        the PHYSICALLY-applied signed setpoint (``factor * cap``), or ``None``
+        when nothing is actuated (cap=0, tier-1 hard-lock, slack, no action).
+        The caller uses the return value to write the actuated delta back into
+        the gossip ledger.
+        """
         obs = self.behavior.observe(self.context.aid) or {}
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         if cap == 0.0:
-            return
-        # Tier-1 hard-lock guard: the leader's pre-step has already
-        # applied ``regulation = 1`` (feasible branch) or a pro-rata
-        # share (infeasible branch) to every tier-1 load.  The QP that
-        # follows assigns these agents ``a_i = 0`` so they don't
-        # contribute, but the existing apply-on-first-visit path would
-        # still drag their factor back to 0 because the QP-side
-        # ``starting_sp`` is read from a not-yet-refreshed obs.
-        # Skip every actuator write on tier-1 during the QP — the
-        # pre-step's write stands until the next negotiation cycle
-        # re-evaluates feasibility.
+            return None
+        # Tier-1 hard-lock guard: the leader's pre-step already set tier-1
+        # loads (regulation=1 feasible, or pro-rata infeasible) and the QP
+        # gives them a_i = 0. Skip the actuator write so the apply-on-first-
+        # visit path doesn't drag them back to 0 off a stale ``starting_sp``;
+        # the pre-step's write stands until the next negotiation cycle.
         if int(self.priority) == 1:
-            return
-        # Slack agents (ExtPowerGrid / ExtHydrGrid) have a *free* p_mw /
-        # mass_flow Var the LP picks within a wide physical envelope.
-        # ``_reported_setpoint`` already surfaces a soft slack-target
-        # contribution into the gossip's imbalance accounting (F2), so
-        # the protocol pushes the *other* agents toward equilibrium
-        # against that target.  Writing ``regulation = sp / rating`` on
-        # the slack itself clamps the LP's effective slack envelope to
-        # an arbitrary mid-gossip fraction — and any subsequent step
-        # that needs more slack to balance the network finds the slack
-        # capped at that fraction, presolving into infeasibility.  The
-        # slack carries the residual; gossip must not curtail it.
+            return None
+        # Slacks (ExtPowerGrid/ExtHydrGrid) have a free p_mw/mass_flow Var the
+        # LP picks within a wide envelope; ``_reported_setpoint`` already
+        # surfaces a soft slack target (F2). Writing ``regulation = sp/rating``
+        # clamps the LP's slack envelope to an arbitrary fraction, presolving
+        # into infeasibility when more slack is later needed. The slack carries
+        # the residual; gossip must not curtail it.
         #
-        # We have to use a class check (not just the slack registry)
-        # because heat-side ExtHydrGrid is intentionally left unbounded
-        # by ``apply_slack_budget`` (the heat LP has no slack-budget
-        # discipline), which means ``_maybe_register_slack`` cannot
-        # derive a rating and skips it — yet it is still structurally
-        # a slack and must never be curtailed.
+        # Use a class check, not the slack registry: heat-side ExtHydrGrid is
+        # left unbounded by ``apply_slack_budget`` so it never registers a
+        # rating, yet is structurally a slack and must never be curtailed.
         if _is_slack_class_child(self.behavior, self.context.aid):
-            return
+            return None
 
-        # Constraint-aware clamping: reduce the setpoint when local grid
-        # measurements are near or beyond safety bounds.  Pass the role's
-        # own priority tier so critical loads (tier ≤ 2) get the tighter
-        # 0.99 deadband — without this, the priority-blind clamp
-        # truncates tier-1 demand as soon as any local variable drifts
-        # past 0.85, silently overruling the priority waterfall.
+        # Constraint-aware clamping: reduce the setpoint near/beyond safety
+        # bounds. Pass the priority tier so critical loads (tier <= 2) get the
+        # tighter 0.99 deadband; a priority-blind clamp would truncate tier-1
+        # demand as soon as any local variable drifts past 0.85.
         if self.constraint_aware:
             new_setpoint = clamp_to_constraints(
                 new_setpoint, obs, self.sector, tier=self.priority
@@ -2374,12 +1990,9 @@ class EnergyBalanceNegotiator(Role):
 
         factor = max(0.0, min(1.0, abs(new_setpoint / cap)))
 
-        # --- Monotonic progress guarantee ---
-        # The "no-regret switching" floor only applies when the current
-        # negotiation is a restoration (target > 0 means the group needs
-        # to grow net supply/demand back).  In a shedding negotiation
-        # (target < 0), loads legitimately need to reduce factor to
-        # rebalance, so the floor must not block them.
+        # Monotonic progress: the "no-regret switching" floor applies only
+        # during restoration (target > 0). In a shedding negotiation (target <
+        # 0) loads legitimately reduce factor, so the floor must not block them.
         target = self._gossip.target if self._gossip is not None else 0.0
         is_restoration = target > 0
         if self.priority > 0 and is_restoration:
@@ -2391,23 +2004,17 @@ class EnergyBalanceNegotiator(Role):
                 elif not self._constraint_violation_active:
                     factor = self._restoration_floor
 
-            # --- Cold-load pickup rate limit ---
-            # Only apply to ramp-up (increase).  Decreases pass through
-            # immediately so shedding and violation-driven reductions
-            # are not throttled.
+            # Cold-load pickup rate limit: ramp-up only; decreases (sheds,
+            # violation-driven reductions) pass through unthrottled.
             if self.enable_clpu_ramp:
                 factor = self._rate_limit_increase(factor)
 
-        # --- L2 priority-floor (gossip path) ---
-        # The component ADMM decided this load's served tier; a
-        # supply-poor local gossip group must not shed it below that
-        # decision purely to zero its own imbalance.  Clamp the gossip
-        # factor up to ``min(L2 allocation, constraint-allowed)`` — the
-        # constraint term (computed from the same util as the clamp
-        # above) lets curtailment/physics still shed it during a real
-        # violation, per-load and continuously, so the floor and the
-        # constraint clamp never fight.  Tier 1 already returned above;
-        # this governs tiers 2/3/4 only.
+        # L2 priority-floor (gossip path): the component ADMM set this load's
+        # served tier, so a supply-poor local group must not shed it below that
+        # just to zero its own imbalance. Clamp up to ``min(L2 allocation,
+        # constraint-allowed)`` — the constraint term still lets physics shed
+        # it during a real violation, so floor and clamp never fight. Tiers
+        # 2/3/4 only (tier 1 returned above).
         if self.enable_l2_priority_floor:
             floor = l2_effective_floor(
                 self.behavior, self.context.aid, obs, self.sector, self.priority
@@ -2415,22 +2022,16 @@ class EnergyBalanceNegotiator(Role):
             if floor is not None and factor < floor:
                 factor = floor
 
-        # NB: gossip-driven regulates intentionally bypass the
-        # ``apply_regulate`` no-op dedup.  Each gossip round computes a
-        # small per-step delta (order of convergence_rate × cap / n) and
-        # the protocol's correctness depends on the requested delta
-        # being applied — the per-agent ledger in ``_GossipState.memory``
-        # advances regardless of whether behavior.act is called, so
-        # dedupping micro-steps here causes the ledger to diverge from
-        # physical state and gossip stalls at k_max instead of
-        # converging.  monee's warm-start absorbs consecutive small
-        # deltas efficiently, so they are not the bottleneck here.
+        # Gossip-driven regulates bypass the ``apply_regulate`` dedup on
+        # purpose: the ledger in ``_GossipState.memory`` advances whether or
+        # not ``behavior.act`` is called, so dedupping micro-steps would let
+        # the ledger diverge from physical state and stall gossip at k_max.
+        # monee's warm-start absorbs the small consecutive deltas efficiently.
         if self.behavior.has_action(self.context.aid, "regulate"):
             self.behavior.act(self.context.aid, "regulate", factor)
-            # Keep the ``apply_regulate`` dedup cache truthful — this
-            # direct write bypasses it, and a stale cache silently drops
-            # a later L2 re-dispatch that would restore this load (the
-            # gossip-shed-never-restored cause; see note_actuated_factor).
+            # Keep the dedup cache truthful: this direct write bypasses it, and
+            # a stale cache would silently drop a later L2 re-dispatch that
+            # would restore this load.
             note_actuated_factor(self.behavior, self.context.aid, factor)
             record_regulate(
                 t=self.context.current_timestamp,
@@ -2441,6 +2042,44 @@ class EnergyBalanceNegotiator(Role):
             )
             self._last_regulate_timestamp = self.context.current_timestamp
             self._last_regulate_factor = factor
+
+        # Signed actuated setpoint: ``factor`` scales the (signed) nominal
+        # capacity, so ``factor * cap`` is the power physically realised after
+        # the clamp + floors. The caller reconciles the ledger against it.
+        return factor * cap
+
+    def _writeback_actuated_delta(
+        self,
+        self_key: str,
+        applied_sp: float | None,
+        requested_delta: float,
+        counter: int,
+        dmin: float,
+        dmax: float,
+    ) -> None:
+        """Reconcile the gossip ledger with the physically-actuated setpoint.
+
+        After ``_apply_setpoint`` clamps/floors the requested delta, record what
+        was ACTUALLY applied so ``_gossip_total_delta`` reflects real
+        consumption. A load held below its request by a constraint clamp is also
+        marked *saturated* (it won't move with more λ), so the dual denominator
+        excludes it and the freed supply flows to the unconstrained loads. The
+        constraint stays solved — only the ledger is corrected, not the clamp.
+        """
+        if (
+            not self.enable_actuated_ledger_writeback
+            or applied_sp is None
+            or self._gossip is None
+        ):
+            return
+        actuated_delta = applied_sp - self._gossip.starting_setpoint
+        # Clamp / ramp held it below the requested magnitude ⇒ constraint-bound.
+        held_below = abs(actuated_delta) < abs(requested_delta) - 1e-12
+        saturated = held_below or _is_saturated(actuated_delta, dmin, dmax)
+        self._gossip.memory[self_key] = (
+            actuated_delta, counter, self.priority, saturated,
+        )
+        self._gossip.current_delta = actuated_delta
 
     def _rate_limit_increase(self, requested: float) -> float:
         prev = self._last_regulate_factor
@@ -2455,18 +2094,16 @@ class EnergyBalanceNegotiator(Role):
 
 
     def _try_self_dispatch(self, deficit: float) -> None:
-        """Inline local-gen fallback for isolated agents without a
-        co-located LocalGenerationFallbackRole.
-
-        If this agent is a generator with available headroom, ramp up to
-        cover as much of the deficit as possible.
+        """Inline local-gen fallback for isolated agents without a co-located
+        LocalGenerationFallbackRole: if this agent is a generator with
+        headroom, ramp up to cover as much of the deficit as possible.
         """
         if deficit <= 0:
             return
         obs = self.behavior.observe(self.context.aid) or {}
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         if cap >= 0:
-            return  # not a generator (generators have negative capacity)
+            return  # not a generator (generators have cap < 0)
         sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
         headroom = abs(cap) - abs(sp)
         if headroom < 1e-6:
@@ -2496,20 +2133,17 @@ class EnergyBalanceNegotiator(Role):
 
 
 def _compute_actual_priority(priority: int, target: float) -> int:
-    """Map a raw priority value and imbalance direction to a gossip round.
+    """Map a raw priority and imbalance direction to a gossip round.
 
-    The mapping guarantees:
-    - **Restoration (target > 0)**: loads participate ordered by priority
-      (lower number = higher urgency = earlier round).  Generators wait
-      until all load tiers have had a chance.
-    - **Reduction (target < 0)**: generators (priority 0) go first.
-      Loads are shed in *reverse* priority order — high-priority loads
-      (low number) are shed last.
+    - Restoration (target > 0): loads ordered by priority (lower = more
+      urgent = earlier); generators wait until all load tiers have acted.
+    - Reduction (target < 0): generators (priority 0) first; loads shed in
+      reverse priority order (high-priority shed last).
     """
     if target < 0:
         if priority == 0:
             return 0  # generators first
-        # Invert: lower number → more important → shed later (higher round)
+        # Invert: lower number = more important = shed later (higher round).
         return max(1, _PRIORITY_TIERS - min(priority, _PRIORITY_TIERS) + 1)
     elif target > 0:
         if priority > 0:
@@ -2537,7 +2171,7 @@ def create_energy_balance_role(
     step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
     enable_qp_gossip: bool = True,
     enable_l2_priority_floor: bool = True,
-    enable_heat_mw_balance: bool = True,
+    enable_actuated_ledger_writeback: bool = True,
 ) -> EnergyBalanceNegotiator:
     if priority is None:
         priority = obs_priority(obs)
@@ -2553,5 +2187,5 @@ def create_energy_balance_role(
         step_decay_k0=step_decay_k0,
         enable_qp_gossip=enable_qp_gossip,
         enable_l2_priority_floor=enable_l2_priority_floor,
-        enable_heat_mw_balance=enable_heat_mw_balance,
+        enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,
     )

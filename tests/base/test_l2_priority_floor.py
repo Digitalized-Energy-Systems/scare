@@ -115,11 +115,10 @@ def test_floor_disabled_lets_stability_shed():
 
 
 def test_tier1_stability_is_floored_hardlock():
-    # Tier 1 IS floored against reactive sheds (re-asserts the hard-lock
-    # against stability erosion — eval task-18 child-90).  Its
-    # constraint-allowed is always 1.0 (immune), so the floor is its L2
-    # allocation; the curtailment auction (reason="curtail") can still
-    # shed it, but stability/balance cannot.
+    # Tier 1 is floored against reactive sheds: its constraint-allowed is
+    # always 1.0 (immune), so the floor is its L2 allocation. The
+    # curtailment auction (reason="curtail") can still shed it, but
+    # stability/balance cannot.
     cfg = _Cfg(floor=True)
     obs = {"p_mw": 1.0, "vm_pu": 1.0}
     b = _Behavior(config=cfg, obs=obs)
@@ -157,7 +156,7 @@ def test_external_write_unsticks_apply_regulate_dedup():
     """A gossip ``_apply_setpoint`` write bypasses apply_regulate; without
     syncing the dedup cache, a later L2 re-dispatch to the load's
     allocation is silently deduped against the stale value and the
-    gossip-shed load is never restored (eval task-105 child-260)."""
+    gossip-shed load is never restored."""
     from scare.base.util import note_actuated_factor
 
     b = _Behavior(config=_Cfg(floor=False), obs={"p_mw": 1.0})

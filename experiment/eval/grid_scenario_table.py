@@ -1,18 +1,12 @@
 """Collect the unique grid-scenarios of a campaign and emit a LaTeX table.
 
-A *grid-scenario* is one unique combination of
+A *grid-scenario* is one unique combination of (grid factory,
+slack-budget policy) appearing in a campaign config's experiments.
+Everything else in the row (simbench network, backup branches, node and
+CP counts) is a property of the grid factory, resolved by inspecting the
+factory closure and building the grid once.
 
-    (grid factory, slack-budget policy)
-
-appearing anywhere in a campaign config's experiments.  Everything else in
-the row — the underlying simbench network, whether the grid carries
-normally-open backup branches, its node count, and its coupling-point (CP)
-count — is a property of the grid factory, resolved by inspecting the factory
-closure and building the grid once.
-
-Each unique combination is given a short id (``S1``, ``S2``, …) and a pretty
-name so the dissertation text can refer to scenarios by name instead of by the
-raw ``simbench_lv_cp_heavy_dependent`` factory key.
+Each combination gets a short id (``S1``, ``S2``, ...) and a pretty name.
 
 Usage::
 
@@ -20,10 +14,10 @@ Usage::
         --config experiment/configs/eval_full.json \
         --out experiment/_runs/grid_scenarios.tex
 
-``--config`` accepts either a campaign config JSON or a campaign run directory
-containing ``config.json``.  Without ``--out`` the table is printed to stdout.
-Pass ``--no-build`` to skip the (slow) grid builds — node / CP counts then
-read ``—`` but the rest of the table is produced instantly.
+``--config`` accepts a campaign config JSON or a run directory containing
+``config.json``.  Without ``--out`` the table is printed to stdout.
+``--no-build`` skips the slow grid builds; node/CP counts then read
+``---``.
 """
 
 from __future__ import annotations
@@ -44,9 +38,8 @@ logger = logging.getLogger(__name__)
 # Pretty-name map
 # ---------------------------------------------------------------------------
 #
-# Hand-written labels for the known grid factories.  A factory not in the map
-# falls back to a label derived from its key (see ``_grid_pretty``), so the
-# table still renders for campaigns that introduce new grids.
+# Labels for known grid factories; unknown keys fall back to
+# ``_grid_pretty``.
 _GRID_PRETTY: dict[str, str] = {
     "simbench_lv_low": "LV, low CP density",
     "simbench_lv": "LV, large",
@@ -59,7 +52,7 @@ _GRID_PRETTY: dict[str, str] = {
     "simbench_lv_cp_heavy_dependent": "CP-heavy-dependent (2x, replacing)",
 }
 
-# Friendly short names for the simbench codes we use.
+# Short names for the simbench codes.
 _SIMBENCH_PRETTY: dict[str, str] = {
     "1-LV-rural1--1-no_sw": "1-LV-rural1",
     "1-LV-rural3--1-no_sw": "1-LV-rural3",
@@ -70,24 +63,25 @@ _SIMBENCH_PRETTY: dict[str, str] = {
 def _grid_pretty(grid_name: str) -> str:
     if grid_name in _GRID_PRETTY:
         return _GRID_PRETTY[grid_name]
-    # Fallback: strip the simbench prefix and title-case the rest.
+    # Strip the simbench prefix and title-case the rest.
     label = grid_name.replace("simbench_", "").replace("_", " ").strip()
     return label[:1].upper() + label[1:] if label else grid_name
 
 
 def _slack_label(slack_budget_pct: float | None) -> str:
-    """Plain-text label for a single slack budget (e.g. ``"45%"``), with
-    ``∞`` for an unbudgeted (operator-policy-free) slack.  LaTeX escaping of
-    the ``%`` / ``∞`` is applied once at render time by :func:`_tex_escape`."""
+    """Plain-text label for one slack budget (e.g. ``"45%"``), or ``∞``
+    for an unbudgeted slack.  LaTeX escaping happens later in
+    :func:`_tex_escape`.
+    """
     if slack_budget_pct is None:
         return "∞"
     return f"{slack_budget_pct * 100:g}%"
 
 
 def _slack_cell(slacks: list[float | None]) -> str:
-    """Plain-text label for the full set of slack budgets a grid is run
-    under — numeric values ascending, the unbudgeted ``∞`` last (e.g.
-    ``"30%, 45%, 60%, ∞"``)."""
+    """Plain-text label for a grid's full set of slack budgets: numeric
+    values ascending, unbudgeted ``∞`` last (e.g. ``"30%, 45%, 60%, ∞"``).
+    """
     nums = sorted(s for s in slacks if s is not None)
     parts = [_slack_label(s) for s in nums]
     if any(s is None for s in slacks):
@@ -118,12 +112,12 @@ class GridFacts:
 
 
 def _closure_params(grid_name: str) -> dict[str, Any]:
-    """Read the construction params off the grid factory's closure.
+    """Read construction params off the grid factory's closure.
 
-    ``GRIDS[name]`` is the ``create`` thunk returned by
-    ``create_large_lv_simbench``; its free variables capture the keyword
-    arguments (simbench_code, backup count, CP knobs, density).  Reading them
-    avoids building the grid just to learn its configuration.
+    ``GRIDS[name]`` is the ``create`` thunk from
+    ``create_large_lv_simbench``; its free variables hold the keyword
+    arguments (simbench_code, backup count, CP knobs, density).  Reading
+    them avoids building the grid just to learn its configuration.
     """
     factory = GRIDS[grid_name]
     free = getattr(factory, "__code__", None)
@@ -137,11 +131,10 @@ def _closure_params(grid_name: str) -> dict[str, Any]:
 def _count_cps(net: Any) -> int:
     """Number of cross-sector coupling plants on a built network.
 
-    Mirrors ``scare.base.failure_sampling._iter_generator_candidates``: a CP is
-    either a coupling *compound* (CHP / CHPHG / PowerToHeat control node) or a
-    coupling *branch* (``branch.model.is_cp()`` — GasToPower / PowerToGas /
-    PowerToHeatHG).  The two populations are disjoint, so the total is their
-    sum.
+    Mirrors ``scare.base.failure_sampling._iter_generator_candidates``:
+    a CP is either a coupling compound (CHP / CHPHG / PowerToHeat) or a
+    coupling branch (``branch.model.is_cp()``: GasToPower / PowerToGas /
+    PowerToHeatHG).  The populations are disjoint, so total is their sum.
     """
     from scare.base.failure_sampling import CHP, CHPHG, PowerToHeat
 
@@ -189,9 +182,9 @@ def grid_facts(grid_name: str, *, build: bool = True) -> GridFacts:
 
 @dataclass
 class GridScenario:
-    scenario_id: str            # S1, S2, …
+    scenario_id: str            # S1, S2, ...
     grid_name: str
-    slack_budgets: list[float | None]   # every operator slack budget the grid runs under
+    slack_budgets: list[float | None]   # every slack budget the grid runs under
     facts: GridFacts
 
     @property
@@ -209,13 +202,11 @@ def _load_config(path: Path) -> CampaignConfig:
 def collect_grid_scenarios(
     cfg: CampaignConfig, *, build: bool = True
 ) -> list[GridScenario]:
-    """Walk every experiment's (grids x scenarios) and return one row per
-    unique grid, in first-appearance order.
+    """Return one row per unique grid, in first-appearance order.
 
-    Rows that differ *only* in their operator slack budget are collapsed:
-    everything else in the row (simbench network, backup branches, node and
-    CP counts) is a property of the grid, so the slack budget is carried as
-    the list of distinct values the grid is exercised under.
+    Rows differing only in slack budget are collapsed (everything else is
+    a grid property); the slack budget is carried as the list of distinct
+    values the grid runs under.
     """
     facts_cache: dict[str, GridFacts] = {}
     slacks_by_grid: dict[str, list[float | None]] = {}
@@ -275,9 +266,9 @@ def render_latex(
 ) -> str:
     """Render the unique grid configurations as a booktabs LaTeX table.
 
-    Assumes the document preamble provides ``booktabs``, ``amsmath`` (for
-    ``$\\mathcal{S}_{\\rm cap}$`` / ``$\\infty$``), the ``acronym`` package
-    (``\\ac{CP}``), and a fixed-width ``x`` column type (``x{4cm}``).
+    Requires preamble support for ``booktabs``, ``amsmath``, the
+    ``acronym`` package (``\\ac{CP}``), and a fixed-width ``x`` column
+    type (``x{4cm}``).
     """
     lines: list[str] = []
     lines.append(r"\begin{table}[thb]")
@@ -322,7 +313,7 @@ def render_latex(
 
 
 def render_plain(scenarios: list[GridScenario]) -> str:
-    """Compact text summary (logged to stderr / shown when no --out)."""
+    """Compact text summary (shown when no --out)."""
     rows = [("ID", "Description", "SimBench", "Slack", "Backup", "Nodes", "CPs")]
     for gs in scenarios:
         f = gs.facts
@@ -374,9 +365,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    # ``force`` so our handler wins even if an imported module (simbench /
-    # pyomo) already called basicConfig and pinned the root level higher,
-    # which would otherwise swallow the INFO summary.
+    # ``force`` so our handler wins over an imported module's
+    # basicConfig, which could otherwise swallow the INFO summary.
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s [%(name)s] %(message)s",

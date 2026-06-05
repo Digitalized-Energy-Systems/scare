@@ -16,14 +16,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Initial TTL stamped on FailureNotice when an endpoint detects the
-# failure.  Each same-sector hop costs 1; each CP-bridge hop costs
-# ``_CP_BRIDGE_COST``.  At K=3 with bridge cost 2, a failure can reach
-# directly-affected groups up to 3 same-sector hops away, plus the
-# heat/gas neighbourhood one hop beyond a CP that sits within 1 hop of
-# the failure — which matches the physical reach of a single-branch
-# outage on the simbench LV grids without flooding the rest of the
-# network.
+# Initial TTL stamped on a FailureNotice. Each same-sector hop costs 1;
+# each CP-bridge hop costs ``_CP_BRIDGE_COST``. Tuned to the physical
+# reach of a single-branch outage on simbench LV grids without flooding.
 _INITIAL_HOPS: int = 3
 _CP_BRIDGE_COST: int = 2
 
@@ -33,25 +28,20 @@ class ProblemDetector(Role):
 
     Two responsibilities:
 
-    1. **Local conversion** — when a global ``BranchFailureEvent`` lands
-       on one of the two endpoint nodes, emit a local ``LineFailure``
-       event so the co-located ``GridReconfigurator`` can start its
-       path search.  (Unchanged from before.)
-    2. **Distributed propagation** — replaces the previous centralised
-       pre-filter that used a global ``nx.Graph`` snapshot.  The
-       endpoint detectors stamp a ``FailureNotice`` and gossip it
-       through grid-topology neighbours, sector-tagged and TTL-bounded.
-       Each detector along the way notifies the children at its node
-       so their negotiators can react locally.
+    1. Local conversion — when a global ``BranchFailureEvent`` lands on
+       an endpoint node, emit a local ``LineFailure`` so the co-located
+       ``GridReconfigurator`` can start its path search.
+    2. Distributed propagation — endpoint detectors stamp a
+       ``FailureNotice`` and gossip it through grid-topology neighbours,
+       sector-tagged and TTL-bounded; each detector along the way
+       notifies its node's children so negotiators react locally.
 
-    The detector knows two pieces of locally-acquirable state passed at
-    construction:
+    Construction state:
 
-    - ``neighbour_branch_sectors`` — the sector of each grid-edge
-      leaving this node.  Drives the per-edge forwarding cost.
-    - ``child_addrs`` — agent addresses of the children sitting at
-      this node.  The notice is delivered locally so the children's
-      ``EnergyBalanceNegotiator`` can trigger a balance round.
+    - ``neighbour_branch_sectors`` — sector of each grid edge leaving
+      this node; drives per-edge forwarding cost.
+    - ``child_addrs`` — children at this node; the notice is delivered
+      locally so their ``EnergyBalanceNegotiator`` can trigger a round.
     """
 
     def __init__(
@@ -71,25 +61,21 @@ class ProblemDetector(Role):
         self.enable_distributed_failure_notice = enable_distributed_failure_notice
         self.ttl_hops = ttl_hops
         self.cp_bridge_cost = cp_bridge_cost
-        # Sector of the branch connecting this node to each grid
-        # neighbour, keyed by neighbour node id.  Values: ``"electricity"``
-        # / ``"gas"`` / ``"heat"`` / ``"cp"``.  Populated at scenario
-        # build time; missing keys are treated as untraversable.
+        # Sector of the grid edge to each neighbour, keyed by neighbour
+        # node id. Values: "electricity"/"gas"/"heat"/"cp". Missing keys
+        # are untraversable.
         self.neighbour_branch_sectors: dict[Any, str] = (
             dict(neighbour_branch_sectors) if neighbour_branch_sectors else {}
         )
-        # Children at this node — recipients of local notices so their
-        # negotiators can trigger without going through a global event.
+        # Children at this node — recipients of local notices.
         self.child_addrs: list[Any] = list(child_addrs) if child_addrs else []
 
-        # Dedup table: maximum ``hops_remaining`` we have already
-        # forwarded for each ``(origin_addr_str, branch_id)``.  A later
-        # notice with strictly higher TTL overrides (because it can
-        # reach farther); equal/lower TTLs are suppressed.  Same shape
-        # as ``GridConstraintMonitor._state_forwarded`` for consistency.
+        # Dedup table: max ``hops_remaining`` already forwarded per
+        # ``(origin_addr_str, branch_id)``. A strictly higher TTL
+        # overrides (reaches farther); equal/lower are suppressed.
         self._forwarded_ttl: dict[tuple, int] = {}
-        # Same key, separate ledger for *delivered* (to local children)
-        # so each child gets exactly one notice per unique failure.
+        # Same key; separate ledger so each child is delivered exactly
+        # once per unique failure.
         self._delivered: set[tuple] = set()
 
     def setup(self) -> None:
@@ -136,9 +122,7 @@ class ProblemDetector(Role):
             )
         )
 
-        # Determine the failing branch's sector.  The lookup table on
-        # the behavior is populated once at scenario build; defensive
-        # fallback to the sector of the local node's grid.
+        # Sector of the failing branch, from the behavior lookup table.
         sector_str = self._lookup_branch_sector(event.branch_id)
         sector = _sector_from_str(sector_str)
         if sector is None:
@@ -150,10 +134,8 @@ class ProblemDetector(Role):
             return
 
         if not self.enable_distributed_failure_notice:
-            # Distributed propagation is disabled (ablation comparison
-            # against the centralised pre-filter).  The local
-            # ``LineFailure`` event has already been emitted above for
-            # the reconfigurator; nothing else to do here.
+            # Propagation disabled; the local ``LineFailure`` for the
+            # reconfigurator was already emitted above.
             return
 
         notice = FailureNotice(
@@ -162,8 +144,8 @@ class ProblemDetector(Role):
             hops_remaining=self.ttl_hops,
             origin_addr=self.context.addr,
         )
-        # Originator counts as "delivered" so a subsequent inbound
-        # notice for the same failure isn't redundantly re-pushed.
+        # Originator counts as "delivered" so a later inbound copy of
+        # the same failure isn't re-pushed.
         key = (str(notice.origin_addr), notice.branch_id)
         self._delivered.add(key)
         self._forwarded_ttl[key] = notice.hops_remaining
@@ -179,18 +161,15 @@ class ProblemDetector(Role):
         self, message: FailureNotice, meta: dict
     ) -> None:
         key = (str(message.origin_addr), message.branch_id)
-        # Forwarding gate: only proceed if this copy is fresher than
-        # what we have already forwarded.  Standard TTL-based dedup —
-        # fresher copies (higher hops_remaining) reach farther.
+        # Forwarding gate: only forward copies fresher (higher TTL) than
+        # what we already forwarded.
         prev_ttl = self._forwarded_ttl.get(key)
         if prev_ttl is not None and message.hops_remaining <= prev_ttl:
             return
         self._forwarded_ttl[key] = message.hops_remaining
 
-        # Delivery to local children is independent of forwarding gate:
-        # we want to deliver exactly once per failure regardless of how
-        # many copies traverse this node.  But the dedup table is
-        # already updated above; gate on a separate ``_delivered`` set.
+        # Local delivery is gated separately so each child receives the
+        # notice exactly once regardless of how many copies traverse.
         if key not in self._delivered:
             self._delivered.add(key)
             await self._deliver_local(message)
@@ -205,9 +184,9 @@ class ProblemDetector(Role):
     async def _propagate(
         self, notice: FailureNotice, *, exclude_addr: Any
     ) -> None:
-        """Forward ``notice`` to every grid neighbour whose connecting
-        edge is traversable for this sector.  Skip the sender (no
-        reflection) and the origin (closure of the propagation).
+        """Forward ``notice`` to every grid neighbour whose edge is
+        traversable for this sector. Skip the sender (no reflection) and
+        the origin (closes the propagation).
         """
         for neigh_addr in topology_neighbors(self, tid="grid"):
             if exclude_addr is not None and neigh_addr == exclude_addr:
@@ -239,9 +218,9 @@ class ProblemDetector(Role):
             )
 
     async def _deliver_local(self, notice: FailureNotice) -> None:
-        """Send the notice to every child agent at this node.  The
-        children's ``EnergyBalanceNegotiator`` decides — based on its
-        sector — whether to trigger a balance negotiation.
+        """Send the notice to every child at this node; each child's
+        ``EnergyBalanceNegotiator`` decides (per sector) whether to
+        trigger a balance negotiation.
         """
         for child_addr in self.child_addrs:
             await self.context.send_message(notice, receiver_addr=child_addr)
@@ -258,8 +237,8 @@ class ProblemDetector(Role):
 
 
 def _normalise_branch_id(branch_id: tuple) -> tuple:
-    """Order-insensitive key for lookups: branches are undirected, so
-    swap ``(from, to, idx)`` to its lex-min form for a stable key."""
+    """Order-insensitive lookup key: branches are undirected, so map
+    ``(from, to, idx)`` to its lex-min form."""
     if len(branch_id) < 2:
         return branch_id
     a, b = branch_id[0], branch_id[1]
@@ -297,9 +276,9 @@ def _edge_cost(
     *,
     cp_bridge_cost: int = _CP_BRIDGE_COST,
 ) -> int | None:
-    """Return the hop cost for traversing ``edge_sector`` while
-    propagating a failure of ``failure_sector``.  ``None`` means the
-    edge is untraversable (different-sector physical branch).
+    """Hop cost for traversing ``edge_sector`` while propagating a
+    ``failure_sector`` failure. ``None`` means untraversable
+    (different-sector physical branch).
     """
     if edge_sector == failure_sector:
         return 1

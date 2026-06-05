@@ -60,9 +60,8 @@ def _functional_baseline(campaign: CampaignData, out_dir: Path) -> list[str]:
             title=f"Restoration trajectory — task {rep.task_id} ({rep.grid})",
             failure_t=rep.first_failure_time(),
         )))
-        # Constraint-envelope overlay for the same task — directly
-        # surfaces whether voltage / pressure / temperature ever left
-        # the operating band during the recovery.
+        # Constraint-envelope overlay: whether voltage / pressure /
+        # temperature ever left the operating band during recovery.
         figs.append(str(plots.constraint_envelope_trajectory(
             rep.timeseries, rep.events,
             out_dir / "representative_constraint_envelope.png",
@@ -96,8 +95,7 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
             sub, out_dir / "served_by_variant.png",
             title="Priority-weighted served by variant",
         )),
-        # "Which control layer actually fires under each variant?" —
-        # exposes the regulate trigger mix so ablations stand out.
+        # Regulate trigger mix per variant — which control layer fires.
         str(plots.regulates_by_reason_bar(
             sub, out_dir / "regulates_by_reason.png",
         )),
@@ -109,11 +107,9 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
 def _restoration_time(campaign: CampaignData, out_dir: Path) -> list[str]:
     """Campaign-wide time-to-stabilise box plot.
 
-    Pools every OK task across every experiment so the per-variant box
-    has enough samples to be meaningful — restricting it to the
-    ``variant_comparison`` slice (the natural home for the PWSF bar)
-    collapses the box to n=1 per variant in small campaigns and hides
-    the scare distribution entirely.
+    Pools every OK task across all experiments so the per-variant box has
+    enough samples to be meaningful (the ``variant_comparison`` slice alone
+    collapses to n=1 per variant in small campaigns).
     """
     df = campaign.summary
     if df.empty:
@@ -204,10 +200,9 @@ def _claims(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 
 def _solver_health(campaign: CampaignData, out_dir: Path) -> list[str]:
-    """Campaign-wide solver-health view.  Surfaces mean infeasibility /
-    warning counts per task split by variant so regressions in the
-    energy-flow LP (e.g. the failure-mode the run-log audit chased
-    down) show up at a glance instead of needing a grep over run.log.
+    """Campaign-wide solver-health view: mean infeasibility / warning counts
+    per task split by variant, so energy-flow LP regressions show up without
+    a grep over run.log.
     """
     df = campaign.summary
     if df.empty:
@@ -240,14 +235,11 @@ def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
     if ok.empty:
         return []
 
-    # Validity plots are most informative when the most-recently-added
-    # recordings are present in ``timeseries.csv``.  Walk OK scare tasks
-    # in ``functional_baseline``-first order; prefer tasks that carry
-    # the slack columns (latest), fall back to coalition_balance
-    # (previous landing), fall back to ``functional_baseline``'s
-    # representative or just the first OK task.  Each "prefix" needed
-    # is a superset of the previous one, so picking the newest gives
-    # all subplots data.
+    # Pick a representative OK scare task whose ``timeseries.csv`` carries the
+    # richest recordings.  Walk ``functional_baseline``-first, preferring tasks
+    # with slack columns, then coalition_balance, then the FB representative or
+    # first OK task.  Each required prefix is a superset of the next, so the
+    # newest match gives every subplot data.
     fb_first = pd.concat([
         ok[ok["experiment"] == "functional_baseline"],
         ok[ok["experiment"] != "functional_baseline"],
@@ -311,14 +303,11 @@ def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 
 def _constraints(campaign: CampaignData, out_dir: Path) -> list[str]:
-    """Campaign-wide constraint-handling view.  Surfaces the per-sector
-    violation integral (``∫ max(0, util-1) dt``) split by variant so
-    "did the constraint layer keep the network inside its envelope"
-    is answered in one bar.  The constraint envelope trajectories
-    (per-task voltage / pressure / temperature with shaded bands)
-    live next to each ``functional_baseline`` representative task and
-    each per-experiment trajectory pair; the dedicated
-    ``overview_constraints.html`` page collates them all in one view.
+    """Campaign-wide constraint-handling view: the per-sector violation
+    integral (``int max(0, util-1) dt``) split by variant — did the constraint
+    layer keep the network inside its envelope.  Per-task envelope trajectories
+    live alongside each representative task; ``overview_constraints.html``
+    collates them.
     """
     df = campaign.summary
     if df.empty:
@@ -333,12 +322,9 @@ def _per_experiment_trajectories(
 ) -> list[tuple[str, list[str]]]:
     """One trajectory + constraint-envelope per (experiment, variant).
 
-    Previously only ``functional_baseline`` got a representative task
-    drawn — every other experiment had the same per-task artefacts but
-    no figure.  Iterate over the (experiment × variant) cells of the
-    summary and emit a trajectory + envelope for the lowest-id OK task
-    in each.  Skips ``functional_baseline`` since the dedicated
-    dispatcher already covers it.
+    Emits a trajectory + envelope for the representative OK task in each
+    (experiment x variant) cell.  Skips ``functional_baseline``, covered by
+    its own dispatcher.
     """
     df = campaign.summary
     if df.empty or "experiment" not in df.columns or "variant" not in df.columns:
@@ -449,10 +435,9 @@ def _per_task_overviews(
 
 
 def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
-    """Campaign-wide restoration view: pre-failure baseline vs
-    post-restoration absolute MW + per-tier ratio.  Only emits figures
-    when the campaign carried the new ``outcomes.restoration.*`` block
-    (older campaigns silently fall back to an empty placeholder).
+    """Campaign-wide restoration view: pre-failure baseline vs post-restoration
+    absolute MW + per-tier ratio.  Emits figures only when the campaign carried
+    the ``outcomes.restoration.*`` block (else an empty placeholder).
     """
     df = campaign.summary
     if df.empty:
@@ -473,15 +458,12 @@ def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
         str(plots.restoration_by_tier_bar(
             ok, out_dir / "by_tier.png",
         )),
-        # Per-sector mirror of the per-tier ratio bar — uses the
-        # outcomes__restoration__by_sector__<sec>__ratio columns the
-        # aggregator already flattens.
+        # Per-sector mirror of the per-tier ratio bar.
         str(plots.restoration_by_sector_bar(
             ok, out_dir / "by_sector.png",
         )),
-        # Split per-tier loss into priority-blind (physical disconnect)
-        # vs priority-aware (agent-shed) — the chapter's tier waterfall
-        # claim applies only to the latter.
+        # Split per-tier loss into priority-blind (physical disconnect) vs
+        # priority-aware (agent-shed); the tier-waterfall claim covers the latter.
         str(plots.restoration_loss_split_by_tier_bar(
             ok, out_dir / "loss_split_by_tier.png",
         )),
@@ -495,11 +477,9 @@ def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
 def _missing_experiment_sections(
     campaign: CampaignData, plots_root: Path,
 ) -> list[tuple[str, list[str]]]:
-    """Per-experiment served-by-variant bars for every experiment that
-    doesn't have a dedicated dispatcher above.  Closes the gap where
-    cp_flexibility / cp_size_sweep / cold_day_stress /
-    concentrated_imbalance / generator_failure / scaling had data in
-    summary.csv but no figure in the report.
+    """Per-experiment served-by-variant bars for every experiment lacking a
+    dedicated dispatcher above, so experiments with data in summary.csv still
+    get a figure.
     """
     df = campaign.summary
     if df.empty or "experiment" not in df.columns:
@@ -589,8 +569,7 @@ def _table_claims(campaign: CampaignData) -> str:
 
 
 def _todo_section(campaign: CampaignData) -> str:
-    """Surface the TODO experiments listed in metadata so reviewers see
-    what isn't yet measured."""
+    """Surface the TODO experiments listed in metadata (not yet measured)."""
     md = campaign.metadata or {}
     cfg = md.get("campaign_config", {}) or {}
     exps = cfg.get("experiments", []) or []
@@ -613,15 +592,13 @@ def generate_report(
     *,
     per_task_overviews: bool = False,
 ) -> Path:
-    """Generate plots + REPORT.md for *campaign_dir*.  Returns the
-    Markdown path.
+    """Generate plots + REPORT.md for *campaign_dir*.  Returns the Markdown
+    path.
 
-    ``per_task_overviews`` (default ``False``) controls whether the
-    one-figure-per-OK-task ``system_state_overview`` panels are
-    rendered.  These are the only "per-task" plots in the pipeline; on
-    a large campaign they're hundreds of HTML/PDF files of which only a
-    couple are ever opened.  Representative-task plots (one per
-    experiment-variant) are always rendered regardless.
+    ``per_task_overviews`` (default ``False``) renders the
+    one-figure-per-OK-task ``system_state_overview`` panels — hundreds of files
+    on a large campaign.  Representative-task plots (one per experiment-variant)
+    are always rendered regardless.
     """
     campaign = load_campaign(campaign_dir)
     plots_root = campaign_dir / "plots"
@@ -654,10 +631,8 @@ def generate_report(
         if figs:
             sections.append((label, figs))
 
-    # Auto-dispatched per-experiment sections — closes the gap where
-    # experiments like cp_flexibility / cp_size_sweep / cold_day_stress
-    # /concentrated_imbalance / generator_failure / scaling have data
-    # in summary.csv but no dedicated curve.
+    # Auto-dispatched per-experiment sections for experiments with data in
+    # summary.csv but no dedicated curve.
     try:
         for label, figs in _missing_experiment_sections(campaign, plots_root):
             if figs:
@@ -666,9 +641,7 @@ def generate_report(
         logger.warning("Auto-dispatch failed: %s — skipping", exc)
 
     # Representative trajectory + constraint envelope per (experiment,
-    # variant).  ``_functional_baseline`` already covers its own slot;
-    # this dispatcher handles every other experiment so the per-task
-    # artefacts that were collected stop going to waste.
+    # variant) for every experiment except functional_baseline (own slot).
     try:
         for label, figs in _per_experiment_trajectories(campaign, plots_root):
             if figs:
@@ -676,11 +649,8 @@ def generate_report(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Per-experiment trajectories failed: %s — skipping", exc)
 
-    # One system-state overview HTML per OK task — slack + control vars
-    # + line loading + per-tier fulfilment on shared time axes.  Skipped
-    # by default: on a multi-hundred-task campaign this renders one
-    # html+pdf per task and almost none get opened — pass
-    # ``--per-task-overviews`` to opt in.
+    # One system-state overview HTML per OK task (slack + control vars + line
+    # loading + per-tier fulfilment).  Opt-in via ``--per-task-overviews``.
     if per_task_overviews:
         try:
             for label, figs in _per_task_overviews(
@@ -696,8 +666,7 @@ def generate_report(
     report_path.write_text(md, encoding="utf-8")
     logger.info("Wrote %s (%d sections)", report_path, len(sections))
 
-    # Generate the multi-plot HTML overviews — non-fatal if it fails,
-    # the per-figure HTML/PDF is still on disk for inclusion.
+    # Multi-plot HTML overviews — non-fatal; per-figure HTML/PDF is on disk.
     try:
         overview_path = write_overview(campaign)
         logger.info("Wrote %s", overview_path)

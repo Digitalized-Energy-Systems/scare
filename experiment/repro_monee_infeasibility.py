@@ -1,17 +1,15 @@
 """Standalone reproducer for the monee ``run_energy_flow`` infeasibility.
 
-Observed in scare evaluation runs (see ``experiment/_runs/eval/.../run.log``):
-a single non-CP branch is deactivated on a simbench-LV multi-energy
-network and the next call to ``monee.run_energy_flow(... exclude_unconnected_
-nodes=True)`` returns ``SolverResult.success = False`` with
-``termination_condition = infeasible``.  The MIS pinpoints per-node balance
-equations (``node_{n}_eq_1`` / ``node_{n}_eq_3``) relaxable by ~5e-3.
+Deactivating a single non-CP branch on a simbench-LV multi-energy network
+makes the next ``monee.run_energy_flow(... exclude_unconnected_nodes=True)``
+return ``success = False`` with ``termination_condition = infeasible``. The
+MIS pinpoints per-node balance equations (``node_{n}_eq_1`` / ``_eq_3``)
+relaxable by ~5e-3.
 
-This script has **no scare imports** — it builds the network directly via
-``simbench`` + ``monee`` + ``mango_energy_environments``, applies the same
-slack-budget shaping scare uses, and triggers the infeasibility by
-deactivating one branch.  Drop into the monee repo as-is to iterate on
-the upstream fix.
+No scare imports — builds the network via ``simbench`` + ``monee``, applies
+the same slack-budget shaping scare uses, and triggers the infeasibility by
+deactivating one branch. Drop into the monee repo as-is to iterate on the
+upstream fix.
 
 Required packages::
 
@@ -26,10 +24,8 @@ Usage::
         --coupling-density 0.3 --cp-size-multiplier 2.0 \\
         --slack-budget-pct 0.45 --branch 380 15
 
-The defaults reproduce the ``hebbian_eval_20260517-024741/000002`` case
-exactly (simbench_lv_cp_heavy, branch ``(380, 15, 0)``, slack 0.45).
-Use ``--branch 328 271`` for the ``eval_smoke_20260518-213519/000001``
-case (smaller ``simbench_lv`` variant).
+Defaults reproduce the simbench_lv_cp_heavy case (branch ``(380, 15, 0)``,
+slack 0.45); use ``--branch 328 271`` for the smaller ``simbench_lv`` variant.
 """
 from __future__ import annotations
 
@@ -45,9 +41,8 @@ from monee.model.formulation import MISOCP_NETWORK_FORMULATION
 from monee.network import generate_supply_return_mes_based_on_power_net
 
 
-# Slack LP envelope is widened by this factor over the operator's soft
-# budget so the energy-flow LP has headroom; same constant scare uses
-# (see experiment/restoration.py:_SLACK_LP_HEADROOM_FACTOR).
+# Widens the slack LP envelope over the operator's soft budget for
+# headroom; mirrors experiment/restoration.py:_SLACK_LP_HEADROOM_FACTOR.
 _SLACK_LP_HEADROOM_FACTOR: float = 10.0
 
 
@@ -58,9 +53,8 @@ def build_simbench_mes(
     cp_size_multiplier: float,
     replace_primary_generation: bool,
 ):
-    """Build the same simbench multi-energy network scare's
-    ``create_large_lv_simbench`` produces.  No scare imports needed —
-    this is the verbatim sequence the failing runs took.
+    """Build the same simbench multi-energy network as scare's
+    ``create_large_lv_simbench``, without scare imports.
     """
     pp_net = simbench.get_simbench_net(simbench_code)
     mn = from_pandapower_net(pp_net)
@@ -82,13 +76,12 @@ def build_simbench_mes(
 
 
 def apply_slack_budget(mes, fraction: float) -> None:
-    """Operator slack-budget shaping — verbatim port of scare's
+    """Operator slack-budget shaping — port of scare's
     ``experiment.restoration.apply_slack_budget``.
 
     Widens the slack ``p_mw`` / ``mass_flow`` LP envelope to
-    ``±10 × fraction × Σ|nominal loads|`` so the LP has headroom after
-    a branch failure shifts the imbalance.  Heat-side ExtHydrGrid is
-    left fully unbounded.
+    ``±10 × fraction × Σ|nominal loads|`` for headroom after a branch
+    failure shifts the imbalance. Heat-side ExtHydrGrid left unbounded.
     """
     total_p_mw = 0.0
     total_gas_mass_kgs = 0.0
@@ -133,10 +126,8 @@ def apply_slack_budget(mes, fraction: float) -> None:
 
 
 def _resolve_branch_id(net, from_node: int, to_node: int):
-    """Return the full ``(from, to, idx)`` branch id matching the endpoints.
-
-    Accepts either orientation.  The third element disambiguates parallel
-    branches.
+    """Return the full ``(from, to, idx)`` branch id for the endpoints
+    (either orientation); the third element disambiguates parallels.
     """
     for branch in net.branches:
         if branch.id[:2] == (from_node, to_node):
@@ -184,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--slack-budget-pct", type=float, default=0.45,
-        help="Operator slack budget (None to skip).  0.45 = failing-run default.",
+        help="Operator slack budget (None to skip).",
     )
     parser.add_argument(
         "--branch", nargs=2, type=int, default=[380, 15],
@@ -197,8 +188,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Surface monee's own _classify_solve_result ERROR (which already
-    # carries the MIS report) and pyomo.core's load_solutions WARNING.
+    # Surface monee's solve-result ERROR (carries the MIS report) and
+    # pyomo.core's load_solutions WARNING.
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s [%(name)s] %(message)s",

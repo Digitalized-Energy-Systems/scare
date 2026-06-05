@@ -3,20 +3,19 @@
 Reads the aggregator's ``summary.csv`` plus each task's ``events.csv``
 and writes:
 
-* ``cp_coalition_findings.md`` — per-experiment + per-grid breakdown
-  comparing the "with cross-sector" arm against the "without" arm,
-  with priority-weighted served fraction, restoration ratio, and the
-  cross-sector event-count roll-up.
-* ``plots/`` — every CP-specific figure from :mod:`experiment.eval.cp_plots`,
-  rendered against (a) the representative task's event ledger and
-  (b) the flag-on / flag-off comparison summary.
+* ``cp_coalition_findings.md`` — per-experiment / per-grid breakdown of
+  the with- vs without-cross-sector arms (PWSF, restoration ratio,
+  cross-sector event-count roll-up).
+* ``plots/`` — every figure from :mod:`experiment.eval.cp_plots`,
+  rendered against the representative task's ledger and the
+  flag-on/flag-off comparison summary.
 
 Usage:
     python -m experiment.eval.cp_campaign_analysis \\
         --campaign-dir experiment/_runs/eval/cp_coalition_eval
 
-By default looks for the most recent ``cp_coalition_eval*`` directory
-under ``experiment/_runs/eval/``.
+Defaults to the most recent ``cp_coalition_eval*`` directory under
+``experiment/_runs/eval/``.
 """
 
 from __future__ import annotations
@@ -85,9 +84,8 @@ def _events_for_task(campaign_dir: Path, task_id: int) -> pd.DataFrame:
 
 
 def _events_json_for_task(campaign_dir: Path, task_id: int) -> Path:
-    """Render the task's events.csv into the events.json layout the
-    cp_plots helpers consume.  Plots accept either source, but plot
-    code reads JSON directly so we materialise it once here.
+    """Materialise the task's events.csv as the events.json layout the
+    cp_plots helpers read.
     """
     csv_path = (
         campaign_dir / CAMPAIGN_LAYOUT["tasks"]
@@ -112,8 +110,8 @@ def _events_json_for_task(campaign_dir: Path, task_id: int) -> Path:
 def _summary_json_for_run(
     campaign_dir: Path, task_ids: list[int], out_path: Path,
 ) -> Path:
-    """Aggregate the event_log() snapshots of a set of tasks into the
-    summary.json layout the flag_on_off_comparison helper consumes.
+    """Aggregate a set of tasks' event counts into the summary.json
+    layout the flag_on_off_comparison helper reads.
     """
     all_counts: dict[str, int] = defaultdict(int)
     for tid in task_ids:
@@ -140,8 +138,8 @@ _LABEL_RE = re.compile(r"\$label=([^;]+)")
 
 
 def _label_from_ablation_key(key: str) -> str:
-    """The ablation column is a sorted ``k=v`` string.  Pull the
-    ``$label`` value out if present, else fall back to the full key.
+    """Pull ``$label`` out of the sorted ``k=v`` ablation key, else
+    return the full key.
     """
     m = _LABEL_RE.search(key)
     return m.group(1) if m else key
@@ -189,15 +187,14 @@ def write_findings_report(
     summary: pd.DataFrame,
     out_path: Path,
 ) -> Path:
-    """Per-experiment / per-grid markdown with the with/without
-    cross-sector deltas + the event-count roll-up.
+    """Per-experiment / per-grid markdown: with/without cross-sector
+    deltas plus the event-count roll-up.
     """
     pwsf = "outcomes__priority_weighted_fraction"
     restoration_col = "outcomes__restoration"
     served_col = "outcomes__served_fraction"
 
-    # Attach per-task event-count columns from disk so the report can
-    # show them alongside the metric deltas.
+    # Attach per-task event-count columns alongside the metric deltas.
     xs_counts_per_task: dict[int, dict[str, int]] = {}
     for tid in summary["task_id"].astype(int):
         xs_counts_per_task[int(tid)] = _xs_event_counts_for_task(
@@ -258,7 +255,7 @@ def write_findings_report(
                     f"{_format_int_counts(arm_df['xs__cp_envelope_clamp'])} |"
                 )
 
-            # Δ-row between the with/without arms.
+            # Delta row between the with/without arms.
             arms = sorted(ok_df["arm"].unique())
             if len(arms) == 2 and pwsf in ok_df.columns:
                 v0 = ok_df[ok_df["arm"] == arms[0]][pwsf].dropna()
@@ -284,10 +281,10 @@ def write_findings_report(
 def _pick_representative_task(
     summary: pd.DataFrame, *, prefer_label: str = "with_xs"
 ) -> int | None:
-    """Pick the task most likely to show interesting cross-sector
-    activity: largest ``cp_envelope_set`` count, then largest
-    ``cross_sector_coalition_allocation``, then any task with that arm.
-    Falls back to the first OK task with ``arm == prefer_label``.
+    """Pick the most cross-sector-active task: largest
+    ``cp_envelope_set``, then largest
+    ``cross_sector_coalition_allocation``, restricted to
+    ``arm == prefer_label``.
     """
     if summary.empty:
         return None
@@ -313,10 +310,10 @@ def render_campaign_plots(
 ) -> dict[str, Path]:
     """Render every CP-focused figure off the campaign output.
 
-    * ``representative_run/`` — figures off the task with the most
-      cross-sector activity in the ``with_xs`` arm.
-    * ``flag_comparison/`` — the with-vs-without bar chart aggregated
-      across the entire ``xs_coalition_ablation`` experiment.
+    * ``representative_run/`` — figures off the most cross-sector-active
+      task in the ``with_xs`` arm.
+    * ``flag_comparison/`` — with-vs-without bar chart aggregated across
+      the ``xs_coalition_ablation`` experiment.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
@@ -329,7 +326,7 @@ def render_campaign_plots(
         events_json = _events_json_for_task(campaign_dir, rep_task_id)
         rep_out = out_dir / "representative_run"
         rep_out.mkdir(parents=True, exist_ok=True)
-        # Inline render so paths land under our out_dir, not the task dir.
+        # Render so paths land under out_dir, not the task dir.
         written.update({
             "cp_setpoint_timeline": cp_plots.cp_setpoint_timeline(
                 events_json, rep_out / "cp_setpoint_timeline",
@@ -352,8 +349,7 @@ def render_campaign_plots(
             rep_task_id,
         )
 
-    # Flag-comparison summaries are aggregated across the headline
-    # ablation experiment only — keeps the bar chart focussed.
+    # Aggregate flag-comparison summaries over the ablation experiment only.
     ablation = summary[summary["experiment"] == "xs_coalition_ablation"].copy()
     if not ablation.empty:
         ablation["arm"] = ablation["ablation"].apply(_label_from_ablation_key)

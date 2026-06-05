@@ -299,7 +299,7 @@ class TestComputePriorityWeightedShares:
         assert shares == [0.0, 0.0]
 
     def test_scarce_resource_all_to_critical(self):
-        """Only 1 MW available, group A has 10 MW tier-1, group B has 10 MW tier-5.
+        """Only 1 MW available, group A has 10 MW tier-1, group B has 10 MW tier-4.
         All goes to group A (tier-1 first)."""
         shares = compute_priority_weighted_shares(
             [{1: 10.0}, {4: 10.0}],

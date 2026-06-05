@@ -1,9 +1,8 @@
-"""Smoke tests for the adaptive-network analysis bundle (C.2/3/5/7).
+"""Smoke tests for the adaptive-network analysis bundle.
 
-Synthetic eval-root layout: each task is a folder with the same files
-SCARE writes (config.json, timeseries.csv, served.csv, events.csv).
-The fixtures generate runs whose order parameter has a known
-saddle-node-like transition along a sweep axis, so the analysis
+Fixtures synthesise SCARE-shaped task folders (config.json,
+timeseries.csv, served.csv, events.csv) whose order parameter has a
+known saddle-node-like transition along a sweep axis, so the analysis
 should pick it up.
 """
 
@@ -68,8 +67,7 @@ def sweep_root(tmp_path: Path) -> Path:
     root = tmp_path / "eval"
     rng = np.random.default_rng(42)
     for nf in range(1, 11):
-        # Below threshold: full restoration with relaxation curve.
-        # Above threshold: residual deficit + larger variance.
+        # Below threshold: full restoration. Above: residual deficit + variance.
         for seed in range(3):
             taskid = f"{nf:02d}_{seed}"
             n = 200
@@ -93,7 +91,7 @@ def sweep_root(tmp_path: Path) -> Path:
 
 def test_load_eval_root(sweep_root: Path):
     runs = load_eval_root(sweep_root)
-    assert len(runs) == 30  # 10 nf × 3 seeds
+    assert len(runs) == 30  # 10 nf x 3 seeds
 
 
 def test_mean_field_fit_runs(sweep_root: Path):
@@ -102,10 +100,8 @@ def test_mean_field_fit_runs(sweep_root: Path):
     assert fit.n_runs > 0
     # gamma should be positive (relaxation toward eta_inf)
     assert fit.gamma > 0.0
-    # eta_inf is just a fitted intercept; require finite, not bounded.
-    # The synthetic sweep mixes pre- and post-bifurcation regimes which
-    # the linear ODE cannot represent exactly — non-finiteness would
-    # indicate a numerical bug, not a model mismatch.
+    # eta_inf is a fitted intercept; the mixed-regime sweep cannot be
+    # represented exactly by the linear ODE, so require finite, not bounded.
     assert math.isfinite(fit.eta_infinity)
 
 
@@ -113,8 +109,7 @@ def test_bifurcation_continuation_detects_jump(sweep_root: Path):
     runs = load_eval_root(sweep_root)
     cont = continue_bifurcation(runs, axis="n_failures", bin_count=5)
     assert len(cont.points) >= 3
-    # The synthetic sweep has a jump at nf=5; the detector should flag
-    # at least one saddle-node candidate.
+    # Sweep has a jump at nf=5; detector should flag a saddle-node candidate.
     saddles = [d for d in cont.detected if d["type"].startswith("saddle")]
     assert len(saddles) >= 1
 
@@ -124,15 +119,14 @@ def test_critical_exponents_fits(sweep_root: Path):
     cont = continue_bifurcation(runs, axis="n_failures", bin_count=5)
     fit = fit_critical_exponents(cont, p_critical=5.0, side="below")
     assert fit.n_points >= 2
-    # Below-critical fit: eta is near 1, so |eta - eta_inf| is small;
-    # the magnitude of beta is unconstrained but should be finite.
+    # Below-critical fit: beta/gamma magnitudes are unconstrained but finite.
     assert math.isfinite(fit.beta)
     assert math.isfinite(fit.gamma)
 
 
 def test_cluster_synchronisation_handles_missing_traj(sweep_root: Path, tmp_path: Path):
     runs = load_eval_root(sweep_root)
-    # No trajectories.csv → should return an empty result with a note.
+    # No trajectories.csv: should return an empty result with a note.
     result = cluster_synchronisation(runs[0])
     assert result.n_devices == 0
     assert result.notes
@@ -168,6 +162,6 @@ def test_cluster_synchronisation_with_trajectories(tmp_path: Path):
         run, threshold=0.6, aid_traj_csv=traj
     )
     assert result.n_devices == 3
-    # dev_a and dev_b should land in the same cluster, dev_c separate.
+    # dev_a and dev_b should cluster together, dev_c separate.
     assert result.cluster_assignment["dev_a"] == result.cluster_assignment["dev_b"]
     assert result.cluster_assignment["dev_c"] != result.cluster_assignment["dev_a"]

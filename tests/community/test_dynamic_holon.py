@@ -1,18 +1,11 @@
-"""Unit tests for the L2 dynamic holon-membership filter (Concept C).
+"""Unit tests for the L2 dynamic holon-membership filter.
 
-Two layers of testing, mirroring the production composition:
+Two layers:
 
-1. :class:`DynamicHolonRole` itself — its ``is_live`` predicate after a
-   simulated branch failure, driven directly through the shared
-   :class:`GridTopologyMirror` (no mango context required for that
-   part).
-2. :class:`HolonicCommunityRole._live_members` filter — exercised with
-   a plain stub ``LivePeerFilter`` so we can confirm peer iteration in
-   the host role honours the filter without needing the full ADMM
-   plumbing.
-
-The full mango end-to-end is left to the integration suite; the
-dataflow contract between the two roles is fully covered here.
+1. :class:`DynamicHolonRole`'s ``is_live`` predicate after a simulated
+   branch failure, driven through the shared :class:`GridTopologyMirror`.
+2. :class:`HolonicCommunityRole._live_members`, exercised with a stub
+   ``LivePeerFilter`` to confirm peer iteration honours the filter.
 """
 
 from __future__ import annotations
@@ -64,11 +57,7 @@ class _StubAddr:
 
 
 class _NoOpContext:
-    """Just enough context surface for DynamicHolonRole._reassess_membership
-    to run without scheduling.  We invoke the coroutine synchronously
-    via ``asyncio.run``-free dispatch by directly awaiting in the test
-    coroutines below.
-    """
+    """Minimal context surface for _reassess_membership without scheduling."""
 
     def __init__(self, aid: str, t: float = 100.0) -> None:
         self.aid = aid
@@ -90,9 +79,7 @@ class TestDynamicHolonRoleIsLive:
             aid_to_node_id=aid_to_node,
             mirror=mirror,
         )
-        # The filter is additive — until something is declared dead it
-        # treats everything as alive.  This is the contract documented
-        # on ``LivePeerFilter``.
+        # Additive filter: everything is alive until declared dead.
         assert role.is_live(_StubAddr("leader-2"))
         assert role.is_live(_StubAddr("stranger"))
 
@@ -105,20 +92,14 @@ class TestDynamicHolonRoleIsLive:
             aid_to_node_id=aid_to_node,
             mirror=mirror,
         )
-        # Simulate the reassess result by populating the unreachable
-        # set directly — drives the same predicate the role would set.
+        # Populate the unreachable set directly, as reassess would.
         role._unreachable_aids.add("leader-3")
         assert role.is_live(_StubAddr("leader-2"))
         assert not role.is_live(_StubAddr("leader-3"))
 
     def test_self_aware_filter_after_break(self) -> None:
-        """Replay the BFS path the role's reassess uses.
-
-        After breaking the middle branch (``b2``), node 4 (leader-3) is
-        unreachable from node 1 (leader-1).  We don't run the full
-        async reassess here — that requires a mango scheduler — but we
-        replay the BFS the role would do and verify the resulting
-        predicate.
+        """After breaking middle branch ``b2``, node 4 (leader-3) is
+        unreachable from node 1; replaying the role's BFS marks it dead.
         """
         mirror, aid_to_node = _three_leader_grid()
         role = DynamicHolonRole(
@@ -140,8 +121,8 @@ class TestDynamicHolonRoleIsLive:
         assert not role.is_live(_StubAddr("leader-3"))
 
     def test_never_drops_self(self) -> None:
-        """The reassess must skip the leader's own aid — dropping it
-        would orphan the holon entirely."""
+        """Reassess must never drop the leader's own aid — that would
+        orphan the holon."""
         mirror, aid_to_node = _three_leader_grid()
         role = DynamicHolonRole(
             behavior=SimpleNamespace(),
@@ -150,9 +131,6 @@ class TestDynamicHolonRoleIsLive:
             aid_to_node_id=aid_to_node,
             mirror=mirror,
         )
-        # Even if the leader's own node became isolated (impossible in
-        # the toy grid but worth pinning the rule), it isn't in the
-        # unreachable set.
         assert role.is_live(_StubAddr("leader-1"))
 
 
@@ -174,8 +152,6 @@ class _DroppingFilter:
 
 class TestHolonicCommunityRoleLiveMembers:
     def _build(self, filt) -> HolonicCommunityRole:
-        # Use the minimal constructor args; we only exercise the
-        # filter helper, not the role's lifecycle.
         return HolonicCommunityRole(
             sector=Sector.ELECTRICITY,
             live_member_filter=filt,

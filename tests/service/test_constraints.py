@@ -32,7 +32,6 @@ async def test_no_event_within_bounds():
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)
 
-    # Capture events by adding a listener role
     class EventCapture:
         pass
 
@@ -57,7 +56,6 @@ async def test_violation_emitted_when_out_of_bounds():
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)
 
-    # Subscribe to violation events on the same agent
     from mango.agent.role import Role
 
     class Listener(Role):
@@ -73,7 +71,7 @@ async def test_violation_emitted_when_out_of_bounds():
     agent.add_role(listener)
 
     async with world:
-        # Advance past the poll period (0.5s for electricity)
+        # Advance past the electricity poll period (0.5s).
         await step_simulation(world, step_size_s=1.0)
 
     assert len(violations) >= 1
@@ -84,9 +82,8 @@ async def test_violation_emitted_when_out_of_bounds():
 
 @pytest.mark.asyncio
 async def test_warning_emitted_near_bound():
-    # vm_pu=1.04 => util = |1.04 - 1.0| / 0.05 = 0.8 < 1.0 (no violation)
-    # but > PROACTIVE_WARNING_FRACTION (0.85)?  0.8 < 0.85, so no warning.
-    # vm_pu=1.044 => util = 0.88 > 0.85 => warning
+    # vm_pu=1.044 => util = |1.044-1.0|/0.05 = 0.88, above the 0.85
+    # PROACTIVE_WARNING_FRACTION but below the 1.0 violation threshold.
     behavior = MockBehavior()
     monitor = _make_monitor(behavior, vm_pu=1.044)
 
@@ -149,7 +146,6 @@ async def test_local_sensitivity_ema_update():
             behavior.set_obs("agent-0", {"p_mw": p, "vm_pu": v})
             await step_simulation(world, step_size_s=1.0)
 
-    # Each |ΔV/ΔP| = 0.02 / 1.0 = 0.02; EMA should move toward this.
     assert monitor.local_sensitivity() != initial
     assert monitor.local_sensitivity() > 0.0
 
@@ -158,11 +154,10 @@ async def test_local_sensitivity_ema_update():
 async def test_heat_sensitivity_updates_for_mw_scale_dp():
     """Heat sensitivity must update for MW-scale setpoint deltas.
 
-    Regression for the ``_SENSITIVITY_MIN_DP[HEAT]`` unit mismatch: it was
-    0.5 (as if P were in W), but heat ``obs_setpoint`` is ``q_mw_heat`` in
-    MW (~0.0075–0.05), so no regulation step could ever exceed it — the
-    estimate stayed pinned at the 1e-5 default and the curtailment-auction
-    willingness lost its sensitivity term entirely.
+    Heat ``obs_setpoint`` is ``q_mw_heat`` in MW (~0.0075-0.05), so
+    ``_SENSITIVITY_MIN_DP[HEAT]`` must be small enough that a regulation
+    step exceeds it; otherwise the estimate stays pinned at its default
+    and the curtailment-auction willingness loses its sensitivity term.
     """
     behavior = MockBehavior()
     behavior.add_action("agent-0", "regulate")
@@ -351,7 +346,7 @@ async def test_frontier_defers_shed_when_lower_priority_reducible_in_region():
     async with world:
         monitor._sensitivity = 660.0
         now = monitor.context.current_timestamp
-        monitor._heat_peer_state["peer-4"] = (now, 4, 0.05)  # tier-4, reducible
+        monitor._heat_frontier.note_peer_state("peer-4", now, 4, 0.05)  # tier-4
         await monitor._heat_frontier_control()
     assert not [a for a in behavior.action_log if a[1] == "regulate"], \
         "tier-1 load should defer to the lower-priority peer, not self-shed"
@@ -368,7 +363,7 @@ async def test_frontier_sheds_when_only_higher_priority_peers():
     async with world:
         monitor._sensitivity = 660.0
         now = monitor.context.current_timestamp
-        monitor._heat_peer_state["peer-1"] = (now, 1, 0.05)  # higher priority
+        monitor._heat_frontier.note_peer_state("peer-1", now, 1, 0.05)  # higher prio
         await monitor._heat_frontier_control()
     regs = [a for a in behavior.action_log if a[1] == "regulate"]
     assert regs and regs[-1][2][0] < 1.0
@@ -385,7 +380,7 @@ async def test_frontier_sheds_when_lower_priority_exhausted():
     async with world:
         monitor._sensitivity = 660.0
         now = monitor.context.current_timestamp
-        monitor._heat_peer_state["peer-4"] = (now, 4, 1e-9)  # essentially shed
+        monitor._heat_frontier.note_peer_state("peer-4", now, 4, 1e-9)  # ~shed
         await monitor._heat_frontier_control()
     regs = [a for a in behavior.action_log if a[1] == "regulate"]
     assert regs and regs[-1][2][0] < 1.0
@@ -402,8 +397,8 @@ async def test_frontier_stale_peer_aged_out():
     async with world:
         monitor._sensitivity = 660.0
         now = monitor.context.current_timestamp
-        stale = now - monitor._HEAT_PEER_FRESHNESS_S - 1.0
-        monitor._heat_peer_state["peer-4"] = (stale, 4, 0.05)
+        stale = now - monitor._heat_frontier._peer_freshness_s - 1.0
+        monitor._heat_frontier.note_peer_state("peer-4", stale, 4, 0.05)
         await monitor._heat_frontier_control()
     regs = [a for a in behavior.action_log if a[1] == "regulate"]
     assert regs and regs[-1][2][0] < 1.0
@@ -420,7 +415,7 @@ async def test_frontier_waterfall_disabled_sheds_tier_blind():
     async with world:
         monitor._sensitivity = 660.0
         now = monitor.context.current_timestamp
-        monitor._heat_peer_state["peer-4"] = (now, 4, 0.05)
+        monitor._heat_frontier.note_peer_state("peer-4", now, 4, 0.05)
         await monitor._heat_frontier_control()
     regs = [a for a in behavior.action_log if a[1] == "regulate"]
     assert regs and regs[-1][2][0] < 1.0
@@ -445,8 +440,8 @@ async def test_handle_constraint_state_populates_heat_peer_cache():
         await monitor._handle_constraint_state(
             msg, {"sender_addr": "peer-sender", "sender_id": "s0"}
         )
-    assert "peer-9" in monitor._heat_peer_state
-    _t, tier, reducible = monitor._heat_peer_state["peer-9"]
+    assert "peer-9" in monitor._heat_frontier._peer_state
+    _t, tier, reducible = monitor._heat_frontier._peer_state["peer-9"]
     assert tier == 4 and abs(reducible - 0.03) < 1e-9
 
 

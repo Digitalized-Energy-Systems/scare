@@ -78,7 +78,7 @@ def _build_constraint_group(
 
 @pytest.mark.asyncio
 async def test_violation_triggers_rebalance():
-    """Voltage violation on gen → BalanceProblem → leader triggers gossip → load regulated."""
+    """Voltage violation on gen raises BalanceProblem; leader rebalances and load gets regulated."""
     behavior = MockBehavior()
     world, agents, monitors, negotiators = _build_constraint_group(
         behavior,
@@ -110,14 +110,12 @@ async def test_violation_triggers_rebalance():
     agents[0].add_role(ViolationCapture())
 
     async with world:
-        # Let the periodic monitor fire (poll period for electricity is 0.5s)
+        # Electricity monitor poll period is 0.5s.
         await discrete_step_until(world, max_advance_time_s=3.0)
 
-    # Should have detected the voltage violation
     assert len(violations) >= 1
     assert violations[0].variable == "vm_pu"
 
-    # The rebalance triggered by BalanceProblem should have regulated the load
     regulate_calls = [
         c for c in behavior.action_log if c[0] == "load-0" and c[1] == "regulate"
     ]
@@ -129,7 +127,6 @@ async def test_constraint_state_propagates_to_neighbour():
     """ConstraintStateMessage reaches a 1-hop neighbour."""
     behavior = MockBehavior()
 
-    # Two agents: gen-0 has a constraint issue, load-0 is normal
     world, agents, monitors, _ = _build_constraint_group(
         behavior,
         [
@@ -147,13 +144,12 @@ async def test_constraint_state_propagates_to_neighbour():
     )
 
     async with world:
-        # Advance past the poll period so constraint state propagates
+        # Advance past the poll period so constraint state propagates.
         await discrete_step_until(world, max_advance_time_s=3.0)
 
-    # The load's monitor should have received constraint state from gen-0
+    # The load's monitor should have cached gen-0's vm_pu constraint state.
     load_monitor = monitors[1]
     assert len(load_monitor._neighbour_state) >= 1
-    # Check the cached state contains vm_pu from gen-0
     has_vm_pu = any(
         key[1] == "vm_pu" for key in load_monitor._neighbour_state
     )
