@@ -31,8 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 _PLOTLY_CDN = (
-    '<script src="https://cdn.plot.ly/plotly-3.5.0.min.js" charset="utf-8">'
-    "</script>"
+    '<script src="https://cdn.plot.ly/plotly-3.5.0.min.js" charset="utf-8"></script>'
 )
 
 # Shared fonts with the figures plus a responsive grid that drops to one
@@ -155,11 +154,7 @@ def _status_table(campaign: CampaignData) -> str:
             else:
                 val = f"{int(df[col].fillna(0).sum())}"
             extras.append(f"<tr><td>{label}</td><td>{val}</td></tr>")
-    return (
-        "<table class='status-table'>"
-        + "".join(rows + extras)
-        + "</table>"
-    )
+    return "<table class='status-table'>" + "".join(rows + extras) + "</table>"
 
 
 def _variant_means_table(campaign: CampaignData) -> str:
@@ -195,12 +190,7 @@ def _section(title: str, html_paths: list[Path]) -> str:
     cards = [c for c in (_plot_card(p) for p in html_paths) if c is not None]
     if not cards:
         return ""
-    return (
-        f"<h2>{title}</h2>"
-        + '<div class="grid">'
-        + "\n".join(cards)
-        + "</div>"
-    )
+    return f"<h2>{title}</h2>" + '<div class="grid">' + "\n".join(cards) + "</div>"
 
 
 def _page(title: str, *, lead: str, meta: str, body: str) -> str:
@@ -220,9 +210,7 @@ def _page(title: str, *, lead: str, meta: str, body: str) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
 # Top-level / per-experiment generators
-# ---------------------------------------------------------------------------
 
 
 def _top_level_sections(plots_root: Path) -> list[tuple[str, list[Path]]]:
@@ -231,40 +219,56 @@ def _top_level_sections(plots_root: Path) -> list[tuple[str, list[Path]]]:
     """
     p = plots_root
     return [
-        ("Restoration headline", [
-            p / "functional_baseline" / "served_per_grid.html",
-            p / "restoration" / "absolute_vs_baseline.html",
-            p / "restoration" / "ratio_by_variant.html",
-            p / "restoration" / "absolute_load_lost.html",
-        ]),
-        ("Per-tier / per-sector breakdown", [
-            p / "restoration" / "by_tier.html",
-            p / "restoration" / "by_sector.html",
-            p / "restoration" / "loss_split_by_tier.html",
-            p / "restoration" / "agent_only_ratio_by_tier.html",
-        ]),
-        ("Variant comparison", [
-            p / "variant_comparison" / "served_by_variant.html",
-            p / "restoration_time" / "time_to_stabilise.html",
-            p / "variant_comparison" / "regulates_by_reason.html",
-            p / "variant_comparison" / "diary_outcomes.html",
-        ]),
-        ("Diagnostics", [
-            p / "solver_health" / "solver_health.html",
-            p / "constraints" / "violation_integral.html",
-            p / "claims" / "claims_overall.html",
-            p / "variant_comparison" / "claims_pass_rate.html",
-        ]),
-        ("Representative trajectory (functional baseline)", [
-            p / "functional_baseline" / "representative_trajectory.html",
-            p / "functional_baseline" / "representative_constraint_envelope.html",
-            p / "functional_baseline" / "representative_served_by_tier.html",
-        ]),
+        (
+            "Restoration headline",
+            [
+                p / "functional_baseline" / "served_per_grid.html",
+                p / "restoration" / "absolute_vs_baseline.html",
+                p / "restoration" / "ratio_by_variant.html",
+                p / "restoration" / "absolute_load_lost.html",
+            ],
+        ),
+        (
+            "Per-tier / per-sector breakdown",
+            [
+                p / "restoration" / "by_tier.html",
+                p / "restoration" / "by_sector.html",
+                p / "restoration" / "loss_split_by_tier.html",
+                p / "restoration" / "agent_only_ratio_by_tier.html",
+            ],
+        ),
+        (
+            "Variant comparison",
+            [
+                p / "variant_comparison" / "served_by_variant.html",
+                p / "restoration_time" / "time_to_stabilise.html",
+                p / "variant_comparison" / "regulates_by_reason.html",
+                p / "variant_comparison" / "diary_outcomes.html",
+            ],
+        ),
+        (
+            "Diagnostics",
+            [
+                p / "solver_health" / "solver_health.html",
+                p / "constraints" / "violation_integral.html",
+                p / "claims" / "claims_overall.html",
+                p / "variant_comparison" / "claims_pass_rate.html",
+            ],
+        ),
+        (
+            "Representative trajectory (functional baseline)",
+            [
+                p / "functional_baseline" / "representative_trajectory.html",
+                p / "functional_baseline" / "representative_constraint_envelope.html",
+                p / "functional_baseline" / "representative_served_by_tier.html",
+            ],
+        ),
     ]
 
 
 def _constraints_sections(
-    plots_root: Path, experiments: list[str],
+    plots_root: Path,
+    experiments: list[str],
 ) -> list[tuple[str, list[Path]]]:
     """Constraint-handling overview: did the network stay inside its operating
     envelope?  Bundles the campaign-wide per-sector violation-integral bar, the
@@ -303,7 +307,8 @@ def _constraints_sections(
 
 
 def _experiment_sections(
-    plots_root: Path, experiment: str,
+    plots_root: Path,
+    experiment: str,
 ) -> list[tuple[str, list[Path]]]:
     """All ``.html`` figures rendered under ``plots/<experiment>/`` plus
     any per-variant trajectory pair under ``plots/trajectories/<experiment>/``.
@@ -330,7 +335,7 @@ def write_overview(campaign: CampaignData) -> Path:
     plots_root = campaign.campaign_dir / "plots"
     plots_root.mkdir(exist_ok=True)
 
-    # --- Top-level ----------------------------------------------------
+    # Top-level
     lead = (
         "Headline view of campaign "
         f"<code>{campaign.campaign_dir.name}</code>. "
@@ -349,14 +354,16 @@ def write_overview(campaign: CampaignData) -> Path:
         '<a href="overview_constraints.html">constraints</a>',
     ]
     for exp in experiments:
-        toc_links.append(
-            f'<a href="overview_{exp}.html">{exp}</a>'
-        )
+        toc_links.append(f'<a href="overview_{exp}.html">{exp}</a>')
     toc = (
-        "<nav class='toc'><b>Dedicated overviews:</b><br>"
-        + " ".join(toc_links)
-        + "</nav>"
-    ) if toc_links else ""
+        (
+            "<nav class='toc'><b>Dedicated overviews:</b><br>"
+            + " ".join(toc_links)
+            + "</nav>"
+        )
+        if toc_links
+        else ""
+    )
 
     out_path = plots_root / "overview.html"
     out_path.write_text(
@@ -369,7 +376,7 @@ def write_overview(campaign: CampaignData) -> Path:
         encoding="utf-8",
     )
 
-    # --- Validity overview (dedicated) --------------------------------
+    # Validity overview (dedicated)
     validity_dir = plots_root / "validity"
     if validity_dir.exists():
         validity_figs = [
@@ -385,9 +392,7 @@ def write_overview(campaign: CampaignData) -> Path:
         if validity_body:
             (plots_root / "overview_validity.html").write_text(
                 _page(
-                    title=(
-                        f"Validity overview — {campaign.campaign_dir.name}"
-                    ),
+                    title=(f"Validity overview — {campaign.campaign_dir.name}"),
                     lead=(
                         "Did the multi-level controller behave as the "
                         "architecture chapter claims?  The four traces "
@@ -409,7 +414,7 @@ def write_overview(campaign: CampaignData) -> Path:
                 encoding="utf-8",
             )
 
-    # --- Constraints overview (dedicated) -----------------------------
+    # Constraints overview (dedicated)
     constraints_sections = _constraints_sections(plots_root, experiments)
     if any(figs for _, figs in constraints_sections):
         constraints_body = "".join(
@@ -439,7 +444,7 @@ def write_overview(campaign: CampaignData) -> Path:
             encoding="utf-8",
         )
 
-    # --- Per experiment -----------------------------------------------
+    # Per experiment
     for exp in experiments:
         sections = _experiment_sections(plots_root, exp)
         if not sections:
@@ -458,7 +463,7 @@ def write_overview(campaign: CampaignData) -> Path:
                 title=f"Overview — {exp}",
                 lead=(
                     "All figures rendered for this experiment, in one place. "
-                    f'Top-level overview: <a href="overview.html">overview.html</a>.'
+                    'Top-level overview: <a href="overview.html">overview.html</a>.'
                 ),
                 meta=meta,
                 body=page_body,

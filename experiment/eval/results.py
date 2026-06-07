@@ -24,10 +24,6 @@ from typing import Any
 
 from monee.model.child import ExtHydrGrid, ExtPowerGrid
 
-from scare.base import diagnostics
-from scare.base.model import Sector
-from scare.base.util import sector_from_grid
-
 from experiment.eval.metrics import (
     constraint_rows,
     constraint_violation_integral,
@@ -37,11 +33,11 @@ from experiment.eval.metrics import (
     served_by_load,
     time_to_stabilise_s,
 )
+from scare.base.model import Sector
+from scare.base.runtime import diagnostics
+from scare.base.util import sector_from_grid
 
-
-# ---------------------------------------------------------------------------
 # Result composition
-# ---------------------------------------------------------------------------
 
 
 def compose_result(
@@ -130,9 +126,7 @@ def _diary_invariant_holds(summary: dict[str, int]) -> bool:
     return started == terminals
 
 
-# ---------------------------------------------------------------------------
 # Artefact writers
-# ---------------------------------------------------------------------------
 
 
 def write_result_json(path: Path, payload: dict[str, Any]) -> None:
@@ -152,13 +146,15 @@ def write_served_csv(
         w.writerow(["sector", "tier", "demand", "served", "fraction"])
         for sec, tiers in sorted(served["by_tier_sector"].items()):
             for tier, entry in sorted(tiers.items()):
-                w.writerow([
-                    sec,
-                    tier,
-                    f"{entry['demand']:.6f}",
-                    f"{entry['served']:.6f}",
-                    f"{entry['fraction']:.6f}",
-                ])
+                w.writerow(
+                    [
+                        sec,
+                        tier,
+                        f"{entry['demand']:.6f}",
+                        f"{entry['served']:.6f}",
+                        f"{entry['fraction']:.6f}",
+                    ]
+                )
 
 
 def write_served_by_load_csv(
@@ -175,18 +171,35 @@ def write_served_by_load_csv(
     """
     rows = served_by_load(monee_net, behavior, priorities=priorities)
     cols = (
-        "aid", "sector", "tier", "node_id", "component",
-        "demand", "served", "fraction", "disconnected", "constraint_allowed",
+        "aid",
+        "sector",
+        "tier",
+        "node_id",
+        "component",
+        "demand",
+        "served",
+        "fraction",
+        "disconnected",
+        "constraint_allowed",
     )
     with Path(path).open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
         for r in rows:
-            w.writerow([
-                r["aid"], r["sector"], r["tier"], r["node_id"], r["component"],
-                f"{r['demand']:.6f}", f"{r['served']:.6f}", f"{r['fraction']:.6f}",
-                r["disconnected"], f"{r.get('constraint_allowed', 1.0):.6f}",
-            ])
+            w.writerow(
+                [
+                    r["aid"],
+                    r["sector"],
+                    r["tier"],
+                    r["node_id"],
+                    r["component"],
+                    f"{r['demand']:.6f}",
+                    f"{r['served']:.6f}",
+                    f"{r['fraction']:.6f}",
+                    r["disconnected"],
+                    f"{r.get('constraint_allowed', 1.0):.6f}",
+                ]
+            )
 
 
 def write_constraints_final_csv(path: Path, monee_net: Any) -> None:
@@ -199,18 +212,33 @@ def write_constraints_final_csv(path: Path, monee_net: Any) -> None:
     """
     rows = constraint_rows(monee_net)
     cols = (
-        "kind", "id", "sector", "variable",
-        "value", "lo", "hi", "overshoot", "violated",
+        "kind",
+        "id",
+        "sector",
+        "variable",
+        "value",
+        "lo",
+        "hi",
+        "overshoot",
+        "violated",
     )
     with Path(path).open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
         for r in rows:
-            w.writerow([
-                r["kind"], r["id"], r["sector"], r["variable"],
-                f"{r['value']:.6f}", f"{r['lo']:.6f}", f"{r['hi']:.6f}",
-                f"{r['overshoot']:.6f}", int(bool(r["violated"])),
-            ])
+            w.writerow(
+                [
+                    r["kind"],
+                    r["id"],
+                    r["sector"],
+                    r["variable"],
+                    f"{r['value']:.6f}",
+                    f"{r['lo']:.6f}",
+                    f"{r['hi']:.6f}",
+                    f"{r['overshoot']:.6f}",
+                    int(bool(r["violated"])),
+                ]
+            )
 
 
 def write_slack_meta(path: Path, monee_net: Any) -> None:
@@ -340,17 +368,14 @@ def write_messages_csv(path: Path, world: Any) -> None:
         w = csv.writer(f)
         w.writerow(["t", "type", "sender", "recipient"])
         for rec in recs:
-            w.writerow([
-                getattr(rec, "time", ""),
-                type(getattr(rec, "content", rec)).__name__,
-                getattr(rec, "sender", ""),
-                getattr(rec, "receiver", ""),
-            ])
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+            w.writerow(
+                [
+                    getattr(rec, "time", ""),
+                    type(getattr(rec, "content", rec)).__name__,
+                    getattr(rec, "sender", ""),
+                    getattr(rec, "receiver", ""),
+                ]
+            )
 
 
 def _write_dataclass_csv(path: Path, rows: list[Any]) -> None:

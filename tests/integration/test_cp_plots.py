@@ -31,46 +31,67 @@ def _synthetic_events() -> list[dict]:
     return [
         {"t": 0.0, "kind": "failure", "aid": "branch", "sector": "", "detail": ""},
         {
-            "t": 0.5, "kind": "cp_setpoint", "aid": "p2h-1", "sector": "cp",
+            "t": 0.5,
+            "kind": "cp_setpoint",
+            "aid": "p2h-1",
+            "sector": "cp",
             "detail": "flows={electricity: 0.0000, heat: 0.0000} reg=1.000 envelope_active=False",
         },
         {
-            "t": 1.0, "kind": "cross_sector_inversion_detected",
-            "aid": "leader-el-1", "sector": "electricity",
+            "t": 1.0,
+            "kind": "cross_sector_inversion_detected",
+            "aid": "leader-el-1",
+            "sector": "electricity",
             "detail": "cp=p2h-1 own_sec=electricity tier_high=1 frac_high=0.300 peer_sec=heat tier_low=5 frac_low=1.000",
         },
         {
-            "t": 1.0, "kind": "cross_sector_coalition_allocation",
-            "aid": "leader-el-1", "sector": "electricity",
+            "t": 1.0,
+            "kind": "cross_sector_coalition_allocation",
+            "aid": "leader-el-1",
+            "sector": "electricity",
             "detail": (
                 "id=xs:leader-el-1#1 cp=p2h-1 transfer_out=0.5000 transfer_in=1.0000 "
                 "own_frac={1: 0.550} peer_frac={5: 0.000}"
             ),
         },
         {
-            "t": 1.0, "kind": "cp_envelope_set", "aid": "p2h-1", "sector": "cp",
+            "t": 1.0,
+            "kind": "cp_envelope_set",
+            "aid": "p2h-1",
+            "sector": "cp",
             "detail": (
                 "coalition=xs:leader-el-1#1 ttl=4.00 "
                 "flows={electricity: 0.5000, heat: -1.0000}"
             ),
         },
         {
-            "t": 1.5, "kind": "cp_setpoint", "aid": "p2h-1", "sector": "cp",
+            "t": 1.5,
+            "kind": "cp_setpoint",
+            "aid": "p2h-1",
+            "sector": "cp",
             "detail": "flows={electricity: 0.5000, heat: -1.0000} reg=0.700 envelope_active=True",
         },
         {
-            "t": 2.0, "kind": "cp_envelope_clamp", "aid": "p2h-1", "sector": "cp",
+            "t": 2.0,
+            "kind": "cp_envelope_clamp",
+            "aid": "p2h-1",
+            "sector": "cp",
             "detail": (
-                "coalition=xs:leader-el-1#1 "
-                "pre=[0.7, -0.6, 0.0] post=[0.5, -1.0, 0.0]"
+                "coalition=xs:leader-el-1#1 pre=[0.7, -0.6, 0.0] post=[0.5, -1.0, 0.0]"
             ),
         },
         {
-            "t": 2.0, "kind": "cp_setpoint", "aid": "p2h-1", "sector": "cp",
+            "t": 2.0,
+            "kind": "cp_setpoint",
+            "aid": "p2h-1",
+            "sector": "cp",
             "detail": "flows={electricity: 0.5000, heat: -1.0000} reg=0.700 envelope_active=True",
         },
         {
-            "t": 5.5, "kind": "cp_setpoint", "aid": "p2h-1", "sector": "cp",
+            "t": 5.5,
+            "kind": "cp_setpoint",
+            "aid": "p2h-1",
+            "sector": "cp",
             "detail": "flows={electricity: 0.2000, heat: -0.4000} reg=0.400 envelope_active=False",
         },
     ]
@@ -126,12 +147,27 @@ def off_run_dir(tmp_path) -> Path:
     # CP setpoints but no cross-sector events.
     off_events = [
         {"t": 0.0, "kind": "failure", "aid": "branch", "sector": "", "detail": ""},
-        {"t": 0.5, "kind": "cp_setpoint", "aid": "p2h-1", "sector": "cp",
-         "detail": "flows={electricity: 0.0000, heat: 0.0000} reg=1.000 envelope_active=False"},
-        {"t": 1.5, "kind": "cp_setpoint", "aid": "p2h-1", "sector": "cp",
-         "detail": "flows={electricity: 0.1000, heat: -0.2000} reg=0.900 envelope_active=False"},
-        {"t": 2.5, "kind": "cp_setpoint", "aid": "p2h-1", "sector": "cp",
-         "detail": "flows={electricity: 0.2000, heat: -0.4000} reg=0.800 envelope_active=False"},
+        {
+            "t": 0.5,
+            "kind": "cp_setpoint",
+            "aid": "p2h-1",
+            "sector": "cp",
+            "detail": "flows={electricity: 0.0000, heat: 0.0000} reg=1.000 envelope_active=False",
+        },
+        {
+            "t": 1.5,
+            "kind": "cp_setpoint",
+            "aid": "p2h-1",
+            "sector": "cp",
+            "detail": "flows={electricity: 0.1000, heat: -0.2000} reg=0.900 envelope_active=False",
+        },
+        {
+            "t": 2.5,
+            "kind": "cp_setpoint",
+            "aid": "p2h-1",
+            "sector": "cp",
+            "detail": "flows={electricity: 0.2000, heat: -0.4000} reg=0.800 envelope_active=False",
+        },
     ]
     (off_dir / "events.json").write_text(json.dumps(off_events))
     (off_dir / "summary.json").write_text(json.dumps(_synthetic_summary_off()))
@@ -175,7 +211,10 @@ class TestPlots:
 
 class TestComparison:
     def test_flag_comparison_writes_html(
-        self, run_dir: Path, off_run_dir: Path, tmp_path: Path,
+        self,
+        run_dir: Path,
+        off_run_dir: Path,
+        tmp_path: Path,
     ):
         out = tmp_path / "compare"
         stem = flag_on_off_comparison(
@@ -186,7 +225,10 @@ class TestComparison:
         assert stem.with_suffix(".html").exists()
 
     def test_render_comparison_bundle(
-        self, run_dir: Path, off_run_dir: Path, tmp_path: Path,
+        self,
+        run_dir: Path,
+        off_run_dir: Path,
+        tmp_path: Path,
     ):
         out = tmp_path / "compare"
         stem = render_comparison(off_run_dir, run_dir, out)
@@ -206,6 +248,7 @@ class TestEmptyLedger:
 
     def test_missing_ledger_does_not_crash(self, tmp_path: Path):
         stem = cp_setpoint_timeline(
-            tmp_path / "does_not_exist.json", tmp_path / "out" / "x",
+            tmp_path / "does_not_exist.json",
+            tmp_path / "out" / "x",
         )
         assert stem.with_suffix(".html").exists()

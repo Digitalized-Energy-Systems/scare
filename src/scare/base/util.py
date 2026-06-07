@@ -8,18 +8,17 @@ from typing import Any
 import numpy as np
 from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink
 
-from scare.base.diagnostics import record_event, record_regulate
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
+from scare.base.runtime.diagnostics import record_event, record_regulate
 
-# Higher heating value of natural gas. MW/(kg/s) conversion factor is
-# 3.6*HHV (1 kWh/s = 3.6 MW); do NOT read HHV itself as MW/(kg/s).
+# Natural gas HHV. MW/(kg/s) factor is 3.6*HHV, not HHV itself.
 HHV: float = 15.3  # kWh/kg
 
 _CAPACITY_KEYS = (
     "p_mw",
-    "q_mw_heat",       # heat load capacity [MW]
-    "q_mw_set",        # heat exchanger setpoint [MW]
-    "q_mw",            # heat branch actual power [MW]
+    "q_mw_heat",  # heat load capacity [MW]
+    "q_mw_set",  # heat exchanger setpoint [MW]
+    "q_mw",  # heat branch actual power [MW]
     "mass_flow",
     "p_kw",
     "q_mvar",
@@ -44,11 +43,8 @@ def obs_capacity(
 ) -> float:
     """Return the rated capacity for this agent's child.
 
-    For load/generator/Sink/Source children the rated value lives
-    directly in ``obs``. For slack children (``ExtPowerGrid`` /
-    ``ExtHydrGrid``) the obs key carries the LP's *current* operating
-    point, not the rating, so return the registered rating instead when
-    the slack registry resolves (see ``register_slack``).
+    Slack children carry the LP's current operating point in obs, not the
+    rating, so return the registered rating when it resolves.
     """
     if behavior is not None and aid is not None:
         slack = lookup_slack(behavior, aid)
@@ -68,14 +64,13 @@ def obs_setpoint(
 ) -> float:
     """Return the current dispatched power (load convention).
 
-    Non-slack children: ``setpoint = capacity * regulation``. Slack
-    children have no regulation knob; the dispatched value is the
-    LP-chosen value in ``obs``.
+    Non-slack: ``capacity * regulation``. Slack has no regulation knob;
+    the dispatched value is the LP-chosen value in obs.
     """
     if behavior is not None and aid is not None:
         slack = lookup_slack(behavior, aid)
         if slack is not None:
-            # Slack: the LP-chosen operating point is in the obs key.
+            # Slack: LP-chosen operating point is in the obs key.
             for key in _CAPACITY_KEYS:
                 if key in obs:
                     return float(obs[key])
@@ -91,9 +86,8 @@ def obs_min_max(
 ) -> tuple[float, float]:
     """Return (delta_min, delta_max) relative to current setpoint.
 
-    For slack children the δ-range is the full Var bound range minus the
-    current value (headroom for both import and export). Other children
-    stay in ``[-sp, cap-sp]`` / ``[cap-sp, -sp]``.
+    Slack δ-range is the full Var bound range minus the current value;
+    other children stay in ``[-sp, cap-sp]`` / ``[cap-sp, -sp]``.
     """
     if behavior is not None and aid is not None:
         slack = lookup_slack(behavior, aid)
@@ -111,8 +105,8 @@ def obs_min_max(
 def sector_from_grid(grid: Any) -> Sector | None:
     """Resolve a Sector from a monee grid object via its .name attribute.
 
-    Returns None for multi-grid nodes (e.g. CHPControlNode): they
-    straddle sectors and the sector must be chosen explicitly by context.
+    Returns None for multi-grid nodes (e.g. CHPControlNode) which straddle
+    sectors and must be resolved by context.
     """
     if grid is None or isinstance(grid, (list, tuple)):
         return None
@@ -127,10 +121,8 @@ def sector_from_grid(grid: Any) -> Sector | None:
 
 
 def _get_behavior_store(behavior: Any, attr: str, factory=dict) -> Any:
-    """Lazy ``getattr(behavior, attr) or factory()`` accessor for the
-    per-behavior registries. Storing on the behavior ties registry
-    lifetime to the simulation world.
-    """
+    """Lazy per-behavior registry accessor; storing on the behavior ties
+    registry lifetime to the simulation world."""
     store = getattr(behavior, attr, None)
     if store is None:
         store = factory()
@@ -154,35 +146,26 @@ def lookup_sector(behavior: Any, aid: str) -> Sector | None:
 # ---------------------------------------------------------------------------
 # Slack-agent metadata
 # ---------------------------------------------------------------------------
-#
-# Slack children (ExtPowerGrid / ExtHydrGrid) carry their rated capacity
-# in the ``p_mw`` / ``mass_flow`` Var bounds, which are not in the runtime
-# obs dict (only the current value is). Without this registry the gossip
-# negotiator would read a slack's "capacity" as the LP's current value
-# (and treat an importing slack as a load). The registry holds the rated
-# capacity + δ-range so ``obs_capacity`` / ``obs_min_max`` / ``obs_priority``
-# return physically meaningful values for slacks.
+# Slack children carry rated capacity in Var bounds not present in the obs
+# dict. This registry holds the rating + δ-range so obs_* helpers don't
+# mistake a slack's current LP value for its capacity.
+
 
 @dataclass(frozen=True)
 class _SlackMeta:
     """Cached slack rating + δ-range for one ExtPowerGrid / ExtHydrGrid child.
 
-    ``cap`` follows monee's load convention; a slack is always a source
-    from the local network's view, so ``cap < 0`` (generator-priority).
-    ``dmin_abs`` / ``dmax_abs`` are the absolute Var bounds; relative
-    deltas are derived in ``obs_min_max``.
-
-    Units are the slack's native sector unit — MW for an ExtPowerGrid
-    (``p_mw``), kg/s for an ExtHydrGrid gas slack (``mass_flow``). Values
-    are produced and consumed within one sector and are NOT MW-normalised;
-    a consumer pooling a gas slack with MW quantities must ``kgps_to_mw`` first.
+    ``cap < 0`` (a slack is always a source). Values are in the slack's
+    native sector unit (MW for power, kg/s for gas), NOT MW-normalised;
+    pooling a gas slack with MW quantities needs ``kgps_to_mw`` first.
     """
-    cap: float          # rated output, < 0 (generator convention, native unit)
-    dmin_abs: float     # min absolute Var value (p_mw / mass_flow)
-    dmax_abs: float     # max absolute Var value (p_mw / mass_flow)
+
+    cap: float  # rated output, < 0 (generator convention, native unit)
+    dmin_abs: float  # min absolute Var value (p_mw / mass_flow)
+    dmax_abs: float  # max absolute Var value (p_mw / mass_flow)
 
 
-def _slack_store(behavior: Any) -> dict[str, "_SlackMeta"]:
+def _slack_store(behavior: Any) -> dict[str, _SlackMeta]:
     return _get_behavior_store(behavior, "_scare_slacks")
 
 
@@ -196,25 +179,20 @@ def register_slack(
 ) -> None:
     """Register a slack-class agent's rating.
 
-    ``rating_mw`` is the positive magnitude of rated transformer /
-    pipeline capacity. ``p_min`` / ``p_max`` are the ``p_mw`` Var bounds
-    (load convention: negative = export, positive = import); if both None
-    the slack is bidirectional at ``[-rating_mw, +rating_mw]``.
-
-    Despite the name, the value is stored in the slack's native sector
-    unit — for an ExtHydrGrid gas slack callers pass kg/s (the
-    ``mass_flow`` budget), not MW. Gas consumers treat ``cap`` as kg/s;
-    code crossing gas into shared-MW space must ``kgps_to_mw`` it.
+    ``rating_mw`` is the positive rated capacity. ``p_min`` / ``p_max`` are
+    the Var bounds (load convention); both None ⇒ bidirectional
+    ``[-rating_mw, +rating_mw]``. Despite the name, stored in the slack's
+    native unit — gas slacks pass kg/s, not MW.
     """
     if rating_mw <= 0.0:
-        # A non-positive rating would leave the slack unregistered, so
-        # obs_capacity/obs_priority fall back to the LP's current value
-        # and reclassify the slack as a load. Surface the bad input.
+        # Non-positive rating leaves the slack unregistered, falling back
+        # to the LP value and reclassifying it as a load. Surface it.
         logging.getLogger(__name__).warning(
             "register_slack(%s, rating_mw=%s): non-positive rating; "
             "slack will fall back to LP-value capacity, which is "
             "rarely what callers want.",
-            aid, rating_mw,
+            aid,
+            rating_mw,
         )
         return
     if p_min is None:
@@ -228,7 +206,7 @@ def register_slack(
     )
 
 
-def lookup_slack(behavior: Any, aid: str) -> "_SlackMeta | None":
+def lookup_slack(behavior: Any, aid: str) -> _SlackMeta | None:
     return _slack_store(behavior).get(aid)
 
 
@@ -237,10 +215,9 @@ def _slack_eff_budget_store(behavior: Any) -> dict[str, float]:
 
 
 def set_slack_eff_budget(behavior: Any, aid: str, value: float) -> None:
-    """Record a slack's effective budget — the loss-compensated cap the
-    supply pool advertises, maintained by ``SlackBudgetMonitor``'s integral
-    feedback. Used in place of nominal ``|cap|`` so control targets
-    ``B - losses`` and the slack's actual draw lands at operator budget ``B``."""
+    """Record a slack's loss-compensated effective budget (maintained by
+    ``SlackBudgetMonitor``) so control targets ``B - losses`` and the actual
+    draw lands at operator budget ``B``."""
     _slack_eff_budget_store(behavior)[aid] = float(value)
 
 
@@ -253,15 +230,9 @@ def _priority_store(behavior: Any) -> dict[str, int]:
 
 
 def register_priority(behavior: Any, aid: str, tier: int) -> None:
-    """Record an agent's priority tier on the behavior so callers that
-    don't own the role (e.g. aggregating across all group members) can
-    look it up.
-
-    Without this registry, ``obs_priority`` falls back to uniform
-    priorities and every per-tier feature degenerates to a single-tier
-    baseline. Stored values are ints >= 0; tier 0 is reserved for
-    generator-class agents and slacks.
-    """
+    """Record an agent's priority tier so callers that don't own the role
+    can look it up; without it ``obs_priority`` falls back to uniform
+    priorities. Tier 0 is reserved for generators and slacks."""
     _priority_store(behavior)[aid] = int(tier)
 
 
@@ -273,28 +244,32 @@ def lookup_priority(behavior: Any, aid: str) -> int | None:
 # Regulate-action de-duplication
 # ---------------------------------------------------------------------------
 
-# Tolerance below which re-applying the same regulation factor is a no-op.
-# 1e-3 (0.1% of capacity) is below the precision of any monitored
-# constraint, so sub-promille re-applies don't churn monee state.
+# Re-applying the same factor within this tolerance is a no-op (below any
+# monitored-constraint precision, so it doesn't churn monee state).
 _REGULATE_DEDUP_TOL: float = 1e-3
 
 
-# Regulate reasons carrying the L2 holon's authoritative per-tier
-# allocation — these SET the load's L2 floor. L1 reactive sheds are
-# clamped UP to that floor so a supply-poor local group can't undo a
-# served-tier decision the component ADMM just made.
+# Reasons carrying the L2 holon's per-tier allocation — these SET the L2
+# floor; L1 reactive sheds are clamped UP to it so a supply-poor group
+# can't undo a served-tier decision.
 L2_ALLOCATION_REASONS: frozenset[str] = frozenset(
     {"holon_supply_priority", "holon_tier_alloc"}
 )
 L1_REACTIVE_SHED_REASONS: frozenset[str] = frozenset({"balance", "stability"})
 
-# Reason written by the community curtailment auction. Acts as the heat-only
-# L2 defer signal: while a heat load holds an auction curtailment for a live
-# violation, L2 allocation writes defer to it (see ``apply_regulate``).
+# Community curtailment auction reason; heat-only L2 defer signal (see
+# ``apply_regulate``).
 CURTAIL_AUCTION_REASON: str = "curtail"
-# Reason written by the heat un-shed recovery loop; lifts the heat curtail
-# lock as it ramps a recovered load back toward full service.
+# Heat un-shed recovery reason; lifts the heat curtail lock as it ramps a
+# recovered load back toward full service.
 HEAT_RECOVERY_REASON: str = "heat_recovery"
+
+# Local-generation RESTORE reasons (inline self-dispatch + fallback role).
+# Both ramp a generator UP; while the auction holds it down for a local
+# violation they must DEFER — see the gen curtail-lock in ``apply_regulate``.
+GEN_RESTORE_REASONS: frozenset[str] = frozenset(
+    {"self_local_gen", "local_gen_fallback"}
+)
 
 
 def _last_regulate_store(behavior: Any) -> dict[str, float]:
@@ -302,50 +277,38 @@ def _last_regulate_store(behavior: Any) -> dict[str, float]:
 
 
 def note_actuated_factor(behavior: Any, aid: str, factor: float) -> None:
-    """Sync the per-aid dedup cache with a regulate actuation written
-    outside :func:`apply_regulate`.
-
-    The gossip path writes ``behavior.act("regulate", …)`` directly,
-    bypassing the dedup; the cache then keeps the last ``apply_regulate``
-    value, not the gossip's write. A later L2 re-dispatch would then dedup
-    against the stale cache and silently drop, leaving a gossip-shed load
-    unrestored. Call this after every direct write to keep the cache truthful.
-    """
+    """Sync the dedup cache with a regulate written outside
+    :func:`apply_regulate` (e.g. the gossip path's direct ``act``). Without
+    it a later L2 re-dispatch dedups against a stale value and silently
+    drops, leaving a gossip-shed load unrestored."""
     _last_regulate_store(behavior)[str(aid)] = float(factor)
 
 
 def _l2_floor_store(behavior: Any) -> dict[str, float]:
-    """Per-aid L2 priority allocation: the served fraction the
-    component-scope holon ADMM most recently assigned to this load."""
+    """Per-aid served fraction the component-scope holon ADMM last assigned."""
     return _get_behavior_store(behavior, "_scare_l2_floor")
 
 
 def _heat_curtail_lock_store(behavior: Any) -> dict[str, float]:
-    """Per-aid heat curtailment-auction lock: the regulation level the
-    auction holds a heat load at for a live temperature violation. An entry
-    means the auction owns this load and L2 writes must defer. Set by
-    ``reason="curtail"``, lifted by ``heat_recovery`` ramp-up (see
-    :func:`apply_regulate`)."""
+    """Per-aid heat curtailment-auction lock (regulation level held for a
+    live temperature violation). An entry means the auction owns the load
+    and L2 must defer. Set by ``curtail``, lifted by ``heat_recovery``."""
     return _get_behavior_store(behavior, "_scare_heat_curtail_lock")
 
 
 def _line_curtail_lock_store(behavior: Any) -> dict[str, tuple]:
     """Per-aid electricity line-relief lock: ``aid -> (factor, t_set)``.
 
-    Set by the branch-downstream line-relief auction (``reason="curtail"``).
-    While an entry is fresh (re-asserted within ``_LINE_CURTAIL_LOCK_TTL_S``,
-    which the auction does every poll the line is over), L2 holon writes to
-    that load DEFER, else the holon re-serves a just-shed load and the line
-    never clears. Freshness-lifted (no explicit release): once the line drops
-    <=100% the auction stops re-arming and the entry goes stale. Electricity
-    analogue of the heat curtail lock."""
+    Set by the line-relief auction (``curtail``). While fresh (re-asserted
+    within ``_LINE_CURTAIL_LOCK_TTL_S`` every poll the line is over), L2
+    writes DEFER else the holon re-serves a just-shed load. Freshness-lifted:
+    once the line clears the auction stops re-arming and it goes stale.
+    Electricity analogue of the heat curtail lock."""
     return _get_behavior_store(behavior, "_scare_line_curtail_lock")
 
 
-# How long a line-relief lock stays authoritative after its last refresh.
-# Must exceed the electricity monitor poll (~0.5 s) so it survives between
-# re-arms, but be short enough to release within a second or two of the
-# line clearing.
+# Line-relief lock TTL after last refresh. Exceeds the monitor poll (~0.5 s)
+# so it survives between re-arms, but short enough to release soon after clear.
 _LINE_CURTAIL_LOCK_TTL_S: float = 3.0
 
 
@@ -359,13 +322,10 @@ def has_line_curtail_lock(behavior: Any, aid: str, now: float) -> bool:
 
 
 def refresh_line_curtail_lock(behavior: Any, aid: str, now: float) -> None:
-    """Re-stamp an EXISTING line-relief lock entry to ``now`` (keeping its
-    held factor) so it stays fresh, without shedding the load further.
-
-    The branch monitor calls this every poll while the line is over (or in
-    the release hysteresis band) so the lock survives gaps between the
-    auction's curtail writes — otherwise the lock ages out mid-relief and
-    L2 claws the loads back up. No-op for loads with no lock entry."""
+    """Re-stamp an EXISTING line-relief lock to ``now`` (keeping its factor)
+    so it stays fresh without shedding further. Called by the branch monitor
+    every poll the line is over, so the lock survives gaps between curtail
+    writes. No-op when no lock entry exists."""
     store = _line_curtail_lock_store(behavior)
     entry = store.get(str(aid))
     if entry is not None:
@@ -373,12 +333,143 @@ def refresh_line_curtail_lock(behavior: Any, aid: str, now: float) -> None:
         store[str(aid)] = (factor, float(now))
 
 
+def _gen_curtail_lock_store(behavior: Any) -> dict[str, float]:
+    """Per-aid generator over-voltage curtail-lock: ``aid -> t_set``.
+
+    Set by the auction (``curtail``) when it sheds a generator below full for
+    a live node violation (PV over-voltage). While fresh, the local-gen
+    RESTORE paths DEFER instead of ramping straight back to full, else the
+    auction/restore pair limit-cycles and over-voltage never clears.
+    Freshness-lifted; gated on ``enable_curtail_ramp_interlock``."""
+    return _get_behavior_store(behavior, "_scare_gen_curtail_lock")
+
+
+def has_gen_curtail_lock(behavior: Any, aid: str, now: float) -> bool:
+    """True iff *aid* holds a FRESH generator over-voltage curtail-lock."""
+    t_set = _gen_curtail_lock_store(behavior).get(str(aid))
+    if t_set is None:
+        return False
+    return (now - float(t_set)) < _LINE_CURTAIL_LOCK_TTL_S
+
+
+# --- Coordinated Q(U)-droop / curtailment-auction reactive-relief ledger ---
+# Shared state through which the Q(U) droop tells the auction (and gen
+# curtail-lock) how much more over-voltage relief its reactive lever can still
+# deliver. Gated on ``enable_qv_auction_coordination`` (see config.py).
+
+
+def _qv_relief_store(behavior: Any) -> dict[str, tuple]:
+    """Per-aid reactive voltage state from the Q(U) droop:
+    ``aid -> (t_set, relief_pu, v_pu)``.
+
+    ``relief_pu = (q_max − |q_cmd|) · |dV/dQ|`` is the extra p.u. voltage
+    reduction the inverter's unused reactive capability could still provide
+    (not yet in ``vm_pu``); ``v_pu`` is the latest local voltage. Read by the
+    auction to shed only residual over-voltage and by the gen curtail-lock to
+    release active only once reactive holds voltage in-band. Freshness-stamped."""
+    return _get_behavior_store(behavior, "_scare_qv_relief")
+
+
+# Published reactive-relief reading TTL. Exceeds the droop poll (~0.5 s) so it
+# survives between ticks, but short so a stalled inverter's relief expires.
+_QV_RELIEF_TTL_S: float = 2.0
+
+
+def publish_qv_relief(
+    behavior: Any, aid: str, relief_pu: float, now: float, v_pu: float = 0.0
+) -> None:
+    """Record the reactive voltage-relief and current voltage at *aid*."""
+    _qv_relief_store(behavior)[str(aid)] = (
+        float(now),
+        max(0.0, float(relief_pu)),
+        float(v_pu),
+    )
+
+
+def qv_relief_avail(behavior: Any, aid: str, now: float) -> float:
+    """Fresh reactive voltage-relief (p.u.) still available at *aid*, or 0.0
+    when none is published / the reading is stale."""
+    entry = _qv_relief_store(behavior).get(str(aid))
+    if entry is None:
+        return 0.0
+    t_set, relief = entry[0], entry[1]
+    if (now - float(t_set)) >= _QV_RELIEF_TTL_S:
+        return 0.0
+    return max(0.0, float(relief))
+
+
+def qv_relief_voltage(behavior: Any, aid: str, now: float) -> float | None:
+    """Fresh local voltage (p.u.) the droop at *aid* last observed, or None when
+    none is published / the reading is stale."""
+    entry = _qv_relief_store(behavior).get(str(aid))
+    if entry is None or len(entry) < 3:
+        return None
+    t_set, v_pu = entry[0], entry[2]
+    if (now - float(t_set)) >= _QV_RELIEF_TTL_S:
+        return None
+    return float(v_pu)
+
+
+# Min fresh reactive headroom (p.u.) at which the gen curtail-lock releases
+# early (Mechanism B): the droop must re-absorb at least this much of the rise
+# that ramping active back causes.
+_QV_LOCK_RELEASE_MARGIN_PU: float = 1e-3
+
+# Upper voltage (p.u.) below which the droop is holding the node genuinely
+# in-band, so handing active back is safe. Above it restoring risks re-breach.
+# Anchored at the VDE deadband top.
+_QV_LOCK_RELEASE_V_CEILING_PU: float = 1.03
+
+# Max regulation the gen lock hands back per restore cycle (Mechanism B). The
+# hand-back is a voltage-gated ramp re-evaluated each cycle, so a speed knob
+# (any value in (0, 1] is stable), not load-bearing.
+_QV_LOCK_RESTORE_STEP: float = 0.1
+
+
+# --- Phase-2 feeder-voltage ledger -----------------------------------------
+# Shared blackboard of per-node voltage so an inverter's auction can see whether
+# the FEEDER (not just its own node) is over-voltage. Reuses the per-world
+# behaviour store (like the curtail-locks). Assumes one LV feeder per
+# electricity grid (true for the simbench_lv_* family).
+
+
+def _feeder_voltage_store(behavior: Any) -> dict[str, tuple]:
+    """Per-aid electricity node voltage: ``aid -> (t_set, vm_pu)``."""
+    return _get_behavior_store(behavior, "_scare_feeder_voltage")
+
+
+_FEEDER_VOLTAGE_TTL_S: float = 2.0
+
+
+def publish_node_voltage(behavior: Any, aid: str, vm_pu: float, now: float) -> None:
+    """Record this node's latest voltage on the shared feeder ledger."""
+    _feeder_voltage_store(behavior)[str(aid)] = (float(now), float(vm_pu))
+
+
+def feeder_max_voltage(
+    behavior: Any, now: float, *, exclude_aid: str | None = None
+) -> float | None:
+    """Max fresh node voltage (p.u.) published on the feeder, excluding
+    ``exclude_aid``; ``None`` when nothing fresh is published."""
+    store = _feeder_voltage_store(behavior)
+    ex = None if exclude_aid is None else str(exclude_aid)
+    mx = None
+    for aid, entry in store.items():
+        if ex is not None and aid == ex:
+            continue
+        t_set, v = entry
+        if (now - float(t_set)) >= _FEEDER_VOLTAGE_TTL_S:
+            continue
+        if mx is None or float(v) > mx:
+            mx = float(v)
+    return mx
+
+
+
 def has_heat_curtail_lock(behavior: Any, aid: str) -> bool:
-    """True iff *aid* is held by a temperature-driven curtailment lock —
-    the auction or heat frontier controller shed it (``reason="curtail"``),
-    as opposed to an L2 priority shed (no lock). Lets the frontier
-    controller restore only loads it shed for temperature, never claw back
-    a priority decision."""
+    """True iff *aid* is held by a temperature-driven curtailment lock (vs an
+    L2 priority shed, which has no lock). Lets the frontier controller restore
+    only loads it shed for temperature, never claw back a priority decision."""
     return str(aid) in _heat_curtail_lock_store(behavior)
 
 
@@ -390,13 +481,11 @@ def l2_effective_floor(
     tier: int | None,
 ) -> float | None:
     """The served fraction an L1 reactive shed must not push below:
-    ``min(L2 allocation, constraint-allowed fraction)``.
+    ``min(L2 allocation, constraint-allowed fraction)``; ``None`` if unallocated.
 
-    Returns ``None`` when the holon has not yet allocated to this load.
-    Capping by the constraint-allowed fraction means the floor yields
-    continuously to the physical shedding the local constraint requires,
-    so curtailment/clamp own the violation window while the floor only
-    blocks balance-driven shedding below the priority decision.
+    Capping by the constraint fraction makes the floor yield to physical
+    shedding, so the floor only blocks balance-driven shedding below the
+    priority decision.
     """
     alloc = _l2_floor_store(behavior).get(aid)
     if alloc is None:
@@ -412,12 +501,9 @@ def _last_regulate_t_store(behavior: Any) -> dict[str, float]:
 def _stale_obs_state(behavior: Any) -> dict[str, Any]:
     """Per-behavior tracker of regulate-on-stale-observation events.
 
-    ``behavior._net_results`` is replaced only on a successful solve (an
-    infeasible ``energyflow`` solve re-uses the previous result), so its
-    ``id()`` is a cheap freshness oracle. This tracks the last-seen id;
-    if unchanged and an apply has already landed on it, the new regulate
-    is acting on stale state and is counted / surfaced once via a
-    ``regulate_on_stale_obs`` event.
+    ``behavior._net_results`` is replaced only on a successful solve, so its
+    ``id()`` is a cheap freshness oracle: if unchanged and an apply already
+    landed on it, the regulate is acting on stale state.
     """
     return _get_behavior_store(
         behavior,
@@ -431,29 +517,23 @@ def _stale_obs_state(behavior: Any) -> dict[str, Any]:
     )
 
 
-# Tiers at or below this threshold bypass the global cooldown: a critical
-# dispatch must not be dropped just because it arrives within cooldown_s of
-# an unrelated update. Lower tiers still pay the cooldown.
+# Tiers at or below this bypass the cooldown: a critical dispatch must not be
+# dropped for arriving within cooldown_s of an unrelated update.
 _COOLDOWN_BYPASS_TIER_THRESHOLD: int = 2
 
 
 def _is_slack_class_child(behavior: Any, aid: str) -> bool:
-    """True iff *aid* is a monee ``ExtPowerGrid`` / ``ExtHydrGrid`` child —
-    the network's slack-class boundary.
+    """True iff *aid* is a monee ``ExtPowerGrid`` / ``ExtHydrGrid`` slack child.
 
-    Slacks have a free p_mw / mass_flow Var; writing ``regulation < 1``
-    clamps the slack to a fraction of its envelope and the next solve goes
-    infeasible the moment the network needs more headroom. Curtailment /
-    stability / gossip writes must skip slacks.
-
-    Class-based rather than registry-based: the heat-side ExtHydrGrid is
-    intentionally unbounded (no operator slack discipline) and never lands
-    in the ``register_slack`` registry, yet is still structurally a slack.
+    Writing ``regulation < 1`` clamps the slack's free Var and the next solve
+    goes infeasible once the network needs headroom, so curtail/stability/gossip
+    writes must skip slacks. Class-based not registry-based: the unbounded
+    heat-side ExtHydrGrid never registers yet is structurally a slack.
     """
     if not aid.startswith("child-"):
         return False
     try:
-        cid = int(aid[len("child-"):])
+        cid = int(aid[len("child-") :])
     except ValueError:
         return False
     net = getattr(behavior, "_net", None)
@@ -469,19 +549,15 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
 def _is_heat_side_mass_flow_sink(behavior: Any, aid: str) -> bool:
     """True iff *aid* is a monee ``Sink`` child on a water/heat junction.
 
-    Heat consumers are modelled as a (HeatLoad, Sink) pair sharing a
-    junction: HeatLoad withdraws thermal energy (``q_mw_heat``), Sink
-    withdraws the matching return-line mass flow. Forcing
-    ``Sink.regulation < 1`` zeroes the mass-flow withdrawal without zeroing
-    upstream supply, making the junction mass balance infeasible. Thermal
-    curtailment must instead go through the HeatLoad (``q_mw_heat *
-    regulation``), which leaves mass flow untouched. Gas-sector Sinks model
-    real gas consumption and stay curtailable.
+    A heat consumer is a (HeatLoad, Sink) pair; curtailing the Sink's mass flow
+    without cutting upstream supply makes the junction mass balance infeasible,
+    so thermal curtailment must go through the HeatLoad instead. Gas-sector
+    Sinks model real consumption and stay curtailable.
     """
     if not aid.startswith("child-"):
         return False
     try:
-        cid = int(aid[len("child-"):])
+        cid = int(aid[len("child-") :])
     except ValueError:
         return False
     net = getattr(behavior, "_net", None)
@@ -494,9 +570,7 @@ def _is_heat_side_mass_flow_sink(behavior: Any, aid: str) -> bool:
     if not isinstance(child.model, Sink):
         return False
     try:
-        grid_name = str(
-            getattr(net.node_by_id(child.node_id).grid, "name", "")
-        ).lower()
+        grid_name = str(getattr(net.node_by_id(child.node_id).grid, "name", "")).lower()
     except Exception:  # noqa: BLE001
         return False
     return "water" in grid_name or "heat" in grid_name
@@ -513,17 +587,12 @@ def apply_regulate(
     tolerance: float = _REGULATE_DEDUP_TOL,
     priority_tier: int | None = None,
 ) -> bool:
-    """Apply a regulate action, suppressing requests that would set the
-    same factor (within ``tolerance``) the agent already holds.
+    """Apply a regulate action, suppressing requests that set the same factor
+    (within ``tolerance``) the agent already holds.
 
-    Also enforces a sim-time cooldown when ``cooldown_s > 0``: same-aid
-    writes within ``cooldown_s`` of the previous applied write are
-    suppressed regardless of factor delta ("max one solve every Δt").
-    ``priority_tier`` (when set) lets critical loads bypass the cooldown
-    gate — see ``_COOLDOWN_BYPASS_TIER_THRESHOLD``.
-
-    Returns ``True`` if applied, ``False`` if suppressed (no behavior.act
-    call, no diagnostics record).
+    Also enforces a sim-time cooldown when ``cooldown_s > 0`` ("max one solve
+    every Δt"); ``priority_tier`` lets critical loads bypass it. Returns True
+    if applied, False if suppressed (no act call, no diagnostics).
     """
     factor = max(0.0, min(1.0, factor))
 
@@ -531,19 +600,14 @@ def apply_regulate(
 
     # --- Heat curtailment-auction lock (heat sector only) -------------
     # While the auction holds a heat load down for a live temperature
-    # violation it is the authoritative shedding lever: L2 allocation writes
-    # DEFER rather than claw the load back up. Breaks the cold-day limit
-    # cycle where MW-based holon re-dispatch restores a just-curtailed cold
-    # node and re-cools it. Set by auction ("curtail") writes, lifted as
-    # ``heat_recovery`` ramps the load back to ~1.0. Heat-scoped: other
-    # sectors and unlocked heat loads fall through to the L2 path below.
+    # violation, L2 allocation writes DEFER rather than claw it back up
+    # (breaks the cold-day re-dispatch/re-cool cycle). Set by "curtail",
+    # lifted as "heat_recovery" ramps back to ~1.0.
     try:
         _sector_e = Sector(sector) if not isinstance(sector, Sector) else sector
     except ValueError:
         _sector_e = None
-    if _sector_e is Sector.HEAT and getattr(
-        _cfg, "enable_heat_curtail_lock", True
-    ):
+    if _sector_e is Sector.HEAT and getattr(_cfg, "enable_heat_curtail_lock", True):
         _lock = _heat_curtail_lock_store(behavior)
         if reason == CURTAIL_AUCTION_REASON:
             # Lock only when the auction holds the load BELOW full service;
@@ -566,16 +630,14 @@ def apply_regulate(
                 aid=str(aid),
                 sector=str(sector),
                 detail=f"reason={reason} lock={_lock[str(aid)]:.4f} "
-                       f"requested_factor={factor:.4f}",
+                f"requested_factor={factor:.4f}",
             )
             return False
 
     # --- Electricity line-relief lock ---------------------------------
-    # While the line-relief auction holds an electricity load down to relieve
-    # an overloaded line, L2 must DEFER, else it re-serves the just-shed load
-    # every cycle and the line never clears. Freshness-lifted: the auction
-    # re-asserts every poll the line is over, so a stale entry stops
-    # deferring. Gated on the downstream-relief flag and electricity sector.
+    # While the line-relief auction holds a load down for an overloaded line,
+    # L2 must DEFER else it re-serves the just-shed load and the line never
+    # clears. Freshness-lifted. Gated on the downstream-relief flag.
     if _sector_e is Sector.ELECTRICITY and getattr(
         _cfg, "enable_branch_downstream_relief", False
     ):
@@ -597,34 +659,79 @@ def apply_regulate(
             )
             return False
 
+    # --- Electricity generator over-voltage curtail-lock --------------
+    # Curtail-vs-ramp interlock. When the auction sheds a generator for a live
+    # node violation (PV over-voltage), the local-gen RESTORE paths must DEFER
+    # rather than ramp straight back to 1.0, else the auction/restore pair
+    # limit-cycles and over-voltage never clears. Freshness-lifted.
+    if _sector_e is Sector.ELECTRICITY and getattr(
+        _cfg, "enable_curtail_ramp_interlock", False
+    ):
+        _lgen = _gen_curtail_lock_store(behavior)
+        if reason == CURTAIL_AUCTION_REASON:
+            if factor < 1.0 - tolerance:
+                _lgen[str(aid)] = float(timestamp)
+            else:
+                _lgen.pop(str(aid), None)
+        elif reason in GEN_RESTORE_REASONS and has_gen_curtail_lock(
+            behavior, aid, float(timestamp)
+        ):
+            # Mechanism B (coordinated hand-off): hand active back only when the
+            # Q(U) droop is BOTH holding the node in-band (v ≤ ceiling) AND has
+            # spare reactive headroom to re-absorb the rise — and only one bounded
+            # STEP per cycle (closed-loop, re-gated each tick). A one-shot release
+            # re-breached over-voltage in validation v1.
+            # Saturated / still-elevated droop ⇒ keep deferring.
+            _qv_v = qv_relief_voltage(behavior, aid, float(timestamp))
+            if (
+                getattr(_cfg, "enable_qv_auction_coordination", False)
+                and _qv_v is not None
+                and _qv_v <= _QV_LOCK_RELEASE_V_CEILING_PU
+                and qv_relief_avail(behavior, aid, float(timestamp))
+                >= _QV_LOCK_RELEASE_MARGIN_PU
+            ):
+                current = _last_regulate_store(behavior).get(str(aid), 0.0)
+                factor = min(factor, float(current) + _QV_LOCK_RESTORE_STEP)
+                if factor >= 1.0 - tolerance:
+                    _lgen.pop(str(aid), None)  # fully restored — drop the lock
+                else:
+                    _lgen[str(aid)] = float(timestamp)  # keep fresh; ramp continues
+                record_event(
+                    t=float(timestamp),
+                    kind="gen_curtail_lock_released_to_qv",
+                    aid=str(aid),
+                    sector=str(sector),
+                    detail=f"reason={reason} stepped_factor={factor:.4f} "
+                    f"v={_qv_v:.4f}",
+                )
+                # fall through: the bounded restore step applies this tick.
+            else:
+                record_event(
+                    t=float(timestamp),
+                    kind="regulate_deferred_to_gen_curtail_lock",
+                    aid=str(aid),
+                    sector=str(sector),
+                    detail=f"reason={reason} requested_factor={factor:.4f}",
+                )
+                return False
+
     # --- L2 priority-floor reconciliation -----------------------------
-    # The component-scope holon ADMM is authoritative on which tier gets
-    # served; L1 must not undo it. Record the floor on L2 writes; clamp L1
-    # reactive sheds (here ``stability``; gossip ``balance`` writes bypass
-    # this and are floored in ``_apply_setpoint``). Applies to all tiers:
-    # ``constraint_allowed_fraction`` is tier-1-immune (1.0), so tier-1's
-    # floor is its L2 allocation, re-asserting the tier-1 hard-lock against
-    # stability erosion while the curtailment auction can still shed tier-1
-    # when a constraint demands it. Generators (tier <= 0) excluded.
+    # The holon ADMM is authoritative on which tier is served; L1 must not
+    # undo it. Record the floor on L2 writes; clamp L1 reactive sheds UP to it.
+    # tier-1-immune ``constraint_allowed_fraction`` re-asserts the tier-1
+    # hard-lock. Generators (tier <= 0) excluded.
     if getattr(_cfg, "enable_l2_priority_floor", False):
         if reason in L2_ALLOCATION_REASONS:
-            # Cap the holon allocation (applied factor and stored floor) by
-            # the load's constraint-allowed fraction. The MW-based L2 ADMM is
-            # blind to per-node physics; without the cap a holon write
-            # restores an out-of-bounds node to ~1.0 and the floor pins it
-            # there. ``constraint_allowed_fraction`` is tier-1-immune (1.0),
-            # matching ``l2_effective_floor``'s read-time cap, so the stored
-            # floor is never above feasibility regardless of caller.
+            # Cap the holon allocation by the constraint-allowed fraction: the
+            # MW-based ADMM is blind to per-node physics and would otherwise
+            # restore an out-of-bounds node to ~1.0 and pin it there.
             try:
-                _sector = (
-                    Sector(sector) if not isinstance(sector, Sector) else sector
-                )
+                _sector = Sector(sector) if not isinstance(sector, Sector) else sector
             except ValueError:
                 _sector = None
-            # HEAT is exempt — the frontier controller owns its temperature
-            # (and locks managed loads, so this write already defers); capping
-            # here would re-shed feasible heat loads on transient t_k dips.
-            # El/gas keep the cap.
+            # HEAT exempt — the frontier controller owns its temperature;
+            # capping here would re-shed feasible heat loads on transient
+            # t_k dips. El/gas keep the cap.
             if (
                 _sector is not None
                 and _sector is not Sector.HEAT
@@ -633,9 +740,7 @@ def apply_regulate(
                 _obs = behavior.observe(aid) or {}
                 factor = min(
                     factor,
-                    constraint_allowed_fraction(
-                        _obs, _sector, tier=int(priority_tier)
-                    ),
+                    constraint_allowed_fraction(_obs, _sector, tier=int(priority_tier)),
                 )
             _l2_floor_store(behavior)[aid] = factor
         elif (
@@ -702,9 +807,8 @@ def apply_regulate(
     if not behavior.has_action(aid, "regulate"):
         return False
 
-    # Stale-observation detector: if the LP has not re-solved since the
-    # previous apply, this regulate computes against a stale net_results
-    # snapshot (otherwise hidden by the LP infeasibility cascade).
+    # Stale-observation detector: an unchanged net_results since the last
+    # apply means this regulate computes against a stale snapshot.
     state = _stale_obs_state(behavior)
     current_id = id(getattr(behavior, "_net_results", None))
     if state["last_id"] == current_id and state["applies_on_current_id"] > 0:
@@ -715,9 +819,7 @@ def apply_regulate(
                 kind="regulate_on_stale_obs",
                 aid=str(aid),
                 sector=str(sector),
-                detail=(
-                    f"reason={reason} stale_landed_total={state['stale_landed']}"
-                ),
+                detail=(f"reason={reason} stale_landed_total={state['stale_landed']}"),
             )
             state["warned_for_id"] = current_id
     elif state["last_id"] != current_id:
@@ -749,9 +851,8 @@ def obs_sector(
 ) -> Sector | None:
     """Resolve the energy sector an observation belongs to.
 
-    Prefers the (behavior, aid) sector registry. The obs-key heuristic
-    is a last-resort fallback only: monee junction obs dicts are
-    shape-identical between gas and water, so key inference is unreliable.
+    Prefers the (behavior, aid) registry; the obs-key heuristic is a
+    last-resort fallback (gas/water junction obs are shape-identical).
     """
     if behavior is not None and aid is not None:
         found = lookup_sector(behavior, aid)
@@ -780,7 +881,7 @@ def get_by_branch_id(centrality: dict, branch_id: tuple) -> float:
 
 
 # Re-export for backwards compatibility with callers importing it here.
-from scare.base.failure_sampling import create_failures  # noqa: E402,F401
+from scare.scenario.failure_sampling import create_failures  # noqa: E402,F401
 
 
 def efficiency_vector(eta_el: float, eta_heat: float, eta_gas: float) -> np.ndarray:
@@ -788,7 +889,7 @@ def efficiency_vector(eta_el: float, eta_heat: float, eta_gas: float) -> np.ndar
 
 
 # Re-export for backwards compatibility with callers importing them here.
-from scare.base.admm_factories import (  # noqa: E402,F401
+from scare.base.optimization.admm_factories import (  # noqa: E402,F401
     create_chp_admm_flex_actor,
     create_g2p_admm_flex_actor,
     create_p2g_admm_flex_actor,
@@ -806,18 +907,18 @@ def sector_color(sector: Sector) -> str:
 # Grid-constraint observation helpers
 # ---------------------------------------------------------------------------
 
-# Constraint-relevant obs keys. Must match monee model.values keys, which
-# are per-unit / SI (Kelvin) — NOT engineering units (bar, °C).
+# Constraint-relevant obs keys. Must match monee model.values keys (per-unit /
+# SI Kelvin, NOT bar/°C).
 _CONSTRAINT_OBS_KEYS: dict[Sector, dict[str, str]] = {
     Sector.ELECTRICITY: {
-        "vm_pu": "vm_pu",              # Bus
+        "vm_pu": "vm_pu",  # Bus
         "loading_percent": "loading_percent",  # PowerLine
     },
     Sector.GAS: {
         "pressure_pu": "pressure_pu",  # Junction
     },
     Sector.HEAT: {
-        "t_k": "t_k",                  # Junction [K]
+        "t_k": "t_k",  # Junction [K]
     },
 }
 
@@ -825,15 +926,10 @@ _CONSTRAINT_OBS_KEYS: dict[Sector, dict[str, str]] = {
 def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
     """Extract grid-constraint measurements from an observation dict.
 
-    ``loading_percent`` has two monee variants: a fraction ([0,1], from
-    ``GenericPowerBranch``) and an actual percent (×100, from
-    ``IntermediateEq``). ``SECTOR_CONSTRAINTS`` uses percent, so the
-    fraction form is scaled by 100×; the discriminator is magnitude (a
-    value ≤ 5 can only be the fraction form).
-
-    ``loading_percent`` is a Python property, not in ``model.values``, so
-    fall back to the max of the ``loading_from/to_percent`` Vars when the
-    bare key is missing.
+    ``loading_percent`` comes as a fraction ([0,1]) or actual percent;
+    ``SECTOR_CONSTRAINTS`` wants percent, so values ≤ 5 (only the fraction
+    form) are scaled ×100. When the bare key is missing (it's a property,
+    not in ``model.values``) fall back to max of ``loading_from/to_percent``.
     """
     keys = _CONSTRAINT_OBS_KEYS.get(sector, {})
     result: dict[str, float] = {}
@@ -857,9 +953,7 @@ def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
     return result
 
 
-def constraint_utilization(
-    value: float, bound_low: float, bound_high: float
-) -> float:
+def constraint_utilization(value: float, bound_low: float, bound_high: float) -> float:
     """Return 0..1 indicating how close *value* is to violating a bound.
 
     0.0 = at the centre of the feasible range.
@@ -879,20 +973,12 @@ def obs_priority(
     aid: str | None = None,
     record_default_fallback_t: float | None = None,
 ) -> int:
-    """Read an explicit priority value from an observation dict.
+    """Read an explicit priority tier for a (behavior, aid) or obs dict.
 
-    monee obs carry no ``priority`` key, so this is meaningful only when
-    callers pre-populate priorities (via the priority registry or an
-    explicit obs key). The fallback returns tier 0 for generators and tier
-    4 (sheddable) for loads; callers needing tier diversity must register
-    priorities or set ``priority_assignment`` in the scenario.
-
-    Slack agents are always tier 0 regardless of the LP's current sign —
-    a slack supplies/absorbs at the network boundary and is never shed.
-
-    Pass ``record_default_fallback_t`` to surface a one-shot
-    ``priority_default_fallback`` event the first time a (behavior, aid)
-    takes the fallback branch, so missed registrations show up in events.
+    Meaningful only when priorities are pre-populated; the fallback is tier 0
+    for generators, tier 4 (sheddable) for loads. Slacks are always tier 0
+    (never shed). ``record_default_fallback_t`` surfaces a one-shot
+    ``priority_default_fallback`` event the first time the fallback is taken.
     """
     if behavior is not None and aid is not None:
         if lookup_slack(behavior, aid) is not None:
@@ -903,9 +989,8 @@ def obs_priority(
     if "priority" in obs:
         return int(obs["priority"])
     cap = obs_capacity(obs)
-    # Unannotated loads default to tier 4 (sheddable). Tier 1 is hard-locked
-    # at x=1, so defaulting there would over-assign critical priority to
-    # unregistered loads; tier 4 means missing annotation -> first to shed.
+    # Unannotated loads default to tier 4 (first to shed); defaulting to the
+    # hard-locked tier 1 would over-assign critical priority.
     fallback = 0 if cap < 0 else 4
     if (
         record_default_fallback_t is not None
@@ -935,19 +1020,16 @@ def compute_priority_weighted_shares(
 ) -> list[float]:
     """Compute each group's share of *total_available* via waterfall allocation.
 
-    From the highest-priority tier down, allocate proportionally to
-    unserved demand within each tier until the budget is exhausted, so
-    critical loads across all groups are served before any low-priority
-    load. Returns one share per group, summing to at most *total_available*.
+    From the highest tier down, allocate proportionally to unserved demand
+    until the budget is exhausted. Returns one share per group, summing to at
+    most *total_available*.
     """
     n = len(demand_by_priority_per_group)
     shares = [0.0] * n
     if total_available <= 0 or n == 0:
         return shares
 
-    all_tiers = sorted(
-        {t for d in demand_by_priority_per_group for t in d}
-    )
+    all_tiers = sorted({t for d in demand_by_priority_per_group for t in d})
     remaining = total_available
 
     for tier in all_tiers:
@@ -976,13 +1058,11 @@ def aggregate_priority_weight(
     demand_by_priority: dict[int, float],
     served_by_priority: dict[int, float],
 ) -> float:
-    """Compute a scalar urgency weight from priority-tier demand breakdown.
+    """Scalar urgency weight from a priority-tier demand breakdown.
 
-    Higher-priority tiers contribute more weight per unit unserved demand.
-    Used by the L3 CP S-coefficient to pull allocation toward sectors with
-    high-priority unmet demand. Uses the strict-monotone schedule
-    (:func:`tier_priority_weight_strict`), not the L1 QP schedule which
-    returns 0 for tier 1 and would mask tier-1 unmet demand here.
+    Higher tiers weigh more per unit unserved demand. Used by the L3 CP
+    S-coefficient. Uses the strict-monotone schedule, not the L1 QP schedule
+    which returns 0 for tier 1 and would mask tier-1 unmet demand.
     """
     weight = 0.0
     for tier, demand in demand_by_priority.items():
@@ -992,18 +1072,13 @@ def aggregate_priority_weight(
     return weight
 
 
-# 4-tier priority model with hard tier-1 enforcement.
-#
-# Tier 1 = critical: leader pre-applies ``regulation = 1`` before the
-# gossip QP runs, then carries a defensive QP weight of 1.0 (its δ-box
-# collapses post-pre-step, so the QP pins δ=0 regardless of weight).
-# Tiers 2-4 = QP-weighted with steep exponents so the proportional
-# equilibrium is effectively strict. Generators (tier <= 0) keep unit weight.
+# 4-tier priority model with hard tier-1 enforcement. Tier 1 is pre-locked at
+# ``regulation = 1`` off-QP; tiers 2-4 are QP-weighted with steep exponents so
+# the equilibrium is effectively strict. Generators (tier <= 0) keep unit weight.
 DEFAULT_PRIORITY_TIERS: int = 4
 
-# Restoration (target > 0): higher-priority tiers get higher weight.
-# Tier 1 weight is 0 — hard-locked at the pre-step, so it must not
-# participate in the QP and contributes nothing to the dual normaliser.
+# Restoration (target > 0): higher tiers get higher weight. Tier 1 weight is 0
+# (hard-locked at the pre-step, must not enter the QP or the dual normaliser).
 _TIER_WEIGHT_RESTORATION: dict[int, float] = {
     1: 0.0,
     2: 1e8,
@@ -1011,8 +1086,7 @@ _TIER_WEIGHT_RESTORATION: dict[int, float] = {
     4: 1.0,
 }
 
-# Curtailment (target < 0): lowest-priority tier sheds first.  Tier 1 is
-# always pre-locked at full and never sheds via the QP.
+# Curtailment (target < 0): lowest tier sheds first. Tier 1 pre-locked at full.
 _TIER_WEIGHT_CURTAILMENT: dict[int, float] = {
     1: 0.0,
     2: 1.0,
@@ -1029,16 +1103,10 @@ def tier_priority_weight(
 ) -> float:
     """Single source of truth for the per-tier QP weight (L1 gossip).
 
-    4-tier schedule with hard tier-1 enforcement off-QP:
-
-    * ``regime > 0`` (restoration): tier 2 → 1e8, 3 → 1e4, 4 → 1.
-    * ``regime < 0`` (curtailment): tier 4 → 1e8 (sheds first), 3 → 1e4, 2 → 1.
-    * ``regime == 0``: 1.0.
-    Tier 1 returns the defensive weight 1.0 in all regimes (hard-locked
-    at the pre-step, never negotiated via the QP).
-
-    ``priority_tiers`` is kept for API compatibility; the schedule is
-    fixed at 4 tiers and inputs are clamped to ``[1, 4]``.
+    ``regime > 0`` restoration: tier 2→1e8, 3→1e4, 4→1. ``regime < 0``
+    curtailment: 4→1e8 (sheds first), 3→1e4, 2→1. ``regime == 0``: 1.0.
+    Tier 1 returns 1.0 (hard-locked off-QP). ``priority_tiers`` kept for API
+    compatibility; schedule is fixed at 4 tiers, inputs clamped to ``[1, 4]``.
     """
     p = max(0, int(tier))
     if regime == 0 or p <= 0:
@@ -1054,13 +1122,10 @@ def tier_priority_weight_strict(
     *,
     priority_tiers: int = DEFAULT_PRIORITY_TIERS,
 ) -> float:
-    """Strictly-monotone tier weight for waterfall-style sorts.
-
-    L2's supply-priority waterfall sorts cells by weight, and tier 1 must
-    sort first — but the QP schedule gives tier 1 a low weight. This
-    returns a schedule strictly decreasing in tier (tier 1 → P, tier P →
-    1), keeping sort-by-weight intact without the wild magnitudes that
-    would destabilise the ADMM sharing-distance objective.
+    """Strictly-monotone tier weight (tier 1 → P, tier P → 1) for
+    waterfall-style sorts; tier 1 must sort first, which the QP schedule's low
+    tier-1 weight breaks. Avoids the QP's wild magnitudes that would
+    destabilise the ADMM sharing-distance objective.
     """
     P = max(1, int(priority_tiers))
     p = max(1, min(P, int(tier)))
@@ -1085,10 +1150,8 @@ def remap_legacy_priority(tier: int) -> int:
     return 4
 
 
-# Tier-aware deadbands for ``clamp_to_constraints``: higher deadband =
-# measurement must drift closer to a hard bound before the clamp throttles.
-# Tier 1 is fully immune (handled in ``clamp_to_constraints``); lower
-# tiers throttle more aggressively as priority drops.
+# Tier-aware deadbands for the clamp: higher deadband = measurement must drift
+# closer to a hard bound before throttling. Tier 1 is fully immune.
 _CLAMP_TIER_DEADBAND: dict[int, float] = {
     2: 0.95,
     3: 0.90,
@@ -1104,22 +1167,13 @@ def clamp_to_constraints(
     *,
     tier: int | None = None,
 ) -> float:
-    """Clamp a proposed setpoint so it stays within local constraint bounds.
+    """Clamp a proposed setpoint within local constraint bounds.
 
-    When a local grid measurement approaches a hard bound, reduce the
-    proposed setpoint to avoid actuating a violation. Activates only past
-    a tier-dependent deadband; above it the allowed fraction ramps linearly
-    to zero:
-
-        allowed = (1 - util) / (1 - DEADBAND)   for util ∈ [DEADBAND, 1]
-        allowed = 1.0                            for util < DEADBAND
-
-    The deadband prevents normal LV voltage drift from cutting every load
-    and overriding the priority-aware gossip waterfall. ``tier`` is the
-    load's priority tier (1 = most critical). Tier 1 is immune to clamping
-    (its pre-step lock at ``regulation = 1`` must not be overruled by a soft
-    proximity signal; a true ConstraintViolation re-checks it). Tiers 2/3/4
-    use deadbands 0.95/0.90/0.85; ``None`` uses the uniform 0.85 default.
+    Past a tier-dependent deadband the allowed fraction ramps linearly to zero
+    (``(1-util)/(1-DEADBAND)``); the deadband stops normal LV drift from cutting
+    every load and overriding the gossip waterfall. Tier 1 is immune (its
+    pre-step lock must not be overruled; a true ConstraintViolation re-checks
+    it). Tiers 2/3/4 → 0.95/0.90/0.85; ``None`` → 0.85.
     """
     cap = obs_capacity(obs)
     if cap == 0.0:
@@ -1140,17 +1194,13 @@ def constraint_allowed_fraction(
     tier: int | None = None,
 ) -> float:
     """Tightest constraint-allowed served fraction ``∈ [0, 1]`` from local
-    grid measurements, using the same tier-dependent deadband as
-    :func:`clamp_to_constraints` (tier 1 immune → 1.0; tiers 2/3/4 use the
-    ``_CLAMP_TIER_DEADBAND`` schedule).
+    measurements (same tier deadband as :func:`clamp_to_constraints`).
 
-    The fraction of rated capacity the load may be served at given local
-    physics, before the priority decision. Shared by ``clamp_to_constraints``
-    and the L2 priority-floor (``l2_effective_floor``) so the floor relaxes
-    by exactly the amount the clamp sheds — they never fight over a load.
+    The capacity fraction the load may be served at given local physics,
+    before the priority decision. Shared with the L2 priority-floor so the
+    floor relaxes by exactly the amount the clamp sheds.
     """
-    # Tier 1 is immune to the soft proximity clamp; a true
-    # ConstraintViolation re-checks its feasibility instead.
+    # Tier 1 immune to the soft clamp; a true ConstraintViolation re-checks it.
     if tier is not None and int(tier) == 1:
         return 1.0
     if tier is not None and int(tier) >= 2:

@@ -41,9 +41,7 @@ def _tier_weight(tier: int) -> float:
     return 2.0 ** max(0, _P - tier)
 
 
-# ---------------------------------------------------------------------------
 # Final served fractions
-# ---------------------------------------------------------------------------
 
 
 def _disconnected_node_ids(monee_net: Any) -> set[int]:
@@ -86,7 +84,9 @@ def _branch_carries_sector(branch: Any, monee_net: Any, sector: str | None) -> b
 
 
 def _active_node_components(
-    monee_net: Any, *, sector: str | None = None,
+    monee_net: Any,
+    *,
+    sector: str | None = None,
 ) -> dict[Any, int]:
     """Map ``node_id -> component_index`` over the active-branch subgraph
     (failed branches removed), capturing the post-failure islands within
@@ -196,7 +196,11 @@ def _line_feasibility_factor(monee_net: Any) -> dict[Any, float]:
         # <= 5 cannot be a real percent, so scale it to percent.
         if 0.0 < loading <= 5.0:
             loading *= 100.0
-        edge_f = min(1.0, 100.0 / loading) if loading > 100.0 + _LINE_LOADING_TOL_PCT else 1.0
+        edge_f = (
+            min(1.0, 100.0 / loading)
+            if loading > 100.0 + _LINE_LOADING_TOL_PCT
+            else 1.0
+        )
         adj[a].append((b, edge_f))
         adj[b].append((a, edge_f))
     # Widest-path (maximin) relaxation from the slack set.
@@ -250,8 +254,7 @@ def served_by_load(
         if not (cap > 0):
             continue
         is_disconnected = (
-            not getattr(child, "active", True)
-            or child.node_id in disconnected
+            not getattr(child, "active", True) or child.node_id in disconnected
         )
         sp = 0.0 if is_disconnected else obs_setpoint(obs)
         served = max(0.0, min(cap, sp))
@@ -284,18 +287,20 @@ def served_by_load(
             allowed = constraint_allowed_fraction(obs, sec, tier=tier)
         sec_components = components_by_sector.get(sec.value, {})
         comp_idx = sec_components.get(child.node_id, -1)
-        rows.append({
-            "aid": aid,
-            "sector": sec.value,
-            "tier": tier,
-            "node_id": child.node_id,
-            "component": _component_label(comp_idx, sec.value),
-            "demand": cap,
-            "served": served,
-            "fraction": served / cap if cap > 0 else 0.0,
-            "disconnected": int(is_disconnected),
-            "constraint_allowed": allowed,
-        })
+        rows.append(
+            {
+                "aid": aid,
+                "sector": sec.value,
+                "tier": tier,
+                "node_id": child.node_id,
+                "component": _component_label(comp_idx, sec.value),
+                "demand": cap,
+                "served": served,
+                "fraction": served / cap if cap > 0 else 0.0,
+                "disconnected": int(is_disconnected),
+                "constraint_allowed": allowed,
+            }
+        )
     return rows
 
 
@@ -356,8 +361,7 @@ def served_breakdown(
         # agent-driven path (QP / ADMM priority weighting decides who sheds).
         # restoration_breakdown uses this to split per-tier losses.
         is_disconnected = (
-            not getattr(child, "active", True)
-            or child.node_id in disconnected
+            not getattr(child, "active", True) or child.node_id in disconnected
         )
         if is_disconnected:
             sp = 0.0
@@ -390,7 +394,9 @@ def served_breakdown(
         w = _tier_weight(tier)
 
         sec_key = sec.value
-        by_sector.setdefault(sec_key, {"demand": 0.0, "served": 0.0, "demand_disconnected": 0.0})
+        by_sector.setdefault(
+            sec_key, {"demand": 0.0, "served": 0.0, "demand_disconnected": 0.0}
+        )
         by_sector[sec_key]["demand"] += demand
         by_sector[sec_key]["served"] += served
         by_sector[sec_key]["demand_disconnected"] += demand_disc
@@ -436,17 +442,13 @@ def served_breakdown(
         "by_tier": by_tier,
         "priority_weighted_demand": pw_demand,
         "priority_weighted_served": pw_served,
-        "priority_weighted_fraction": (
-            pw_served / pw_demand if pw_demand > 0 else 1.0
-        ),
+        "priority_weighted_fraction": (pw_served / pw_demand if pw_demand > 0 else 1.0),
         "n_loads": n_loads,
         "n_loads_served_zero": n_zero,
     }
 
 
-# ---------------------------------------------------------------------------
 # Restoration breakdown — relative to the pre-failure baseline
-# ---------------------------------------------------------------------------
 
 
 def restoration_breakdown(
@@ -490,9 +492,7 @@ def restoration_breakdown(
     sector_baseline = baseline.get("by_sector", {})
     sector_post = post.get("by_sector", {})
     total_demand = sum(s.get("demand", 0.0) for s in sector_baseline.values())
-    total_served_baseline = sum(
-        s.get("served", 0.0) for s in sector_baseline.values()
-    )
+    total_served_baseline = sum(s.get("served", 0.0) for s in sector_baseline.values())
     total_served_post = sum(s.get("served", 0.0) for s in sector_post.values())
 
     by_tier_b = baseline.get("by_tier", {})
@@ -517,7 +517,9 @@ def restoration_breakdown(
             logger.warning(
                 "Tier %s: demand_disconnected=%.4g > total_loss=%.4g; "
                 "clamping disconnect_lost to total_loss.",
-                tier, disc_p, total_loss,
+                tier,
+                disc_p,
+                total_loss,
             )
         agent_shed = max(0.0, total_loss - disconnect_lost)
         ratio = s_p / s_b if s_b > 1e-12 else (1.0 if d_b < 1e-12 else 0.0)
@@ -525,14 +527,14 @@ def restoration_breakdown(
         s_b_recoverable = max(1e-12, s_b - disconnect_lost)
         agent_ratio = (s_b - total_loss + disconnect_lost) / s_b_recoverable
         by_tier_out[str(tier)] = {
-            "demand_baseline_mw":   d_b,
-            "served_baseline_mw":   s_b,
-            "served_post_mw":       s_p,
-            "ratio":                max(0.0, min(1.0, ratio)),
-            "disconnect_lost_mw":   disconnect_lost,
-            "agent_shed_mw":        agent_shed,
-            "agent_only_ratio":     max(0.0, min(1.0, agent_ratio)),
-            "weight":               float(tb.get("weight", 0.0)),
+            "demand_baseline_mw": d_b,
+            "served_baseline_mw": s_b,
+            "served_post_mw": s_p,
+            "ratio": max(0.0, min(1.0, ratio)),
+            "disconnect_lost_mw": disconnect_lost,
+            "agent_shed_mw": agent_shed,
+            "agent_only_ratio": max(0.0, min(1.0, agent_ratio)),
+            "weight": float(tb.get("weight", 0.0)),
         }
 
     by_sector_out: dict[str, dict[str, float]] = {}
@@ -548,53 +550,45 @@ def restoration_breakdown(
         disconnect_lost = max(0.0, min(disc_p, total_loss))
         agent_shed = max(0.0, total_loss - disconnect_lost)
         by_sector_out[sec] = {
-            "demand_baseline_mw":   d_b,
-            "served_baseline_mw":   s_b,
-            "served_post_mw":       s_p,
-            "ratio":                max(0.0, min(1.0, ratio)),
-            "disconnect_lost_mw":   disconnect_lost,
-            "agent_shed_mw":        agent_shed,
+            "demand_baseline_mw": d_b,
+            "served_baseline_mw": s_b,
+            "served_post_mw": s_p,
+            "ratio": max(0.0, min(1.0, ratio)),
+            "disconnect_lost_mw": disconnect_lost,
+            "agent_shed_mw": agent_shed,
         }
 
     # Campaign-level disconnect vs agent split (sum of per-sector shares).
     total_disconnect_lost = sum(
         s.get("disconnect_lost_mw", 0.0) for s in by_sector_out.values()
     )
-    total_agent_shed = sum(
-        s.get("agent_shed_mw", 0.0) for s in by_sector_out.values()
-    )
+    total_agent_shed = sum(s.get("agent_shed_mw", 0.0) for s in by_sector_out.values())
 
     return {
-        "baseline_available":          True,
-        "absolute_load_lost_mw":       max(0.0, total_demand - total_served_post),
-        "absolute_load_dropped_mw":    max(0.0, total_served_baseline - total_served_post),
-        "disconnect_lost_mw":          total_disconnect_lost,
-        "agent_shed_mw":               total_agent_shed,
-        "total_demand_mw":             total_demand,
-        "total_served_baseline_mw":    total_served_baseline,
-        "total_served_post_mw":        total_served_post,
-        "raw_restoration_ratio":       (
+        "baseline_available": True,
+        "absolute_load_lost_mw": max(0.0, total_demand - total_served_post),
+        "absolute_load_dropped_mw": max(0.0, total_served_baseline - total_served_post),
+        "disconnect_lost_mw": total_disconnect_lost,
+        "agent_shed_mw": total_agent_shed,
+        "total_demand_mw": total_demand,
+        "total_served_baseline_mw": total_served_baseline,
+        "total_served_post_mw": total_served_post,
+        "raw_restoration_ratio": (
             total_served_post / total_served_baseline
-            if total_served_baseline > 1e-12 else 1.0
+            if total_served_baseline > 1e-12
+            else 1.0
         ),
-        "pwsf_baseline":               (
-            pw_served_baseline / pw_demand if pw_demand > 0 else 1.0
+        "pwsf_baseline": (pw_served_baseline / pw_demand if pw_demand > 0 else 1.0),
+        "pwsf_post": (pw_served_post / pw_demand if pw_demand > 0 else 1.0),
+        "pwsf_restoration_ratio": (
+            pw_served_post / pw_served_baseline if pw_served_baseline > 1e-12 else 1.0
         ),
-        "pwsf_post":                   (
-            pw_served_post / pw_demand if pw_demand > 0 else 1.0
-        ),
-        "pwsf_restoration_ratio":      (
-            pw_served_post / pw_served_baseline
-            if pw_served_baseline > 1e-12 else 1.0
-        ),
-        "by_tier":                     by_tier_out,
-        "by_sector":                   by_sector_out,
+        "by_tier": by_tier_out,
+        "by_sector": by_sector_out,
     }
 
 
-# ---------------------------------------------------------------------------
 # Constraint violation integral
-# ---------------------------------------------------------------------------
 
 
 def constraint_violation_integral(world: Any) -> dict[str, float]:
@@ -637,10 +631,7 @@ def constraint_violation_integral(world: Any) -> dict[str, float]:
     return out
 
 
-# ---------------------------------------------------------------------------
 # Final constraint-violation scan (end-of-sim hard-bound feasibility)
-# ---------------------------------------------------------------------------
-#
 # Node-by-node / branch-by-branch feasibility of the final solved network
 # against the same ``SECTOR_CONSTRAINTS`` envelope the oracle LP enforces
 # (bounds_el / _gas / _heat + ``max_line_loading``). Flags a SCARE run that
@@ -723,7 +714,13 @@ def _bound_overshoot(val: float, lo: float, hi: float, *, one_sided: bool) -> fl
 
 
 def _violation_row(
-    kind: str, cid: Any, sec: Sector, var: str, val: float, lo: float, hi: float,
+    kind: str,
+    cid: Any,
+    sec: Sector,
+    var: str,
+    val: float,
+    lo: float,
+    hi: float,
 ) -> dict[str, Any]:
     tol = _CONSTRAINT_ABS_TOL.get(var, 0.0)
     one_sided = var in _ONE_SIDED_VARS
@@ -793,60 +790,140 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
             if val is None or not math.isfinite(val):
                 continue
             rows.append(
-                _violation_row("branch", branch.id, Sector.ELECTRICITY,
-                               "loading_percent", val, lo, hi)
+                _violation_row(
+                    "branch",
+                    branch.id,
+                    Sector.ELECTRICITY,
+                    "loading_percent",
+                    val,
+                    lo,
+                    hi,
+                )
             )
     return rows
+
+
+# Constraint variables whose breach is governed by LOCAL PHYSICS and is already
+# reflected in the served-load metric, so gating compliance on them would
+# double-penalise the sector.  Heat junction temperature (``t_k``): a
+# temperature-infeasible heat node serves zero/less load (its
+# ``constraint_allowed`` fraction collapses), so the served-fraction / PWSF
+# metric already counts the cold node against the run; counting the ``t_k``
+# breach here too punishes the heat grid twice for one local hydraulic-thermal
+# limit that no extra slack can buy back.  Canonical for both the
+# ``constraint_violations_final`` scan (SCARE outcome + oracle claim) and the
+# ``_check_constraint_compliance`` CSV claim (which imports this set), so SCARE
+# and the oracle gate on identical flags.
+NON_GATING_CONSTRAINT_VARIABLES: frozenset[str] = frozenset({"t_k"})
+
+# Canonical display label per raw ``SECTOR_CONSTRAINTS`` variable, for the
+# per-variable-type violation tally that accompanies the compliance gate.
+# Electricity carries TWO gating variables (voltage + line loading), so the
+# per-sector counts can't separate them — this split does. Shared by the
+# ``constraint_violations_final`` scan and the ``_check_constraint_compliance``
+# CSV claim so both report identical variable buckets. Slack is tallied
+# separately (``slack_budget_compliance`` — a different artefact).
+CONSTRAINT_VARIABLE_LABEL: dict[str, str] = {
+    "vm_pu": "voltage",
+    "pressure_pu": "pressure",
+    "t_k": "temperature",
+    "loading_percent": "line_load",
+}
+
+
+def _variable_tally_entry(
+    by_variable: dict[str, dict[str, Any]], var: str
+) -> dict[str, Any]:
+    """Get-or-create the per-variable-type tally bucket for raw variable
+    ``var``, keyed by its :data:`CONSTRAINT_VARIABLE_LABEL` (falls back to the
+    raw name for any unmapped variable)."""
+    label = CONSTRAINT_VARIABLE_LABEL.get(var, var)
+    return by_variable.setdefault(
+        label,
+        {
+            "n_checked": 0,
+            "n_violations": 0,
+            "worst_overshoot": 0.0,
+            "gating": var not in NON_GATING_CONSTRAINT_VARIABLES,
+        },
+    )
 
 
 def constraint_violations_final(monee_net: Any) -> dict[str, Any]:
     """End-of-sim hard-bound feasibility summary over the final network state.
 
-    Returns ``{passed, n_checked, n_violations, by_sector, violations}`` where
-    ``passed`` is True iff no active, connected node or branch breaches its
-    ``SECTOR_CONSTRAINTS`` bound (within :data:`_CONSTRAINT_ABS_TOL`). Basis for
-    the ``constraint_compliance`` claim: a "compliant" run needs both the
-    operator slack budget and in-bounds grid state, so the PWSF gap to the
-    oracle is a real allocation gap, not feasibility bought by violations.
+    Returns ``{passed, n_checked, n_violations, n_nongating_violations,
+    by_sector, violations, nongating_violations}`` where ``passed`` is True iff
+    no active, connected node or branch breaches its GATING ``SECTOR_CONSTRAINTS``
+    bound (within :data:`_CONSTRAINT_ABS_TOL`). Basis for the
+    ``constraint_compliance`` claim: a "compliant" run needs both the operator
+    slack budget and in-bounds grid state, so the PWSF gap to the oracle is a
+    real allocation gap, not feasibility bought by violations.
+
+    Heat junction temperature (``t_k``) is NON-GATING (see
+    :data:`NON_GATING_CONSTRAINT_VARIABLES`): a temperature-infeasible heat node
+    already serves no load, so the served-fraction metric penalises it — gating
+    here as well would double-count. ``t_k`` breaches are still reported (in
+    ``by_sector`` and ``nongating_violations``) but do not flip ``passed``.
     """
     rows = constraint_rows(monee_net)
     by_sector: dict[str, dict[str, Any]] = {}
-    violations: list[dict[str, Any]] = []
+    by_variable: dict[str, dict[str, Any]] = {}
+    gating: list[dict[str, Any]] = []
+    nongating: list[dict[str, Any]] = []
     for r in rows:
         entry = by_sector.setdefault(
             r["sector"],
-            {"n_checked": 0, "n_violations": 0, "worst_overshoot": 0.0},
+            {
+                "n_checked": 0,
+                "n_violations": 0,
+                "worst_overshoot": 0.0,
+                "n_nongating_violations": 0,
+            },
         )
+        var_entry = _variable_tally_entry(by_variable, r["variable"])
         entry["n_checked"] += 1
+        var_entry["n_checked"] += 1
         if r["violated"]:
             entry["n_violations"] += 1
             entry["worst_overshoot"] = max(entry["worst_overshoot"], r["overshoot"])
-            violations.append(r)
-    violations.sort(key=lambda r: r["overshoot"], reverse=True)
+            var_entry["n_violations"] += 1
+            var_entry["worst_overshoot"] = max(
+                var_entry["worst_overshoot"], r["overshoot"]
+            )
+            if r["variable"] in NON_GATING_CONSTRAINT_VARIABLES:
+                entry["n_nongating_violations"] += 1
+                nongating.append(r)
+            else:
+                gating.append(r)
+    gating.sort(key=lambda r: r["overshoot"], reverse=True)
+    nongating.sort(key=lambda r: r["overshoot"], reverse=True)
+
+    def _fmt(r: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "kind": r["kind"],
+            "id": str(r["id"]),
+            "sector": r["sector"],
+            "variable": r["variable"],
+            "value": round(r["value"], 6),
+            "lo": r["lo"],
+            "hi": r["hi"],
+            "overshoot": round(r["overshoot"], 6),
+        }
+
     return {
-        "passed": not violations,
+        "passed": not gating,
         "n_checked": len(rows),
-        "n_violations": len(violations),
+        "n_violations": len(gating),
+        "n_nongating_violations": len(nongating),
         "by_sector": by_sector,
-        "violations": [
-            {
-                "kind": r["kind"],
-                "id": str(r["id"]),
-                "sector": r["sector"],
-                "variable": r["variable"],
-                "value": round(r["value"], 6),
-                "lo": r["lo"],
-                "hi": r["hi"],
-                "overshoot": round(r["overshoot"], 6),
-            }
-            for r in violations[:10]
-        ],
+        "by_variable": by_variable,
+        "violations": [_fmt(r) for r in gating[:10]],
+        "nongating_violations": [_fmt(r) for r in nongating[:10]],
     }
 
 
-# ---------------------------------------------------------------------------
 # Time-to-stabilise
-# ---------------------------------------------------------------------------
 
 
 def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
@@ -875,8 +952,7 @@ def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
 
     # Per-series threshold = 0.5 % of max magnitude (or 1e-6 if zero).
     thresholds = {
-        k: max(1e-6, 0.005 * max(abs(v) for v in ts))
-        for k, (_, ts) in series.items()
+        k: max(1e-6, 0.005 * max(abs(v) for v in ts)) for k, (_, ts) in series.items()
     }
 
     # Common timestep grid (series share recording cadence); a step is stable
@@ -903,9 +979,7 @@ def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
     return None
 
 
-# ---------------------------------------------------------------------------
 # Optimality gap (vs oracle)
-# ---------------------------------------------------------------------------
 
 
 def optimality_gap(scare_pw_served: float, oracle_pw_served: float) -> float:

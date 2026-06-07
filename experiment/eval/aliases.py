@@ -10,6 +10,7 @@ Scenario aliasing is rule-based, not table-based: scenario keys are flat
 (e.g. ``conc-5;skewed``, ``cold-day;1.5x``) without a config entry per
 combination.
 """
+
 from __future__ import annotations
 
 import json
@@ -32,9 +33,9 @@ def _load(path: str | None = None) -> dict[str, dict[str, str]]:
     except json.JSONDecodeError:
         return {"grids": {}, "experiments": {}, "variants": {}}
     return {
-        "grids":       data.get("grids", {}) or {},
+        "grids": data.get("grids", {}) or {},
         "experiments": data.get("experiments", {}) or {},
-        "variants":    data.get("variants", {}) or {},
+        "variants": data.get("variants", {}) or {},
     }
 
 
@@ -93,7 +94,7 @@ def alias_scenario(scenario: Any) -> str:
         share = sc.get("generator_share")
         if share:
             try:
-                parts.append(f"mix{int(float(share)*100)}")
+                parts.append(f"mix{int(float(share) * 100)}")
             except Exception:
                 parts.append("mix")
         else:

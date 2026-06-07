@@ -60,7 +60,9 @@ def _slurm_flags(slurm: SlurmConfig) -> list[str]:
     return flags
 
 
-def _array_command(campaign_dir: Path, slurm: SlurmConfig, array_spec: str, log_dir: Path) -> list[str]:
+def _array_command(
+    campaign_dir: Path, slurm: SlurmConfig, array_spec: str, log_dir: Path
+) -> list[str]:
     job_name = slurm.job_name or f"scare-restore-{campaign_dir.name}"
     py = _python_bin(slurm)
     wrap = (
@@ -69,7 +71,8 @@ def _array_command(campaign_dir: Path, slurm: SlurmConfig, array_spec: str, log_
         f"--campaign-dir {shlex.quote(str(campaign_dir))}"
     )
     return [
-        "sbatch", "--parsable",
+        "sbatch",
+        "--parsable",
         f"--job-name={job_name}",
         f"--array={array_spec}",
         f"--output={log_dir}/slurm-%A_%a.out",
@@ -79,7 +82,9 @@ def _array_command(campaign_dir: Path, slurm: SlurmConfig, array_spec: str, log_
     ]
 
 
-def _aggregator_command(campaign_dir: Path, slurm: SlurmConfig, after_job: str, log_dir: Path) -> list[str]:
+def _aggregator_command(
+    campaign_dir: Path, slurm: SlurmConfig, after_job: str, log_dir: Path
+) -> list[str]:
     job_name = (slurm.job_name or f"scare-restore-{campaign_dir.name}") + "-agg"
     py = _python_bin(slurm)
     wrap = (
@@ -95,7 +100,8 @@ def _aggregator_command(campaign_dir: Path, slurm: SlurmConfig, after_job: str, 
         if v:
             light_flags.append(f"--{k}={v}")
     return [
-        "sbatch", "--parsable",
+        "sbatch",
+        "--parsable",
         f"--job-name={job_name}",
         f"--dependency=afterany:{after_job}",
         "--kill-on-invalid-dep=yes",
@@ -142,31 +148,50 @@ def submit(campaign_dir: Path, only: FilterMode, dry_run: bool) -> int:
     logger.info("  python:      %s", py)
     logger.info("  partition:   %s", cfg.slurm.partition or "<default>")
     logger.info("  nodelist:    %s", cfg.slurm.nodelist or "<any>")
-    logger.info("  time/mem:    %s / %s (cpus=%d)", cfg.slurm.time, cfg.slurm.mem, cfg.slurm.cpus)
+    logger.info(
+        "  time/mem:    %s / %s (cpus=%d)",
+        cfg.slurm.time,
+        cfg.slurm.mem,
+        cfg.slurm.cpus,
+    )
 
-    array_job = _run_sbatch(_array_command(campaign_dir, cfg.slurm, array_spec, log_dir), dry_run)
+    array_job = _run_sbatch(
+        _array_command(campaign_dir, cfg.slurm, array_spec, log_dir), dry_run
+    )
     logger.info("  array job:   %s", array_job)
 
     if cfg.slurm.aggregate:
-        agg_job = _run_sbatch(_aggregator_command(campaign_dir, cfg.slurm, array_job, log_dir), dry_run)
+        agg_job = _run_sbatch(
+            _aggregator_command(campaign_dir, cfg.slurm, array_job, log_dir), dry_run
+        )
         logger.info("  aggregator:  %s (afterany:%s)", agg_job, array_job)
 
     return 0
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+    )
     p.add_argument("campaign_dir", type=Path)
-    p.add_argument("--only", default="all",
-                   choices=["all", "failed", "timeout", "missing", "incomplete", "ok"],
-                   help="Filter task subset to (re-)submit (default: all)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the sbatch command(s) instead of running them")
+    p.add_argument(
+        "--only",
+        default="all",
+        choices=["all", "failed", "timeout", "missing", "incomplete", "ok"],
+        help="Filter task subset to (re-)submit (default: all)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the sbatch command(s) instead of running them",
+    )
     return p.parse_args()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s"
+    )
     args = _parse_args()
     sys.exit(submit(args.campaign_dir.resolve(), args.only, args.dry_run))
 

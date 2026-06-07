@@ -32,14 +32,17 @@ import logging
 import os
 import shlex
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 from experiment.eval.report import generate_report
 from experiment.hpc.aggregate import write_summary
 from experiment.hpc.config import CAMPAIGN_LAYOUT, CampaignConfig
-from experiment.hpc.plan import compress_ranges, create_campaign, filter_task_ids, read_manifest
+from experiment.hpc.plan import (
+    compress_ranges,
+    create_campaign,
+    filter_task_ids,
+    read_manifest,
+)
 from experiment.hpc.run_local import run_campaign
 from experiment.hpc.submit import (
     _aggregator_command,
@@ -54,9 +57,7 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-# ---------------------------------------------------------------------------
 # Mode detection
-# ---------------------------------------------------------------------------
 
 
 def _resolve_mode(mode: str) -> str:
@@ -68,9 +69,7 @@ def _resolve_mode(mode: str) -> str:
     return "local"
 
 
-# ---------------------------------------------------------------------------
 # Local pipeline
-# ---------------------------------------------------------------------------
 
 
 def _run_local(campaign_dir: Path, workers: int) -> Path:
@@ -92,9 +91,7 @@ def _run_local(campaign_dir: Path, workers: int) -> Path:
     return report_path
 
 
-# ---------------------------------------------------------------------------
 # SLURM pipeline
-# ---------------------------------------------------------------------------
 
 
 def _run_slurm(campaign_dir: Path) -> Path:
@@ -120,10 +117,14 @@ def _run_slurm(campaign_dir: Path) -> Path:
     logger.info("  array:     %s", array_spec)
     logger.info("  python:    %s", py)
 
-    array_job = _run_sbatch(_array_command(campaign_dir, cfg.slurm, array_spec, log_dir), False)
+    array_job = _run_sbatch(
+        _array_command(campaign_dir, cfg.slurm, array_spec, log_dir), False
+    )
     logger.info("  array job: %s", array_job)
 
-    agg_job = _run_sbatch(_aggregator_command(campaign_dir, cfg.slurm, array_job, log_dir), False)
+    agg_job = _run_sbatch(
+        _aggregator_command(campaign_dir, cfg.slurm, array_job, log_dir), False
+    )
     logger.info("  aggregator: %s (afterany:%s)", agg_job, array_job)
 
     report_job = _run_sbatch(
@@ -156,7 +157,8 @@ def _report_command(
         if v:
             light_flags.append(f"--{k}={v}")
     return [
-        "sbatch", "--parsable",
+        "sbatch",
+        "--parsable",
         f"--job-name={job_name}",
         f"--dependency=afterok:{after_job}",
         "--kill-on-invalid-dep=yes",
@@ -167,9 +169,7 @@ def _report_command(
     ]
 
 
-# ---------------------------------------------------------------------------
 # Top-level orchestration
-# ---------------------------------------------------------------------------
 
 
 def run(config_path: Path, *, mode: str = "auto", workers: int | None = None) -> Path:
@@ -195,11 +195,6 @@ def _default_workers() -> int:
     return max(1, (os.cpu_count() or 2) - 1)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -222,7 +217,9 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s"
+    )
     args = _parse_args()
     report_path = run(args.config.resolve(), mode=args.mode, workers=args.workers)
     print(report_path)

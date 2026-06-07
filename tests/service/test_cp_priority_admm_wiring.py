@@ -1,8 +1,8 @@
 """Contract tests for the L3 priority-ADMM role wiring.
 
-The kernel in :mod:`scare.service.cp_priority_admm` is the compute
+The kernel in :mod:`scare.service.coupling.cp_priority_admm` is the compute
 side of the L3 redesign; the role
-:class:`scare.service.cp_priority_admm_role.CPPriorityAdmmRole` is the
+:class:`scare.service.coupling.cp_priority_admm_role.CPPriorityAdmmRole` is the
 wiring side that drives the kernel from the gossiped peer view and
 commits the local CP's regulation factor.
 
@@ -25,14 +25,12 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import pytest
 
 from scare.base.channel import CPSummary, HolonSummary
 from scare.base.model import Sector
-from scare.service.cp_priority_admm_role import CPPriorityAdmmRole
+from scare.service.coupling.cp_priority_admm_role import CPPriorityAdmmRole
 from tests.conftest import MockBehavior
-
 
 # ---------------------------------------------------------------------------
 # Fake mango context
@@ -110,12 +108,15 @@ def _make_role(
         behavior=behavior,
         cp_id=cp_id,
         capacity_by_sector=capacity_by_sector,
-        bridged_sectors=bridged_sectors or [
+        bridged_sectors=bridged_sectors
+        or [
             Sector(s) if not isinstance(s, Sector) else s
             for s in (
                 # Default: derive bridged sectors from the non-zero
                 # capacity entries so tests can pass just the dict.
-                k for k, v in capacity_by_sector.items() if v != 0.0
+                k
+                for k, v in capacity_by_sector.items()
+                if v != 0.0
             )
         ],
         rebalance_min_gap_s=rebalance_min_gap_s,
@@ -265,8 +266,7 @@ def test_holon_summary_triggers_kernel_and_self_addressed_apply_regulate() -> No
 
     # Exactly one regulate write on this CP's aid.
     regulates = [
-        e for e in behavior.action_log
-        if e[0] == "p2h-A" and e[1] == "regulate"
+        e for e in behavior.action_log if e[0] == "p2h-A" and e[1] == "regulate"
     ]
     assert len(regulates) == 1, (
         f"expected exactly one regulate write on p2h-A; got: {behavior.action_log}"
@@ -357,12 +357,16 @@ def test_two_roles_with_identical_view_commit_the_same_factor() -> None:
     asyncio.run(role_a._maybe_rebalance())  # type: ignore[attr-defined]
     asyncio.run(role_b._maybe_rebalance())  # type: ignore[attr-defined]
 
-    f_a = float([
-        e for e in beh_a.action_log if e[0] == "p2h-A" and e[1] == "regulate"
-    ][-1][2][0])
-    f_b = float([
-        e for e in beh_b.action_log if e[0] == "p2h-B" and e[1] == "regulate"
-    ][-1][2][0])
+    f_a = float(
+        [e for e in beh_a.action_log if e[0] == "p2h-A" and e[1] == "regulate"][-1][2][
+            0
+        ]
+    )
+    f_b = float(
+        [e for e in beh_b.action_log if e[0] == "p2h-B" and e[1] == "regulate"][-1][2][
+            0
+        ]
+    )
 
     # Determinism: same input view → same output factor.
     assert f_a == pytest.approx(f_b, abs=1e-9), (
@@ -413,18 +417,14 @@ def test_rebalance_throttle_suppresses_back_to_back_triggers() -> None:
 
     role._dirty = True  # type: ignore[attr-defined]
     asyncio.run(role._maybe_rebalance())  # type: ignore[attr-defined]
-    n_after_first = sum(
-        1 for e in behavior.action_log if e[1] == "regulate"
-    )
+    n_after_first = sum(1 for e in behavior.action_log if e[1] == "regulate")
 
     # Second trigger at the same simulated time — throttle should
     # suppress.  ``_dirty`` must be re-flipped to True because the
     # first run cleared it.
     role._dirty = True  # type: ignore[attr-defined]
     asyncio.run(role._maybe_rebalance())  # type: ignore[attr-defined]
-    n_after_second = sum(
-        1 for e in behavior.action_log if e[1] == "regulate"
-    )
+    n_after_second = sum(1 for e in behavior.action_log if e[1] == "regulate")
 
     assert n_after_first == 1, (
         f"first trigger should produce one regulate; got {n_after_first}"
@@ -463,14 +463,14 @@ def test_build_demands_converts_gas_dimension_to_mw() -> None:
         role,
         leader_aid="gas-leader",
         sector=Sector.GAS,
-        supply_mw=1.0,            # 1.0 kg/s despite the generic param name
+        supply_mw=1.0,  # 1.0 kg/s despite the generic param name
         demand_by_tier={1: 2.0},  # 2.0 kg/s
     )
     _inject_holon_summary(
         role,
         leader_aid="el-leader",
         sector=Sector.ELECTRICITY,
-        supply_mw=10.0,           # 10 MW
+        supply_mw=10.0,  # 10 MW
         demand_by_tier={1: 4.0},  # 4 MW
     )
 
@@ -502,9 +502,9 @@ def test_heat_base_supply_uses_delivered_heat_in_deficit_mode():
         role,
         leader_aid="heat-leader",
         sector=Sector.HEAT,
-        supply_mw=10.0,                 # unbounded-ish slack pool
-        demand_by_tier={1: 0.8},        # nominal heat demand
-        served_by_tier={1: 0.3},        # only 0.3 delivered (temp-limited)
+        supply_mw=10.0,  # unbounded-ish slack pool
+        demand_by_tier={1: 0.8},  # nominal heat demand
+        served_by_tier={1: 0.3},  # only 0.3 delivered (temp-limited)
     )
     heat = {d.sector: d for d in role._build_demands()}[Sector.HEAT.value]
     # base supply == delivered (0.3), NOT the 10.0 slack pool
@@ -536,15 +536,19 @@ def test_deficit_mode_caps_electricity_input_at_served_plus_slack_budget():
     sector is bounded by the binding slack's operator budget, not the
     (uncapped) non-slack |cap| sum."""
     role, _, _ = _make_role(
-        "p2h-A", capacity_by_sector={"heat": -0.05, "electricity": 0.05},
+        "p2h-A",
+        capacity_by_sector={"heat": -0.05, "electricity": 0.05},
         bridged_sectors=[Sector.HEAT, Sector.ELECTRICITY],
     )
     role.heat_supply_from_deficit = True
     _inject_holon_summary(
-        role, leader_aid="el-leader", sector=Sector.ELECTRICITY,
-        supply_mw=10.0,            # aggregate pool (slack + non-slack |cap|)
-        slack_budget_mw=0.168,     # binding electricity slack's eff_budget
-        demand_by_tier={1: 0.4}, served_by_tier={1: 0.37},
+        role,
+        leader_aid="el-leader",
+        sector=Sector.ELECTRICITY,
+        supply_mw=10.0,  # aggregate pool (slack + non-slack |cap|)
+        slack_budget_mw=0.168,  # binding electricity slack's eff_budget
+        demand_by_tier={1: 0.4},
+        served_by_tier={1: 0.37},
     )
     el = {d.sector: d for d in role._build_demands()}[Sector.ELECTRICITY.value]
     # served (0.37) + slack budget (0.168) = 0.538, NOT the 10.0 pool.
@@ -563,10 +567,13 @@ def test_deficit_mode_caps_gas_input_at_served_plus_slack_budget():
     )
     role.heat_supply_from_deficit = True
     _inject_holon_summary(
-        role, leader_aid="gas-leader", sector=Sector.GAS,
-        supply_mw=5.0,                # aggregate (kg/s in the summary)
-        slack_budget_mw=0.01,         # binding gas slack budget (kg/s)
-        demand_by_tier={1: 0.04}, served_by_tier={1: 0.03},
+        role,
+        leader_aid="gas-leader",
+        sector=Sector.GAS,
+        supply_mw=5.0,  # aggregate (kg/s in the summary)
+        slack_budget_mw=0.01,  # binding gas slack budget (kg/s)
+        demand_by_tier={1: 0.04},
+        served_by_tier={1: 0.03},
     )
     gas = {d.sector: d for d in role._build_demands()}[Sector.GAS.value]
     # served (0.03) + slack budget (0.01) = 0.04 kg/s, kgps_to_mw'd:
@@ -577,14 +584,19 @@ def test_input_cap_off_when_flag_off():
     """Default (flag off): electricity keeps slack supply, preserving
     the pre-existing behaviour for ablation."""
     role, _, _ = _make_role(
-        "chp-A", capacity_by_sector={"heat": -0.05, "electricity": -0.02},
+        "chp-A",
+        capacity_by_sector={"heat": -0.05, "electricity": -0.02},
         bridged_sectors=[Sector.HEAT, Sector.ELECTRICITY],
     )
     assert role.heat_supply_from_deficit is False
     _inject_holon_summary(
-        role, leader_aid="el-leader", sector=Sector.ELECTRICITY,
-        supply_mw=10.0, slack_budget_mw=0.168,
-        demand_by_tier={1: 4.0}, served_by_tier={1: 1.0},
+        role,
+        leader_aid="el-leader",
+        sector=Sector.ELECTRICITY,
+        supply_mw=10.0,
+        slack_budget_mw=0.168,
+        demand_by_tier={1: 4.0},
+        served_by_tier={1: 1.0},
     )
     el = {d.sector: d for d in role._build_demands()}[Sector.ELECTRICITY.value]
     assert float(el.base_supply[0]) == pytest.approx(10.0)

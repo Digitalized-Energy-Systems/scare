@@ -1,13 +1,12 @@
 """Component tests for LocalGenerationFallbackRole."""
 
 import pytest
-
-from mango import RoleAgent, agent_composed_of, create_world
+from mango import RoleAgent, create_world
 from mango.express.topology import create_topology
 from mango.simulation.world import step_simulation
 
 from scare.base.model import LocalGenerationApproval, Sector
-from scare.service.local_generation import LocalGenerationFallbackRole
+from scare.service.control.local_generation import LocalGenerationFallbackRole
 from tests.conftest import MockBehavior, make_electricity_gen, make_electricity_load
 
 

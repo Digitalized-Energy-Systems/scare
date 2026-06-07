@@ -1,15 +1,7 @@
 """SCARE – Scalable Community-based Adaptive Resilience for Energy Systems.
 
-A distributed multi-agent system for resilient multi-energy restoration
-built on top of mango-agents, mango-energy-environments, and
-distributed-resource-optimization.
-
-Key capabilities:
-- Grid constraint enforcement (voltage, pressure, temperature)
-- Priority-aware intra-sector load restoration
-- Holonic (multi-level) community formation for scalability
-- Sector-specific time-scale awareness
-- Proactive curtailment signaling and multi-hop constraint propagation
+A distributed multi-agent system for resilient multi-energy restoration, built
+on mango-agents, mango-energy-environments, and distributed-resource-optimization.
 """
 
 from scare.base.model import (

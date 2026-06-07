@@ -36,11 +36,6 @@ from experiment.hpc.config import CAMPAIGN_LAYOUT
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-
 XS_EVENT_KINDS: tuple[str, ...] = (
     "cross_sector_inversion_detected",
     "cross_sector_coalition_allocation",
@@ -49,11 +44,6 @@ XS_EVENT_KINDS: tuple[str, ...] = (
     "cp_setpoint",
     "cp_admm_skipped_same_sign",
 )
-
-
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
 
 
 def _campaign_dir_default(base: Path = Path("experiment/_runs/eval")) -> Path | None:
@@ -75,8 +65,7 @@ def _load_summary(campaign_dir: Path) -> pd.DataFrame:
 
 def _events_for_task(campaign_dir: Path, task_id: int) -> pd.DataFrame:
     path = (
-        campaign_dir / CAMPAIGN_LAYOUT["tasks"]
-        / f"{int(task_id):06d}" / "events.csv"
+        campaign_dir / CAMPAIGN_LAYOUT["tasks"] / f"{int(task_id):06d}" / "events.csv"
     )
     if not path.exists():
         return pd.DataFrame()
@@ -88,27 +77,30 @@ def _events_json_for_task(campaign_dir: Path, task_id: int) -> Path:
     cp_plots helpers read.
     """
     csv_path = (
-        campaign_dir / CAMPAIGN_LAYOUT["tasks"]
-        / f"{int(task_id):06d}" / "events.csv"
+        campaign_dir / CAMPAIGN_LAYOUT["tasks"] / f"{int(task_id):06d}" / "events.csv"
     )
     json_path = csv_path.with_name("events.json")
     if csv_path.exists() and not json_path.exists():
         df = pd.read_csv(csv_path)
         records: list[dict[str, Any]] = []
         for _, row in df.iterrows():
-            records.append({
-                "t": float(row.get("t", 0.0)),
-                "kind": str(row.get("kind", "")),
-                "aid": str(row.get("aid", "")),
-                "sector": str(row.get("sector", "")),
-                "detail": str(row.get("detail", "")),
-            })
+            records.append(
+                {
+                    "t": float(row.get("t", 0.0)),
+                    "kind": str(row.get("kind", "")),
+                    "aid": str(row.get("aid", "")),
+                    "sector": str(row.get("sector", "")),
+                    "detail": str(row.get("detail", "")),
+                }
+            )
         json_path.write_text(json.dumps(records, indent=2))
     return json_path
 
 
 def _summary_json_for_run(
-    campaign_dir: Path, task_ids: list[int], out_path: Path,
+    campaign_dir: Path,
+    task_ids: list[int],
+    out_path: Path,
 ) -> Path:
     """Aggregate a set of tasks' event counts into the summary.json
     layout the flag_on_off_comparison helper reads.
@@ -122,16 +114,14 @@ def _summary_json_for_run(
             all_counts[kind] += int(n)
     xs_counts = {k: all_counts.get(k, 0) for k in XS_EVENT_KINDS}
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(
-        {"all": dict(all_counts), "cross_sector": xs_counts},
-        indent=2, sort_keys=True,
-    ))
+    out_path.write_text(
+        json.dumps(
+            {"all": dict(all_counts), "cross_sector": xs_counts},
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return out_path
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 _LABEL_RE = re.compile(r"\$label=([^;]+)")
@@ -146,7 +136,8 @@ def _label_from_ablation_key(key: str) -> str:
 
 
 def _xs_event_counts_for_task(
-    campaign_dir: Path, task_id: int,
+    campaign_dir: Path,
+    task_id: int,
 ) -> dict[str, int]:
     df = _events_for_task(campaign_dir, task_id)
     counts = {k: 0 for k in XS_EVENT_KINDS}
@@ -158,9 +149,7 @@ def _xs_event_counts_for_task(
     return counts
 
 
-# ---------------------------------------------------------------------------
 # Findings report
-# ---------------------------------------------------------------------------
 
 
 def _format_metric(values: pd.Series) -> str:
@@ -197,9 +186,7 @@ def write_findings_report(
     # Attach per-task event-count columns alongside the metric deltas.
     xs_counts_per_task: dict[int, dict[str, int]] = {}
     for tid in summary["task_id"].astype(int):
-        xs_counts_per_task[int(tid)] = _xs_event_counts_for_task(
-            campaign_dir, int(tid)
-        )
+        xs_counts_per_task[int(tid)] = _xs_event_counts_for_task(campaign_dir, int(tid))
     for kind in XS_EVENT_KINDS:
         summary[f"xs__{kind}"] = summary["task_id"].map(
             lambda t: xs_counts_per_task.get(int(t), {}).get(kind, 0)
@@ -237,12 +224,11 @@ def write_findings_report(
                 "| arm | n_ok | PWSF | restoration | served | "
                 "xs_inv | xs_alloc | env_set | env_clamp |"
             )
-            lines.append(
-                "|---|---:|---|---|---|---:|---:|---:|---:|"
-            )
+            lines.append("|---|---:|---|---|---|---:|---:|---:|---:|")
             ok_df = grid_df[grid_df["status"] == "ok"]
             for arm, arm_df in sorted(
-                ok_df.groupby("arm"), key=lambda kv: kv[0],
+                ok_df.groupby("arm"),
+                key=lambda kv: kv[0],
             ):
                 lines.append(
                     f"| **{arm}** | {len(arm_df)} | "
@@ -263,19 +249,14 @@ def write_findings_report(
                 if len(v0) and len(v1):
                     delta = v1.mean() - v0.mean()
                     lines.append("")
-                    lines.append(
-                        f"**Δ PWSF** ({arms[1]} − {arms[0]}) = "
-                        f"`{delta:+.3f}`"
-                    )
+                    lines.append(f"**Δ PWSF** ({arms[1]} − {arms[0]}) = `{delta:+.3f}`")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return out_path
 
 
-# ---------------------------------------------------------------------------
 # Plot rendering
-# ---------------------------------------------------------------------------
 
 
 def _pick_representative_task(
@@ -320,30 +301,32 @@ def render_campaign_plots(
 
     rep_task_id = _pick_representative_task(summary, prefer_label="with_xs")
     if rep_task_id is not None:
-        rep_dir = (
-            campaign_dir / CAMPAIGN_LAYOUT["tasks"] / f"{rep_task_id:06d}"
-        )
         events_json = _events_json_for_task(campaign_dir, rep_task_id)
         rep_out = out_dir / "representative_run"
         rep_out.mkdir(parents=True, exist_ok=True)
         # Render so paths land under out_dir, not the task dir.
-        written.update({
-            "cp_setpoint_timeline": cp_plots.cp_setpoint_timeline(
-                events_json, rep_out / "cp_setpoint_timeline",
-            ),
-            "coalition_lifecycle_gantt": cp_plots.coalition_lifecycle_gantt(
-                events_json, rep_out / "coalition_lifecycle_gantt",
-            ),
-            "envelope_clamp_arrows": cp_plots.envelope_clamp_arrows(
-                events_json, rep_out / "envelope_clamp_arrows",
-            ),
-            "cross_sector_transfer_distribution": (
-                cp_plots.cross_sector_transfer_distribution(
+        written.update(
+            {
+                "cp_setpoint_timeline": cp_plots.cp_setpoint_timeline(
                     events_json,
-                    rep_out / "cross_sector_transfer_distribution",
-                )
-            ),
-        })
+                    rep_out / "cp_setpoint_timeline",
+                ),
+                "coalition_lifecycle_gantt": cp_plots.coalition_lifecycle_gantt(
+                    events_json,
+                    rep_out / "coalition_lifecycle_gantt",
+                ),
+                "envelope_clamp_arrows": cp_plots.envelope_clamp_arrows(
+                    events_json,
+                    rep_out / "envelope_clamp_arrows",
+                ),
+                "cross_sector_transfer_distribution": (
+                    cp_plots.cross_sector_transfer_distribution(
+                        events_json,
+                        rep_out / "cross_sector_transfer_distribution",
+                    )
+                ),
+            }
+        )
         logger.info(
             "Representative task = %06d (CP-active run from with_xs arm)",
             rep_task_id,
@@ -356,23 +339,26 @@ def render_campaign_plots(
         comp_dir = out_dir / "flag_comparison"
         comp_dir.mkdir(parents=True, exist_ok=True)
         on_ids = ablation[ablation["arm"] == "with_xs"]["task_id"].astype(int).tolist()
-        off_ids = ablation[ablation["arm"] == "without_xs"]["task_id"].astype(int).tolist()
+        off_ids = (
+            ablation[ablation["arm"] == "without_xs"]["task_id"].astype(int).tolist()
+        )
         on_summary = _summary_json_for_run(
-            campaign_dir, on_ids, comp_dir / "on" / "summary.json",
+            campaign_dir,
+            on_ids,
+            comp_dir / "on" / "summary.json",
         )
         off_summary = _summary_json_for_run(
-            campaign_dir, off_ids, comp_dir / "off" / "summary.json",
+            campaign_dir,
+            off_ids,
+            comp_dir / "off" / "summary.json",
         )
         written["flag_on_off_comparison"] = cp_plots.flag_on_off_comparison(
-            off_summary, on_summary, comp_dir / "flag_on_off_comparison",
+            off_summary,
+            on_summary,
+            comp_dir / "flag_on_off_comparison",
         )
 
     return written
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -384,9 +370,7 @@ def main() -> None:
 
     campaign_dir = args.campaign_dir or _campaign_dir_default()
     if campaign_dir is None or not campaign_dir.is_dir():
-        raise SystemExit(
-            "no campaign directory found; pass --campaign-dir explicitly."
-        )
+        raise SystemExit("no campaign directory found; pass --campaign-dir explicitly.")
     campaign_dir = campaign_dir.resolve()
     out_dir = (
         args.out_dir.resolve()
@@ -398,13 +382,16 @@ def main() -> None:
     logger.info("Loaded %d tasks from %s", len(summary), campaign_dir)
 
     findings = write_findings_report(
-        campaign_dir, summary,
+        campaign_dir,
+        summary,
         out_dir / "cp_coalition_findings.md",
     )
     logger.info("Wrote findings: %s", findings)
 
     plots = render_campaign_plots(
-        campaign_dir, summary, out_dir / "plots",
+        campaign_dir,
+        summary,
+        out_dir / "plots",
     )
     for name, stem in plots.items():
         logger.info("  %s -> %s.html", name, stem)

@@ -136,8 +136,11 @@ class TestLineHomeEndpoint:
             }
         )
         priorities = {
-            "child-10": 5, "child-11": 5, "child-12": 5,
-            "child-13": 5, "child-14": 5,
+            "child-10": 5,
+            "child-11": 5,
+            "child-12": 5,
+            "child-13": 5,
+            "child-14": 5,
             "child-20": 1,
         }
         branch = SimpleNamespace(id=(1, 2))

@@ -25,9 +25,9 @@ class TaskSpec:
     grid: str
     seed: int
     n_failures: int
-    # ---- Evaluation axes (all optional for backward compat) --------
-    variant: str = "scare"                 # scare | single_level | component_level | oracle
-    experiment: str = ""                    # campaign-internal label
+    # Evaluation axes (all optional for backward compat)
+    variant: str = "scare"  # scare | single_level | component_level | oracle
+    experiment: str = ""  # campaign-internal label
     ablation: dict[str, Any] = field(default_factory=dict)
     sweep: dict[str, Any] = field(default_factory=dict)
     scenario: dict[str, Any] = field(default_factory=dict)
@@ -46,12 +46,14 @@ class GridSpec:
     max_failures: int | None = None
 
     @classmethod
-    def parse(cls, item: Any) -> "GridSpec":
+    def parse(cls, item: Any) -> GridSpec:
         if isinstance(item, str):
             return cls(name=item)
         if isinstance(item, dict):
             return cls(**item)
-        raise TypeError(f"grids[] entries must be str or object, got {type(item).__name__}")
+        raise TypeError(
+            f"grids[] entries must be str or object, got {type(item).__name__}"
+        )
 
 
 @dataclass
@@ -90,19 +92,18 @@ class ExperimentSpec:
     no axes set just runs baseline scare on its grids and seeds. Empty
     ``grids`` marks a TODO placeholder (skipped, surfaced in metadata).
     """
+
     name: str
     grids: list[GridSpec] = field(default_factory=list)
-    n_seeds: int = 0                          # 0 => defer to campaign default
+    n_seeds: int = 0  # 0 => defer to campaign default
     variants: list[str] = field(default_factory=lambda: ["scare"])
     ablations: list[dict[str, Any]] = field(default_factory=lambda: [{}])
     sweeps: list[dict[str, Any]] = field(default_factory=lambda: [{}])
-    scenarios: list[dict[str, Any]] = field(
-        default_factory=lambda: [{"kind": "clean"}]
-    )
+    scenarios: list[dict[str, Any]] = field(default_factory=lambda: [{"kind": "clean"}])
     notes: str = ""
 
     @classmethod
-    def parse(cls, item: Any) -> "ExperimentSpec":
+    def parse(cls, item: Any) -> ExperimentSpec:
         if not isinstance(item, dict):
             raise TypeError(
                 f"experiments[] entries must be objects, got {type(item).__name__}"
@@ -140,15 +141,13 @@ class CampaignConfig:
     # key (e.g. ``"nodelist": null`` releases a per-task node pin).
     slurm_eval: dict[str, Any] | None = None
 
-    # ---- I/O -----------------------------------------------------------
-
     @classmethod
-    def from_json(cls, path: Path) -> "CampaignConfig":
+    def from_json(cls, path: Path) -> CampaignConfig:
         data = json.loads(Path(path).read_text())
         return cls.from_dict(data)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "CampaignConfig":
+    def from_dict(cls, data: dict) -> CampaignConfig:
         # Strip ``$``-prefixed keys (e.g. "$schema") so config comments
         # don't break the loader.
         data = {k: v for k, v in data.items() if not k.startswith("$")}
@@ -186,14 +185,20 @@ class CampaignConfig:
     def to_json(self, path: Path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2, sort_keys=True))
 
-    # ---- Derived ------------------------------------------------------
+    # Derived
 
     def resolve_grid(self, g: GridSpec) -> tuple[int, float, int]:
         """Apply per-grid overrides over campaign defaults."""
         return (
-            g.runs_per_grid if g.runs_per_grid is not None else self.defaults.runs_per_grid,
-            g.failure_lambda if g.failure_lambda is not None else self.defaults.failure_lambda,
-            g.max_failures if g.max_failures is not None else self.defaults.max_failures,
+            g.runs_per_grid
+            if g.runs_per_grid is not None
+            else self.defaults.runs_per_grid,
+            g.failure_lambda
+            if g.failure_lambda is not None
+            else self.defaults.failure_lambda,
+            g.max_failures
+            if g.max_failures is not None
+            else self.defaults.max_failures,
         )
 
     def effective_eval_slurm(self) -> SlurmConfig:
@@ -228,7 +233,7 @@ class RuntimePlan:
     fatal_claims: tuple[str, ...] = ("priority_invariant", "monotonic_progress")
 
     @classmethod
-    def from_config_json(cls, path: Path) -> "RuntimePlan":
+    def from_config_json(cls, path: Path) -> RuntimePlan:
         data = json.loads(Path(path).read_text())
         fatal = data.get("fatal_claims")
         return cls(
@@ -237,13 +242,14 @@ class RuntimePlan:
             failure_delay_s_max=float(data.get("failure_delay_s_max", 2.0)),
             write_timeseries=bool(data.get("write_timeseries", True)),
             write_trajectories=bool(data.get("write_trajectories", True)),
-            fatal_claims=tuple(fatal) if fatal is not None
-                         else ("priority_invariant", "monotonic_progress"),
+            fatal_claims=tuple(fatal)
+            if fatal is not None
+            else ("priority_invariant", "monotonic_progress"),
         )
 
 
 CAMPAIGN_LAYOUT = {
-    "config": "config.json",        # resolved CampaignConfig (source of truth)
+    "config": "config.json",  # resolved CampaignConfig (source of truth)
     "config_source": "config.source.json",  # original config as passed
     "manifest": "manifest.jsonl",
     "metadata": "metadata.json",

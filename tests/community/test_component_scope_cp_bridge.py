@@ -12,16 +12,13 @@ with L2's per-sector election scope.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import networkx as nx
-import pytest
 
 from scare.base.model import Sector
-from scare.base.topology_mirror import GridTopologyMirror
+from scare.base.topology.topology_mirror import GridTopologyMirror
 from scare.community.holonic import HolonicCommunityRole
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,7 +61,9 @@ def _make_leader_role(
     return role
 
 
-def _patch_sector_peers(role: HolonicCommunityRole, peer_addrs: dict[str, _StubAddr]) -> None:
+def _patch_sector_peers(
+    role: HolonicCommunityRole, peer_addrs: dict[str, _StubAddr]
+) -> None:
     """Inject the unfiltered sector-peer set directly so the topology
     mirror filter is the only variable under test."""
     role._resolve_sector_peer_addrs = lambda: dict(peer_addrs)  # type: ignore[method-assign]
@@ -92,11 +91,11 @@ def _patch_sector_peers(role: HolonicCommunityRole, peer_addrs: dict[str, _StubA
 
 def _two_island_grid() -> tuple[GridTopologyMirror, dict[str, int]]:
     branches = {
-        ("a1",): (1, 2),         # el
-        ("a2",): (20, 21),       # el
-        ("cp1",): (2, 10),       # cp bridge (el <-> heat)
-        ("h",): (10, 11),        # heat
-        ("cp2",): (11, 20),      # cp bridge (heat <-> el)
+        ("a1",): (1, 2),  # el
+        ("a2",): (20, 21),  # el
+        ("cp1",): (2, 10),  # cp bridge (el <-> heat)
+        ("h",): (10, 11),  # heat
+        ("cp2",): (11, 20),  # cp bridge (heat <-> el)
     }
     branch_sector = {
         ("a1",): "electricity",
@@ -129,7 +128,7 @@ def test_metrics_active_components_legacy_full_graph_merges_via_cp_bridge() -> N
     """
     mirror, _ = _two_island_grid()
     g = nx.Graph()
-    for (bid_endpoints, _) in [
+    for bid_endpoints, _ in [
         ((1, 2), "electricity"),
         ((20, 21), "electricity"),
         ((2, 10), "cp"),
@@ -190,11 +189,11 @@ def test_metrics_active_components_per_sector_splits_electricity() -> None:
                 _StubNode(21, "power_grid"),
             ]
             self.branches = [
-                _StubBranch((1, 2, 0), is_cp=False),    # el line
+                _StubBranch((1, 2, 0), is_cp=False),  # el line
                 _StubBranch((20, 21, 0), is_cp=False),  # el line
-                _StubBranch((2, 10, 0), is_cp=True),    # CP bridge (el<->heat)
+                _StubBranch((2, 10, 0), is_cp=True),  # CP bridge (el<->heat)
                 _StubBranch((10, 11, 0), is_cp=False),  # heat pipe
-                _StubBranch((11, 20, 0), is_cp=True),   # CP bridge
+                _StubBranch((11, 20, 0), is_cp=True),  # CP bridge
             ]
             self._by_id = {n.id: n for n in self.nodes}
 
@@ -202,15 +201,13 @@ def test_metrics_active_components_per_sector_splits_electricity() -> None:
             return self._by_id[nid]
 
     net = _StubNet()
-    legacy = _active_node_components(net)               # sector=None
+    legacy = _active_node_components(net)  # sector=None
     per_el = _active_node_components(net, sector="electricity")
 
     # Legacy: CP bridges merge everything into one component.
     assert len(set(legacy.values())) == 1, (
         f"legacy full-graph view should merge via CP; got {legacy}"
     )
-    # Per-sector electricity: {1,2} and {20,21} split; heat nodes singletons.
-    el_comps_for_loads = {legacy_node: per_el[legacy_node] for legacy_node in (1, 2, 20, 21)}
     assert per_el[1] == per_el[2], (
         f"island A nodes 1 and 2 must share a component; got {per_el}"
     )
@@ -252,7 +249,9 @@ def test_component_allocation_carries_monotone_version_field() -> None:
     assert alloc2.version == 7
 
     report = ComponentAdmmReport(
-        publisher="leader-A", version=1, sector=Sector.ELECTRICITY,
+        publisher="leader-A",
+        version=1,
+        sector=Sector.ELECTRICITY,
     )
     assert hasattr(report, "last_applied_allocation_version")
     assert report.last_applied_allocation_version == -1
@@ -277,36 +276,44 @@ def test_leader_emerged_registers_promoted_orphan_aid() -> None:
 
     mirror, leader_node_ids = _two_island_grid()
     role = _make_leader_role(
-        aid="leader-A", my_node_id=1,
-        leader_node_ids=leader_node_ids, mirror=mirror,
+        aid="leader-A",
+        my_node_id=1,
+        leader_node_ids=leader_node_ids,
+        mirror=mirror,
     )
     # Sanity: an unknown promoted-leader aid is not in the registry.
     assert "orphan-leader" not in role._leader_node_ids
 
-    role._on_leader_emerged(LeaderEmerged(
-        leader_aid="orphan-leader",
-        leader_addr=_StubAddr("orphan-leader"),
-        node_id=42,
-        sector=Sector.ELECTRICITY,
-    ))
+    role._on_leader_emerged(
+        LeaderEmerged(
+            leader_aid="orphan-leader",
+            leader_addr=_StubAddr("orphan-leader"),
+            node_id=42,
+            sector=Sector.ELECTRICITY,
+        )
+    )
     assert role._leader_node_ids.get("orphan-leader") == 42
 
     # Idempotent: re-applying the same emergence is a no-op.
-    role._on_leader_emerged(LeaderEmerged(
-        leader_aid="orphan-leader",
-        leader_addr=_StubAddr("orphan-leader"),
-        node_id=42,
-        sector=Sector.ELECTRICITY,
-    ))
+    role._on_leader_emerged(
+        LeaderEmerged(
+            leader_aid="orphan-leader",
+            leader_addr=_StubAddr("orphan-leader"),
+            node_id=42,
+            sector=Sector.ELECTRICITY,
+        )
+    )
     assert role._leader_node_ids.get("orphan-leader") == 42
 
     # Empty aid (defensive): ignored without raising.
-    role._on_leader_emerged(LeaderEmerged(
-        leader_aid="",
-        leader_addr=_StubAddr(""),
-        node_id=99,
-        sector=Sector.ELECTRICITY,
-    ))
+    role._on_leader_emerged(
+        LeaderEmerged(
+            leader_aid="",
+            leader_addr=_StubAddr(""),
+            node_id=99,
+            sector=Sector.ELECTRICITY,
+        )
+    )
     assert "" not in role._leader_node_ids
 
 
@@ -323,8 +330,10 @@ def test_resend_allocation_targets_only_stale_leader() -> None:
 
     mirror, leader_node_ids = _two_island_grid()
     role = _make_leader_role(
-        aid="leader-A", my_node_id=1,
-        leader_node_ids=leader_node_ids, mirror=mirror,
+        aid="leader-A",
+        my_node_id=1,
+        leader_node_ids=leader_node_ids,
+        mirror=mirror,
     )
     # Patch the stub context with a send-recording capability.
     sent: list[tuple[Any, Any]] = []
@@ -387,12 +396,16 @@ def test_l2_splits_two_coordinators_on_cp_bridged_islands() -> None:
     mirror, leader_node_ids = _two_island_grid()
 
     role_A = _make_leader_role(
-        aid="leader-A", my_node_id=1,
-        leader_node_ids=leader_node_ids, mirror=mirror,
+        aid="leader-A",
+        my_node_id=1,
+        leader_node_ids=leader_node_ids,
+        mirror=mirror,
     )
     role_B = _make_leader_role(
-        aid="leader-B", my_node_id=20,
-        leader_node_ids=leader_node_ids, mirror=mirror,
+        aid="leader-B",
+        my_node_id=20,
+        leader_node_ids=leader_node_ids,
+        mirror=mirror,
     )
     peer_addrs = {
         "leader-A": _StubAddr("leader-A"),

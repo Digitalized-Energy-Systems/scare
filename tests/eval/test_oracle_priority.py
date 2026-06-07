@@ -11,8 +11,8 @@ Needs a real LP solver (Pyomo + Gurobi); skipped when Gurobi is absent.
 from __future__ import annotations
 
 import pytest
-
 from mango_energy_environments import fetch_example_net
+
 from experiment.eval.oracle import _weight_for_load_factory, run_oracle
 
 
@@ -44,9 +44,7 @@ def test_factory_returns_per_tier_weights():
     for unmapped models (tier 1 → 1e12 ... tier 4 → 1)."""
     net = fetch_example_net()
     load_aids = [
-        f"child-{c.id}"
-        for c in net.childs
-        if type(c.model).__name__ == "PowerLoad"
+        f"child-{c.id}" for c in net.childs if type(c.model).__name__ == "PowerLoad"
     ][:2]
     assert len(load_aids) >= 2
 
@@ -70,16 +68,21 @@ def test_factory_returns_per_tier_weights():
 
     # Unmapped model — return None so monee uses its default.
     other = next(
-        c.model for c in net.childs
-        if c.id not in (cid_1, cid_4)
-        and type(c.model).__name__ == "PowerLoad"
+        c.model
+        for c in net.childs
+        if c.id not in (cid_1, cid_4) and type(c.model).__name__ == "PowerLoad"
     )
     assert wfn(other) is None
 
     # Slack / tier-0 → None
-    assert _weight_for_load_factory(
-        net, {load_aids[0]: 0}, base_demand_weight=100.0,
-    ) is None
+    assert (
+        _weight_for_load_factory(
+            net,
+            {load_aids[0]: 0},
+            base_demand_weight=100.0,
+        )
+        is None
+    )
 
 
 @pytest.mark.slow
@@ -88,18 +91,13 @@ def test_oracle_with_priorities_sheds_low_priority_first():
     forced deficit the lower-priority load is shed at least as deeply as
     the higher-priority one."""
     from monee.model.formulation import MISOCP_NETWORK_FORMULATION
-    from mango_energy_environments.environments.restoration.multi_energy_monee import (
-        Failure,
-    )
 
     net = fetch_example_net()
     net.apply_formulation(MISOCP_NETWORK_FORMULATION)
 
     # Pick two PowerLoads to compare.
     power_loads = [
-        (c.id, c.model)
-        for c in net.childs
-        if type(c.model).__name__ == "PowerLoad"
+        (c.id, c.model) for c in net.childs if type(c.model).__name__ == "PowerLoad"
     ]
     assert len(power_loads) >= 2
     aid_tier1 = f"child-{power_loads[0][0]}"

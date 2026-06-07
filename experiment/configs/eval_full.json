@@ -283,6 +283,9 @@
       "ablations": [
         {},
         {
+          "enable_vvw_coordination": false
+        },
+        {
           "enable_qv_droop": false
         }
       ],
@@ -505,6 +508,9 @@
       ],
       "ablations": [
         {},
+        {
+          "enable_vvw_coordination": false
+        },
         {
           "enable_qv_droop": false
         }

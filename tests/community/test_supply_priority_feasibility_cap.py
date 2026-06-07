@@ -50,16 +50,19 @@ class TestSupplyPriorityFeasibilityCap:
             logging.WARNING,
             logger="distributed_resource_optimization.algorithm.admm.core",
         )
-        service_fraction, _x, meta = _drive(allocate_supply_priority(
-            sectors=sectors,
-            tiers=tiers,
-            actor_supplies=supplies,
-            actor_demands=demands,
-            max_iters=50,
-            abs_tol=1e-3,
-        ))
+        service_fraction, _x, meta = _drive(
+            allocate_supply_priority(
+                sectors=sectors,
+                tiers=tiers,
+                actor_supplies=supplies,
+                actor_demands=demands,
+                max_iters=50,
+                abs_tol=1e-3,
+            )
+        )
         max_iter_warns = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.levelno == logging.WARNING
             and "reached max iterations" in r.getMessage()
         ]
@@ -76,14 +79,16 @@ class TestSupplyPriorityFeasibilityCap:
         the schedule still steers limited supply toward critical loads.
         """
         sectors, tiers, supplies, demands = _scarcity_scenario()
-        service_fraction, _x, _meta = _drive(allocate_supply_priority(
-            sectors=sectors,
-            tiers=tiers,
-            actor_supplies=supplies,
-            actor_demands=demands,
-            max_iters=200,
-            abs_tol=1e-4,
-        ))
+        service_fraction, _x, _meta = _drive(
+            allocate_supply_priority(
+                sectors=sectors,
+                tiers=tiers,
+                actor_supplies=supplies,
+                actor_demands=demands,
+                max_iters=200,
+                abs_tol=1e-4,
+            )
+        )
         sec_frac = service_fraction["electricity"]
         assert sec_frac[1] >= sec_frac[5] - 1e-6, sec_frac
         # Priority weighting concentrates supply: tier 1 served > 0.5
@@ -106,13 +111,15 @@ class TestSupplyPriorityFeasibilityCap:
             {"electricity": {1: 0.02, 2: 0.03, 3: 0.04, 4: 0.02}},
             {"electricity": {1: 0.01, 2: 0.02, 3: 0.01, 4: 0.01}},
         ]
-        service_fraction, x_per_actor, meta = _drive(allocate_supply_priority(
-            sectors=sectors,
-            tiers=tiers,
-            actor_supplies=actor_supplies,
-            actor_demands=actor_demands,
-            max_iters=50,
-        ))
+        service_fraction, x_per_actor, meta = _drive(
+            allocate_supply_priority(
+                sectors=sectors,
+                tiers=tiers,
+                actor_supplies=actor_supplies,
+                actor_demands=actor_demands,
+                max_iters=50,
+            )
+        )
         for tier in tiers:
             assert service_fraction["electricity"][tier] == 0.0, (
                 f"zero-supply scenario must shed tier {tier}; "
@@ -136,13 +143,17 @@ class TestSupplyPriorityFeasibilityCap:
         actor_supplies = [{"electricity": 0.005}, {"electricity": 0.0}]
         actor_demands = [
             {"electricity": {1: 0.01, 2: 0.02, 3: 0.01, 4: 0.01}},
-            {"electricity": {1: 0.0,  2: 0.01, 3: 0.0,  4: 0.0}},
+            {"electricity": {1: 0.0, 2: 0.01, 3: 0.0, 4: 0.0}},
         ]
-        service_fraction, _x, meta = _drive(allocate_supply_priority(
-            sectors=sectors, tiers=tiers,
-            actor_supplies=actor_supplies, actor_demands=actor_demands,
-            max_iters=50,
-        ))
+        service_fraction, _x, meta = _drive(
+            allocate_supply_priority(
+                sectors=sectors,
+                tiers=tiers,
+                actor_supplies=actor_supplies,
+                actor_demands=actor_demands,
+                max_iters=50,
+            )
+        )
         # Tier 1 served at supply/tier_1_demand = 0.005/0.01 = 0.5.
         sec = service_fraction["electricity"]
         assert sec[1] == pytest.approx(0.5, abs=1e-3), sec
@@ -164,17 +175,20 @@ class TestSupplyPriorityFeasibilityCap:
             {"electricity": {1: 0.1, 2: 0.2, 4: 0.3}},
             {"electricity": {1: 0.1, 2: 0.1, 4: 0.2}},
         ]
-        service_fraction, _x, meta = _drive(allocate_supply_priority(
-            sectors=sectors,
-            tiers=tiers,
-            actor_supplies=actor_supplies,
-            actor_demands=actor_demands,
-            max_iters=100,
-        ))
+        service_fraction, _x, meta = _drive(
+            allocate_supply_priority(
+                sectors=sectors,
+                tiers=tiers,
+                actor_supplies=actor_supplies,
+                actor_demands=actor_demands,
+                max_iters=100,
+            )
+        )
         # Supply abundant: all tiers served at 1.0.
         for t in tiers:
             assert service_fraction["electricity"][t] == pytest.approx(
-                1.0, abs=1e-3,
+                1.0,
+                abs=1e-3,
             )
         # No scaling: T_per_cell == demand_per_cell.
         for t_val, d_val in zip(meta["T_per_cell"], meta["demand_per_cell"]):

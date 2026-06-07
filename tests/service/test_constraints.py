@@ -1,12 +1,11 @@
 """Component tests for GridConstraintMonitor role."""
 
 import pytest
-
 from mango import RoleAgent, create_world
 from mango.simulation.world import step_simulation
 
 from scare.base.model import ConstraintViolation, ConstraintWarning, Sector
-from scare.service.constraints import GridConstraintMonitor
+from scare.service.control.constraints import GridConstraintMonitor
 from tests.conftest import MockBehavior
 
 
@@ -27,13 +26,9 @@ async def test_no_event_within_bounds():
     behavior = MockBehavior()
     monitor = _make_monitor(behavior, vm_pu=1.0)  # center of [0.95, 1.05]
 
-    events = []
     world = create_world()
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)
-
-    class EventCapture:
-        pass
 
     async with world:
         await step_simulation(world, step_size_s=1.0)
@@ -60,9 +55,7 @@ async def test_violation_emitted_when_out_of_bounds():
 
     class Listener(Role):
         def setup(self):
-            self.context.subscribe_event(
-                self, ConstraintViolation, self._on_violation
-            )
+            self.context.subscribe_event(self, ConstraintViolation, self._on_violation)
 
         def _on_violation(self, event, src):
             violations.append(event)
@@ -93,9 +86,7 @@ async def test_warning_emitted_near_bound():
 
     class Listener(Role):
         def setup(self):
-            self.context.subscribe_event(
-                self, ConstraintWarning, self._on_warning
-            )
+            self.context.subscribe_event(self, ConstraintWarning, self._on_warning)
 
         def _on_warning(self, event, src):
             warnings.append(event)
@@ -187,7 +178,7 @@ async def test_curtail_willingness_sensitivity_is_bounded():
     """The sensitivity multiplier in the auction willingness is clamped to
     ``[_SENS_MULT_MIN, _SENS_MULT_MAX]`` so it ranks within a tier but can
     never overcome the 1e4 priority tier step (no waterfall inversion)."""
-    from scare.service.constraints import _SENS_MULT_MAX, _SENS_MULT_MIN
+    from scare.service.control.constraints import _SENS_MULT_MAX, _SENS_MULT_MIN
 
     behavior = MockBehavior()
     behavior.set_obs(
@@ -203,7 +194,7 @@ async def test_curtail_willingness_sensitivity_is_bounded():
 
     async with world:
         obs = behavior.observe("agent-0")
-        monitor._sensitivity = 1e9   # absurdly high
+        monitor._sensitivity = 1e9  # absurdly high
         w_hi = monitor._own_curtail_willingness(obs)
         monitor._sensitivity = 1e-9  # absurdly low
         w_lo = monitor._own_curtail_willingness(obs)
@@ -322,7 +313,10 @@ def _cold_heat_monitor(priority: int, waterfall: bool = True):
     )
     behavior.add_action("agent-0", "regulate")
     monitor = GridConstraintMonitor(
-        behavior, Sector.HEAT, node_id=0, max_hops=1,
+        behavior,
+        Sector.HEAT,
+        node_id=0,
+        max_hops=1,
         # Disable the other auto-scheduled levers (SCADA-poll auction
         # self-curtail, multi-hop propagation) so only the manually-invoked
         # frontier gate writes a regulate.
@@ -348,8 +342,9 @@ async def test_frontier_defers_shed_when_lower_priority_reducible_in_region():
         now = monitor.context.current_timestamp
         monitor._heat_frontier.note_peer_state("peer-4", now, 4, 0.05)  # tier-4
         await monitor._heat_frontier_control()
-    assert not [a for a in behavior.action_log if a[1] == "regulate"], \
+    assert not [a for a in behavior.action_log if a[1] == "regulate"], (
         "tier-1 load should defer to the lower-priority peer, not self-shed"
+    )
 
 
 @pytest.mark.asyncio
@@ -433,8 +428,13 @@ async def test_handle_constraint_state_populates_heat_peer_cache():
     agent.add_role(monitor)
     async with world:
         msg = ConstraintStateMessage(
-            sector=Sector.HEAT, variable="t_k", value=300.0, utilization=1.2,
-            hops_remaining=1, origin_addr="peer-9", priority_tier=4,
+            sector=Sector.HEAT,
+            variable="t_k",
+            value=300.0,
+            utilization=1.2,
+            hops_remaining=1,
+            origin_addr="peer-9",
+            priority_tier=4,
             reducible=0.03,
         )
         await monitor._handle_constraint_state(
@@ -455,7 +455,10 @@ def _gating_monitor(gating: bool, sector: Sector = Sector.HEAT):
     behavior.set_obs("agent-0", {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 300.0})
     behavior.add_action("agent-0", "regulate")
     monitor = GridConstraintMonitor(
-        behavior, sector, node_id=0, max_hops=1,
+        behavior,
+        sector,
+        node_id=0,
+        max_hops=1,
         enable_curtailment_auction=True,
         enable_curtail_auction_gating=gating,
         enable_multihop_constraint=False,
@@ -494,7 +497,7 @@ async def test_gating_progress_gate_suspends_stalled_rearm():
     auction stops arming.  Driven directly so each call models one round
     (the in-flight guard is cleared between calls as ``_allocate_auction``
     would)."""
-    from scare.service.constraints import _CURTAIL_NO_PROGRESS_LIMIT
+    from scare.service.control.constraints import _CURTAIL_NO_PROGRESS_LIMIT
 
     behavior, monitor = _gating_monitor(gating=True, sector=Sector.ELECTRICITY)
     world = create_world()
@@ -527,19 +530,26 @@ def test_curtail_proximity_monotonic_in_hops():
     """The targeting proximity multiplier increases with cached
     ``hops_remaining`` (closer to origin) and is neutral with no state."""
     from scare.base.model import ConstraintStateMessage
-    from scare.service.constraints import _CURTAIL_PROX_MIN, _CURTAIL_PROX_MAX
+    from scare.service.control.constraints import _CURTAIL_PROX_MAX, _CURTAIL_PROX_MIN
 
     behavior = MockBehavior()
     behavior.set_obs("agent-0", {"p_mw": 5.0, "vm_pu": 1.0})
     monitor = GridConstraintMonitor(
-        behavior, Sector.ELECTRICITY, node_id=0, max_hops=3,
+        behavior,
+        Sector.ELECTRICITY,
+        node_id=0,
+        max_hops=3,
         enable_curtail_auction_targeting=True,
     )
 
     def _cache(hops):
         monitor._neighbour_state[("orig", "vm_pu")] = ConstraintStateMessage(
-            sector=Sector.ELECTRICITY, variable="vm_pu", value=1.07,
-            utilization=1.2, hops_remaining=hops, origin_addr="orig",
+            sector=Sector.ELECTRICITY,
+            variable="vm_pu",
+            value=1.07,
+            utilization=1.2,
+            hops_remaining=hops,
+            origin_addr="orig",
         )
 
     # No cached state ⇒ neutral.
@@ -559,15 +569,20 @@ async def test_targeting_scales_bid_by_proximity():
     larger willingness than the same bidder when far — so the auctioneer's
     proportional allocation concentrates the shed on near (high-leverage)
     loads."""
-    from scare.base.model import ConstraintStateMessage, CurtailmentNeed, CurtailmentBid
+    from scare.base.model import ConstraintStateMessage, CurtailmentBid, CurtailmentNeed
 
     behavior = MockBehavior()
-    behavior.set_obs("agent-0", {"q_mw_heat": 0.05, "regulation": 1.0,
-                                 "vm_pu": 1.0, "priority": 3})
+    behavior.set_obs(
+        "agent-0", {"q_mw_heat": 0.05, "regulation": 1.0, "vm_pu": 1.0, "priority": 3}
+    )
     behavior.add_action("agent-0", "regulate")
     monitor = GridConstraintMonitor(
-        behavior, Sector.ELECTRICITY, node_id=0, max_hops=3,
-        enable_curtail_auction_targeting=True, enable_multihop_constraint=False,
+        behavior,
+        Sector.ELECTRICITY,
+        node_id=0,
+        max_hops=3,
+        enable_curtail_auction_targeting=True,
+        enable_multihop_constraint=False,
     )
     world = create_world()
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
@@ -579,18 +594,31 @@ async def test_targeting_scales_bid_by_proximity():
         if isinstance(msg, CurtailmentBid):
             bids.append(msg.willingness)
 
-    need = CurtailmentNeed(sector=Sector.ELECTRICITY, total_amount=0.3,
-                           auction_id="a1", origin_addr="orig", variable="vm_pu")
+    need = CurtailmentNeed(
+        sector=Sector.ELECTRICITY,
+        total_amount=0.3,
+        auction_id="a1",
+        origin_addr="orig",
+        variable="vm_pu",
+    )
 
     async with world:
         monitor.context.send_message = _spy_send  # type: ignore[assignment]
         # Far first (no cached state ⇒ neutral), then near.
-        await monitor._handle_curtailment_need(need, {"sender_addr": "orig", "sender_id": "o"})
-        monitor._neighbour_state[("orig", "vm_pu")] = ConstraintStateMessage(
-            sector=Sector.ELECTRICITY, variable="vm_pu", value=1.07,
-            utilization=1.2, hops_remaining=3, origin_addr="orig",
+        await monitor._handle_curtailment_need(
+            need, {"sender_addr": "orig", "sender_id": "o"}
         )
-        await monitor._handle_curtailment_need(need, {"sender_addr": "orig", "sender_id": "o"})
+        monitor._neighbour_state[("orig", "vm_pu")] = ConstraintStateMessage(
+            sector=Sector.ELECTRICITY,
+            variable="vm_pu",
+            value=1.07,
+            utilization=1.2,
+            hops_remaining=3,
+            origin_addr="orig",
+        )
+        await monitor._handle_curtailment_need(
+            need, {"sender_addr": "orig", "sender_id": "o"}
+        )
 
     assert len(bids) == 2 and bids[1] > bids[0]
 
@@ -603,8 +631,12 @@ async def test_line_relief_reassert_cooldown():
     behavior = MockBehavior()
     behavior.set_obs("agent-0", {"vm_pu": 1.0, "p_from_mw": 0.5, "p_to_mw": 0.0})
     monitor = GridConstraintMonitor(
-        behavior, Sector.ELECTRICITY, node_id=0, max_hops=1,
-        branch_id="branch-1", home_leader_addr="leader-0",
+        behavior,
+        Sector.ELECTRICITY,
+        node_id=0,
+        max_hops=1,
+        branch_id="branch-1",
+        home_leader_addr="leader-0",
         enable_line_relief_reassert=True,
     )
     world = create_world()
@@ -620,20 +652,29 @@ async def test_line_relief_reassert_cooldown():
     async with world:
         monitor._send_line_overload_relief = _spy  # type: ignore[assignment]
         # First poll over the bound ⇒ one relief send.
-        await monitor._reassert_line_relief(obs, "loading_percent", 116.0, -100.0, 100.0)
+        await monitor._reassert_line_relief(
+            obs, "loading_percent", 116.0, -100.0, 100.0
+        )
         # Same timestamp ⇒ inside cooldown ⇒ suppressed.
-        await monitor._reassert_line_relief(obs, "loading_percent", 116.0, -100.0, 100.0)
+        await monitor._reassert_line_relief(
+            obs, "loading_percent", 116.0, -100.0, 100.0
+        )
         assert len(sends) == 1
         # Line returns in-bounds clears the cooldown (as _monitor does) ⇒
         # a later re-breach re-arms.
         monitor._relief_inflight.pop("loading_percent", None)
-        await monitor._reassert_line_relief(obs, "loading_percent", 112.0, -100.0, 100.0)
+        await monitor._reassert_line_relief(
+            obs, "loading_percent", 112.0, -100.0, 100.0
+        )
         assert len(sends) == 2
 
 
 def _make_waterfall_monitor(behavior):
     return GridConstraintMonitor(
-        behavior, Sector.ELECTRICITY, node_id=0, max_hops=1,
+        behavior,
+        Sector.ELECTRICITY,
+        node_id=0,
+        max_hops=1,
         branch_id="branch-1",
         enable_branch_downstream_relief=True,
         enable_line_relief_waterfall=True,
@@ -657,7 +698,7 @@ async def _run_waterfall_alloc(monitor, bid_meta, total=0.5):
 
     monitor._open_auctions["a1"] = {
         "bids": {k: 1.0 for k in bid_meta},
-        "bidders": {k: k for k in bid_meta},        # addr == key for the test
+        "bidders": {k: k for k in bid_meta},  # addr == key for the test
         "bid_meta": dict(bid_meta),
         "total": total,
         "var": "loading_percent",

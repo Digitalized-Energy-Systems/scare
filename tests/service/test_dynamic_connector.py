@@ -16,10 +16,9 @@ from types import SimpleNamespace
 from typing import Any
 
 from scare.base.model import Sector
-from scare.base.topology_mirror import GridTopologyMirror
-from scare.service.cp import EnergyConverterRole
-from scare.service.dynamic_connector import DynamicConnectorRole
-
+from scare.base.topology.topology_mirror import GridTopologyMirror
+from scare.service.coupling.cp import EnergyConverterRole
+from scare.service.coupling.dynamic_connector import DynamicConnectorRole
 
 # ---------------------------------------------------------------------------
 # Fixtures

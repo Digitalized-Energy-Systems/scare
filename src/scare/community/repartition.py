@@ -1,23 +1,10 @@
 """Failure-driven dynamic re-partitioning of Level-1 communities.
 
-The L1 partition (``communities_from_topology`` in scare.base.community)
-is computed once at build time. When a branch failure disconnects
-members from their leader, those orphans can no longer reach it through
-the surviving sector subgraph. This module re-partitions: the leader
-detects unreachable members, elects a new leader among them, and pushes
-a fresh ``CommunityAssignment`` via ``RepartitionAssignment``.
-
-Design notes:
-
-- Triggered by the global ``BranchFailureEvent`` (wired by the scenario
-  builder) — no comm topology required.
-- Each leader keeps a branch-level view of its sector subgraph
-  (precomputed at build) and runs a BFS over live branches per failure
-  to find which members remain reachable.
-- Election: lex-smallest aid in the orphan set, no exchange round (same
-  determinism as the static label-propagation seed selection).
-- Reachability uses physical (sector) topology only, not the message
-  bus — islanding is about energy flow, not message delivery.
+The L1 partition is built once. When a branch failure disconnects members
+from their leader, this module re-partitions: the leader detects unreachable
+members (BFS over live branches), elects a new leader (lex-smallest orphan
+aid), and pushes a fresh ``CommunityAssignment`` via ``RepartitionAssignment``.
+Reachability uses physical sector topology, not the message bus.
 """
 
 from __future__ import annotations
@@ -26,12 +13,11 @@ import asyncio
 import logging
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from mango import Role
 from mango.express.topology import topology_characteristic, topology_neighbors
 
-from scare.base.diagnostics import record_event
 from scare.base.model import (
     CommunityAssignment,
     CommunityReassignedEvent,
@@ -39,6 +25,7 @@ from scare.base.model import (
     RepartitionAssignment,
     Sector,
 )
+from scare.base.runtime.diagnostics import record_event
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -52,23 +39,18 @@ logger = logging.getLogger(__name__)
 
 
 class DynamicRepartitionRole(Role):
-    """Installed on each group leader (in the ``groups`` topology).
+    """Installed on each group leader (``groups`` topology).
 
-    On ``BranchFailureEvent`` (wired globally by the scenario builder)
-    tracks live branches in its sector, then after a debounce window
-    BFS-checks which members became physically unreachable. Orphans are
-    dropped from the leader's ``CommunityAssignment.neighbors`` and told
-    their new membership via ``RepartitionAssignment``.
-
-    Does not mutate the mango topology at runtime (no public API from a
-    role context); post-repartition membership lives only on
-    ``CommunityAssignment``, which repartition-aware downstream roles
-    read via ``context.get_or_create_model(CommunityAssignment)``.
+    On ``BranchFailureEvent`` tracks live branches, then after a debounce
+    BFS-checks which members became unreachable. Orphans are dropped from
+    ``CommunityAssignment.neighbors`` and told their new membership via
+    ``RepartitionAssignment``. The mango topology is not mutated at runtime;
+    post-repartition membership lives only on ``CommunityAssignment``.
     """
 
     def __init__(
         self,
-        behavior: "RestorationEnvironmentBehavior",
+        behavior: RestorationEnvironmentBehavior,
         sector: Sector,
         my_node_id: Any,
         member_aid_to_node_id: dict[str, Any],
@@ -83,26 +65,21 @@ class DynamicRepartitionRole(Role):
         self._my_node_id = my_node_id
         self._member_node_id = dict(member_aid_to_node_id)
         self._member_addr = dict(member_aid_to_addr)
-        # Edge view ``{branch_id: (node_a, node_b)}``; broken branches
-        # move out of ``_live_branches`` when a failure is observed.
+        # Edge view ``{branch_id: (node_a, node_b)}``; failures move branches
+        # out of ``_live_branches``.
         self._live_branches: dict[tuple, tuple[Any, Any]] = dict(sector_branches)
         self._broken_branches: set[tuple] = set()
         self._debounce_s = debounce_s
-        # Members already moved to an orphan partition: don't re-orphan
-        # them later (this leader is no longer authoritative for them).
+        # Members already orphaned: don't re-orphan (no longer authoritative).
         self._already_orphaned: set[str] = set()
         self._reassess_pending: bool = False
 
     def setup(self) -> None:
-        # No subscribe_message: the global ``BranchFailureEvent`` wired by
-        # the scenario builder dispatches to ``on_branch_failure`` below.
+        # The global ``BranchFailureEvent`` dispatches to on_branch_failure.
         pass
 
     def on_branch_failure(self, branch_id: tuple) -> None:
-        """Global-event callback: record the failure, debounce, then
-        schedule ``_reassess_membership``. A burst of failures collapses
-        into one reassess.
-        """
+        """Record failure, debounce, then schedule ``_reassess_membership``."""
         if branch_id in self._broken_branches:
             return
         self._broken_branches.add(branch_id)
@@ -111,15 +88,14 @@ class DynamicRepartitionRole(Role):
         if self._reassess_pending:
             return
         self._reassess_pending = True
-        # Debounce on the simulation clock so simultaneous failures
-        # collapse into one reassess pass.
+        # Debounce on the sim clock so simultaneous failures collapse into one.
         try:
             self.context.schedule_timestamp_task(
                 self._reassess_membership(),
                 timestamp=self.context.current_timestamp + self._debounce_s,
             )
         except Exception:
-            # Fallback for early invocations before the scheduler is online.
+            # Fallback before the scheduler is online.
             self.context.schedule_instant_task(self._reassess_membership())
 
     async def _reassess_membership(self) -> None:
@@ -128,15 +104,14 @@ class DynamicRepartitionRole(Role):
             return
 
         live_members = {
-            aid: node_id for aid, node_id in self._member_node_id.items()
+            aid: node_id
+            for aid, node_id in self._member_node_id.items()
             if aid not in self._already_orphaned
         }
         if not live_members:
             return
 
-        reachable_nodes = _bfs_reachable(
-            self._my_node_id, self._live_branches.values()
-        )
+        reachable_nodes = _bfs_reachable(self._my_node_id, self._live_branches.values())
         orphaned_aids: list[str] = []
         for aid, node_id in live_members.items():
             if node_id not in reachable_nodes:
@@ -145,7 +120,8 @@ class DynamicRepartitionRole(Role):
         if not orphaned_aids:
             logger.debug(
                 "[%s] repartition reassess: %d members all reachable, no split",
-                self.context.aid, len(live_members),
+                self.context.aid,
+                len(live_members),
             )
             return
 
@@ -156,7 +132,8 @@ class DynamicRepartitionRole(Role):
         if new_leader_addr is None:
             logger.warning(
                 "[%s] repartition: orphan leader %s has no recorded addr, abort",
-                self.context.aid, new_leader_aid,
+                self.context.aid,
+                new_leader_aid,
             )
             return
         new_community_id = uuid4()
@@ -197,20 +174,17 @@ class DynamicRepartitionRole(Role):
         # Drop orphans from the surviving community's neighbour list.
         own = self.context.get_or_create_model(CommunityAssignment)
         own.neighbors = [
-            addr for aid, addr in self._member_addr.items()
+            addr
+            for aid, addr in self._member_addr.items()
             if aid not in self._already_orphaned and aid not in orphaned_aids
         ]
         self.context.update(own)
         self._already_orphaned.update(orphaned_aids)
 
-        # Broadcast ``LeaderEmerged`` on the ``holon_summary_<sector>`` mesh
-        # so every L2 role adds the promoted orphan leader to its
-        # ``_leader_node_ids`` map. Without it, the component coordinator
-        # drops the new leader's ``ComponentAdmmReport`` (unknown-sender
-        # filter) and the ``SlackBudgetMonitor`` override has no escalation
-        # path. Sent from THIS original-leader role because it is already on
-        # the mesh; the orphan leader was a member at build time and cannot
-        # be added dynamically (no mango API; see module header).
+        # Broadcast ``LeaderEmerged`` on the ``holon_summary_<sector>`` mesh so
+        # L2 roles register the promoted orphan leader; otherwise its
+        # ``ComponentAdmmReport`` is dropped and SlackBudgetMonitor can't
+        # escalate. Sent from this role since it is already on the mesh.
         new_leader_node_id = self._member_node_id.get(new_leader_aid)
         if new_leader_node_id is not None:
             announcement = LeaderEmerged(
@@ -222,7 +196,8 @@ class DynamicRepartitionRole(Role):
             try:
                 summary_peers = list(
                     topology_neighbors(
-                        self, tid=f"holon_summary_{self.sector.value}",
+                        self,
+                        tid=f"holon_summary_{self.sector.value}",
                     )
                 )
             except Exception:
@@ -230,12 +205,15 @@ class DynamicRepartitionRole(Role):
             for peer_addr in summary_peers:
                 try:
                     await self.context.send_message(
-                        announcement, receiver_addr=peer_addr,
+                        announcement,
+                        receiver_addr=peer_addr,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug(
                         "[%s] leader-emerged broadcast to %s failed: %s",
-                        self.context.aid, peer_addr, exc,
+                        self.context.aid,
+                        peer_addr,
+                        exc,
                     )
 
 
@@ -245,16 +223,17 @@ class DynamicRepartitionRole(Role):
 
 
 class RepartitionHandlerRole(Role):
-    """Installed on every community-member agent. On a
-    ``RepartitionAssignment`` (failure-driven re-election) updates the
-    local ``CommunityAssignment`` and emits ``CommunityReassignedEvent``
-    for co-located roles.
+    """Installed on every community member.
+
+    On a ``RepartitionAssignment`` updates the local ``CommunityAssignment``
+    and emits ``CommunityReassignedEvent`` for co-located roles.
     """
 
     def setup(self) -> None:
         def _wrap(coro_fn):
             def _sync(msg, meta):
                 self.context.schedule_instant_task(coro_fn(msg, meta))
+
             return _sync
 
         self.context.subscribe_message(
@@ -263,9 +242,7 @@ class RepartitionHandlerRole(Role):
             lambda msg, meta: isinstance(msg, RepartitionAssignment),
         )
 
-    async def _on_repartition(
-        self, message: RepartitionAssignment, meta: dict
-    ) -> None:
+    async def _on_repartition(self, message: RepartitionAssignment, meta: dict) -> None:
         assignment = self.context.get_or_create_model(CommunityAssignment)
         assignment.community_id = message.community_id
         # Neighbours are the other orphans, excluding self.
@@ -304,12 +281,9 @@ class RepartitionHandlerRole(Role):
             # No local subscribers — downstream reads the model directly.
             pass
 
-        # Repoint any co-located ``SlackBudgetMonitor.home_leader_addr``:
-        # it caches the original leader (wired at build time), which goes
-        # stale on reassignment, so its override
-        # ``StartBalanceNegotiation`` would land at the wrong leader and
-        # silently drop if that leader is isolated. Duck-typed on class
-        # name to avoid a community→service import dependency.
+        # Repoint co-located ``SlackBudgetMonitor.home_leader_addr``: its cached
+        # original leader goes stale on reassignment. Duck-typed on class name
+        # to avoid a community→service import dependency.
         for role in getattr(self.context, "roles", []):
             if type(role).__name__ == "SlackBudgetMonitor":
                 role.home_leader_addr = message.new_leader_addr
@@ -320,14 +294,10 @@ class RepartitionHandlerRole(Role):
 # ---------------------------------------------------------------------------
 
 
-def _bfs_reachable(
-    start: Any, live_edges: Iterable[tuple[Any, Any]]
-) -> set[Any]:
-    """Return nodes reachable from ``start`` over ``live_edges`` (an
-    iterable of unordered, undirected node-pair tuples).
+def _bfs_reachable(start: Any, live_edges: Iterable[tuple[Any, Any]]) -> set[Any]:
+    """Nodes reachable from ``start`` over ``live_edges`` (undirected pairs).
 
-    No radius bound — the membership check needs the full connected
-    component.
+    No radius bound — membership needs the full connected component.
     """
     adj: dict[Any, list[Any]] = {}
     for a, b in live_edges:

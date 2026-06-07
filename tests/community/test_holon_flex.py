@@ -11,7 +11,10 @@ from scare.community.holon_flex import (
 
 def _ans(**kw):
     return AvailableFlexAnswer(
-        flex=0.0, balance=0.0, shedded=0.0, sector=Sector.ELECTRICITY,
+        flex=0.0,
+        balance=0.0,
+        shedded=0.0,
+        sector=Sector.ELECTRICITY,
         supply_by_sector=kw.get("supply", {}),
         demand_by_sector_priority=kw.get("demand", {}),
         served_by_sector_priority=kw.get("served", {}),
@@ -21,6 +24,7 @@ def _ans(**kw):
 # --------------------------------------------------------------------------- #
 # aggregate_holon_flex
 # --------------------------------------------------------------------------- #
+
 
 def test_aggregate_sums_supply_across_answers():
     answers = [
@@ -33,10 +37,13 @@ def test_aggregate_sums_supply_across_answers():
 
 def test_aggregate_sums_demand_and_served_per_cell():
     answers = [
-        _ans(demand={"electricity": {1: 2.0, 2: 1.0}},
-             served={"electricity": {1: 1.0}}),
-        _ans(demand={"electricity": {1: 0.5}, "heat": {3: 4.0}},
-             served={"electricity": {1: 0.5}}),
+        _ans(
+            demand={"electricity": {1: 2.0, 2: 1.0}}, served={"electricity": {1: 1.0}}
+        ),
+        _ans(
+            demand={"electricity": {1: 0.5}, "heat": {3: 4.0}},
+            served={"electricity": {1: 0.5}},
+        ),
     ]
     _supply, demand, served = aggregate_holon_flex(answers)
     assert demand == {"electricity": {1: 2.5, 2: 1.0}, "heat": {3: 4.0}}
@@ -62,14 +69,15 @@ def test_aggregate_coerces_tier_keys_to_int():
 # extract_demand_sectors_tiers
 # --------------------------------------------------------------------------- #
 
+
 def test_extract_basic():
     actor_demands = [
         {"electricity": {1: 2.0, 3: 1.0}},
         {"heat": {2: 0.5}, "electricity": {1: 1.0}},
     ]
     sectors, tiers, total = extract_demand_sectors_tiers(actor_demands)
-    assert sectors == ["electricity", "heat"]   # sorted
-    assert tiers == [1, 2, 3]                    # sorted, present
+    assert sectors == ["electricity", "heat"]  # sorted
+    assert tiers == [1, 2, 3]  # sorted, present
     assert total == 4.5
 
 
@@ -78,8 +86,8 @@ def test_extract_filters_non_positive_tiers():
         [{"electricity": {0: 5.0, 2: 1.0}}]
     )
     assert sectors == ["electricity"]
-    assert tiers == [2]            # tier 0 dropped (must be >= 1)
-    assert total == 6.0           # but its demand still counts in the total
+    assert tiers == [2]  # tier 0 dropped (must be >= 1)
+    assert total == 6.0  # but its demand still counts in the total
 
 
 def test_extract_empty_inputs():

@@ -29,15 +29,12 @@ from pathlib import Path
 from typing import Any
 
 from experiment.hpc.config import CampaignConfig
-from experiment.restoration import GRIDS
+from experiment.scenarios import GRIDS
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Pretty-name map
-# ---------------------------------------------------------------------------
-#
 # Labels for known grid factories; unknown keys fall back to
 # ``_grid_pretty``.
 _GRID_PRETTY: dict[str, str] = {
@@ -89,20 +86,19 @@ def _slack_cell(slacks: list[float | None]) -> str:
     return ", ".join(parts)
 
 
-# ---------------------------------------------------------------------------
 # Grid introspection
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class GridFacts:
     """Static properties of one grid factory."""
+
     simbench_code: str
     backup_lines_per_sector: int
     cp_size_multiplier: float
     replace_primary_generation: bool
     density: float
-    n_nodes: int | None        # None when --no-build
+    n_nodes: int | None  # None when --no-build
     n_cps: int | None
     n_backup_branches: int | None
 
@@ -131,16 +127,17 @@ def _closure_params(grid_name: str) -> dict[str, Any]:
 def _count_cps(net: Any) -> int:
     """Number of cross-sector coupling plants on a built network.
 
-    Mirrors ``scare.base.failure_sampling._iter_generator_candidates``:
+    Mirrors ``scare.scenario.failure_sampling._iter_generator_candidates``:
     a CP is either a coupling compound (CHP / CHPHG / PowerToHeat) or a
     coupling branch (``branch.model.is_cp()``: GasToPower / PowerToGas /
     PowerToHeatHG).  The populations are disjoint, so total is their sum.
     """
-    from scare.base.failure_sampling import CHP, CHPHG, PowerToHeat
+    from scare.scenario.failure_sampling import CHP, CHPHG, PowerToHeat
 
     cp_compound_classes = (CHP, CHPHG, PowerToHeat)
     n_compound = sum(
-        1 for c in getattr(net, "compounds", []) or []
+        1
+        for c in getattr(net, "compounds", []) or []
         if isinstance(c.model, cp_compound_classes)
     )
     n_branch = 0
@@ -160,14 +157,14 @@ def grid_facts(grid_name: str, *, build: bool = True) -> GridFacts:
         net = GRIDS[grid_name]()
         n_nodes = len(net.nodes)
         n_cps = _count_cps(net)
-        n_backup = sum(
-            1 for b in net.branches if getattr(b.model, "backup", False)
-        )
+        n_backup = sum(1 for b in net.branches if getattr(b.model, "backup", False))
     return GridFacts(
         simbench_code=params.get("simbench_code", "?"),
         backup_lines_per_sector=int(params.get("backup_lines_per_sector", 0) or 0),
         cp_size_multiplier=float(params.get("cp_size_multiplier", 1.0) or 1.0),
-        replace_primary_generation=bool(params.get("replace_primary_generation", False)),
+        replace_primary_generation=bool(
+            params.get("replace_primary_generation", False)
+        ),
         density=float(params.get("density", 0.0) or 0.0),
         n_nodes=n_nodes,
         n_cps=n_cps,
@@ -175,16 +172,14 @@ def grid_facts(grid_name: str, *, build: bool = True) -> GridFacts:
     )
 
 
-# ---------------------------------------------------------------------------
 # Campaign → unique grid-scenarios
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class GridScenario:
-    scenario_id: str            # S1, S2, ...
+    scenario_id: str  # S1, S2, ...
     grid_name: str
-    slack_budgets: list[float | None]   # every slack budget the grid runs under
+    slack_budgets: list[float | None]  # every slack budget the grid runs under
     facts: GridFacts
 
     @property
@@ -219,7 +214,8 @@ def collect_grid_scenarios(
             if grid_name not in GRIDS:
                 logger.warning(
                     "experiment %r references unknown grid %r; skipping",
-                    exp.name, grid_name,
+                    exp.name,
+                    grid_name,
                 )
                 continue
             if grid_name not in slacks_by_grid:
@@ -243,9 +239,7 @@ def collect_grid_scenarios(
     ]
 
 
-# ---------------------------------------------------------------------------
 # LaTeX rendering
-# ---------------------------------------------------------------------------
 
 
 def _tex_escape(s: str) -> str:
@@ -262,7 +256,9 @@ def _cell_int(v: int | None) -> str:
 
 
 def render_latex(
-    scenarios: list[GridScenario], *, label: str = "tab:grid-scenarios",
+    scenarios: list[GridScenario],
+    *,
+    label: str = "tab:grid-scenarios",
 ) -> str:
     """Render the unique grid configurations as a booktabs LaTeX table.
 
@@ -290,20 +286,20 @@ def render_latex(
     for gs in scenarios:
         f = gs.facts
         simbench = _SIMBENCH_PRETTY.get(f.simbench_code, f.simbench_code)
-        backup = (
-            f"{f.backup_lines_per_sector}/sector" if f.has_backup else "none"
-        )
+        backup = f"{f.backup_lines_per_sector}/sector" if f.has_backup else "none"
         lines.append(
             "    "
-            + " & ".join([
-                rf"\texttt{{{gs.scenario_id}}}",
-                _tex_escape(gs.name),
-                _tex_escape(simbench),
-                _tex_escape(_slack_cell(gs.slack_budgets)),
-                backup,
-                _cell_int(f.n_nodes),
-                _cell_int(f.n_cps),
-            ])
+            + " & ".join(
+                [
+                    rf"\texttt{{{gs.scenario_id}}}",
+                    _tex_escape(gs.name),
+                    _tex_escape(simbench),
+                    _tex_escape(_slack_cell(gs.slack_budgets)),
+                    backup,
+                    _cell_int(f.n_nodes),
+                    _cell_int(f.n_cps),
+                ]
+            )
             + r" \\"
         )
     lines.append(r"    \bottomrule")
@@ -317,15 +313,17 @@ def render_plain(scenarios: list[GridScenario]) -> str:
     rows = [("ID", "Description", "SimBench", "Slack", "Backup", "Nodes", "CPs")]
     for gs in scenarios:
         f = gs.facts
-        rows.append((
-            gs.scenario_id,
-            gs.name,
-            _SIMBENCH_PRETTY.get(f.simbench_code, f.simbench_code),
-            _slack_cell(gs.slack_budgets),
-            f"{f.backup_lines_per_sector}/sector" if f.has_backup else "none",
-            "-" if f.n_nodes is None else str(f.n_nodes),
-            "-" if f.n_cps is None else str(f.n_cps),
-        ))
+        rows.append(
+            (
+                gs.scenario_id,
+                gs.name,
+                _SIMBENCH_PRETTY.get(f.simbench_code, f.simbench_code),
+                _slack_cell(gs.slack_budgets),
+                f"{f.backup_lines_per_sector}/sector" if f.has_backup else "none",
+                "-" if f.n_nodes is None else str(f.n_nodes),
+                "-" if f.n_cps is None else str(f.n_cps),
+            )
+        )
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     out = []
     for j, r in enumerate(rows):
@@ -335,30 +333,31 @@ def render_plain(scenarios: list[GridScenario]) -> str:
     return "\n".join(out)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawTextHelpFormatter,
+        description=__doc__,
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     p.add_argument(
-        "--config", type=Path,
+        "--config",
+        type=Path,
         default=Path("experiment/configs/eval_full.json"),
         help="campaign config JSON, or a run dir containing config.json",
     )
     p.add_argument(
-        "--out", type=Path, default=None,
+        "--out",
+        type=Path,
+        default=None,
         help="write the LaTeX table here (default: stdout)",
     )
     p.add_argument(
-        "--label", default="tab:grid-scenarios",
+        "--label",
+        default="tab:grid-scenarios",
         help="LaTeX \\label for the table",
     )
     p.add_argument(
-        "--no-build", action="store_true",
+        "--no-build",
+        action="store_true",
         help="skip grid builds — node/CP counts render as '---' (fast)",
     )
     return p.parse_args()
@@ -380,7 +379,9 @@ def main() -> None:
     latex = render_latex(scenarios, label=args.label)
     logger.info(
         "Collected %d unique grid-scenario(s) from %s\n%s",
-        len(scenarios), args.config, render_plain(scenarios),
+        len(scenarios),
+        args.config,
+        render_plain(scenarios),
     )
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)

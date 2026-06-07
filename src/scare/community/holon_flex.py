@@ -1,17 +1,11 @@
 """Pure flex-aggregation algebra for the L2 holon ADMM.
 
-Extracted from :class:`scare.community.holonic.HolonicCommunityRole`:
+* :func:`aggregate_holon_flex` rolls flex answers into one
+  ``(supply_by_sector, demand_by_sector_priority, served_by_sector_priority)``.
+* :func:`extract_demand_sectors_tiers` derives ``(sectors, tiers, total_demand)``
+  from per-actor demand maps.
 
-* :func:`aggregate_holon_flex` rolls a batch of
-  :class:`~scare.base.model.AvailableFlexAnswer` into one
-  ``(supply_by_sector, demand_by_sector_priority, served_by_sector_priority)``
-  triple — the per-actor inputs for the supply-priority ADMM.
-* :func:`extract_demand_sectors_tiers` derives the active
-  ``(sectors, tiers, total_demand)`` from a batch of per-actor demand maps.
-
-Both the per-holon path (over flex answers) and the component-coordinator path
-(over ``ComponentAdmmReport`` demand maps) share this algebra. Side-effect-free,
-so unit-testable without a mango role/context.
+Shared by the per-holon and component-coordinator paths. Side-effect-free.
 """
 
 from __future__ import annotations
@@ -48,13 +42,11 @@ def aggregate_holon_flex(
 def extract_demand_sectors_tiers(
     actor_demands: list[dict[str, dict[int, float]]],
 ) -> tuple[list[str], list[int], float]:
-    """Active ``(sectors, tiers, total_demand)`` across a batch of per-actor
-    ``demand_by_sector_priority`` maps.
+    """Active ``(sectors, tiers, total_demand)`` across per-actor demand maps.
 
-    ``sectors`` are those with any demand cell (sorted); ``tiers`` are the
-    present tiers ``>= 1`` (sorted); ``total_demand`` is the sum over all cells.
-    An empty ``sectors``/``tiers`` or a near-zero ``total_demand`` signals the
-    caller to take its no-demand fallback.
+    ``sectors`` have any demand cell (sorted); ``tiers`` are present tiers >= 1
+    (sorted); ``total_demand`` sums all cells. Empty/near-zero => caller's
+    no-demand fallback.
     """
     sectors = sorted({s for d in actor_demands for s in (d or {})})
     tiers_present: set[int] = set()

@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import networkx as nx
 
-from scare.base.community import (
-    agents_by_label_from_topology,
-    communities_from_topology,
+from scare.base.topology.community import (
     connected_component_partition,
     label_propagation_partition,
     partition_label_by_node,
@@ -26,8 +24,8 @@ def test_single_component_collapses_to_one_label() -> None:
 
 def test_two_components_get_separate_labels() -> None:
     g = nx.Graph()
-    g.add_edges_from([(0, 1), (1, 2)])         # component A
-    g.add_edges_from([(10, 11), (11, 12)])     # component B
+    g.add_edges_from([(0, 1), (1, 2)])  # component A
+    g.add_edges_from([(10, 11), (11, 12)])  # component B
     labels = connected_component_partition(g)
     # Each component's label is its lex-smallest node id.
     assert labels[0] == 0

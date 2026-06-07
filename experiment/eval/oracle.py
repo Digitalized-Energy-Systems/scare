@@ -23,16 +23,12 @@ from monee.problem import (
 )
 from monee.solver.pyo import PyomoSolver
 
-# Partition count for the oracle's McCormick-DHS heat linearisation —
-# matches the value the grid factory uses when DHS is enabled there.
-_ORACLE_MCCORMICK_PARTITIONS = 16
-
 from experiment.eval.metrics import (
     constraint_violations_final,
     restoration_breakdown,
     served_breakdown,
 )
-from experiment.restoration import (
+from experiment.scenarios import (
     GRIDS,
     apply_cold_day,
     apply_line_stress,
@@ -42,6 +38,10 @@ from experiment.restoration import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Partition count for the oracle's McCormick-DHS heat linearisation —
+# matches the value the grid factory uses when DHS is enabled there.
+_ORACLE_MCCORMICK_PARTITIONS = 16
 
 
 def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
@@ -61,7 +61,8 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "oracle: could not find branch %s to disable: %s",
-                    branch_id, exc,
+                    branch_id,
+                    exc,
                 )
                 continue
             branch.active = False
@@ -73,7 +74,8 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "oracle: could not find node %s to disable: %s",
-                    node_id, exc,
+                    node_id,
+                    exc,
                 )
         custom = getattr(failure, "custom", None)
         if custom is not None:
@@ -82,7 +84,8 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "oracle: custom failure %s raised: %s",
-                    getattr(failure, "custom_id", None), exc,
+                    getattr(failure, "custom_id", None),
+                    exc,
                 )
 
 
@@ -144,7 +147,9 @@ def _collect_slack_budgets(monee_net: Any) -> dict[str, float | None]:
     ``None`` when no budget was registered (e.g. heat, left unbounded).
     """
     out: dict[str, float | None] = {
-        "electricity": None, "gas": None, "heat": None,
+        "electricity": None,
+        "gas": None,
+        "heat": None,
     }
     for child in monee_net.childs:
         m = child.model
@@ -253,7 +258,7 @@ def run_oracle(
     # only. The factory leaves DHS in its full nonlinear form; with the binary
     # ``on_off`` decision var on reconfiguration-grid backup branches, the
     # nonlinear heat balance lifts to degree 4, which Pyomo's LP/QCP writer
-    # cannot serialise. McCormick-DHS replaces the balance with a piecewise-
+    # cannot serialise. McCormick-DHS replaces the balance with a piecewise
     # linear envelope (on_off then enters only linear terms), letting the oracle
     # solve with backup lines intact, comparable to SCARE. Applied here, not in
     # the factory, so only the oracle LP is affected; the net is oracle-dedicated
@@ -272,21 +277,24 @@ def run_oracle(
     # ``apply_slack_budget`` was not invoked, keep the defaults (not unbounded).
     ext_grid_el_bounds = (
         (-budgets["electricity"], +budgets["electricity"])
-        if budgets["electricity"] is not None else (-3, 3)
+        if budgets["electricity"] is not None
+        else (-3, 3)
     )
     ext_grid_gas_bounds = (
-        (-budgets["gas"], +budgets["gas"])
-        if budgets["gas"] is not None else (-10, 10)
+        (-budgets["gas"], +budgets["gas"]) if budgets["gas"] is not None else (-10, 10)
     )
-    # Heat-side ExtHydrGrid is left unbounded by ``apply_slack_budget`` (heating-
+    # Heat-side ExtHydrGrid is left unbounded by ``apply_slack_budget`` (heating
     # loop mass flow is constrained by HE physics, not policy); keep the default.
     ext_grid_heat_bounds = (
         (-budgets["heat"], +budgets["heat"])
-        if budgets["heat"] is not None else (-10, 10)
+        if budgets["heat"] is not None
+        else (-10, 10)
     )
     logger.info(
         "oracle: ext-grid budget bounds — el=%s, gas=%s, heat=%s",
-        ext_grid_el_bounds, ext_grid_gas_bounds, ext_grid_heat_bounds,
+        ext_grid_el_bounds,
+        ext_grid_gas_bounds,
+        ext_grid_heat_bounds,
     )
 
     # GEKKO (monee's default) hits "Max Equation Length" on large grids (the LP
@@ -299,7 +307,9 @@ def run_oracle(
     # discriminates between tiers; without it the oracle minimises total unserved
     # MW with every load equal (a priority-blind bound, unfair vs the MAS).
     weight_for_load = _weight_for_load_factory(
-        monee_net, priorities, base_demand_weight=WEIGHT_DEMAND,
+        monee_net,
+        priorities,
+        base_demand_weight=WEIGHT_DEMAND,
     )
     # ``bounds_*`` mirror SCARE's ``SECTOR_CONSTRAINTS`` so the LP solves on the
     # same voltage / pressure / temperature envelope. Heat converts SCARE's
@@ -318,18 +328,29 @@ def run_oracle(
     if weight_for_load is not None:
         logger.info(
             "oracle: priority-aware mode — %d loads have per-tier weights",
-            len({c.id for c in monee_net.childs
-                 if priorities.get(f'child-{c.id}', 0) > 0}),
+            len(
+                {
+                    c.id
+                    for c in monee_net.childs
+                    if priorities.get(f"child-{c.id}", 0) > 0
+                }
+            ),
         )
-    logger.info("oracle: solving min-load-shedding LP on net (%d childs, %d branches)",
-                len(monee_net.childs), len(monee_net.branches))
+    logger.info(
+        "oracle: solving min-load-shedding LP on net (%d childs, %d branches)",
+        len(monee_net.childs),
+        len(monee_net.branches),
+    )
     # ``exclude_unconnected_nodes=True`` is mandatory: otherwise the solver
     # assembles equations for the disconnected component, the LP goes
     # structurally infeasible (e.g. mass-balance on a heat node with no inflow
     # and non-zero load), and monee returns with ``regulation`` left at the
     # default 1.0 — which the metric reads as "everything served".
     result = run_energy_flow_optimization(
-        monee_net, prob, solver=solver, solver_name="gurobi",
+        monee_net,
+        prob,
+        solver=solver,
+        solver_name="gurobi",
         exclude_unconnected_nodes=True,
     )
     lp_success = bool(getattr(result, "success", True))
@@ -431,9 +452,7 @@ def compute_baseline_served(
             apply_cold_day(fresh, **kwargs)
         elif kind == "pv_peak":
             kwargs = {
-                k: scenario[k]
-                for k in ("gen_scale", "load_scale")
-                if k in scenario
+                k: scenario[k] for k in ("gen_scale", "load_scale") if k in scenario
             }
             apply_pv_peak(fresh, **kwargs)
         elif kind == "line_stress":
@@ -446,9 +465,7 @@ def compute_baseline_served(
         elif kind == "microgrid":
             # Baseline LP must use the same islanding config as the sim-time LP,
             # else it overstates the post-failure restoration loss.
-            carriers = scenario.get(
-                "carriers", ("electricity", "water", "gas")
-            )
+            carriers = scenario.get("carriers", ("electricity", "water", "gas"))
             promote_all = bool(scenario.get("promote_all_generators", True))
             former_aids = tuple(scenario.get("grid_former_aids", ()))
             apply_microgrid_islanding(
@@ -491,9 +508,7 @@ def compose_oracle_result(
     # run_oracle, so a successful solve satisfies it by construction. Surfaced
     # via SCARE's ``claims`` shape for like-for-like comparison.
     slack_summary = out.get("slack_budget_summary", {})
-    any_violation = any(
-        bool(d.get("violated")) for d in slack_summary.values()
-    )
+    any_violation = any(bool(d.get("violated")) for d in slack_summary.values())
     slack_claim = {
         "passed": (not any_violation) and bool(out.get("lp_success", True)),
         "detail": {
@@ -523,7 +538,7 @@ def compose_oracle_result(
         "task": task_meta,
         "wallclock_s": wallclock_s,
         "completed": True,
-        "sim_time_final": 0.0,                # one-shot — no sim trajectory
+        "sim_time_final": 0.0,  # one-shot — no sim trajectory
         "outcomes": {
             "priority_weighted_demand": served["priority_weighted_demand"],
             "priority_weighted_served": served["priority_weighted_served"],
@@ -548,7 +563,7 @@ def compose_oracle_result(
             "slack_budget_compliance": slack_claim,
             "constraint_compliance": constraint_claim,
         },
-        "diary": {"invariant_holds": True},   # vacuous
+        "diary": {"invariant_holds": True},  # vacuous
         "events": {},
         "messages": {},
         "oracle_regulations": out["regulations"],

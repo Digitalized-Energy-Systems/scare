@@ -5,13 +5,12 @@ real message passing, topology, and periodic tasks.
 """
 
 import pytest
-
 from mango import RoleAgent, SimpleCommunicationSimulation, create_world
 from mango.express.topology import create_topology
 from mango.simulation.world import discrete_step_until
 
 from scare.base.model import Sector
-from scare.service.balance import EnergyBalanceNegotiator
+from scare.service.balance.balance import EnergyBalanceNegotiator
 from tests.conftest import MockBehavior, make_electricity_gen, make_electricity_load
 
 
@@ -26,9 +25,7 @@ def _build_group(
     Returns (world, agents, roles).
     """
     world = create_world(
-        communication_sim=SimpleCommunicationSimulation(
-            default_delay_s=comm_delay_s
-        )
+        communication_sim=SimpleCommunicationSimulation(default_delay_s=comm_delay_s)
     )
 
     agents = []
@@ -65,18 +62,29 @@ def _build_group(
 async def test_two_agent_gossip_converges():
     """Generator + load: gossip should restore the load partially."""
     behavior = MockBehavior()
-    world, agents, roles = _build_group(behavior, [
-        {"aid": "gen-0", "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0), "priority": 0},
-        {"aid": "load-0", "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1), "priority": 1},
-    ])
+    world, agents, roles = _build_group(
+        behavior,
+        [
+            {
+                "aid": "gen-0",
+                "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0),
+                "priority": 0,
+            },
+            {
+                "aid": "load-0",
+                "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1),
+                "priority": 1,
+            },
+        ],
+    )
 
     async with world:
-        roles[0].context.schedule_instant_task(
-            roles[0].trigger_balance_negotiation()
-        )
+        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=5.0)
 
-    regulate_calls = [c for c in behavior.action_log if c[0] == "load-0" and c[1] == "regulate"]
+    regulate_calls = [
+        c for c in behavior.action_log if c[0] == "load-0" and c[1] == "regulate"
+    ]
     assert len(regulate_calls) >= 1
 
 
@@ -84,20 +92,37 @@ async def test_two_agent_gossip_converges():
 async def test_three_agent_gossip():
     """One generator, two loads: both should get regulated."""
     behavior = MockBehavior()
-    world, agents, roles = _build_group(behavior, [
-        {"aid": "gen-0", "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0), "priority": 0},
-        {"aid": "load-0", "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1), "priority": 1},
-        {"aid": "load-1", "obs": make_electricity_load(p_mw=2.0, regulation=0.0, priority=2), "priority": 2},
-    ])
+    world, agents, roles = _build_group(
+        behavior,
+        [
+            {
+                "aid": "gen-0",
+                "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0),
+                "priority": 0,
+            },
+            {
+                "aid": "load-0",
+                "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1),
+                "priority": 1,
+            },
+            {
+                "aid": "load-1",
+                "obs": make_electricity_load(p_mw=2.0, regulation=0.0, priority=2),
+                "priority": 2,
+            },
+        ],
+    )
 
     async with world:
-        roles[0].context.schedule_instant_task(
-            roles[0].trigger_balance_negotiation()
-        )
+        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=5.0)
 
-    load_0_calls = [c for c in behavior.action_log if c[0] == "load-0" and c[1] == "regulate"]
-    load_1_calls = [c for c in behavior.action_log if c[0] == "load-1" and c[1] == "regulate"]
+    load_0_calls = [
+        c for c in behavior.action_log if c[0] == "load-0" and c[1] == "regulate"
+    ]
+    load_1_calls = [
+        c for c in behavior.action_log if c[0] == "load-1" and c[1] == "regulate"
+    ]
     assert len(load_0_calls) >= 1
     assert len(load_1_calls) >= 1
 
@@ -111,19 +136,36 @@ async def test_priority_ordering():
     receive at least one regulate call.
     """
     behavior = MockBehavior()
-    world, agents, roles = _build_group(behavior, [
-        {"aid": "gen-0", "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0), "priority": 0},
-        {"aid": "high-prio", "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1), "priority": 1},
-        {"aid": "low-prio", "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=4), "priority": 4},
-    ])
+    world, agents, roles = _build_group(
+        behavior,
+        [
+            {
+                "aid": "gen-0",
+                "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0),
+                "priority": 0,
+            },
+            {
+                "aid": "high-prio",
+                "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1),
+                "priority": 1,
+            },
+            {
+                "aid": "low-prio",
+                "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=4),
+                "priority": 4,
+            },
+        ],
+    )
 
     async with world:
-        roles[0].context.schedule_instant_task(
-            roles[0].trigger_balance_negotiation()
-        )
+        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=5.0)
 
-    high_calls = [c for c in behavior.action_log if c[0] == "high-prio" and c[1] == "regulate"]
-    low_calls = [c for c in behavior.action_log if c[0] == "low-prio" and c[1] == "regulate"]
+    high_calls = [
+        c for c in behavior.action_log if c[0] == "high-prio" and c[1] == "regulate"
+    ]
+    low_calls = [
+        c for c in behavior.action_log if c[0] == "low-prio" and c[1] == "regulate"
+    ]
     assert len(high_calls) >= 1
     assert len(low_calls) >= 1

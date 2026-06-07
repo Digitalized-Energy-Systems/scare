@@ -5,19 +5,17 @@ event, which the leader picks up and triggers rebalance negotiation.
 """
 
 import pytest
-
 from mango import RoleAgent, SimpleCommunicationSimulation, create_world
 from mango.agent.role import Role
 from mango.express.topology import create_topology
-from mango.simulation.world import discrete_step_until, step_simulation
+from mango.simulation.world import discrete_step_until
 
 from scare.base.model import (
-    BalanceProblem,
     ConstraintViolation,
     Sector,
 )
-from scare.service.balance import EnergyBalanceNegotiator
-from scare.service.constraints import GridConstraintMonitor
+from scare.service.balance.balance import EnergyBalanceNegotiator
+from scare.service.control.constraints import GridConstraintMonitor
 from tests.conftest import MockBehavior, make_electricity_gen, make_electricity_load
 
 
@@ -32,9 +30,7 @@ def _build_constraint_group(
     Returns (world, agents, monitors, negotiators).
     """
     world = create_world(
-        communication_sim=SimpleCommunicationSimulation(
-            default_delay_s=comm_delay_s
-        )
+        communication_sim=SimpleCommunicationSimulation(default_delay_s=comm_delay_s)
     )
 
     agents = []
@@ -90,7 +86,9 @@ async def test_violation_triggers_rebalance():
             },
             {
                 "aid": "load-0",
-                "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1, vm_pu=1.0),
+                "obs": make_electricity_load(
+                    p_mw=3.0, regulation=0.0, priority=1, vm_pu=1.0
+                ),
                 "priority": 1,
             },
         ],
@@ -100,9 +98,7 @@ async def test_violation_triggers_rebalance():
 
     class ViolationCapture(Role):
         def setup(self):
-            self.context.subscribe_event(
-                self, ConstraintViolation, self._on_violation
-            )
+            self.context.subscribe_event(self, ConstraintViolation, self._on_violation)
 
         def _on_violation(self, event, src):
             violations.append(event)
@@ -137,7 +133,9 @@ async def test_constraint_state_propagates_to_neighbour():
             },
             {
                 "aid": "load-0",
-                "obs": make_electricity_load(p_mw=3.0, regulation=0.0, priority=1, vm_pu=1.0),
+                "obs": make_electricity_load(
+                    p_mw=3.0, regulation=0.0, priority=1, vm_pu=1.0
+                ),
                 "priority": 1,
             },
         ],
@@ -150,7 +148,5 @@ async def test_constraint_state_propagates_to_neighbour():
     # The load's monitor should have cached gen-0's vm_pu constraint state.
     load_monitor = monitors[1]
     assert len(load_monitor._neighbour_state) >= 1
-    has_vm_pu = any(
-        key[1] == "vm_pu" for key in load_monitor._neighbour_state
-    )
+    has_vm_pu = any(key[1] == "vm_pu" for key in load_monitor._neighbour_state)
     assert has_vm_pu

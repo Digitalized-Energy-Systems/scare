@@ -18,11 +18,13 @@ from experiment.hpc.config import CampaignConfig
 
 
 def _cfg(experiments: list[dict]) -> CampaignConfig:
-    return CampaignConfig.from_dict({
-        "name": "t",
-        "out_root": "x",
-        "experiments": experiments,
-    })
+    return CampaignConfig.from_dict(
+        {
+            "name": "t",
+            "out_root": "x",
+            "experiments": experiments,
+        }
+    )
 
 
 class TestSlackLabel:
@@ -33,19 +35,29 @@ class TestSlackLabel:
         assert _slack_label(None) == "∞"
 
     def test_render_escapes_percent_exactly_once(self):
-        cfg = _cfg([{
-            "name": "e", "grids": ["simbench_lv"],
-            "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
-        }])
+        cfg = _cfg(
+            [
+                {
+                    "name": "e",
+                    "grids": ["simbench_lv"],
+                    "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
+                }
+            ]
+        )
         tex = render_latex(collect_grid_scenarios(cfg, build=False))
         assert r"45\%" in tex
         assert r"45\\%" not in tex
 
     def test_unbudgeted_renders_as_infty(self):
-        cfg = _cfg([{
-            "name": "pv", "grids": ["simbench_lv"],
-            "scenarios": [{"kind": "pv_peak"}],  # no slack_budget_pct
-        }])
+        cfg = _cfg(
+            [
+                {
+                    "name": "pv",
+                    "grids": ["simbench_lv"],
+                    "scenarios": [{"kind": "pv_peak"}],  # no slack_budget_pct
+                }
+            ]
+        )
         tex = render_latex(collect_grid_scenarios(cfg, build=False))
         assert r"$\infty$" in tex
         assert "unbudgeted" not in tex
@@ -55,16 +67,24 @@ class TestCollect:
     def test_collapses_slack_into_one_row_per_grid(self):
         # One grid under several slack budgets collapses to ONE row
         # carrying every distinct budget.
-        cfg = _cfg([
-            {"name": "a", "grids": ["simbench_lv"],
-             "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}]},
-            {"name": "b", "grids": ["simbench_lv"],
-             "scenarios": [
-                 {"kind": "clean", "slack_budget_pct": 0.45},   # dup
-                 {"kind": "clean", "slack_budget_pct": 0.30},   # new
-                 {"kind": "pv_peak"},                            # unbudgeted
-             ]},
-        ])
+        cfg = _cfg(
+            [
+                {
+                    "name": "a",
+                    "grids": ["simbench_lv"],
+                    "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
+                },
+                {
+                    "name": "b",
+                    "grids": ["simbench_lv"],
+                    "scenarios": [
+                        {"kind": "clean", "slack_budget_pct": 0.45},  # dup
+                        {"kind": "clean", "slack_budget_pct": 0.30},  # new
+                        {"kind": "pv_peak"},  # unbudgeted
+                    ],
+                },
+            ]
+        )
         scen = collect_grid_scenarios(cfg, build=False)
         assert [s.grid_name for s in scen] == ["simbench_lv"]
         assert [s.scenario_id for s in scen] == ["S1"]
@@ -72,39 +92,60 @@ class TestCollect:
         assert scen[0].slack_budgets == [0.45, 0.30, None]
 
     def test_distinct_grids_get_distinct_rows(self):
-        cfg = _cfg([{
-            "name": "e", "grids": ["simbench_lv", "simbench_lv_reconfig"],
-            "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
-        }])
+        cfg = _cfg(
+            [
+                {
+                    "name": "e",
+                    "grids": ["simbench_lv", "simbench_lv_reconfig"],
+                    "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
+                }
+            ]
+        )
         scen = collect_grid_scenarios(cfg, build=False)
         assert [s.grid_name for s in scen] == [
-            "simbench_lv", "simbench_lv_reconfig",
+            "simbench_lv",
+            "simbench_lv_reconfig",
         ]
         assert [s.scenario_id for s in scen] == ["S1", "S2"]
 
     def test_missing_slack_is_none(self):
-        cfg = _cfg([{
-            "name": "pv", "grids": ["simbench_lv"],
-            "scenarios": [{"kind": "pv_peak"}],  # no slack_budget_pct
-        }])
+        cfg = _cfg(
+            [
+                {
+                    "name": "pv",
+                    "grids": ["simbench_lv"],
+                    "scenarios": [{"kind": "pv_peak"}],  # no slack_budget_pct
+                }
+            ]
+        )
         (scen,) = collect_grid_scenarios(cfg, build=False)
         assert scen.slack_budgets == [None]
         # Name no longer carries the slack — that's its own column now.
         assert "∞" not in scen.name
 
     def test_unknown_grid_skipped(self):
-        cfg = _cfg([{
-            "name": "x", "grids": ["does_not_exist"],
-            "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
-        }])
+        cfg = _cfg(
+            [
+                {
+                    "name": "x",
+                    "grids": ["does_not_exist"],
+                    "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
+                }
+            ]
+        )
         assert collect_grid_scenarios(cfg, build=False) == []
 
     def test_facts_from_closure_without_build(self):
         # reconfig grid: backup detected purely from the factory closure.
-        cfg = _cfg([{
-            "name": "r", "grids": ["simbench_lv_reconfig"],
-            "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
-        }])
+        cfg = _cfg(
+            [
+                {
+                    "name": "r",
+                    "grids": ["simbench_lv_reconfig"],
+                    "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
+                }
+            ]
+        )
         (scen,) = collect_grid_scenarios(cfg, build=False)
         assert scen.facts.has_backup is True
         assert scen.facts.backup_lines_per_sector == 5
@@ -116,10 +157,15 @@ class TestCollect:
 
 class TestRender:
     def test_latex_is_well_formed(self):
-        cfg = _cfg([{
-            "name": "e", "grids": ["simbench_lv", "simbench_lv_reconfig"],
-            "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
-        }])
+        cfg = _cfg(
+            [
+                {
+                    "name": "e",
+                    "grids": ["simbench_lv", "simbench_lv_reconfig"],
+                    "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
+                }
+            ]
+        )
         tex = render_latex(collect_grid_scenarios(cfg, build=False))
         assert tex.count(r"\begin{table}") == 1
         assert tex.count(r"\end{table}") == 1

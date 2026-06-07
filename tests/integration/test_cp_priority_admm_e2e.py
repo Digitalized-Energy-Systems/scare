@@ -21,19 +21,18 @@ does not affect the agent-layer decision logic under test.
 
 from __future__ import annotations
 
-import pytest
-
-from mango_energy_environments import fetch_example_net
 import mango_energy_environments.environments.restoration.multi_energy_monee as _restoration_mod
+import pytest
+from mango_energy_environments import fetch_example_net
 
-from scare.base import diagnostics
 from scare.base.config import RestorationConfiguration
+from scare.base.runtime import diagnostics
 from scare.base.util import create_failures, obs_capacity, obs_sector
 from scare.scenario.restoration import (
     create_restoration_scenario_world,
     start_restoration_simulation,
 )
-from scare.service.cp_priority_admm_role import CPPriorityAdmmRole
+from scare.service.coupling.cp_priority_admm_role import CPPriorityAdmmRole
 
 
 class _FakeEnergyFlowResult:
@@ -150,7 +149,9 @@ async def _run_once(
 
     failures = create_failures(net, "branch", num_failures=2, delay_s_max=1.0)
     await start_restoration_simulation(
-        world, failures, simulation_duration_s=simulation_duration_s,
+        world,
+        failures,
+        simulation_duration_s=simulation_duration_s,
     )
 
     cp_aids = _cp_aids(world) if enable_cp_priority_admm else set()
@@ -162,7 +163,7 @@ async def _run_once(
 async def test_role_installed_on_every_cp_agent_when_flag_on():
     """When the flag is on, every CP agent carries the new role and the
     legacy ``EnergyConverterRole`` is not installed (replace, not augment)."""
-    from scare.service.cp import EnergyConverterRole
+    from scare.service.coupling.cp import EnergyConverterRole
 
     world, _, cp_aids = await _run_once(
         enable_cp_priority_admm=True,
@@ -209,12 +210,10 @@ async def test_cp_priority_admm_activates_cps_under_electricity_scarcity():
     writes = _regulate_writes_per_cp(cp_aids)
 
     activated_via_role = {
-        aid: f for aid, f in commits.items()
-        if f is not None and f > 1e-6
+        aid: f for aid, f in commits.items() if f is not None and f > 1e-6
     }
     activated_via_ledger = {
-        aid: ws for aid, ws in writes.items()
-        if any(f > 1e-6 for (_t, f, _r) in ws)
+        aid: ws for aid, ws in writes.items() if any(f > 1e-6 for (_t, f, _r) in ws)
     }
 
     assert activated_via_role, (
@@ -234,9 +233,7 @@ async def test_cp_priority_admm_activates_cps_under_electricity_scarcity():
 
     # Commits must carry the reason tag so eval/report tooling can
     # attribute the writes to L3.
-    reasons_seen = {
-        r for ws in writes.values() for (_t, _f, r) in ws
-    }
+    reasons_seen = {r for ws in writes.values() for (_t, _f, r) in ws}
     assert "cp_priority_admm" in reasons_seen, (
         f"expected at least one regulate with reason='cp_priority_admm'; "
         f"saw reasons: {reasons_seen}"
@@ -259,6 +256,7 @@ async def test_baseline_no_cp_path_means_no_cp_regulate_writes():
     from mango_energy_environments.environments.restoration.multi_energy_monee import (
         create_branch_aid,
     )
+
     net = fetch_example_net()
     for branch in net.branches:
         if branch.model.is_cp():

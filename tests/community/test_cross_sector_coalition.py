@@ -28,12 +28,10 @@ import pytest
 from scare.base.channel import (
     CPCommitment,
     HolonSummary,
-    MonotonicVersion,
 )
 from scare.base.model import Sector, StartBalanceNegotiation
 from scare.community.coalition_store import CoalitionConstraintStore
 from scare.community.summary import HolonSummaryRole, _xs_registry
-
 
 # ---------------------------------------------------------------------------
 # Fake mango context: records outbound messages, carries an aid + sim
@@ -136,14 +134,16 @@ def _inject_inversion(behavior: Any) -> None:
     registry = _xs_registry(behavior)
     registry[Sector.ELECTRICITY] = {
         "leader-el-1": _make_summary(
-            "leader-el-1", Sector.ELECTRICITY,
+            "leader-el-1",
+            Sector.ELECTRICITY,
             demand_by_tier={1: 2.0},
             served_by_tier={1: 0.6},  # 30 % served
         ),
     }
     registry[Sector.HEAT] = {
         "leader-heat-1": _make_summary(
-            "leader-heat-1", Sector.HEAT,
+            "leader-heat-1",
+            Sector.HEAT,
             demand_by_tier={5: 1.0},
             served_by_tier={5: 1.0},  # 100 % served
         ),
@@ -232,9 +232,7 @@ class TestCrossSectorCoalitionFlagEnabled:
         asyncio.run(pending)
 
         # ---- CPCommitment was dispatched -------------------------------
-        cp_msgs = [
-            m for m in role.context.sent if isinstance(m.payload, CPCommitment)
-        ]
+        cp_msgs = [m for m in role.context.sent if isinstance(m.payload, CPCommitment)]
         assert len(cp_msgs) == 1
         cp_commit = cp_msgs[0].payload
         assert cp_msgs[0].receiver_addr is cp_addr
@@ -252,7 +250,8 @@ class TestCrossSectorCoalitionFlagEnabled:
 
         # ---- Per-sector StartBalanceNegotiation was dispatched ---------
         sb_msgs = [
-            m for m in role.context.sent
+            m
+            for m in role.context.sent
             if isinstance(m.payload, StartBalanceNegotiation)
         ]
         # One dispatch per sector (heat leader + own electricity leader).
@@ -358,9 +357,11 @@ class TestCrossSectorCoalitionFlagSideBySide:
         if hasattr(role_on.context, "_pending"):
             asyncio.run(role_on.context._pending)
 
-        cp_msgs_off = [m for m in role_off.context.sent
-                       if isinstance(m.payload, CPCommitment)]
-        cp_msgs_on = [m for m in role_on.context.sent
-                      if isinstance(m.payload, CPCommitment)]
+        cp_msgs_off = [
+            m for m in role_off.context.sent if isinstance(m.payload, CPCommitment)
+        ]
+        cp_msgs_on = [
+            m for m in role_on.context.sent if isinstance(m.payload, CPCommitment)
+        ]
         assert len(cp_msgs_off) == 0
         assert len(cp_msgs_on) == 1

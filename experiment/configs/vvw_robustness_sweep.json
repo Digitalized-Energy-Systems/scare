@@ -1,0 +1,39 @@
+{
+  "$comment": [
+    "Robustness proof for the coordinated hand-off after the closed-loop changes",
+    "(confidence-gated measured dV/dQ + safety undercredit, progress-based",
+    "escalation, ramped voltage-gated hand-back).  Sweeps qv_dvdq_prior across a",
+    "WIDE range incl. values that destabilised seeds before (0.05) and beyond",
+    "(0.08, 0.10).  SUCCESS = stability no longer depends on the prior: every",
+    "arm clean on all 8 seeds, regulation >= default scare.  Paired per seed."
+  ],
+  "name": "vvw_robustness_sweep",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 8, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "robustness_sweep",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 8,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_vvw_coordination": true, "enable_qv_auction_coordination": true, "qv_dvdq_prior": 0.01 },
+        { "enable_vvw_coordination": true, "enable_qv_auction_coordination": true, "qv_dvdq_prior": 0.03 },
+        { "enable_vvw_coordination": true, "enable_qv_auction_coordination": true, "qv_dvdq_prior": 0.05 },
+        { "enable_vvw_coordination": true, "enable_qv_auction_coordination": true, "qv_dvdq_prior": 0.08 },
+        { "enable_vvw_coordination": true, "enable_qv_auction_coordination": true, "qv_dvdq_prior": 0.10 }
+      ],
+      "scenarios": [
+        { "kind": "pv_peak", "gen_scale": 1.5, "load_scale": 0.4, "slack_vm_pu": 1.04, "priority_assignment": "skewed" }
+      ]
+    }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "02:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 64 }
+}

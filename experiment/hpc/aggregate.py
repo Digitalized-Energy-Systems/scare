@@ -16,13 +16,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from experiment.eval.aliases import alias_grid, alias_variant
+from experiment.eval.compliance import COMPLIANCE_COLS, compliant_mask, mean_ci95
 from experiment.hpc.config import CAMPAIGN_LAYOUT
 from experiment.hpc.plan import read_manifest
 
@@ -50,27 +50,29 @@ def aggregate(campaign_dir: Path) -> pd.DataFrame:
         # Flatten the structured eval payload into top-level columns so
         # the Markdown / pandas comparisons can group on them.
         flat = _flatten(result)
-        rows.append({
-            "task_id": task.task_id,
-            "grid": task.grid,
-            "seed": task.seed,
-            "n_failures": task.n_failures,
-            "variant": getattr(task, "variant", "scare"),
-            "experiment": getattr(task, "experiment", ""),
-            "ablation": _key_of(getattr(task, "ablation", {}) or {}),
-            "sweep": _key_of(getattr(task, "sweep", {}) or {}),
-            "scenario": _key_of(getattr(task, "scenario", {}) or {}),
-            "status": status.get("status", "missing"),
-            "duration_s": status.get("duration_s"),
-            "solver_failures": status.get("solver_failures"),
-            # Split solver-failure counts (LP infeasibility vs non-OK
-            # warnings) so per-variant plots can show the split.
-            "solver_infeasibilities": status.get("solver_infeasibilities"),
-            "solver_warnings": status.get("solver_warnings"),
-            "exception_type": (exception or {}).get("type"),
-            "exception_message": (exception or {}).get("message"),
-            **flat,
-        })
+        rows.append(
+            {
+                "task_id": task.task_id,
+                "grid": task.grid,
+                "seed": task.seed,
+                "n_failures": task.n_failures,
+                "variant": getattr(task, "variant", "scare"),
+                "experiment": getattr(task, "experiment", ""),
+                "ablation": _key_of(getattr(task, "ablation", {}) or {}),
+                "sweep": _key_of(getattr(task, "sweep", {}) or {}),
+                "scenario": _key_of(getattr(task, "scenario", {}) or {}),
+                "status": status.get("status", "missing"),
+                "duration_s": status.get("duration_s"),
+                "solver_failures": status.get("solver_failures"),
+                # Split solver-failure counts (LP infeasibility vs non-OK
+                # warnings) so per-variant plots can show the split.
+                "solver_infeasibilities": status.get("solver_infeasibilities"),
+                "solver_warnings": status.get("solver_warnings"),
+                "exception_type": (exception or {}).get("type"),
+                "exception_message": (exception or {}).get("message"),
+                **flat,
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -104,9 +106,6 @@ def _key_of(d) -> str:
     return repr(d)
 
 
-# ---- Markdown report --------------------------------------------------------
-
-
 _INTERESTING_METRIC_SUFFIXES = ("__last", "__mean", "__min")
 
 
@@ -138,11 +137,15 @@ def _format_md(df: pd.DataFrame) -> str:
         if "duration_s" in df.columns and df["duration_s"].notna().any():
             dur = df["duration_s"].dropna()
             if not dur.empty:
-                parts.append(f"- Mean duration: {dur.mean():.1f}s "
-                             f"(p95 {dur.quantile(0.95):.1f}s)")
+                parts.append(
+                    f"- Mean duration: {dur.mean():.1f}s "
+                    f"(p95 {dur.quantile(0.95):.1f}s)"
+                )
         if "solver_failures" in df.columns:
-            parts.append(f"- Total solver-failure warnings: "
-                         f"{int(df['solver_failures'].fillna(0).sum())}")
+            parts.append(
+                f"- Total solver-failure warnings: "
+                f"{int(df['solver_failures'].fillna(0).sum())}"
+            )
 
     parts.append("")
     parts.append("## Per grid")
@@ -162,18 +165,41 @@ def _format_md(df: pd.DataFrame) -> str:
         )
         rows = []
         for grid, r in agg.iterrows():
-            rows.append([
-                alias_grid(grid), int(r["total"]), int(r["ok"]),
-                int(r["claims_failed"]), int(r["error"]),
-                int(r["timeout"]), int(r["killed"]), int(r["missing"]),
-                f"{r['mean_duration_s']:.1f}" if pd.notna(r["mean_duration_s"]) else "—",
-                f"{r['mean_solver_failures']:.2f}" if pd.notna(r["mean_solver_failures"]) else "—",
-            ])
-        parts.append(_markdown_table(
-            ["grid", "total", "ok", "claims_failed", "error", "timeout",
-             "killed", "missing", "mean dur (s)", "mean solver fails"],
-            rows,
-        ))
+            rows.append(
+                [
+                    alias_grid(grid),
+                    int(r["total"]),
+                    int(r["ok"]),
+                    int(r["claims_failed"]),
+                    int(r["error"]),
+                    int(r["timeout"]),
+                    int(r["killed"]),
+                    int(r["missing"]),
+                    f"{r['mean_duration_s']:.1f}"
+                    if pd.notna(r["mean_duration_s"])
+                    else "—",
+                    f"{r['mean_solver_failures']:.2f}"
+                    if pd.notna(r["mean_solver_failures"])
+                    else "—",
+                ]
+            )
+        parts.append(
+            _markdown_table(
+                [
+                    "grid",
+                    "total",
+                    "ok",
+                    "claims_failed",
+                    "error",
+                    "timeout",
+                    "killed",
+                    "missing",
+                    "mean dur (s)",
+                    "mean solver fails",
+                ],
+                rows,
+            )
+        )
 
     metric_cols = _interesting_metric_columns(df) if n else []
     if metric_cols:
@@ -189,7 +215,15 @@ def _format_md(df: pd.DataFrame) -> str:
             agg = ok_df.groupby("grid")[metric_cols].mean()
             rows = []
             for grid, r in agg.iterrows():
-                rows.append([alias_grid(grid), *[f"{r[c]:.4g}" if pd.notna(r[c]) else "—" for c in metric_cols]])
+                rows.append(
+                    [
+                        alias_grid(grid),
+                        *[
+                            f"{r[c]:.4g}" if pd.notna(r[c]) else "—"
+                            for c in metric_cols
+                        ],
+                    ]
+                )
             parts.append(_markdown_table(["grid", *metric_cols], rows))
 
     if "exception_type" in df.columns and df["exception_type"].notna().any():
@@ -209,18 +243,9 @@ def _format_md(df: pd.DataFrame) -> str:
     return "\n".join(parts) + "\n"
 
 
-# ---- Eval-specific sections ------------------------------------------------
-
-
 _PRIMARY_OUTCOME = "outcomes__priority_weighted_fraction"
 _TIME_TO_STABILISE = "outcomes__time_to_stabilise_s"
 _REGULATES_TOTAL = "outcomes__regulates_total"
-_SLACK_COMPLIANCE_COL = "claims__slack_budget_compliance__passed"
-_CONSTRAINT_COMPLIANCE_COL = "claims__constraint_compliance__passed"
-# A run is compliant only if both hold: the operator slack budget AND
-# end-of-sim grid feasibility (no voltage / pressure / temperature / line
-# violation). See ``_compliant_split``.
-_COMPLIANCE_COLS = (_SLACK_COMPLIANCE_COL, _CONSTRAINT_COMPLIANCE_COL)
 
 
 def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
@@ -245,19 +270,20 @@ def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
     the constraint-respecting oracle, so the PWSF mean is restricted to
     runs honouring both, with the joint rate reported as a paired metric.
     """
-    full = g[_PRIMARY_OUTCOME].dropna() if _PRIMARY_OUTCOME in g.columns else pd.Series(dtype=float)
+    full = (
+        g[_PRIMARY_OUTCOME].dropna()
+        if _PRIMARY_OUTCOME in g.columns
+        else pd.Series(dtype=float)
+    )
     n_total = int(len(full))
-    present = [c for c in _COMPLIANCE_COLS if c in g.columns]
+    present = [c for c in COMPLIANCE_COLS if c in g.columns]
     if not present:
         # No compliance columns: can't verify, so report every task and
         # suppress the rate column.
         return full, float("nan"), n_total, n_total
-    # Conjunction across the available compliance flags, aligned to the
-    # PWSF series. NaN => False (treat unknown compliance as failure to
-    # under-report rather than over-report PWSF).
-    passed_bool = pd.Series(True, index=full.index)
-    for col in present:
-        passed_bool &= g.loc[full.index, col].fillna(False).astype(bool)
+    # Conjunction across the available compliance flags, restricted to the
+    # PWSF-defined rows (NaN => False, handled by ``compliant_mask``).
+    passed_bool = compliant_mask(g).loc[full.index]
     n_compliant = int(passed_bool.sum())
     pwsf_compliant = full[passed_bool]
     rate = float(n_compliant / n_total) if n_total else float("nan")
@@ -278,7 +304,9 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
     # tasks (see ``_compliant_split``); ``compliance`` reports the
     # fraction honouring the operator's slack-budget policy.
     parts.append("")
-    parts.append("## Variant comparison (priority-weighted served on compliant runs, mean ± 95% CI)")
+    parts.append(
+        "## Variant comparison (priority-weighted served on compliant runs, mean ± 95% CI)"
+    )
     rows = []
     for (grid, variant), g in ok.groupby(["grid", "variant"]):
         pwsf_c, rate, n_c, n_t = _compliant_split(g)
@@ -287,20 +315,34 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
         if pwsf_c.empty:
             mean_str, ci_str = "—", "—"
         else:
-            mean, ci = _mean_ci95(pwsf_c)
+            mean, ci = mean_ci95(pwsf_c)
             mean_str, ci_str = f"{mean:.4f}", f"±{ci:.4f}"
-        rate_str = "—" if pd.isna(rate) else f"{rate*100:.0f}%"
-        rows.append([
-            alias_grid(grid), alias_variant(variant),
-            f"{n_c}/{n_t}", rate_str, mean_str, ci_str,
-        ])
+        rate_str = "—" if pd.isna(rate) else f"{rate * 100:.0f}%"
+        rows.append(
+            [
+                alias_grid(grid),
+                alias_variant(variant),
+                f"{n_c}/{n_t}",
+                rate_str,
+                mean_str,
+                ci_str,
+            ]
+        )
     if rows:
         rows.sort(key=lambda r: (r[0], r[1]))
-        parts.append(_markdown_table(
-            ["grid", "variant", "n_compliant/n_total", "compliance",
-             "mean PWSF", "95% CI"],
-            rows,
-        ))
+        parts.append(
+            _markdown_table(
+                [
+                    "grid",
+                    "variant",
+                    "n_compliant/n_total",
+                    "compliance",
+                    "mean PWSF",
+                    "95% CI",
+                ],
+                rows,
+            )
+        )
 
     # Ablation impact: only experiments that define an ablation matrix
     # (else the "default" baseline pools across non-ablation experiments
@@ -313,36 +355,59 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
         for exp_name, g in abl_all.groupby("experiment"):
             if g["ablation"].nunique() > 1:
                 abl_experiments.append(exp_name)
-    abl = abl_all[abl_all["experiment"].isin(abl_experiments)] if abl_experiments else abl_all.iloc[0:0]
+    abl = (
+        abl_all[abl_all["experiment"].isin(abl_experiments)]
+        if abl_experiments
+        else abl_all.iloc[0:0]
+    )
     if "ablation" in abl.columns and abl["ablation"].nunique() > 1:
         parts.append("")
         parts.append("## Ablation impact (scare variant only, compliant runs)")
         baseline_pwsf_c, _, _, _ = _compliant_split(abl[abl["ablation"] == "default"])
-        b_mean = float(baseline_pwsf_c.mean()) if not baseline_pwsf_c.empty else float("nan")
+        b_mean = (
+            float(baseline_pwsf_c.mean()) if not baseline_pwsf_c.empty else float("nan")
+        )
         rows = []
         for ablation_key, g in abl.groupby("ablation"):
             pwsf_c, rate, n_c, n_t = _compliant_split(g)
             if n_t == 0:
                 continue
             mean = float(pwsf_c.mean()) if not pwsf_c.empty else float("nan")
-            diff = mean - b_mean if not (pd.isna(b_mean) or pd.isna(mean)) else float("nan")
-            rate_str = "—" if pd.isna(rate) else f"{rate*100:.0f}%"
-            rows.append([
-                ablation_key, f"{n_c}/{n_t}", rate_str,
-                "—" if pd.isna(mean) else f"{mean:.4f}",
-                "—" if pd.isna(diff) else f"{diff:+.4f}",
-            ])
+            diff = (
+                mean - b_mean
+                if not (pd.isna(b_mean) or pd.isna(mean))
+                else float("nan")
+            )
+            rate_str = "—" if pd.isna(rate) else f"{rate * 100:.0f}%"
+            rows.append(
+                [
+                    ablation_key,
+                    f"{n_c}/{n_t}",
+                    rate_str,
+                    "—" if pd.isna(mean) else f"{mean:.4f}",
+                    "—" if pd.isna(diff) else f"{diff:+.4f}",
+                ]
+            )
         rows.sort(key=lambda r: (r[0] != "default", r[0]))
-        parts.append(_markdown_table(
-            ["ablation", "n_compliant/n_total", "compliance",
-             "mean PWSF", "Δ vs default"],
-            rows,
-        ))
+        parts.append(
+            _markdown_table(
+                [
+                    "ablation",
+                    "n_compliant/n_total",
+                    "compliance",
+                    "mean PWSF",
+                    "Δ vs default",
+                ],
+                rows,
+            )
+        )
 
     # Sweep curves.
     if "sweep" in ok.columns and ok["sweep"].nunique() > 1:
         parts.append("")
-        parts.append("## Sensitivity sweeps (priority-weighted served on compliant runs)")
+        parts.append(
+            "## Sensitivity sweeps (priority-weighted served on compliant runs)"
+        )
         rows = []
         for sweep_key, g in ok.groupby("sweep"):
             pwsf_c, rate, n_c, n_t = _compliant_split(g)
@@ -351,18 +416,31 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
             t = g[_TIME_TO_STABILISE].dropna()
             r = g[_REGULATES_TOTAL].dropna()
             mean_str = "—" if pwsf_c.empty else f"{pwsf_c.mean():.4f}"
-            rate_str = "—" if pd.isna(rate) else f"{rate*100:.0f}%"
-            rows.append([
-                sweep_key, f"{n_c}/{n_t}", rate_str, mean_str,
-                f"{t.mean():.2f}" if not t.empty else "—",
-                f"{int(r.mean())}" if not r.empty else "—",
-            ])
+            rate_str = "—" if pd.isna(rate) else f"{rate * 100:.0f}%"
+            rows.append(
+                [
+                    sweep_key,
+                    f"{n_c}/{n_t}",
+                    rate_str,
+                    mean_str,
+                    f"{t.mean():.2f}" if not t.empty else "—",
+                    f"{int(r.mean())}" if not r.empty else "—",
+                ]
+            )
         rows.sort(key=lambda r: (r[0] != "default", r[0]))
-        parts.append(_markdown_table(
-            ["sweep", "n_compliant/n_total", "compliance",
-             "mean PWSF", "mean t_stab (s)", "mean regulates"],
-            rows,
-        ))
+        parts.append(
+            _markdown_table(
+                [
+                    "sweep",
+                    "n_compliant/n_total",
+                    "compliance",
+                    "mean PWSF",
+                    "mean t_stab (s)",
+                    "mean regulates",
+                ],
+                rows,
+            )
+        )
 
     # Scenarios — robustness + cascading.
     if "scenario" in ok.columns and ok["scenario"].nunique() > 1:
@@ -374,15 +452,22 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
             if n_t == 0:
                 continue
             mean_str = "—" if pwsf_c.empty else f"{pwsf_c.mean():.4f}"
-            rate_str = "—" if pd.isna(rate) else f"{rate*100:.0f}%"
-            rows.append([
-                scenario_key, f"{n_c}/{n_t}", rate_str, mean_str,
-            ])
+            rate_str = "—" if pd.isna(rate) else f"{rate * 100:.0f}%"
+            rows.append(
+                [
+                    scenario_key,
+                    f"{n_c}/{n_t}",
+                    rate_str,
+                    mean_str,
+                ]
+            )
         rows.sort(key=lambda r: r[0])
-        parts.append(_markdown_table(
-            ["scenario", "n_compliant/n_total", "compliance", "mean PWSF"],
-            rows,
-        ))
+        parts.append(
+            _markdown_table(
+                ["scenario", "n_compliant/n_total", "compliance", "mean PWSF"],
+                rows,
+            )
+        )
 
     # Restoration vs no-failure baseline — surface absolute load lost
     # alongside the priority-weighted view, so "PWSF 99%" vs "10 MW of
@@ -390,7 +475,7 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
     base_col = "outcomes__restoration__total_served_baseline_mw"
     post_col = "outcomes__restoration__total_served_post_mw"
     drop_col = "outcomes__restoration__absolute_load_dropped_mw"
-    raw_col  = "outcomes__restoration__raw_restoration_ratio"
+    raw_col = "outcomes__restoration__raw_restoration_ratio"
     pwsf_col = "outcomes__restoration__pwsf_restoration_ratio"
     if base_col in ok.columns and post_col in ok.columns:
         rest = ok[ok["variant"] == "scare"] if "scare" in ok["variant"].unique() else ok
@@ -402,23 +487,48 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
             for grid, g in rest.groupby("grid"):
                 base_mw = float(g[base_col].mean())
                 post_mw = float(g[post_col].mean())
-                drop_mw = float(g[drop_col].mean()) if drop_col in g.columns else max(0.0, base_mw - post_mw)
-                raw_r   = float(g[raw_col].mean())  if raw_col  in g.columns else (post_mw / base_mw if base_mw else 1.0)
-                pwsf_r  = float(g[pwsf_col].mean()) if pwsf_col in g.columns else float("nan")
-                pct     = drop_mw / base_mw if base_mw else 0.0
-                rows.append([
-                    alias_grid(grid), len(g),
-                    f"{base_mw:.3f}", f"{post_mw:.3f}",
-                    f"{drop_mw:.3f}", f"{pct*100:.1f}%",
-                    f"{raw_r:.3f}",
-                    f"{pwsf_r:.3f}" if not (pwsf_r != pwsf_r) else "—",
-                ])
+                drop_mw = (
+                    float(g[drop_col].mean())
+                    if drop_col in g.columns
+                    else max(0.0, base_mw - post_mw)
+                )
+                raw_r = (
+                    float(g[raw_col].mean())
+                    if raw_col in g.columns
+                    else (post_mw / base_mw if base_mw else 1.0)
+                )
+                pwsf_r = (
+                    float(g[pwsf_col].mean()) if pwsf_col in g.columns else float("nan")
+                )
+                pct = drop_mw / base_mw if base_mw else 0.0
+                rows.append(
+                    [
+                        alias_grid(grid),
+                        len(g),
+                        f"{base_mw:.3f}",
+                        f"{post_mw:.3f}",
+                        f"{drop_mw:.3f}",
+                        f"{pct * 100:.1f}%",
+                        f"{raw_r:.3f}",
+                        f"{pwsf_r:.3f}" if not (pwsf_r != pwsf_r) else "—",
+                    ]
+                )
             rows.sort(key=lambda r: -float(r[4]))  # biggest drop first
-            parts.append(_markdown_table(
-                ["grid", "n", "base MW", "post MW", "dropped MW",
-                 "% of base", "raw ratio", "PWSF ratio"],
-                rows,
-            ))
+            parts.append(
+                _markdown_table(
+                    [
+                        "grid",
+                        "n",
+                        "base MW",
+                        "post MW",
+                        "dropped MW",
+                        "% of base",
+                        "raw ratio",
+                        "PWSF ratio",
+                    ],
+                    rows,
+                )
+            )
 
     # Diary invariant rate per variant — flag where the protocol drifts.
     inv_col = "diary__invariant_holds"
@@ -432,30 +542,14 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
                 continue
             ok_pct = 100.0 * float(s.astype(bool).sum()) / len(s)
             rows.append([alias_variant(variant), len(s), f"{ok_pct:.1f}%"])
-        parts.append(_markdown_table(
-            ["variant", "n", "invariant holds"], rows,
-        ))
+        parts.append(
+            _markdown_table(
+                ["variant", "n", "invariant holds"],
+                rows,
+            )
+        )
 
     return parts
-
-
-def _mean_ci95(s: pd.Series) -> tuple[float, float]:
-    """Sample mean and 95% CI half-width via t-distribution (robust to
-    small n). ``ci`` is the half-width — display as ``mean ± ci``.
-    """
-    n = len(s)
-    if n <= 1:
-        return float(s.mean()) if n else 0.0, 0.0
-    mean = float(s.mean())
-    sd = float(s.std(ddof=1))
-    se = sd / math.sqrt(n)
-    # t critical for 95%, 2-sided, df = n-1; coarse table avoids a scipy
-    # dependency.
-    t = 1.96 if n > 30 else 2.262 if n > 10 else 2.776
-    return mean, t * se
-
-
-# ---- Entry point ------------------------------------------------------------
 
 
 def write_summary(campaign_dir: Path) -> tuple[Path, Path]:
@@ -472,20 +566,26 @@ def write_summary(campaign_dir: Path) -> tuple[Path, Path]:
         if s in by_status:
             logger.info("  %-14s %d", s, by_status[s])
     if "solver_failures" in df.columns and df["solver_failures"].notna().any():
-        logger.info("  total solver-failure warnings: %d",
-                    int(df["solver_failures"].fillna(0).sum()))
+        logger.info(
+            "  total solver-failure warnings: %d",
+            int(df["solver_failures"].fillna(0).sum()),
+        )
     logger.info("Markdown report → %s", md_path)
     return csv_path, md_path
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+    )
     p.add_argument("--campaign-dir", required=True, type=Path)
     return p.parse_args()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s"
+    )
     args = _parse_args()
     write_summary(args.campaign_dir.resolve())
 

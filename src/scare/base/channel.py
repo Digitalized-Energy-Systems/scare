@@ -1,15 +1,9 @@
-"""Typed pub/sub primitives with monotonic versioning for inter-layer
-communication.
+"""Typed pub/sub primitives with monotonic versioning for inter-layer comms.
 
-Layered on top of mango: cross-agent publication uses ``send_message``;
-the simulation clock drives periodic publishers via
-``schedule_periodic_task``.
-
-Each layer evaluates a ``should_run(inputs)`` predicate over inputs it
-watches directly rather than reacting to upstream events. Every
-published decision carries a per-publisher monotonic ``version`` and a
-``caused_by`` map of ``{publisher: version_consumed}`` so subscribers
-damp their own echoes.
+Layered on mango (``send_message`` + ``schedule_periodic_task``). Each layer
+evaluates a ``should_run(inputs)`` predicate over watched inputs. Every decision
+carries a per-publisher monotonic ``version`` and a ``caused_by`` map
+(``{publisher: version_consumed}``) so subscribers damp their own echoes.
 """
 
 from __future__ import annotations
@@ -37,10 +31,8 @@ logger = logging.getLogger(__name__)
 class Decision:
     """Versioned, attributable payload published on a typed channel.
 
-    Subclasses add channel-specific payload fields; the four fields here
-    are channel-protocol fields and must not be reused. ``caused_by``
-    lets a subscriber detect a decision triggered by its own earlier
-    publication and skip the re-fire (echo damping).
+    Subclasses add payload fields; these four are protocol fields and must not be
+    reused. ``caused_by`` lets a subscriber detect (and skip) its own echo.
     """
 
     publisher: str
@@ -53,11 +45,9 @@ class Decision:
 class SectorImbalanceUpdate(Decision):
     """A group leader's local imbalance estimate for one sector.
 
-    Published by ``SectorImbalanceBeacon``. ``local_imbalance_mw`` is
-    signed: positive = surplus available to export, negative = local
-    deficit needing import. It is the leader's own contribution, not the
-    group sum — a cheap "should you wake up?" hint; L3 collects the full
-    group sum in its ``AskForAvailableFlex`` round once triggered.
+    Published by ``SectorImbalanceBeacon``. ``local_imbalance_mw`` is signed
+    (positive = exportable surplus, negative = import deficit) and is the leader's
+    own contribution, not the group sum — a cheap "should you wake up?" hint.
     """
 
     sector: Sector = Sector.ELECTRICITY
@@ -68,14 +58,9 @@ class SectorImbalanceUpdate(Decision):
 class HolonAllocation(Decision):
     """A holon's ADMM-result allocation for one of its member groups.
 
-    Published by ``HolonicCommunityRole`` (L2) after a successful
-    inter-group ADMM round; consumed by ``EnergyConverterRole`` (L3) so
-    CPs react to the cross-sector setpoint shift without waiting for
-    downstream L1 gossip (direct L2 -> L3 link).
-
-    ``targets_mw`` is signed in load convention (positive = consume from
-    sector, negative = produce into sector). The CP-side predicate
-    aggregates this stream and ``SectorImbalanceUpdate`` the same way.
+    Published by ``HolonicCommunityRole`` (L2) after an inter-group ADMM round;
+    consumed by ``EnergyConverterRole`` (L3) as a direct L2->L3 link so CPs react
+    without waiting for L1 gossip. ``targets_mw`` is signed (load convention).
     """
 
     sector: Sector = Sector.ELECTRICITY
@@ -88,14 +73,10 @@ class HolonAllocation(Decision):
 class CPSetpoint(Decision):
     """A CP plant's chosen cross-sector setpoint.
 
-    Published by ``EnergyConverterRole`` (L3) after an ADMM round commits
-    a new operating point; consumed by ``HolonicCommunityRole`` (L2) so
-    affected holons re-evaluate their allocation directly (L3 -> L2).
-
-    ``sector_flows_mw`` is the per-sector signed flow committed (load
-    convention). ``regulation_factor`` is surfaced separately so
-    subscribers distinguish a small correction from a setpoint that
-    materially redistributes cross-sector flow.
+    Published by ``EnergyConverterRole`` (L3) after an ADMM round; consumed by
+    ``HolonicCommunityRole`` (L2) as a direct L3->L2 link. ``sector_flows_mw`` is
+    signed per-sector flow (load convention); ``regulation_factor`` is surfaced
+    separately so subscribers gauge how materially the setpoint shifts flow.
     """
 
     cp_id: str = ""
@@ -105,38 +86,30 @@ class CPSetpoint(Decision):
 
 @dataclass
 class HolonSummary(Decision):
-    """Post-rebalance per-tier served/demand summary for one
-    holon-leader's local community.
+    """Post-rebalance per-tier served/demand summary for one leader's community.
 
-    Published periodically on the sector-wide ``holon_summary_<sector>``
-    full mesh so every leader sees every other holon's per-tier service.
-    Consumed by :class:`HolonSummaryRole` (L2.5) to detect cross-holon
-    priority inversions. Communication-only — no optimization decisions
-    ride on this channel; an inversion triggers a separate coalition
-    message.
-
-    ``per_tier_served_mw`` / ``per_tier_demand_mw`` are the leader's own
-    community aggregates per tier, so subscribers compute the fraction
-    receiver-side (no division-by-tiny in the publisher).
+    Published periodically on the sector-wide ``holon_summary_<sector>`` mesh;
+    consumed by :class:`HolonSummaryRole` (L2.5) to detect cross-holon priority
+    inversions. Communication-only — an inversion triggers a separate coalition
+    message. ``per_tier_*`` are the leader's own per-tier aggregates, so
+    subscribers compute the fraction receiver-side.
     """
 
     sector: Sector = Sector.ELECTRICITY
     per_tier_served_mw: dict[int, float] = field(default_factory=dict)
     per_tier_demand_mw: dict[int, float] = field(default_factory=dict)
-    # Mirrors the ``CoalitionAcceptance`` slice so an L2 leader can run
-    # ``allocate_supply_priority`` on the gossiped peer view without a
-    # flex-collection round-trip. Dict shape (single key per sector role)
-    # lets the kernel ingest summary and acceptance payloads via one path.
+    # Mirrors the ``CoalitionAcceptance`` slice so an L2 leader runs
+    # ``allocate_supply_priority`` on the peer view without a flex round-trip;
+    # the shared dict shape lets the kernel ingest both payloads via one path.
     supply_by_sector: dict[str, float] = field(default_factory=dict)
     demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
     served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
-    # Per-sector slack-only operator budget (Σ over slack members'
-    # eff_budget), split from ``supply_by_sector`` so the L3 CP-ADMM caps
-    # a CP's INPUT-sector draw at the binding slack's operator budget
-    # rather than the aggregate generator pool.
+    # Per-sector slack-only operator budget (Σ slack members' eff_budget), split
+    # from ``supply_by_sector`` so L3 CP-ADMM caps a CP's input-sector draw at
+    # the slack budget rather than the aggregate generator pool.
     slack_budget_by_sector: dict[str, float] = field(default_factory=dict)
-    # Publisher's monee node id on the per-sector subgraph; used for
-    # deliverability filtering via ``GridTopologyMirror.reachable_from``.
+    # Publisher's monee node id; used for deliverability filtering via
+    # ``GridTopologyMirror.reachable_from``.
     home_node_id: Any = None
 
 
@@ -144,15 +117,11 @@ class HolonSummary(Decision):
 class CoalitionInvitation(Decision):
     """L2.5 invitation to join an ad-hoc rebalance coalition.
 
-    Published by the lex-smallest leader that detected a cross-holon
-    priority inversion (election keeps one initiator per inversion
-    cohort). Sent on the ``holon_summary_<sector>`` mesh used for
-    detection — no new topology required.
-
-    ``target_tiers`` carries the (tier_high, tier_low) pair so invitees
-    reply with only the relevant demand/supply slices. ``ttl_s`` bounds
-    how long the resulting constraint may override the L2 holon-ADMM
-    allocation; it is also invalidated early on any ``BranchFailureEvent``.
+    Published by the lex-smallest leader detecting a cross-holon priority
+    inversion (one initiator per cohort) on the ``holon_summary_<sector>`` mesh.
+    ``target_tiers`` is the (high, low) pair scoping invitee replies; ``ttl_s``
+    bounds how long the constraint overrides L2 (also voided on
+    ``BranchFailureEvent``).
     """
 
     coalition_id: str = ""
@@ -166,21 +135,13 @@ class CoalitionInvitation(Decision):
 class CoalitionAcceptance(Decision):
     """Reply from an invited leader carrying its scoped flex slice.
 
-    The initiator runs the coalition ADMM on the aggregate of received
-    acceptances plus its own state, so the payload mirrors
-    :class:`AvailableFlexAnswer`'s per-(sector, tier) schema. Set
-    ``accepted=False`` to opt out (skipped by the initiator).
-
-    ``home_node_id`` and ``demand_nodes_by_tier`` give the initiator the
-    spatial info to compute per-actor deliverability caps via the shared
-    :class:`GridTopologyMirror`; without them the ADMM would treat supply
-    as fungible and could commit supply the LP cannot route across a
-    broken edge.
-
-    Cross-sector: a CP advertises supply on the output sectors it drives
-    and lists ``coupling_ratios`` ``{(in, out): mw_out_per_mw_in}`` so the
-    initiator derives the implied input-side draw. Regular leaders leave
-    ``coupling_ratios`` empty.
+    The initiator runs coalition ADMM on the aggregate of acceptances plus its
+    own state, mirroring :class:`AvailableFlexAnswer`'s per-(sector, tier) schema;
+    ``accepted=False`` opts out. ``home_node_id`` / ``demand_nodes_by_tier`` give
+    deliverability caps via the shared :class:`GridTopologyMirror`, so the ADMM
+    cannot commit supply the LP can't route across a broken edge. A CP advertises
+    output-sector supply with ``coupling_ratios`` ``{(in, out): mw_out_per_mw_in}``
+    so the initiator derives the input-side draw; regular leaders leave it empty.
     """
 
     coalition_id: str = ""
@@ -200,23 +161,18 @@ class CoalitionAcceptance(Decision):
 class CPSummary(Decision):
     """Per-CP self-description for the L3 priority-cascaded ADMM mesh.
 
-    Published on the CP-only summary overlay by every CP carrying
-    :class:`~scare.service.cp_priority_admm_role.CPPriorityAdmmRole`.
-    Every CP in the same cross-sector connected component subscribes and
-    accumulates the latest summary per publisher, feeding the L3
-    sharing-ADMM kernel its full peer view without a coordinator or
-    request/reply round. Fields are what the kernel's :class:`CPSpec`
-    consumes:
+    Published on the CP-only overlay by every
+    :class:`~scare.service.coupling.cp_priority_admm_role.CPPriorityAdmmRole`;
+    every CP in the cross-sector component accumulates the latest per publisher,
+    feeding the kernel its peer view with no coordinator. Fields feed
+    :class:`CPSpec`:
 
-    * ``capacity_by_sector`` — per-sector signed effective capacity (MW,
-      load convention: positive = consumes, negative = produces). The
-      coupling ratio η is baked in at build time, so the kernel's
-      ``x_i = r_i · c_i`` substitution honours the CP's physics.
-    * ``home_node_id`` — CP host monee node id, used for cross-sector
-      reachability via the shared :class:`GridTopologyMirror`.
+    * ``capacity_by_sector`` — signed effective capacity (MW, load convention).
+      The coupling ratio η is baked in so the kernel's ``x_i = r_i · c_i``
+      substitution honours CP physics.
+    * ``home_node_id`` — CP host node id, for reachability via the mirror.
 
-    Republished (delta gate + watchdog, as :class:`HolonSummary`) only
-    when ``capacity_by_sector`` materially shifts or the watchdog fires.
+    Republished (delta gate + watchdog) only on a material capacity shift.
     """
 
     capacity_by_sector: dict[str, float] = field(default_factory=dict)
@@ -225,15 +181,13 @@ class CPSummary(Decision):
 
 @dataclass
 class CoalitionConstraint(Decision):
-    """Coalition-issued per-(sector, tier) service-fraction constraint
-    with TTL.
+    """Coalition-issued per-(sector, tier) service-fraction constraint with TTL.
 
-    Issued by the coalition initiator to accepting members after the
-    scoped ADMM converges. Recipients store it in
-    :class:`CoalitionConstraintStore`; the underlying
-    :class:`HolonicCommunityRole` consults it before dispatching its own
-    ADMM result (coalition wins per-tier, L2 covers untouched cells).
-    Expires on ``issued_at + ttl_s`` or a :class:`BranchFailureEvent`.
+    Issued by the initiator to accepting members after the scoped ADMM converges;
+    stored in :class:`CoalitionConstraintStore` and consulted by
+    :class:`HolonicCommunityRole` before its own ADMM result (coalition wins
+    per-tier, L2 covers untouched cells). Expires on ``issued_at + ttl_s`` or a
+    :class:`BranchFailureEvent`.
     """
 
     coalition_id: str = ""
@@ -244,24 +198,15 @@ class CoalitionConstraint(Decision):
 
 @dataclass
 class ComponentAdmmReport(Decision):
-    """A group leader's flex report for the per-(sector, active-component)
-    L2 ADMM.
+    """A group leader's flex report for the per-(sector, active-component) L2 ADMM.
 
-    Sent by every group leader to the component coordinator (lex-smallest
-    aid among leaders mutually reachable on the sector's active branch
-    subgraph). The coordinator buffers reports by ``round_id`` +
-    ``leader_aid`` (latest-wins), runs the supply-priority ADMM over all
-    reports, then dispatches a component-uniform
-    :class:`ComponentAllocation` to every leader.
-
-    Active when ``RestorationConfiguration.holon_admm_scope ==
-    "component"``: each community leader is one ADMM actor (no holon
-    abstraction). When a failure splits a sector, each sub-component
-    re-elects its own coordinator and runs independently.
-
-    Fields mirror the subset of :class:`AvailableFlexAnswer` the
-    supply-priority ADMM consumes (per-sector supply, per-(sector, tier)
-    demand), keeping wire size O(n_tiers · n_sectors).
+    Sent by every leader to the component coordinator (lex-smallest aid among
+    leaders mutually reachable on the active branch subgraph), which buffers by
+    ``round_id`` + ``leader_aid`` (latest-wins), runs the supply-priority ADMM,
+    then dispatches a component-uniform :class:`ComponentAllocation`. Active when
+    ``holon_admm_scope == "component"`` (each leader is one ADMM actor); a sector
+    split re-elects a coordinator per sub-component. Fields mirror the
+    :class:`AvailableFlexAnswer` subset the ADMM consumes.
     """
 
     round_id: str = ""
@@ -270,40 +215,29 @@ class ComponentAdmmReport(Decision):
     supply_by_sector: dict[str, float] = field(default_factory=dict)
     demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
     served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
-    # Implicit ACK: echoes the last applied ``ComponentAllocation.version``
-    # so the coordinator detects leaders that missed a dispatch under
-    # packet loss and re-sends to them. ``-1`` = none applied yet.
+    # Implicit ACK: echoes the last applied ``ComponentAllocation.version`` so the
+    # coordinator detects missed dispatches and re-sends. ``-1`` = none yet.
     last_applied_allocation_version: int = -1
 
 
 @dataclass
 class ComponentAllocation(Decision):
-    """Per-(sector, active-component) ADMM result: the per-tier service
-    fraction every group leader in the component applies to its members.
+    """Per-(sector, active-component) ADMM result: the per-tier service fraction
+    every leader in the component applies to its members.
 
-    Issued by the component coordinator after collecting a
-    :class:`ComponentAdmmReport` from each leader. Recipients rebroadcast
-    as ``StartBalanceNegotiation(service_fraction_by_sector_priority=…)``
-    to their community members.
-
-    Component-uniform: every leader gets the same
-    ``service_fraction_by_tier``, so all loads at the same tier in the
-    same (sector, component) are served equally — no cross-community
-    priority inversion.
-
-    ``version`` is a monotone-per-coordinator dispatch counter; receivers
-    echo it via ``ComponentAdmmReport.last_applied_allocation_version``
-    so the coordinator detects message loss and re-sends, making the
-    fire-and-forget broadcast reliable under packet loss.
+    Issued by the coordinator after collecting a :class:`ComponentAdmmReport` from
+    each leader; recipients rebroadcast as ``StartBalanceNegotiation``.
+    Component-uniform (same ``service_fraction_by_tier`` for all leaders), so
+    same-tier loads in a (sector, component) are served equally. ``version`` is a
+    monotone-per-coordinator dispatch counter receivers echo via
+    ``last_applied_allocation_version``, making the broadcast reliable under loss.
     """
 
     round_id: str = ""
     sector: Sector = Sector.ELECTRICITY
     service_fraction_by_tier: dict[int, float] = field(default_factory=dict)
-    # Monotone-per-coordinator dispatch version; ``0`` = first dispatch
-    # since startup, incremented once per ``_run_component_admm_round``
-    # send. Default 0 keeps version-less senders as a single repeating
-    # round (no spurious stale-version retries).
+    # Monotone-per-coordinator dispatch version (0 = first), bumped once per
+    # ``_run_component_admm_round`` send; default 0 avoids stale-version retries.
     version: int = 0
 
 
@@ -312,19 +246,13 @@ class CPFlexReport(Decision):
     """A CP agent's self-description for the multi-sector L3 coordinator.
 
     Sent by every CP to the L3 coordinator (lex-smallest CP aid in the
-    multi-sector connected component per the topology mirror with
-    ``allow_cp_bridges=True``) when asked for state at the start of a
-    joint ADMM round. Same role :class:`ComponentAdmmReport` plays for
-    community leaders. Fields build the CP's actor row:
+    multi-sector component, ``allow_cp_bridges=True``) at the start of a joint
+    ADMM round — the CP analogue of :class:`ComponentAdmmReport`. Fields:
 
-    * ``sectors`` — sector values this CP bridges (e.g.
-      ``["electricity", "heat"]``), sizing the per-cell vector.
-    * ``capacity_mw`` — rated conversion capacity, signed load
-      convention on the input side (positive ⇒ consumes from source).
-    * ``coupling_ratios`` — keyed by ``(in_sector, out_sector)``; value
-      ``r`` means ``output ≤ r · input`` (e.g. 90% P2H = 0.9).
-    * ``current_setpoint_by_sector`` — the CP's realised per-sector flow
-      under the previous round, used as the ADMM warm start.
+    * ``sectors`` — sectors this CP bridges, sizing the per-cell vector.
+    * ``capacity_mw`` — rated capacity, signed load convention on the input side.
+    * ``coupling_ratios`` — keyed by ``(in, out)``; ``r`` means ``output ≤ r·input``.
+    * ``current_setpoint_by_sector`` — previous-round flow, used as warm start.
     """
 
     cp_aid: str = ""
@@ -336,14 +264,12 @@ class CPFlexReport(Decision):
 
 @dataclass
 class CPAllocation(Decision):
-    """Per-CP allocation envelope dispatched by the L3 coordinator to
-    every CP in the multi-sector component.
+    """Per-CP allocation envelope from the L3 coordinator to every CP in the
+    multi-sector component.
 
-    Result of the joint multi-sector ADMM. Carries the CP's per-sector
-    flow targets, applied via ``_apply_result`` / ``apply_regulate``
-    (same semantics as ``CPSetpoint.sector_flows_mw``), addressed by
-    ``cp_aid`` so one broadcast can include multiple CPs. Coupling
-    (``output = ratio × input``) is already enforced in the ADMM, so the
+    Result of the joint ADMM: per-sector flow targets applied via
+    ``_apply_result`` / ``apply_regulate`` (same as ``CPSetpoint.sector_flows_mw``),
+    addressed by ``cp_aid``. Coupling is already enforced in the ADMM, so the
     recipient just applies the dispatched flow.
     """
 
@@ -354,20 +280,14 @@ class CPAllocation(Decision):
 
 @dataclass
 class L3RebalanceWakeup(Decision):
-    """Wake-up signal from the L3 multi-sector coordinator to every group
-    leader in the active component, sent after the L3 ADMM dispatches CP
-    allocations.
+    """Wake-up from the L3 coordinator to every leader in the active component,
+    sent after L3 dispatches CP allocations.
 
-    Carries no payload beyond the ``sector`` filter. Recipients call
-    :meth:`HolonicCommunityRole._maybe_schedule_rebalance`, marking
-    ``_rebalance_dirty=True`` and scheduling a fresh L2 round on the
-    post-CP-commit state.
-
-    Dedicated message because the alternatives carry side effects:
-    ``NegotiationFinishedEvent`` makes ``GenerationController`` re-apply
-    regulation, and ``CoalitionConstraint`` / ``HolonAllocation`` carry
-    payload other consumers act on. The CP setpoints ride on
-    :class:`CPAllocation`; this only nudges L2 awake.
+    Carries no payload beyond the ``sector`` filter; recipients call
+    :meth:`HolonicCommunityRole._maybe_schedule_rebalance` to run a fresh L2 round
+    on the post-CP-commit state. Dedicated message because the alternatives carry
+    side effects — this only nudges L2 awake (CP setpoints ride on
+    :class:`CPAllocation`).
     """
 
     sector: Sector = Sector.ELECTRICITY
@@ -377,21 +297,13 @@ class L3RebalanceWakeup(Decision):
 class CPCommitment(Decision):
     """Cross-sector coalition commitment dispatched to a CP member.
 
-    Issued by the L2.5 coalition initiator (alongside the per-sector
-    ``CoalitionConstraint`` / ``StartBalanceNegotiation`` messages) when
-    a coalition spans sectors via a CP. Carries the directional sector
-    flows the CP commits to for the TTL window:
-
-    * ``target_flows_mw[sector]`` signed load convention — positive =
-      consume, negative = produce. A P2H committed to 0.8 MW heat gets
-      ``{electricity: +X, heat: -0.8}``.
-
-    The CP writes this into its envelope state
-    (:class:`scare.service.cp.EnergyConverterRole`) and clamps its L3
-    ADMM per-sector bounds to it. Expiry matches
-    :class:`CoalitionConstraint`. Gated on
-    ``RestorationConfiguration.enable_cross_sector_coalitions``; when
-    False the message is never emitted and CPs run without an envelope.
+    Issued by the L2.5 initiator (alongside ``CoalitionConstraint`` /
+    ``StartBalanceNegotiation``) when a coalition spans sectors via a CP. Carries
+    the directional flows the CP commits to for the TTL window: ``target_flows_mw``
+    signed load convention (e.g. a P2H at 0.8 MW heat → ``{electricity: +X,
+    heat: -0.8}``). The CP writes this into its envelope state and clamps its L3
+    ADMM bounds to it. Gated on ``enable_cross_sector_coalitions``; when False CPs
+    run without an envelope.
     """
 
     coalition_id: str = ""
@@ -404,9 +316,8 @@ class CPCommitment(Decision):
 
 
 class MonotonicVersion:
-    """Per-publisher monotonic counter, incremented once per published
-    decision. A silent publisher leaves the counter still, so subscribers
-    see the same version and the predicate returns False.
+    """Per-publisher monotonic counter, bumped once per decision. A silent
+    publisher leaves it still, so subscribers' predicate returns False.
     """
 
     def __init__(self) -> None:
@@ -423,9 +334,7 @@ class MonotonicVersion:
 
 class SeenVersions:
     """Per-subscriber memory of the latest version consumed per publisher.
-
-    ``mark`` is called after a successful consumption, so ``is_fresh``
-    checks against the unconsumed version frontier.
+    ``mark`` runs post-consumption, so ``is_fresh`` checks the unconsumed frontier.
     """
 
     def __init__(self) -> None:
@@ -449,14 +358,10 @@ class SeenVersions:
 class SectorImbalanceBeacon(Role):
     """Event-driven publisher of ``SectorImbalanceUpdate`` on group leaders.
 
-    Installed alongside ``EnergyBalanceNegotiator`` on each ``groups``
-    cluster leader when ``enable_cp_admm`` is True. Discovers CP
-    destinations via the same cross-topology link ``EnergyConverterRole``
-    uses — no new topology required.
-
-    Triggered by the co-located ``NegotiationFinishedEvent`` on gossip
-    convergence. A slow ``watchdog_s`` republishes current state so a
-    late-joining subscriber still sees the version frontier.
+    Installed alongside ``EnergyBalanceNegotiator`` on each ``groups`` leader when
+    ``enable_cp_admm`` is True; discovers CP destinations via the same link
+    ``EnergyConverterRole`` uses. Triggered by ``NegotiationFinishedEvent`` on
+    gossip convergence; a slow ``watchdog_s`` republishes for late joiners.
     """
 
     def __init__(
@@ -475,17 +380,16 @@ class SectorImbalanceBeacon(Role):
     def setup(self) -> None:
         logger.debug(
             "[%s] SectorImbalanceBeacon setup: sector=%s watchdog_s=%.2f",
-            self.context.aid, self.sector.value, self.watchdog_s,
+            self.context.aid,
+            self.sector.value,
+            self.watchdog_s,
         )
-        # Primary trigger: same-agent emit from
-        # EnergyBalanceNegotiator._finish_negotiation on gossip convergence.
+        # Primary trigger: same-agent emit on gossip convergence.
         self.context.subscribe_event(
             self, NegotiationFinishedEvent, self._on_negotiation_finished
         )
-        # Watchdog: advances the version frontier for late-joining subscribers.
-        self.context.schedule_periodic_task(
-            self._tick, delay=self.watchdog_s
-        )
+        # Watchdog: advances the version frontier for late joiners.
+        self.context.schedule_periodic_task(self._tick, delay=self.watchdog_s)
 
     def _on_negotiation_finished(
         self, event: NegotiationFinishedEvent, _src: Any
@@ -497,15 +401,10 @@ class SectorImbalanceBeacon(Role):
     async def _tick(self) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
             return
-        # Look up CP connectors via ``tid="groups"``: the reverse link is
-        # registered on the groups side, so the leader is not itself in the
-        # cps topology.
-        #
-        # Gotcha: mango's ``Topology._connectors`` deduplicates by agent uid,
-        # so a multi-sector CP (CHP marks electricity+heat+gas) appears under
-        # only one connector type — heat/gas leaders see none and the beacon
-        # stays silent there. Same latent limitation as the balance.py NFE
-        # broadcast; fix at the mango layer if a real heat/gas channel is needed.
+        # CP connectors via ``tid="groups"`` (reverse link is on the groups side).
+        # Gotcha: mango's ``Topology._connectors`` dedups by agent uid, so a
+        # multi-sector CP appears under one connector type only — heat/gas leaders
+        # see none and the beacon stays silent there (fix at the mango layer).
         connectors = topology_connectors(self, tid="groups")
         if not connectors:
             return
@@ -517,27 +416,24 @@ class SectorImbalanceBeacon(Role):
         if not obs:
             return
 
-        # Signed unmet flow through this aid post-regulation (same
-        # convention as cp.py:_run_admm):
-        #   positive = unmet demand (load curtailed; CP-import could help)
-        #   negative = unsupplied supply (gen curtailed; CP-export could place it)
+        # Signed unmet flow post-regulation (positive = unmet demand,
+        # negative = unsupplied supply); same convention as cp.py:_run_admm.
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
         sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
-        # Regulation gap (load-convention MW): what LP curtailment removed
-        # from this aid's served setpoint, signed like ``cap`` (positive
-        # loads, negative generators). Use the gap, not static headroom
-        # ``cap``, so the predicate fires only on actual curtailment.
+        # Regulation gap, not static headroom ``cap``, so the predicate fires only
+        # on actual curtailment.
         imbalance = cap - sp
 
-        # No publisher-side dead-band: gating on |Δimbalance| would freeze
-        # the version on a quiescent grid (imb≈0) and starve subscribers of
-        # later motion. Dead-banding belongs in the predicate
-        # (``_PREDICATE_DEAD_BAND_MW`` in cp.py); the publisher just keeps
-        # the version advancing.
+        # No publisher-side dead-band: gating on |Δimbalance| would freeze the
+        # version on a quiescent grid and starve subscribers. Dead-banding belongs
+        # in the predicate (``_PREDICATE_DEAD_BAND_MW`` in cp.py).
         logger.debug(
             "[%s] beacon publish: sector=%s imb=%.4f v=%d to %d cps",
-            self.context.aid, self.sector.value, imbalance,
-            self._version.current + 1, len(connectors),
+            self.context.aid,
+            self.sector.value,
+            imbalance,
+            self._version.current + 1,
+            len(connectors),
         )
 
         decision = SectorImbalanceUpdate(

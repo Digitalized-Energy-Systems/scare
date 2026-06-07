@@ -25,7 +25,9 @@ logger = logging.getLogger(__name__)
 def _format_table(headers: list[str], rows: list[list[str]]) -> str:
     if not rows:
         return "  (no rows)"
-    widths = [max(len(str(r[i])) for r in [headers, *rows]) for i in range(len(headers))]
+    widths = [
+        max(len(str(r[i])) for r in [headers, *rows]) for i in range(len(headers))
+    ]
     sep = "  "
     out = [sep.join(h.ljust(widths[i]) for i, h in enumerate(headers))]
     out.append(sep.join("-" * widths[i] for i in range(len(headers))))
@@ -45,11 +47,22 @@ def report(campaign_dir: Path, show_failed: int) -> None:
     print(f"Campaign: {campaign_dir}")
     print(f"Tasks:    {n}")
     print()
-    print(_format_table(
-        ["status", "count", "%"],
-        [[s, str(overall.get(s, 0)), pct(overall.get(s, 0))]
-         for s in ("ok", "claims_failed", "error", "timeout", "killed", "missing")],
-    ))
+    print(
+        _format_table(
+            ["status", "count", "%"],
+            [
+                [s, str(overall.get(s, 0)), pct(overall.get(s, 0))]
+                for s in (
+                    "ok",
+                    "claims_failed",
+                    "error",
+                    "timeout",
+                    "killed",
+                    "missing",
+                )
+            ],
+        )
+    )
 
     by_grid: dict[str, Counter] = defaultdict(Counter)
     for t in tasks:
@@ -60,23 +73,38 @@ def report(campaign_dir: Path, show_failed: int) -> None:
     rows = []
     for g, counts in sorted(by_grid.items()):
         total = sum(counts.values())
-        rows.append([
-            g, str(total),
-            str(counts.get("ok", 0)),
-            str(counts.get("claims_failed", 0)),
-            str(counts.get("error", 0)),
-            str(counts.get("timeout", 0)),
-            str(counts.get("killed", 0)),
-            str(counts.get("missing", 0)),
-        ])
-    print(_format_table(
-        ["grid", "total", "ok", "claims_failed", "error",
-         "timeout", "killed", "missing"], rows,
-    ))
+        rows.append(
+            [
+                g,
+                str(total),
+                str(counts.get("ok", 0)),
+                str(counts.get("claims_failed", 0)),
+                str(counts.get("error", 0)),
+                str(counts.get("timeout", 0)),
+                str(counts.get("killed", 0)),
+                str(counts.get("missing", 0)),
+            ]
+        )
+    print(
+        _format_table(
+            [
+                "grid",
+                "total",
+                "ok",
+                "claims_failed",
+                "error",
+                "timeout",
+                "killed",
+                "missing",
+            ],
+            rows,
+        )
+    )
 
     if show_failed > 0:
-        failed = [t for t in tasks
-                  if statuses[t.task_id] in ("error", "timeout", "killed")]
+        failed = [
+            t for t in tasks if statuses[t.task_id] in ("error", "timeout", "killed")
+        ]
         if failed:
             print()
             print(f"Last {min(show_failed, len(failed))} failed task(s):")
@@ -93,20 +121,36 @@ def report(campaign_dir: Path, show_failed: int) -> None:
                         exc_msg = str(d.get("message", ""))[:80]
                     except json.JSONDecodeError:
                         pass
-                rows.append([
-                    str(t.task_id), t.grid, str(t.seed), str(t.n_failures),
-                    statuses[t.task_id], exc_type, exc_msg,
-                ])
-            print(_format_table(
-                ["task", "grid", "seed", "fails", "status", "exception", "message"], rows,
-            ))
+                rows.append(
+                    [
+                        str(t.task_id),
+                        t.grid,
+                        str(t.seed),
+                        str(t.n_failures),
+                        statuses[t.task_id],
+                        exc_type,
+                        exc_msg,
+                    ]
+                )
+            print(
+                _format_table(
+                    ["task", "grid", "seed", "fails", "status", "exception", "message"],
+                    rows,
+                )
+            )
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+    )
     p.add_argument("campaign_dir", type=Path)
-    p.add_argument("--show-failed", type=int, default=10,
-                   help="How many recent failed tasks to list (0 = none)")
+    p.add_argument(
+        "--show-failed",
+        type=int,
+        default=10,
+        help="How many recent failed tasks to list (0 = none)",
+    )
     return p.parse_args()
 
 

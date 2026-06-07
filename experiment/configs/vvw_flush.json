@@ -1,0 +1,28 @@
+{
+  "name": "vvw_flush",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 600.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 40, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "flush",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 40,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_vvw_coordination": true, "enable_qv_auction_coordination": true, "qv_dvdq_prior": 0.05, "enable_qv_feeder_gate": true, "enable_recompute_on_failure": false },
+        { "enable_vvw_coordination": true, "enable_qv_auction_coordination": true, "qv_dvdq_prior": 0.05, "enable_qv_feeder_gate": true, "enable_recompute_on_failure": true }
+      ],
+      "scenarios": [
+        { "kind": "pv_peak", "gen_scale": 1.5, "load_scale": 0.4, "slack_vm_pu": 1.04, "priority_assignment": "skewed" }
+      ]
+    }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "02:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 64 }
+}

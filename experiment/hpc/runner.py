@@ -1,22 +1,11 @@
 """Run a single restoration evaluation task end-to-end.
 
-Invoked once per Slurm array task, but runs identically without Slurm.
-Reads the campaign config + manifest, runs the task, and writes all
-per-task artefacts under ``<campaign_dir>/tasks/<task_id>/``:
+Invoked once per Slurm array task (``--task-id``, else ``$SLURM_ARRAY_TASK_ID``),
+but runs identically without Slurm. Writes per-task artefacts under
+``<campaign_dir>/tasks/<task_id>/``: config/failures/result/status JSON, run.log,
+diagnostics.txt, exception.json (on error), and optional timeseries.csv.
 
-    config.json        copy of the TaskSpec (seed, grid, n_failures)
-    failures.json      resolved branch_ids + delays the simulation saw
-    result.json        scalar metrics extracted from the world
-    status.json        ok|error|timeout, duration, solver-warning count
-    run.log            full DEBUG log of the task
-    diagnostics.txt    last actions captured by scare.base.diagnostics
-    exception.json     traceback (only on error)
-    timeseries.csv     per-step balance/constraint series (optional)
-
-If ``--task-id`` is not given, ``$SLURM_ARRAY_TASK_ID`` is used.
-
-Exit codes: 0 = ok, 2 = timeout, 1 = any other error. Always writes
-status.json before exiting so the aggregator never has to guess.
+Exit codes: 0 = ok, 2 = timeout, 1 = other error. status.json is always written.
 """
 
 from __future__ import annotations
@@ -34,28 +23,13 @@ import sys
 import time
 import time as _time
 import traceback
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from mango.simulation.world import WorldRecording
-
-from scare.base import diagnostics
-from scare.base import diagnostics as _diag
-from scare.base.config import RestorationConfiguration
-from scare.base.infeasibility_capture import (
-    arm_infeasibility_capture,
-    disarm_infeasibility_capture,
-)
-from scare.base.solver_guard import install_solver_time_limit
-from scare.base.util import create_failures
-from scare.scenario.restoration import (
-    _flush_pending_negotiations,
-    create_restoration_scenario_world,
-    start_restoration_simulation,
-)
 
 from experiment.eval.claims import evaluate_task
 from experiment.eval.oracle import compose_oracle_result, compute_baseline_served
@@ -78,7 +52,7 @@ from experiment.hpc.config import (
     task_dir,
 )
 from experiment.hpc.plan import read_manifest
-from experiment.restoration import (
+from experiment.scenarios import (
     GRIDS,
     apply_cold_day,
     apply_line_stress,
@@ -87,6 +61,20 @@ from experiment.restoration import (
     apply_slack_budget,
     apply_temporal_extensions,
     assign_load_priorities,
+)
+from scare.base.config import RestorationConfiguration
+from scare.base.runtime import diagnostics
+from scare.base.runtime import diagnostics as _diag
+from scare.base.runtime.infeasibility_capture import (
+    arm_infeasibility_capture,
+    disarm_infeasibility_capture,
+)
+from scare.base.runtime.solver_guard import install_solver_time_limit
+from scare.base.util import create_failures
+from scare.scenario.restoration import (
+    _flush_pending_negotiations,
+    create_restoration_scenario_world,
+    start_restoration_simulation,
 )
 
 EXIT_OK = 0
@@ -97,19 +85,11 @@ LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
 
 class _SolverFailureCounter(logging.Filter):
-    """Count solver-status escalations across the Pyomo/monee stack to
-    report solver health per task without grepping logs.
+    """Count solver-status escalations to report per-task solver health.
 
-    Two log paths signal an infeasible solve, firing as a pair:
-    monee's ``classify_solve_result`` ERROR and pyomo.core's
-    ``load_solutions`` WARNING. The counter listens on both (either may
-    be silent) and dedupes matches within ``_DEDUPE_WINDOW_S``, since
-    distinct solves are spaced by at least the energy-flow cooldown plus
-    solve time (typically >= 100 ms).
-
-    Also catches Gurobi / Pyomo exception strings (license, host-id,
-    env-init) so the aggregator can tell solver-environment issues apart
-    from algorithm bugs.
+    An infeasible solve fires as a pair (monee ERROR + pyomo.core WARNING),
+    deduped within ``_DEDUPE_WINDOW_S``. Also catches Gurobi/Pyomo env
+    strings so env issues are distinguishable from algorithm bugs.
     """
 
     _SOLVER_ERROR_MARKERS: tuple[str, ...] = (
@@ -117,7 +97,7 @@ class _SolverFailureCounter(logging.Filter):
         "HostID mismatch",
         "License",  # Gurobi LicenseError
     )
-    _DEDUPE_WINDOW_S: float = 1.0
+    _DEDUPE_WINDOW_S: float = 1.0  # min spacing between distinct solves
 
     def __init__(self) -> None:
         super().__init__()
@@ -127,11 +107,10 @@ class _SolverFailureCounter(logging.Filter):
         self._last_infeasible_t: float = float("-inf")
 
     def _is_infeasible_msg(self, msg: str) -> bool:
-        # monee.solver.pyo ERROR path (paired classify_solve_result).
+        # monee.solver.pyo ERROR path.
         if "infeasible (status=" in msg or "Pyomo solve infeasible" in msg:
             return True
-        # pyomo.core load_solutions WARNING path; both substrings land on
-        # the same multi-line record.
+        # pyomo.core load_solutions WARNING path (both substrings, one record).
         if (
             "Loading a SolverResults object" in msg
             and "termination condition: infeasible" in msg
@@ -152,8 +131,7 @@ class _SolverFailureCounter(logging.Filter):
             self.warning_count += 1
             self.count += 1
         elif any(marker in msg for marker in self._SOLVER_ERROR_MARKERS):
-            # Gurobi env / license / host-id errors bypass the monee
-            # "infeasible" pathway but are still solver failures.
+            # Gurobi env/license/host-id errors: still solver failures.
             self.warning_count += 1
             self.count += 1
         return True
@@ -166,22 +144,19 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    # Drop pre-existing handlers to avoid double-logging from an earlier
-    # basicConfig() call (e.g. the manifest CLI).
+    # Drop pre-existing handlers to avoid double-logging (e.g. earlier basicConfig).
     for h in list(root.handlers):
         root.removeHandler(h)
     root.addHandler(handler)
 
-    # Keep WARN+ on stderr so Slurm captures show-stopper events in the
-    # per-array stderr file.
+    # Keep WARN+ on stderr so Slurm captures show-stoppers per array task.
     stderr = logging.StreamHandler(sys.stderr)
     stderr.setLevel(logging.WARNING)
     stderr.setFormatter(logging.Formatter(LOG_FORMAT))
     root.addHandler(stderr)
 
-    # Suppress third-party DEBUG/INFO chatter (mango emits ~60k lines per
-    # 30 s sim; pyomo / gurobipy / simbench add more). Suppress at the
-    # package root so new submodules stay quiet; WARN+ still surfaces.
+    # Suppress third-party DEBUG/INFO chatter (mango alone emits ~60k lines
+    # per 30s sim). At package root so new submodules stay quiet; WARN+ surfaces.
     for noisy in (
         "pyomo",
         "gurobipy",
@@ -192,8 +167,7 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     counter = _SolverFailureCounter()
-    # Listen on both emitters of the infeasibility signal; the counter
-    # dedupes the pair so one infeasible solve is counted once.
+    # Listen on both infeasibility emitters; the counter dedupes the pair.
     for logger_name in ("monee.solver.pyo", "pyomo.core"):
         logging.getLogger(logger_name).addFilter(counter)
     return handler, counter
@@ -205,38 +179,24 @@ def _seed_everything(seed: int) -> None:
 
 
 def ensure_deterministic_hashing(seed: str = "0") -> None:
-    """Pin ``PYTHONHASHSEED`` so the campaign is reproducible.
+    """Pin ``PYTHONHASHSEED`` for reproducibility, re-exec'ing once to apply it.
 
-    ``random`` / ``np.random`` are seeded per task, but Python's hash
-    randomisation is fixed at interpreter start and left random by
-    default. That makes ``set`` / ``frozenset`` iteration order over
-    agent-id strings vary per worker, perturbing async message scheduling
-    and the per-round ADMM actor sets — enough to flip results for the
-    same ``(grid, seed, scenario)`` task.
-
-    Hash randomisation can only be disabled before the interpreter
-    starts, so set the env var and re-exec once; spawned/forked workers
-    inherit the pinned value. A user-supplied ``PYTHONHASHSEED`` (other
-    than the sentinel ``"random"``) is respected. No-op once pinned.
+    Hash randomisation (fixed at interpreter start) varies set/frozenset order
+    over agent-id strings per worker, flipping results for the same task. It can
+    only be disabled before start, so set the env var and re-exec. A user-set
+    value (other than ``"random"``) is respected; no-op once pinned.
     """
     current = os.environ.get("PYTHONHASHSEED")
     if current is not None and current != "random":
         return
     os.environ["PYTHONHASHSEED"] = seed
-    # ``sys.orig_argv`` (3.10+) preserves the exact invocation so
-    # ``-m experiment.hpc.<launcher>`` package imports keep working.
+    # sys.orig_argv (3.10+) preserves the exact invocation for -m imports.
     os.execv(sys.executable, sys.orig_argv)
 
 
 def _resolve_failures(monee_net: Any, plan: RuntimePlan, task: TaskSpec) -> list[Any]:
-    """Draw the failure scenario for this task.
-
-    The ``scenario`` dict can override the default "branch"-only sampling:
-
-    - ``failure_type``    — ``"branch"`` / ``"generator"`` / ``"mixed"``
-                            (default ``"branch"``)
-    - ``generator_share`` — for ``mixed``, generator fraction of the draw
-                            (default 0.5)
+    """Draw the failure scenario. ``scenario`` may override sampling via
+    ``failure_type`` (branch/generator/mixed) and ``generator_share`` (mixed).
     """
     scenario = task.scenario or {}
     failure_type = scenario.get("failure_type", "branch")
@@ -255,9 +215,8 @@ def _resolve_failures(monee_net: Any, plan: RuntimePlan, task: TaskSpec) -> list
 def _serialize_failures(failures: list[Any]) -> list[dict[str, Any]]:
     """JSON-serialise the failure list for ``failures.json``.
 
-    Captures ``branch_ids`` for branch-style failures and ``custom_id``
-    for generator-style ones (the ``Failure.custom`` callable isn't
-    JSON-able, but its stamped id identifies the deactivated component).
+    Branch failures carry ``branch_ids``; generator ones carry ``custom_id``
+    (the callable isn't JSON-able, but its id names the deactivated component).
     """
     out = []
     for f in failures:
@@ -291,7 +250,9 @@ def _extract_metrics(world: Any) -> dict[str, Any]:
         metrics[f"{name}__mean"] = float(arr.mean())
         metrics[f"{name}__n_samples"] = int(arr.size)
         if len(t) >= 2:
-            metrics[f"{name}__integral"] = float(np.trapz(arr, np.asarray(t, dtype=float)))
+            metrics[f"{name}__integral"] = float(
+                np.trapz(arr, np.asarray(t, dtype=float))
+            )
 
     metrics["messages_total"] = len(getattr(world, "recorded_messages", []) or [])
     clock = getattr(world, "clock", None)
@@ -306,7 +267,9 @@ def _write_timeseries(world: Any, path: Path) -> None:
             continue
         if not rec.timeseries:
             continue
-        series_map[name] = pd.Series(rec.timeseries, index=pd.Index(rec.time, name="time_s"))
+        series_map[name] = pd.Series(
+            rec.timeseries, index=pd.Index(rec.time, name="time_s")
+        )
     if not series_map:
         return
     df = pd.concat(series_map, axis=1).sort_index()
@@ -326,43 +289,42 @@ async def _run_simulation(
 ):
     """Build and run one scare-variant simulation.
 
-    Returns (world, failures, net) so the caller can extract metrics and
-    run end-of-sim recordings. When ``out_dir`` is given, the one-shot
+    Returns (world, failures, net). When ``out_dir`` is given, the one-shot
     infeasibility capture writes ``infeasibility_snapshot.json`` there.
     """
     if task.grid not in GRIDS:
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
 
-    # Cap each energyflow MISOCP well under the task budget so
-    # ``asyncio.wait_for`` can preempt at the next ``await`` (it cannot
-    # interrupt a synchronous solve, which would otherwise drift past the
-    # timeout until SLURM SIGTERMs it). Floored at 30s so hard MISOCPs
-    # can finish; capped at 60s so it yields frequently.
+    # Cap each MISOCP under the task budget so asyncio.wait_for can preempt at
+    # the next await (it can't interrupt a sync solve). Floor 30s, cap 60s.
     per_solve_cap = max(30.0, min(plan.task_timeout_s / 4.0, 60.0))
     install_solver_time_limit(per_solve_cap)
 
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s", task.grid)
-    # Factory applies the MISOCP electricity formulation and leaves DHS
-    # physics nonlinear (McCormick-DHS is off for the live sim — it can
-    # hit envelope-bound infeasibilities on failures). The oracle
-    # re-enables DHS linearisation for its own LP only.
+    # Factory applies MISOCP and leaves DHS nonlinear (McCormick-DHS is off
+    # live — it can hit envelope infeasibilities; the oracle re-enables it).
     net = factory()
     _apply_scenario(net, task, logger)
 
     failures = _resolve_failures(net, plan, task)
     logger.info(
         "Resolved %d failure(s) for seed=%d: %s",
-        len(failures), task.seed, [f.branch_ids for f in failures],
+        len(failures),
+        task.seed,
+        [f.branch_ids for f in failures],
     )
 
     cfg = _config_from_task(task)
-    logger.info("Variant=%s ablation=%s sweep=%s",
-                task.variant, task.ablation or {}, task.sweep or {})
+    logger.info(
+        "Variant=%s ablation=%s sweep=%s",
+        task.variant,
+        task.ablation or {},
+        task.sweep or {},
+    )
 
     priorities = _resolve_priorities(net, task, logger)
-    # Stash on the net so post-sim metric writers can pick it up without
-    # threading an extra parameter through ``_run_simulation``.
+    # Stash on the net so post-sim metric writers can pick it up.
     net._scare_priorities = priorities
 
     world = create_restoration_scenario_world(
@@ -371,26 +333,28 @@ async def _run_simulation(
         simulation_duration_s=plan.simulation_duration_s,
         config=cfg,
     )
-    # Arm a one-shot capture so the first failed solve drops a JSON
-    # snapshot next to the other artefacts; disarmed after the task so
-    # the next task on this worker gets its own capture window.
+    # One-shot capture: first failed solve drops a snapshot; disarmed
+    # after the task so the next one on this worker gets a fresh window.
     if out_dir is not None:
         snapshot_path = out_dir / "infeasibility_snapshot.json"
         arm_infeasibility_capture(
-            world.environment.behavior, snapshot_path, clock=world.clock,
+            world.environment.behavior,
+            snapshot_path,
+            clock=world.clock,
         )
-    logger.info("Running simulation for %.1f s (timeout=%.0f s)",
-                plan.simulation_duration_s, plan.task_timeout_s)
+    logger.info(
+        "Running simulation for %.1f s (timeout=%.0f s)",
+        plan.simulation_duration_s,
+        plan.task_timeout_s,
+    )
     try:
         await asyncio.wait_for(
             start_restoration_simulation(world, failures, plan.simulation_duration_s),
             timeout=plan.task_timeout_s,
         )
     except asyncio.TimeoutError:
-        # On timeout the sim coroutine is cancelled before reaching its
-        # own ``_flush_pending_negotiations``, so in-flight gossips would
-        # be lost from the diary. Drain them here so the
-        # started == Σ terminals invariant holds.
+        # Timeout cancels the sim before its own flush, losing in-flight
+        # gossips. Drain here so started == Σ terminals still holds.
         try:
             _flush_pending_negotiations(world)
         except Exception as flush_exc:  # noqa: BLE001
@@ -407,23 +371,22 @@ def _run_oracle(
     *,
     baseline_served: dict[str, Any] | None = None,
 ):
-    """Build the network, draw the same failures the scare variant would,
-    and solve monee's minimal-load-shedding LP. Returns
-    (net, failures, result_payload) — no world, no agents.
+    """Solve monee's minimal-load-shedding LP on the same failures the scare
+    variant would see. Returns (net, failures, result_payload) — no agents.
     """
     if task.grid not in GRIDS:
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
     factory = GRIDS[task.grid]
     logger.info("Building network for grid=%s (oracle)", task.grid)
-    # Factory applies MISOCP and leaves DHS nonlinear;
-    # ``compose_oracle_result`` adds the McCormick-DHS heat linearisation
-    # for the oracle LP.
+    # compose_oracle_result adds the McCormick-DHS linearisation for the LP.
     net = factory()
     _apply_scenario(net, task, logger)
     failures = _resolve_failures(net, plan, task)
     logger.info(
         "Oracle: %d failure(s) for seed=%d: %s",
-        len(failures), task.seed, [f.branch_ids for f in failures],
+        len(failures),
+        task.seed,
+        [f.branch_ids for f in failures],
     )
     priorities = _resolve_priorities(net, task, logger)
     started = _time.monotonic()
@@ -442,22 +405,14 @@ def _run_oracle(
 def _resolve_priorities(
     net: Any, task: TaskSpec, logger: logging.Logger
 ) -> dict[str, int] | None:
-    """Build the per-load priority dict from the scenario's
-    ``priority_assignment`` knob.
+    """Build the per-load priority dict from ``scenario["priority_assignment"]``.
 
-    Default ``"skewed"`` exercises the priority machinery (QP weights,
-    tier-aware ADMM, priority-weighted served fraction); monee
-    observations carry no per-load priority field, so without it every
-    load falls back to tier 1 and priority-aware behaviour is degenerate.
-
-    Recognised values: ``"uniform"``, ``"skewed"``, ``"by_capacity"``,
-    ``"all_one"``. Set ``"all_one"`` for the degenerate single-tier case.
+    Default ``"skewed"`` exercises the priority machinery (without it every load
+    falls back to tier 1). Recognised: uniform/skewed/by_capacity/all_one.
     """
     scenario = task.scenario or {}
     distribution = scenario.get("priority_assignment", "skewed")
-    priorities = assign_load_priorities(
-        net, seed=task.seed, distribution=distribution
-    )
+    priorities = assign_load_priorities(net, seed=task.seed, distribution=distribution)
     counts: dict[int, int] = {}
     for tier in priorities.values():
         counts[tier] = counts.get(tier, 0) + 1
@@ -471,56 +426,35 @@ def _resolve_priorities(
 
 
 def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
-    """Apply scenario-kind mutations to the freshly-built network.
+    """Apply scenario-kind mutations from ``task.scenario["kind"]``.
 
-    Scenario kind comes from ``task.scenario["kind"]``:
+    Kinds: ``clean`` (no-op), ``cold_day`` (colder slack + higher heat load),
+    ``pv_peak`` (over-voltage: more gen, less load), ``line_stress`` (thermal:
+    more load, lower ampacity), ``microgrid``. Each reads its own tunables from
+    the scenario dict. Unknown kinds pass through (warned).
 
-    - ``"clean"`` (default) — no mutation.
-    - ``"cold_day"`` — lower heat slack supply temperature and scale heat
-      loads up. Tunables: ``supply_t_k`` (default 343.15 K),
-      ``heat_load_scale`` (default 1.5x).
-    - ``"pv_peak"`` — over-voltage stress: scale generation up and load
-      down so the feeder runs reverse-power and ``vm_pu`` drifts toward
-      the upper bound (VDE-AR-N 4105 operating point). Tunables:
-      ``gen_scale`` (default 3x), ``load_scale`` (default 0.3x).
-    - ``"line_stress"`` — thermal stress: scale loads up and reduce
-      ``max_i_ka`` so loading_percent overloads after a branch failure.
-      Tunables: ``load_scale`` (1.8x), ``ampacity_scale`` (0.5x),
-      ``affect_branch_fraction`` (1.0).
-
-    Unknown kinds pass through (warned) so future kinds can be wired in.
-
-    Independent of ``kind``, ``slack_budget_pct`` (if set) applies
-    ``apply_slack_budget`` *after* any kind mutation so the budget
-    reflects post-mutation demand. The factory never bakes the budget in
-    — the LP needs an unconstrained slack to converge, and the budget is
-    a per-scenario operator policy, not a physical grid attribute.
+    Orthogonal to ``kind``: ``slack_budget_pct`` is applied after the kind
+    mutation (per-scenario operator policy, not a baked-in grid attribute).
     """
     scenario = task.scenario or {}
     kind = scenario.get("kind", "clean")
     _KNOWN_KINDS = {"clean", "cold_day", "pv_peak", "line_stress", "microgrid"}
     if kind not in _KNOWN_KINDS:
-        # Warn on unknown kinds so a typo (``cold day`` vs ``cold_day``)
-        # doesn't silently produce a clean run.
+        # Warn on unknown kinds so a typo doesn't silently produce a clean run.
         logger.warning(
             "Unknown scenario kind %r (known: %s) — falling through to "
             "no-mutation behaviour.  Check the campaign config for typos.",
-            kind, sorted(_KNOWN_KINDS),
+            kind,
+            sorted(_KNOWN_KINDS),
         )
     if kind == "cold_day":
         kwargs = {
-            k: scenario[k]
-            for k in ("supply_t_k", "heat_load_scale")
-            if k in scenario
+            k: scenario[k] for k in ("supply_t_k", "heat_load_scale") if k in scenario
         }
         apply_cold_day(net, **kwargs)
         logger.info("Applied cold_day scenario: %s", kwargs or "<defaults>")
     elif kind == "pv_peak":
-        kwargs = {
-            k: scenario[k]
-            for k in ("gen_scale", "load_scale")
-            if k in scenario
-        }
+        kwargs = {k: scenario[k] for k in ("gen_scale", "load_scale") if k in scenario}
         apply_pv_peak(net, **kwargs)
         logger.info("Applied pv_peak scenario: %s", kwargs or "<defaults>")
     elif kind == "line_stress":
@@ -532,14 +466,9 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         apply_line_stress(net, **kwargs)
         logger.info("Applied line_stress scenario: %s", kwargs or "<defaults>")
     elif kind == "microgrid":
-        # Opt in to monee's islanding extension AND promote eligible
-        # generator-class children to ``GridForming*`` so the LP has
-        # reference units to anchor sub-islands on when the main slack is
-        # unreachable. Without promotion, ``enable_islanding`` is a no-op
-        # on stock simbench nets (no native GridFormingMixin children).
-        carriers = scenario.get(
-            "carriers", ("electricity", "water", "gas")
-        )
+        # Enable islanding AND promote generator-class children to GridForming*
+        # so sub-islands have reference units (else it's a no-op on simbench).
+        carriers = scenario.get("carriers", ("electricity", "water", "gas"))
         promote_all = bool(scenario.get("promote_all_generators", True))
         former_aids = tuple(scenario.get("grid_former_aids", ()))
         counts = apply_microgrid_islanding(
@@ -550,14 +479,13 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         )
         logger.info(
             "Applied microgrid scenario: carriers=%s promote_all=%s promoted=%s",
-            list(carriers), promote_all, counts,
+            list(carriers),
+            promote_all,
+            counts,
         )
 
-    # Operator slack-budget policy, orthogonal to ``kind``. Applied after
-    # any kind mutation so the budget reflects post-mutation demand.
-    # ``apply_slack_budget`` widens LP Var bounds to ±10·budget (keeps the
-    # LP feasible) and stamps the budget as the slack agents' rating that
-    # the MAS drives toward via ``slack_target_fraction``.
+    # Slack-budget policy: widens LP Var bounds to ±10·budget and stamps the
+    # budget as the slack agents' rating the MAS drives toward.
     slack_budget_pct = scenario.get("slack_budget_pct")
     if slack_budget_pct is not None:
         apply_slack_budget(net, float(slack_budget_pct))
@@ -566,10 +494,8 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
             slack_budget_pct,
         )
 
-    # Temporal-storage extensions, also orthogonal to ``kind``. Attaches
-    # monee's GasLinepack / LumpedThermalCapacitance. In the single-step
-    # energyflow integration these only add vars (no temporal dynamics);
-    # used as a compatibility smoke test, not a flex benchmark.
+    # Temporal-storage extensions (GasLinepack / LumpedThermalCapacitance).
+    # Single-step energyflow only adds vars — a compat smoke test, not a benchmark.
     linepack = bool(scenario.get("linepack", False))
     ltc = bool(scenario.get("ltc", False))
     if linepack or ltc:
@@ -582,7 +508,9 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         )
         logger.info(
             "Applied temporal extensions: linepack=%s ltc=%s counts=%s",
-            linepack, ltc, ext_counts,
+            linepack,
+            ltc,
+            ext_counts,
         )
 
 
@@ -597,19 +525,12 @@ def _config_from_task(task: TaskSpec):
             enable_cp_admm=False,
         )
     elif task.variant == "component_level":
-        # One community per connected component of each per-sector
-        # subgraph — global decision making at L1 with no hierarchy on
-        # top. CPs join the communities they bridge; their legacy CP-ADMM
-        # is replaced by ``MultiCommunityCPRole``'s EMA + deadband +
-        # cooldown guard so a CP in two communities reconciles conflicting
-        # asks instead of ping-ponging.
-        #
-        # ``enable_multihop_constraint=False`` is mandatory: the
-        # connected_component partition collapses the sector into one
-        # ``tid="groups"`` group, so multi-hop ConstraintState forwarding
-        # fans out O(N^2) per hop and OOM-kills the worker. Direct
-        # neighbour visibility still gives the global picture because the
-        # local group already is global.
+        # One community per connected component per sector — global L1, no
+        # hierarchy. CPs join bridged communities and reconcile via
+        # MultiCommunityCPRole (EMA + deadband + cooldown). multihop_constraint
+        # MUST stay off: the partition collapses each sector into one group, so
+        # forwarding fans out O(N^2) and OOM-kills the worker; direct neighbours
+        # already give the global picture.
         base = RestorationConfiguration(
             enable_holonic=False,
             enable_cp_admm=False,
@@ -624,16 +545,158 @@ def _config_from_task(task: TaskSpec):
     overrides.update(task.sweep or {})
     if not overrides:
         return base
-    valid = {f.name for f in __import__(
-        "dataclasses", fromlist=["fields"]
-    ).fields(base)}
+    valid = {
+        f.name for f in __import__("dataclasses", fromlist=["fields"]).fields(base)
+    }
     clean = {k: v for k, v in overrides.items() if k in valid}
     skipped = set(overrides) - valid
     if skipped:
         logging.getLogger("experiment.hpc.runner").warning(
-            "Ignoring unknown config overrides: %s", sorted(skipped),
+            "Ignoring unknown config overrides: %s",
+            sorted(skipped),
         )
     return replace(base, **clean)
+
+
+def _compute_baseline(task: TaskSpec, logger: logging.Logger) -> dict[str, Any] | None:
+    """Solve the no-failure LP so restoration can be expressed as a ratio of
+    pre-failure served. Returns ``None`` (logged) on failure so the task proceeds.
+    """
+    if task.grid not in GRIDS:
+        return None
+    try:
+        # Throwaway net to enumerate loads, released before the heavy phase
+        # so it doesn't double peak RAM (~1-3 GB on CP-heavy grids).
+        base_net = GRIDS[task.grid]()
+        _apply_scenario(base_net, task, logger)
+        base_priorities = _resolve_priorities(base_net, task, logger)
+        baseline_served = compute_baseline_served(
+            task.grid,
+            scenario=task.scenario or {},
+            priorities=base_priorities,
+        )
+        logger.info(
+            "Pre-failure baseline: served=%.4f / demand=%.4f (PWSF=%.4f)",
+            baseline_served.get("priority_weighted_served", 0.0),
+            baseline_served.get("priority_weighted_demand", 0.0),
+            baseline_served.get("priority_weighted_fraction", 0.0),
+        )
+        del base_net, base_priorities
+        gc.collect()
+        return baseline_served
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Baseline LP failed (continuing without it): %s", exc)
+        return None
+
+
+def _write_oracle_outputs(
+    out_dir: Path,
+    plan: RuntimePlan,
+    task: TaskSpec,
+    logger: logging.Logger,
+    baseline_served: dict[str, Any] | None,
+) -> None:
+    """Run the centralized oracle LP and write its result/slack/failures."""
+    net, failures, oracle_metrics = _run_oracle(
+        plan, task, logger, baseline_served=baseline_served
+    )
+    (out_dir / "failures.json").write_text(
+        json.dumps(_serialize_failures(failures), indent=2)
+    )
+    (out_dir / "result.json").write_text(
+        json.dumps(oracle_metrics, indent=2, sort_keys=True, default=str)
+    )
+    write_slack_meta(out_dir / "slack_meta.json", net)
+
+
+def _write_simulation_outputs(
+    out_dir: Path,
+    plan: RuntimePlan,
+    task: TaskSpec,
+    logger: logging.Logger,
+    started: float,
+    baseline_served: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Run the MAS simulation, write every per-task artefact, and return the
+    claims-validation payload (or ``None`` if validation itself failed).
+    """
+    world, failures, net = asyncio.run(
+        _run_simulation(plan, task, logger, out_dir=out_dir)
+    )
+    (out_dir / "failures.json").write_text(
+        json.dumps(_serialize_failures(failures), indent=2)
+    )
+    behavior = world.environment.behavior
+    # Force a fresh energy flow so observers report post-action state, not the
+    # cooldown-cached solve (else the served breakdown is stale).
+    try:
+        behavior.flush_energy_flow()
+    except AttributeError:
+        logger.debug("Behavior has no flush_energy_flow() — skipping")
+    priorities = getattr(net, "_scare_priorities", None)
+    payload = compose_result(
+        world=world,
+        monee_net=net,
+        behavior=behavior,
+        task_meta=task.to_dict(),
+        wallclock_s=time.monotonic() - started,
+        completed=True,
+        extra_metrics={"legacy_metrics": _extract_metrics(world)},
+        priorities=priorities,
+        baseline_served=baseline_served,
+    )
+    write_result_json(out_dir / "result.json", payload)
+    write_served_csv(out_dir / "served.csv", net, behavior, priorities=priorities)
+    write_served_by_load_csv(
+        out_dir / "served_by_load.csv",
+        net,
+        behavior,
+        priorities=priorities,
+    )
+    write_constraints_final_csv(out_dir / "constraints_final.csv", net)
+    write_diary_csv(out_dir / "diary.csv")
+    write_events_csv(out_dir / "events.csv")
+    write_slack_meta(out_dir / "slack_meta.json", net)
+    cfg = _config_from_task(task)
+    if cfg.record_messages:
+        write_messages_csv(out_dir / "messages.csv", world)
+    if plan.write_timeseries:
+        try:
+            _write_timeseries(world, out_dir / "timeseries.csv")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write timeseries.csv: %s", exc)
+    if getattr(plan, "write_trajectories", False):
+        try:
+            write_trajectories_csv(out_dir / "trajectories.csv")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write trajectories.csv: %s", exc)
+    # Claims validation: fold pass/fail into result.json for the aggregator.
+    try:
+        claims = evaluate_task(out_dir)
+        payload["claims"] = claims
+        write_result_json(out_dir / "result.json", payload)
+        return claims
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Claims validation failed: %s", exc)
+        return None
+
+
+def _failing_fatal_claims(
+    claims: dict[str, Any] | None, plan: RuntimePlan
+) -> list[str]:
+    """Failed fatal claims — these escalate ``ok`` to ``claims_failed``. The
+    fatal set is overridable per-campaign via ``plan.fatal_claims``.
+    """
+    if not claims:
+        return []
+    fatal_claims = tuple(
+        getattr(plan, "fatal_claims", ("priority_invariant", "monotonic_progress"))
+    )
+    return [
+        name
+        for name in fatal_claims
+        if name in claims and not claims[name].get("passed", True)
+    ]
 
 
 def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
@@ -645,28 +708,33 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
 
     out_dir = task_dir(campaign_dir, task.task_id)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "config.json").write_text(json.dumps(task.to_dict(), indent=2, sort_keys=True))
+    (out_dir / "config.json").write_text(
+        json.dumps(task.to_dict(), indent=2, sort_keys=True)
+    )
 
     handler, solver_counter = _setup_logging(out_dir / "run.log")
     logger = logging.getLogger("experiment.hpc.runner")
     logger.info(
         "Task %d  grid=%s  seed=%d  n_failures=%d",
-        task.task_id, task.grid, task.seed, task.n_failures,
+        task.task_id,
+        task.grid,
+        task.seed,
+        task.n_failures,
     )
-    logger.info("Slurm: job=%s array_task=%s host=%s",
-                os.environ.get("SLURM_JOB_ID"),
-                os.environ.get("SLURM_ARRAY_TASK_ID"),
-                os.environ.get("HOSTNAME") or platform.node())
+    logger.info(
+        "Slurm: job=%s array_task=%s host=%s",
+        os.environ.get("SLURM_JOB_ID"),
+        os.environ.get("SLURM_ARRAY_TASK_ID"),
+        os.environ.get("HOSTNAME") or platform.node(),
+    )
 
     _seed_everything(task.seed)
-    # Reset per-run diagnostics so this task's counts reflect only this
-    # task — workers reuse the same process across tasks, so without
-    # arm() the event/negotiation logs and action ring buffer carry over.
+    # Reset per-run diagnostics: workers reuse the process, so logs/buffers
+    # carry over without arm().
     _diag.arm()
     # Per-aid trajectory logging (off by default; the log can grow large).
     _diag.set_trajectory_logging(getattr(plan, "write_trajectories", False))
-    # Drop any stale exception.json from a prior failed run so the
-    # aggregator's exception counts reflect only the current status.
+    # Drop stale exception.json from a prior failed run on this worker.
     stale_exc = out_dir / "exception.json"
     if stale_exc.exists():
         try:
@@ -688,180 +756,85 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     exit_code = EXIT_ERROR
     claims: dict[str, Any] | None = None
 
-    # Convert SIGTERM into a Python exception so the ``finally`` block
-    # still writes ``status.json`` (otherwise SIGTERM + grace + SIGKILL
-    # leaves no trace and the aggregator drops the task). SIGKILL is
-    # uncatchable, but we honour the SIGTERM grace window.
+    # Convert SIGTERM to an exception so ``finally`` still writes status.json
+    # (SIGKILL is uncatchable, but we honour the SIGTERM grace window).
     _prev_term = signal.getsignal(signal.SIGTERM)
+
     def _on_sigterm(signum, frame):
         raise KeyboardInterrupt("SIGTERM received — emergency shutdown")
+
     try:
         signal.signal(signal.SIGTERM, _on_sigterm)
     except (ValueError, OSError):
         # Not main thread or otherwise restricted — best-effort only.
         _prev_term = None
 
-    # Pre-failure baseline: solve the no-failure LP on a fresh build of
-    # this grid + scenario. result.json's ``outcomes.restoration`` then
-    # expresses post-restoration served as a ratio of this baseline,
-    # surfacing absolute load lost, not just the priority-weighted view.
-    baseline_served = None
-    try:
-        if task.grid in GRIDS:
-            # Priorities are deterministic in (grid, seed, scenario), so
-            # build a throwaway net just to enumerate loads, then release
-            # it before the heavy sim/oracle phase — otherwise base_net +
-            # its Pyomo state double peak RAM (~1-3 GB on CP-heavy grids).
-            base_net = GRIDS[task.grid]()
-            _apply_scenario(base_net, task, logger)
-            base_priorities = _resolve_priorities(base_net, task, logger)
-            baseline_served = compute_baseline_served(
-                task.grid,
-                scenario=task.scenario or {},
-                priorities=base_priorities,
-            )
-            logger.info(
-                "Pre-failure baseline: served=%.4f / demand=%.4f (PWSF=%.4f)",
-                baseline_served.get("priority_weighted_served", 0.0),
-                baseline_served.get("priority_weighted_demand", 0.0),
-                baseline_served.get("priority_weighted_fraction", 0.0),
-            )
-            del base_net, base_priorities
-            gc.collect()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Baseline LP failed (continuing without it): %s", exc)
+    baseline_served = _compute_baseline(task, logger)
 
     try:
         if task.variant == "oracle":
-            world = None
-            net, failures, oracle_metrics = _run_oracle(
-                plan, task, logger, baseline_served=baseline_served
-            )
-            (out_dir / "failures.json").write_text(
-                json.dumps(_serialize_failures(failures), indent=2)
-            )
-            payload = oracle_metrics
-            (out_dir / "result.json").write_text(
-                json.dumps(payload, indent=2, sort_keys=True, default=str)
-            )
-            write_slack_meta(out_dir / "slack_meta.json", net)
+            _write_oracle_outputs(out_dir, plan, task, logger, baseline_served)
         else:
-            world, failures, net = asyncio.run(
-                _run_simulation(plan, task, logger, out_dir=out_dir)
+            claims = _write_simulation_outputs(
+                out_dir, plan, task, logger, started, baseline_served
             )
-            (out_dir / "failures.json").write_text(
-                json.dumps(_serialize_failures(failures), indent=2)
-            )
-            behavior = world.environment.behavior
-            # End-of-sim measurement boundary: force a fresh energy flow
-            # so observers report post-agent-action state, not the
-            # cooldown-cached previous solve. Otherwise the served
-            # breakdown is stale and the priority-invariant claim
-            # hallucinates intra-component inversions.
-            try:
-                behavior.flush_energy_flow()
-            except AttributeError:
-                logger.debug("Behavior has no flush_energy_flow() — skipping")
-            priorities = getattr(net, "_scare_priorities", None)
-            payload = compose_result(
-                world=world,
-                monee_net=net,
-                behavior=behavior,
-                task_meta=task.to_dict(),
-                wallclock_s=time.monotonic() - started,
-                completed=True,
-                extra_metrics={"legacy_metrics": _extract_metrics(world)},
-                priorities=priorities,
-                baseline_served=baseline_served,
-            )
-            write_result_json(out_dir / "result.json", payload)
-            write_served_csv(out_dir / "served.csv", net, behavior, priorities=priorities)
-            write_served_by_load_csv(
-                out_dir / "served_by_load.csv", net, behavior, priorities=priorities,
-            )
-            write_constraints_final_csv(out_dir / "constraints_final.csv", net)
-            write_diary_csv(out_dir / "diary.csv")
-            write_events_csv(out_dir / "events.csv")
-            write_slack_meta(out_dir / "slack_meta.json", net)
-            cfg = _config_from_task(task)
-            if cfg.record_messages:
-                write_messages_csv(out_dir / "messages.csv", world)
-            if plan.write_timeseries:
-                try:
-                    _write_timeseries(world, out_dir / "timeseries.csv")
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to write timeseries.csv: %s", exc)
-            if getattr(plan, "write_trajectories", False):
-                try:
-                    write_trajectories_csv(out_dir / "trajectories.csv")
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to write trajectories.csv: %s", exc)
-            # Claims validation: consume the artefacts just written and
-            # fold pass/fail into result.json for the aggregator.
-            try:
-                claims = evaluate_task(out_dir)
-                payload["claims"] = claims
-                write_result_json(out_dir / "result.json", payload)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Claims validation failed: %s", exc)
-        # ``ok`` means the task didn't crash. If any fatal claim failed,
-        # escalate to ``claims_failed`` so silent priority inversions
-        # aren't counted as successful runs. Override the fatal set
-        # per-campaign via plan.fatal_claims.
-        fatal_claims = tuple(
-            getattr(plan, "fatal_claims",
-                    ("priority_invariant", "monotonic_progress"))
-        )
-        if claims:
-            failing = [
-                name for name in fatal_claims
-                if name in claims and not claims[name].get("passed", True)
-            ]
-        else:
-            failing = []
+        # Escalate ``ok`` to ``claims_failed`` when a fatal claim failed.
+        failing = _failing_fatal_claims(claims, plan)
         if failing:
             logger.warning("Fatal claims failed: %s", failing)
             status["status"] = "claims_failed"
             status["failing_claims"] = failing
-            exit_code = EXIT_OK
         else:
             status["status"] = "ok"
-            exit_code = EXIT_OK
+        exit_code = EXIT_OK
 
     except asyncio.TimeoutError:
         logger.error("Task timed out after %.0f s", plan.task_timeout_s)
         status["status"] = "timeout"
-        (out_dir / "exception.json").write_text(json.dumps({
-            "type": "TimeoutError",
-            "message": f"Exceeded plan.task_timeout_s={plan.task_timeout_s}",
-        }, indent=2))
+        (out_dir / "exception.json").write_text(
+            json.dumps(
+                {
+                    "type": "TimeoutError",
+                    "message": f"Exceeded plan.task_timeout_s={plan.task_timeout_s}",
+                },
+                indent=2,
+            )
+        )
         exit_code = EXIT_TIMEOUT
 
     except KeyboardInterrupt as exc:
-        # SIGTERM (or Ctrl-C) — record ``killed`` so the aggregator can
-        # tell a wallclock kill from an ordinary error.
+        # SIGTERM/Ctrl-C — record ``killed`` to distinguish from an error.
         logger.error("Task killed: %s", exc)
         status["status"] = "killed"
-        (out_dir / "exception.json").write_text(json.dumps({
-            "type": "KeyboardInterrupt",
-            "message": str(exc),
-        }, indent=2))
+        (out_dir / "exception.json").write_text(
+            json.dumps(
+                {
+                    "type": "KeyboardInterrupt",
+                    "message": str(exc),
+                },
+                indent=2,
+            )
+        )
         exit_code = EXIT_TIMEOUT
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("Task failed: %s", exc)
-        (out_dir / "exception.json").write_text(json.dumps({
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "traceback": traceback.format_exc(),
-        }, indent=2))
+        (out_dir / "exception.json").write_text(
+            json.dumps(
+                {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+                indent=2,
+            )
+        )
         if reraise:
             raise
         exit_code = EXIT_ERROR
 
     finally:
-        # Release the per-task infeasibility-capture window so the next
-        # task on this worker gets a fresh slate. Best-effort.
+        # Release the capture window so the next task on this worker is fresh.
         try:
             disarm_infeasibility_capture()
         except Exception:  # noqa: BLE001
@@ -870,14 +843,20 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         status["solver_failures"] = solver_counter.count
         status["solver_infeasibilities"] = solver_counter.infeasible_count
         status["solver_warnings"] = solver_counter.warning_count
-        (out_dir / "status.json").write_text(json.dumps(status, indent=2, sort_keys=True))
+        (out_dir / "status.json").write_text(
+            json.dumps(status, indent=2, sort_keys=True)
+        )
         try:
             _dump_diagnostics(out_dir / "diagnostics.txt")
         except Exception:  # noqa: BLE001
             pass
-        logger.info("Status=%s duration=%.1fs solver_failures=%d exit=%d",
-                    status["status"], status["duration_s"],
-                    status["solver_failures"], exit_code)
+        logger.info(
+            "Status=%s duration=%.1fs solver_failures=%d exit=%d",
+            status["status"],
+            status["duration_s"],
+            status["solver_failures"],
+            exit_code,
+        )
         logging.getLogger().removeHandler(handler)
         handler.close()
         if _prev_term is not None:
@@ -890,12 +869,21 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+    )
     p.add_argument("--campaign-dir", required=True, type=Path)
-    p.add_argument("--task-id", type=int, default=None,
-                   help="Index into manifest.jsonl. If omitted, falls back to $SLURM_ARRAY_TASK_ID.")
-    p.add_argument("--reraise", action="store_true",
-                   help="Re-raise exceptions for debugging instead of writing exception.json")
+    p.add_argument(
+        "--task-id",
+        type=int,
+        default=None,
+        help="Index into manifest.jsonl. If omitted, falls back to $SLURM_ARRAY_TASK_ID.",
+    )
+    p.add_argument(
+        "--reraise",
+        action="store_true",
+        help="Re-raise exceptions for debugging instead of writing exception.json",
+    )
     return p.parse_args()
 
 
@@ -904,14 +892,20 @@ def _resolve_task_id(args: argparse.Namespace) -> int:
         return args.task_id
     env = os.environ.get("SLURM_ARRAY_TASK_ID")
     if env is None:
-        raise SystemExit("Pass --task-id N or run under Slurm with SLURM_ARRAY_TASK_ID set.")
+        raise SystemExit(
+            "Pass --task-id N or run under Slurm with SLURM_ARRAY_TASK_ID set."
+        )
     return int(env)
 
 
 def main() -> None:
     ensure_deterministic_hashing()
     args = _parse_args()
-    sys.exit(run_task(args.campaign_dir.resolve(), _resolve_task_id(args), reraise=args.reraise))
+    sys.exit(
+        run_task(
+            args.campaign_dir.resolve(), _resolve_task_id(args), reraise=args.reraise
+        )
+    )
 
 
 if __name__ == "__main__":

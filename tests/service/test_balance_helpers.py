@@ -1,14 +1,11 @@
 """Unit tests for balance.py helper functions (pure, no mango deps)."""
 
-import pytest
-
-from scare.service.balance import (
+from scare.service.balance.balance import (
+    _PRIORITY_TIERS,
     _compute_actual_priority,
     _deterministic_next,
     _deterministic_sub_round,
-    _PRIORITY_TIERS,
 )
-
 
 # ===================================================================
 # _deterministic_next
@@ -29,8 +26,7 @@ class TestDeterministicNext:
 
     def test_varies_with_counter(self):
         results = {
-            _deterministic_next(["a", "b", "c", "d"], "neg-1", i)
-            for i in range(20)
+            _deterministic_next(["a", "b", "c", "d"], "neg-1", i) for i in range(20)
         }
         assert len(results) > 1
 
@@ -101,8 +97,7 @@ class TestDeterministicSubRound:
 
     def test_varies_with_address(self):
         results = {
-            _deterministic_sub_round(f"addr-{i}", "neg-1", 1, 10)
-            for i in range(50)
+            _deterministic_sub_round(f"addr-{i}", "neg-1", 1, 10) for i in range(50)
         }
         assert len(results) > 1
 

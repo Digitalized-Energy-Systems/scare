@@ -23,8 +23,7 @@ import pytest
 
 from scare.base.channel import CPSummary
 from scare.base.model import Sector
-from scare.service.cp_priority_admm_role import CPPriorityAdmmRole
-
+from scare.service.coupling.cp_priority_admm_role import CPPriorityAdmmRole
 
 # ---------------------------------------------------------------------------
 # Minimal stubs
@@ -200,7 +199,9 @@ def test_commit_callback_writes_apply_regulate_once():
         peer_addrs={},
     )
     role._on_gossip_commit(
-        r=np.array([0.62]), converged=True, iterations=12,
+        r=np.array([0.62]),
+        converged=True,
+        iterations=12,
     )
     assert len(behavior.action_log) == 1
     aid, kind, value = behavior.action_log[0]
@@ -218,10 +219,14 @@ def test_commit_callback_clamps_to_zero_one():
         peer_addrs={},
     )
     role._on_gossip_commit(
-        r=np.array([1.4]), converged=False, iterations=200,
+        r=np.array([1.4]),
+        converged=False,
+        iterations=200,
     )
     role._on_gossip_commit(
-        r=np.array([-0.1]), converged=False, iterations=200,
+        r=np.array([-0.1]),
+        converged=False,
+        iterations=200,
     )
     assert behavior.action_log[0][2] == pytest.approx(1.0)
     assert behavior.action_log[1][2] == pytest.approx(0.0)
@@ -236,7 +241,9 @@ def test_commit_skipped_on_empty_factor():
         peer_addrs={},
     )
     role._on_gossip_commit(
-        r=np.array([]), converged=True, iterations=0,
+        r=np.array([]),
+        converged=True,
+        iterations=0,
     )
     assert behavior.action_log == []
 
@@ -259,7 +266,9 @@ async def test_run_gossip_round_bumps_round_id():
     from distributed_resource_optimization.algorithm.gossip_lexicographic_cascade.core import (
         create_gossip_cascade_participant,
     )
-    from scare.service.cp_priority_admm_role import _ReachableCPCarrier
+
+    from scare.service.coupling.cp_priority_admm_role import _ReachableCPCarrier
+
     role._gossip_carrier = _ReachableCPCarrier(role)
     role._gossip_participant = create_gossip_cascade_participant(
         cp_id="cp-001",

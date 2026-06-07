@@ -19,10 +19,7 @@ import pandas as pd
 
 from experiment.hpc.config import CAMPAIGN_LAYOUT
 
-
-# ---------------------------------------------------------------------------
 # Per-task wrapper
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -33,6 +30,7 @@ class TaskArtefacts:
     of tasks doesn't pay the IO cost up front when only a small subset
     is plotted (e.g. a single representative trajectory).
     """
+
     task_dir: Path
     task_id: int
     grid: str
@@ -43,7 +41,7 @@ class TaskArtefacts:
     sweep: str
     scenario: str
 
-    # ---- Lazy file accessors ----------------------------------------
+    # Lazy file accessors
 
     @cached_property
     def result(self) -> dict[str, Any]:
@@ -98,7 +96,7 @@ class TaskArtefacts:
         data = _read_json(self.task_dir / "slack_meta.json", default={})
         return data if isinstance(data, dict) else {}
 
-    # ---- Derived helpers --------------------------------------------
+    # Derived helpers
 
     def is_ok(self) -> bool:
         return self.status.get("status") == "ok"
@@ -118,9 +116,7 @@ class TaskArtefacts:
             return 0
 
 
-# ---------------------------------------------------------------------------
 # Campaign wrapper
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -185,9 +181,7 @@ class CampaignData:
         return self.task(int(df["task_id"].iloc[0]))
 
 
-# ---------------------------------------------------------------------------
 # Entry points
-# ---------------------------------------------------------------------------
 
 
 def load_campaign(campaign_dir: Path) -> CampaignData:
@@ -203,9 +197,7 @@ def load_campaign(campaign_dir: Path) -> CampaignData:
             f"first."
         )
     summary = pd.read_csv(summary_path)
-    metadata = _read_json(
-        campaign_dir / CAMPAIGN_LAYOUT["metadata"], default={}
-    )
+    metadata = _read_json(campaign_dir / CAMPAIGN_LAYOUT["metadata"], default={})
     return CampaignData(
         campaign_dir=campaign_dir,
         summary=summary,
@@ -213,9 +205,7 @@ def load_campaign(campaign_dir: Path) -> CampaignData:
     )
 
 
-# ---------------------------------------------------------------------------
 # IO helpers
-# ---------------------------------------------------------------------------
 
 
 def _read_json(path: Path, *, default: Any = None) -> Any:

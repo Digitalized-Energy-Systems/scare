@@ -18,38 +18,32 @@ class SystemStrategy(Enum):
     SIMULTANEOUSLY = auto()
 
 
-# ---------------------------------------------------------------------------
-# Sector-specific physical constraint bounds
-# ---------------------------------------------------------------------------
+# --- Sector-specific physical constraint bounds ---
 
-# Per-sector hard constraint bounds. Keys match observation-dict keys;
-# units are the monee model's (p.u. for voltage/pressure, Kelvin for temp).
+# Per-sector hard bounds. Keys match observation-dict keys; monee units (p.u.
+# for voltage/pressure, K for temp).
 SECTOR_CONSTRAINTS: dict[Sector, dict[str, tuple[float, float]]] = {
     Sector.ELECTRICITY: {
-        "vm_pu": (0.95, 1.05),           # voltage magnitude [p.u.]
-        # Thermal loading. loading_percent is one-sided (0=idle, 100=limit)
-        # but ``constraint_utilization`` is symmetric around the midpoint;
-        # the -100 lower bound puts the midpoint at 0 (the lower half is
-        # physically unreachable). On PowerLine branch agents.
+        "vm_pu": (0.95, 1.05),  # voltage magnitude [p.u.]
+        # Thermal loading. One-sided (0=idle, 100=limit), but utilization is
+        # symmetric around the midpoint, so -100 puts the midpoint at 0.
         "loading_percent": (-100.0, 100.0),
     },
     Sector.GAS: {
-        "pressure_pu": (0.90, 1.10),     # junction pressure [p.u.]
+        "pressure_pu": (0.90, 1.10),  # junction pressure [p.u.]
     },
     Sector.HEAT: {
         # DHS envelope: one pair must admit both supply (~80–130 °C) and
-        # return (~40–70 °C) to avoid false violations at consumer junctions.
-        "t_k": (313.15, 403.15),         # junction temperature [K] (40–130 °C)
+        # return (~40–70 °C) to avoid false violations.
+        "t_k": (313.15, 403.15),  # junction temperature [K] (40–130 °C)
     },
 }
 
-# Fraction of the feasible range at which an agent starts signalling
-# neighbours that it is approaching a limit.
+# Fraction of feasible range at which an agent warns neighbours it nears a limit.
 PROACTIVE_WARNING_FRACTION: float = 0.85
 
 
-# Per-sector time-scale constants: electricity propagates near-instantly,
-# gas changes take minutes, heat transport takes hours.
+# Per-sector time-scales: electricity near-instant, gas minutes, heat hours.
 SECTOR_TIMESCALE: dict[Sector, dict[str, float]] = {
     Sector.ELECTRICITY: {
         "poll_period_s": 0.5,
@@ -90,20 +84,15 @@ class EnergyData:
 class CommunityAssignment:
     community_id: UUID | None = None
     neighbors: list[Any] = field(default_factory=list)
-    # Current community leader. ``None`` ⇒ resolved statically from the
-    # ``groups`` topology. Set explicitly by ``DynamicRepartitionRole``
-    # after a failure-driven re-election that picked a different leader
-    # than the static partition.
+    # Current leader. None ⇒ resolved statically from ``groups``. Set by
+    # DynamicRepartitionRole after a failure-driven re-election.
     leader_addr: Any | None = None
 
 
 @dataclass
 class RepartitionAssignment:
-    """Sent from the original group leader to each orphaned member after a
-    failure-driven re-partition. Carries the orphans' shared new
-    ``community_id``, the elected new leader, and all fellow orphan
-    addresses (so the receiver can update its ``CommunityAssignment``).
-    """
+    """New community_id, leader, and fellow-orphan addresses sent to each
+    orphan after a failure-driven re-partition."""
 
     community_id: UUID
     new_leader_addr: Any
@@ -112,10 +101,8 @@ class RepartitionAssignment:
 
 @dataclass(frozen=True)
 class CommunityReassignedEvent:
-    """Local event emitted by the orphan after its CommunityAssignment is
-    updated post-repartition. Roles caching community-derived state (e.g.
-    leader address) should subscribe and refresh.
-    """
+    """Local event emitted by the orphan after its CommunityAssignment updates
+    post-repartition; roles caching community state should refresh."""
 
     new_leader_addr: Any
     n_neighbors: int
@@ -123,15 +110,12 @@ class CommunityReassignedEvent:
 
 @dataclass
 class LeaderEmerged:
-    """Cross-agent broadcast: an agent was promoted to lead an orphan
-    sub-community after a failure-driven re-partition.
+    """Broadcast that an agent was promoted to lead an orphan sub-community.
 
-    Sent by the new leader to every same-sector peer it knows (via the
-    ``holon_summary_<sector>`` mesh). Receivers add ``(aid, node_id)`` to
-    their ``_leader_node_ids`` map so the new leader appears in
-    ``_resolve_component_peer_addrs`` and can join component-scope ADMM
-    and the L3 escalation path. Without it the new leader is invisible to
-    the component coordinator and its reports/overrides are dropped.
+    Sent to every same-sector peer (holon_summary mesh); receivers add
+    (aid, node_id) to ``_leader_node_ids`` so the new leader joins
+    component-scope ADMM and L3 escalation. Without it it stays invisible
+    to the coordinator and its reports/overrides are dropped.
     """
 
     leader_aid: str
@@ -158,8 +142,9 @@ class OptimizationFinishedLocalEvent:
 
 @dataclass
 class ReconfigurationCompletedEvent:
-    """Emitted after grid reconfiguration closes tie switches: new
-    resources may be reachable, so balance negotiation should restart."""
+    """Emitted after reconfiguration closes tie switches; new resources may be
+    reachable, so balance negotiation should restart."""
+
     closed_switches: int = 0
 
 
@@ -174,15 +159,11 @@ class LineFailure:
 class FailureNotice:
     """Distributed branch-failure announcement.
 
-    Originates at the failed branch's two endpoint nodes and propagates
-    hop-by-hop through the physical-grid neighbour graph. Each
-    ``ProblemDetector`` deduplicates by ``(origin_addr, branch_id)``,
-    decrements ``hops_remaining`` by an edge-type-dependent cost, and
-    forwards to same-sector or CP-bridge grid neighbours.
-
-    ``sector`` is the failing branch's own sector — agents react only on
-    a sector match. Cross-sector coupling responses flow through
-    ``ConstraintViolation``, not this notice.
+    Originates at the failed branch's endpoints and propagates hop-by-hop;
+    each ProblemDetector dedups by (origin_addr, branch_id), decrements
+    hops_remaining by edge cost, and forwards to same-sector / CP-bridge
+    neighbours. ``sector`` is the failing branch's own — agents react only on a
+    match (cross-sector responses flow through ConstraintViolation).
     """
 
     branch_id: tuple
@@ -212,14 +193,12 @@ class EnergyNegotiationMessage:
     negotiation_target: float
     current_delta: float
     counter: int
-    # Per-agent contribution ledger: agent_key -> (delta, counter, priority,
-    # saturated). Propagating the full ledger (merged by latest counter per
-    # agent) avoids the double-counting an aggregate digest hits in cycles.
-    # ``saturated`` flags entries at dmin/dmax so the equal-share denominator
-    # counts only free agents.
+    # Per-agent ledger agent_key -> (delta, counter, priority, saturated).
+    # Full ledger (merged by latest counter) avoids the double-counting an
+    # aggregate digest hits in cycles; ``saturated`` excludes dmin/dmax entries
+    # from the equal-share denominator.
     memory: dict = field(default_factory=dict)
-    # Scalar dual variable for the primal-dual QP gossip. 0.0 = equal-share
-    # behaviour (no QP primal update).
+    # Scalar dual for the primal-dual QP gossip. 0.0 = equal-share (no QP update).
     dual_lambda: float = 0.0
 
 
@@ -232,9 +211,8 @@ class GridPathMessage:
     asked_agents: list[Any]
     uncertain_connections: list[tuple[Any, Any]]
     search_id: str = ""
-    # Running max ``loading_percent`` along the path, updated by each
-    # forwarding agent from its branch obs, so the originator can rank
-    # competing paths by peak thermal stress.
+    # Running max loading_percent along the path (each forwarder updates from
+    # its branch obs) so the originator can rank paths by peak thermal stress.
     max_loading_percent: float = 0.0
 
 
@@ -243,8 +221,8 @@ class GridPathResult:
     path: list[Any]
     uncertain_connections: list[tuple[Any, Any]]
     search_id: str = ""
-    # Peak line loading along this result's path; the reconfigurator picks
-    # the result with the lowest peak among those in a short window.
+    # Peak line loading along this path; reconfigurator picks the lowest peak in
+    # a short window.
     max_loading_percent: float = 0.0
 
 
@@ -252,15 +230,10 @@ class GridPathResult:
 class L2RecycleEscalation:
     """Escalate a locally-detected topology change to the L2 component layer.
 
-    A member that gets a ``FailureNotice`` can't re-run the per-component
-    waterfall itself, so it sends this with ``from_member=True`` to its
-    leader. The leader re-broadcasts (``from_member=False``) to every active
-    component peer and runs a fresh rebalance; peers re-collect and re-report
-    to the coordinator but do NOT re-broadcast, bounding fan-out to one hop.
-
-    Riding the member → leader → component-peer mesh lets the re-cycle reach
-    a coordinator many physical hops from the failure (beyond the TTL-bounded
-    ``FailureNotice``) while staying driven only by locally-detecting agents.
+    A member sends this (from_member=True) to its leader, which re-broadcasts
+    (from_member=False) to every active component peer and rebalances; peers
+    re-report but don't re-broadcast, bounding fan-out to one hop. Reaches a
+    coordinator beyond the TTL-bounded FailureNotice's reach.
     """
 
     sector: Sector
@@ -278,66 +251,52 @@ class AvailableFlexAnswer:
     balance: float
     shedded: float
     sector: Sector
-    # Per-sector (flex, balance) for holon-level multi-dimensional ADMM.
-    # Keys are Sector.value strings.
+    # Per-sector (flex, balance) for holon multi-dimensional ADMM; keys are
+    # Sector.value strings.
     flex_by_sector: dict[str, float] = field(default_factory=dict)
     balance_by_sector: dict[str, float] = field(default_factory=dict)
-    # Per-tier demand/served for priority-aware allocation. Keys are tiers
-    # (1=highest); values in MW (or equivalent).
+    # Per-tier demand/served for priority-aware allocation. Tiers 1=highest;
+    # values in MW (or equivalent).
     demand_by_priority: dict[int, float] = field(default_factory=dict)
     served_by_priority: dict[int, float] = field(default_factory=dict)
-    # Per-(sector, tier) breakdown so the holon ADMM can build a
-    # tier-stratified target instead of a single per-sector scalar.
-    # ``demand_by_sector_priority["electricity"][2] = 5.0`` = 5 MW nominal
-    # tier-2 electricity demand. Sector-agnostic on the producer side;
-    # empty = no positive-cap load with a registered tier and known sector.
+    # Per-(sector, tier) breakdown so the holon ADMM builds a tier-stratified
+    # target. e.g. ["electricity"][2] = 5 MW tier-2 demand. Empty = no
+    # positive-cap load with a registered tier and known sector.
     demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
     served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
-    # Total generator-class supply capacity per sector (sum of |cap| across
-    # generators / slacks). Used by the supply-priority holon ADMM mode to
-    # model the scarce supply pool that priority weighting arbitrates.
+    # Total generator-class supply capacity per sector (Σ|cap|). Models the
+    # scarce supply pool the supply-priority holon ADMM arbitrates.
     supply_by_sector: dict[str, float] = field(default_factory=dict)
-    # Unmet load per sector — load the LP could not deliver (regulation
-    # forced to 0 on disconnect, or otherwise shed). Separate from
-    # ``balance_by_sector``, which reports flowing setpoints that collapse to
-    # zero on disconnect and hide the deficit. Lets the CP ADMM trigger
-    # cross-sector help for invisible-because-disconnected demand.
+    # Unmet load per sector (LP couldn't deliver). Separate from
+    # ``balance_by_sector``, whose setpoints collapse to 0 on disconnect and
+    # hide the deficit; lets the CP ADMM help disconnected demand.
     unmet_by_sector: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
 class StartBalanceNegotiation:
-    # When set, the receiving leader skips the local ask/response round and
-    # uses this directly as the gossip target (= negative of the net setpoint
-    # the group should absorb), so the L2 per-actor allocation drives the
-    # per-group target. ``None`` ⇒ leader recomputes its own target.
+    # When set, the leader uses this directly as the gossip target (= negative
+    # net setpoint to absorb) instead of a local ask/response round. None ⇒
+    # leader recomputes its own.
     override_target: float | None = None
-    # Per-(sector, tier) override from the tier-stratified holon ADMM. When
-    # set, the leader bypasses the scalar target and dispatches each agent
-    # with its tier's allocation slice, preserving the holon's priority
-    # decision through the L2 → L1 handoff. Schema
-    # ``{sector_value: {tier: target_mw}}`` (target = desired setpoint sum
-    # for that sector/tier's loads). ``None`` keeps scalar-only behaviour.
+    # Per-(sector, tier) override from the tier-stratified holon ADMM: dispatch
+    # each agent with its tier's slice, preserving the holon's priority through
+    # L2→L1. Schema {sector_value: {tier: target_mw}}. None = scalar-only.
     override_targets_by_sector_priority: dict[str, dict[int, float]] | None = None
-    # Supply-priority allocation: per-(sector, tier) service fraction; each
-    # local load at (sec, tier) gets ``factor = service_fraction[sec][tier]``
-    # via ``apply_regulate``. Unlike ``override_targets_by_sector_priority``
-    # (absolute MW deltas), this is demand-magnitude-independent, so the
-    # priority allocation reaches each load uniformly within its tier.
+    # Supply-priority allocation: per-(sector, tier) service fraction applied as
+    # the load's factor. Unlike the MW-delta override above, it's demand-
+    # magnitude-independent, reaching each load uniformly within its tier.
     service_fraction_by_sector_priority: dict[str, dict[int, float]] | None = None
 
 
 @dataclass
 class LocalGenerationRequest:
-    """Sent by an L1 group leader to its L2 holon peers when gossip
-    converges with an unresolved deficit. The holon may absorb the residual
-    cross-group via an early rebalance, then replies with a
-    ``LocalGenerationApproval`` so the originator's fallback role activates
-    only after L2 has acted.
+    """Sent by an L1 leader to its L2 holon peers when gossip converges with an
+    unresolved deficit. L2 may absorb it cross-group, then replies with a
+    LocalGenerationApproval so the fallback activates only after L2 acts.
 
-    The fallback is a dispatch heuristic ramping local generator-class
-    children to cover the residual — no physical islanding (switch opening,
-    grid-forming); that lives in monee's ``enable_islanding`` extension."""
+    Fallback ramps local generator children to cover the residual — no physical
+    islanding (that lives in monee's ``enable_islanding`` extension)."""
 
     sector: Sector
     residual_deficit: float
@@ -345,13 +304,9 @@ class LocalGenerationRequest:
 
 @dataclass
 class LocalGenerationApproval:
-    """L2's response to a ``LocalGenerationRequest``: green-lights the
-    originator's ``LocalGenerationFallbackRole`` for the (possibly reduced)
-    residual L2 could not absorb cross-group.
-
-    Carried back over the holons topology so L1 fallback activation is
-    mediated by L2. With ``enable_holonic=False`` the originating role emits
-    this directly so the fallback path still works."""
+    """L2's response to a LocalGenerationRequest: green-lights the originator's
+    fallback for the residual L2 couldn't absorb cross-group. With
+    ``enable_holonic=False`` the originating role emits this directly."""
 
     sector: Sector
     residual_deficit: float
@@ -387,9 +342,7 @@ class CHSJoinRequestAnswer:
     accept: bool
 
 
-# ---------------------------------------------------------------------------
-# Grid constraint violation / warning events
-# ---------------------------------------------------------------------------
+# --- Grid constraint violation / warning events ---
 
 
 @dataclass(frozen=True)
@@ -397,7 +350,7 @@ class ConstraintViolation:
     """Emitted when a local grid measurement exceeds hard bounds."""
 
     sector: Sector
-    variable: str       # e.g. "vm_pu", "pressure_pu", "t_k"
+    variable: str  # e.g. "vm_pu", "pressure_pu", "t_k"
     value: float
     bound_low: float
     bound_high: float
@@ -413,14 +366,14 @@ class ConstraintWarning:
     value: float
     bound_low: float
     bound_high: float
-    utilization: float   # 0..1, how close to the violated bound
+    utilization: float  # 0..1, how close to the violated bound
     node_id: Any = None
 
 
 @dataclass
 class ConstraintStateMessage:
-    """Exchanged between neighbours to build a 2-3 hop picture of
-    constraint tightness."""
+    """Exchanged between neighbours to build a 2-3 hop picture of constraint
+    tightness."""
 
     sector: Sector
     variable: str
@@ -428,18 +381,17 @@ class ConstraintStateMessage:
     utilization: float
     hops_remaining: int
     origin_addr: Any = None
-    # Priority-coordination fields (heat frontier controller): let a cold
-    # heat load see whether lower-priority reducible heat load exists in its
-    # hydraulic region and defer its own tier-blind shed to the priority
-    # waterfall. ``None`` on non-heat / legacy messages.
+    # Priority-coordination fields (heat frontier): let a cold heat load see
+    # lower-priority reducible load in its region and defer to the waterfall.
+    # None on non-heat / legacy messages.
     priority_tier: int | None = None
     reducible: float | None = None
 
 
 @dataclass
 class CurtailmentRequest:
-    """Sent to neighbours when a constraint is violated, asking them to
-    reduce injection / consumption."""
+    """Sent to neighbours on a violation, asking them to reduce injection /
+    consumption."""
 
     sector: Sector
     amount: float  # MW / kg/s / W to curtail (positive = reduce)
@@ -447,47 +399,40 @@ class CurtailmentRequest:
 
 @dataclass
 class CurtailmentNeed:
-    """Auction-phase broadcast announcing total curtailment required; bidders
-    reply with how much they can absorb. Sender then issues per-neighbour
-    :class:`CurtailmentRequest` messages."""
+    """Auction-phase broadcast of total curtailment required; bidders reply
+    with how much they can absorb, then the sender issues per-neighbour
+    :class:`CurtailmentRequest`."""
 
     sector: Sector
-    total_amount: float   # aggregate fractional curtailment needed [0..1]
+    total_amount: float  # aggregate fractional curtailment needed [0..1]
     auction_id: str
-    # Origin/variable of the relieved violation, so a bidder can weight its
-    # willingness by cross-sensitivity (electrical proximity) — a closer load
-    # moves the constraint more per MW shed. ``origin_addr`` keys the bidder's
-    # cached multi-hop distance. Defaulted for back-compat.
+    # Origin/variable of the violation, so a bidder can weight willingness by
+    # electrical proximity. ``origin_addr`` keys cached multi-hop distance.
     origin_addr: Any = None
     variable: str = ""
 
 
 @dataclass
 class CurtailmentBid:
-    """Reply to a :class:`CurtailmentNeed`. Carries a scalar willingness
-    score (higher = more able to absorb curtailment) used to allocate the
-    total."""
+    """Reply to :class:`CurtailmentNeed`: scalar willingness (higher = more
+    able to absorb) used to allocate the total."""
 
     auction_id: str
     willingness: float
     sector: Sector
-    # Bidder's tier and current reducible draw. The default allocator uses
-    # only ``willingness``; the line-relief waterfall also needs ``tier`` to
-    # shed in reverse-priority order and ``reducible`` to know when a tier is
-    # exhausted. Defaulted for back-compat.
+    # Bidder's tier + reducible draw. Default allocator uses only willingness;
+    # the line-relief waterfall needs ``tier`` (reverse-priority order) and
+    # ``reducible`` (tier-exhaustion). Defaulted for back-compat.
     tier: int = 0
     reducible: float = 0.0
 
 
-# ---------------------------------------------------------------------------
-# Holonic community messages
-# ---------------------------------------------------------------------------
+# --- Holonic community messages ---
 
 
 @dataclass
 class HolonicJoinRequest:
-    """A community leader proposes to a neighbouring leader to form a
-    super-community (holon)."""
+    """A leader proposes to a neighbouring leader to form a holon."""
 
     holon_id: UUID
     member_communities: list[UUID]
@@ -503,7 +448,7 @@ class HolonicJoinAnswer:
 
 @dataclass
 class HolonicAssignment:
-    """Stored on each agent: which holon (super-community) it belongs to."""
+    """Which holon (super-community) an agent belongs to."""
 
     holon_id: UUID | None = None
     level: int = 0

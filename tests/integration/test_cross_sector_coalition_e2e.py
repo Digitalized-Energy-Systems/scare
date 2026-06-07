@@ -19,16 +19,15 @@ The GEKKO solver is stubbed to run without a numerical-solver install.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 
-import pytest
-
-from mango_energy_environments import fetch_example_net
 import mango_energy_environments.environments.restoration.multi_energy_monee as _restoration_mod
+import pytest
+from mango_energy_environments import fetch_example_net
 
-from scare.base import diagnostics
 from scare.base.config import RestorationConfiguration
+from scare.base.runtime import diagnostics
 from scare.base.util import create_failures
 from scare.scenario.restoration import (
     create_restoration_scenario_world,
@@ -125,10 +124,15 @@ async def _run_once(
     )
 
     failures = create_failures(
-        net, "branch", num_failures=1, delay_s_max=1.0,
+        net,
+        "branch",
+        num_failures=1,
+        delay_s_max=1.0,
     )
     await start_restoration_simulation(
-        world, failures, simulation_duration_s=simulation_duration_s,
+        world,
+        failures,
+        simulation_duration_s=simulation_duration_s,
     )
 
     artefacts = _dump_events(out_dir, label)
@@ -206,6 +210,5 @@ async def test_cross_sector_coalition_side_by_side(tmp_path):
     # Not asserting > 0 (the net may not invert), but the CP layer runs
     # either way, so on's cp_setpoint count must be >= off's.
     assert (
-        art_on["cross_sector"]["cp_setpoint"]
-        >= art_off["cross_sector"]["cp_setpoint"]
+        art_on["cross_sector"]["cp_setpoint"] >= art_off["cross_sector"]["cp_setpoint"]
     )

@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`scare.base.solver_guard`.
+"""Unit tests for :mod:`scare.base.runtime.solver_guard`.
 
 Verifies the per-solve wall-clock cap is installed so a synchronous
 SCIP/Gurobi MISOCP solve cannot run unbounded and block asyncio
@@ -7,18 +7,19 @@ cancellation.
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
+
 
 # All tests rewrite PER_SOLVER_OPTIONS; restore the original snapshot
 # after each test so other suites don't see leaked state.
 @pytest.fixture(autouse=True)
 def _restore_per_solver_options():
     from monee.solver import pyo as _pyo
+
     original = {k: dict(v) for k, v in _pyo.PER_SOLVER_OPTIONS.items()}
     # Reset the module-level "_INSTALLED" so each test sees a clean run.
-    from scare.base import solver_guard
+    from scare.base.runtime import solver_guard
+
     solver_guard._INSTALLED["done"] = False
     solver_guard._INSTALLED["limit_s"] = None
     yield
@@ -34,7 +35,11 @@ def test_install_seeds_scip_time_limit():
     unbounded and block asyncio cancellation.
     """
     from monee.solver import pyo as _pyo
-    from scare.base.solver_guard import install_solver_time_limit, installed_limit_s
+
+    from scare.base.runtime.solver_guard import (
+        install_solver_time_limit,
+        installed_limit_s,
+    )
 
     # Strip any pre-existing scip entry so we can verify the seed lands.
     _pyo.PER_SOLVER_OPTIONS.pop("scip", None)
@@ -48,7 +53,8 @@ def test_install_seeds_scip_time_limit():
 def test_install_seeds_gurobi_time_limit():
     """Gurobi uses ``TimeLimit`` (camelCase) — different option key."""
     from monee.solver import pyo as _pyo
-    from scare.base.solver_guard import install_solver_time_limit
+
+    from scare.base.runtime.solver_guard import install_solver_time_limit
 
     _pyo.PER_SOLVER_OPTIONS.pop("gurobi", None)
 
@@ -64,7 +70,8 @@ def test_install_does_not_raise_existing_limit():
     raise an explicit user-chosen lower limit.
     """
     from monee.solver import pyo as _pyo
-    from scare.base.solver_guard import install_solver_time_limit
+
+    from scare.base.runtime.solver_guard import install_solver_time_limit
 
     _pyo.PER_SOLVER_OPTIONS["gurobi"] = {"TimeLimit": 30.0}
 
@@ -80,7 +87,8 @@ def test_install_tightens_an_overly_generous_limit():
     runner is actually honoured.
     """
     from monee.solver import pyo as _pyo
-    from scare.base.solver_guard import install_solver_time_limit
+
+    from scare.base.runtime.solver_guard import install_solver_time_limit
 
     _pyo.PER_SOLVER_OPTIONS["gurobi"] = {"TimeLimit": 600.0}
 
@@ -92,7 +100,8 @@ def test_install_tightens_an_overly_generous_limit():
 def test_install_idempotent():
     """Calling twice with the same limit is a no-op the second time."""
     from monee.solver import pyo as _pyo
-    from scare.base.solver_guard import install_solver_time_limit
+
+    from scare.base.runtime.solver_guard import install_solver_time_limit
 
     _pyo.PER_SOLVER_OPTIONS.pop("scip", None)
 
@@ -109,7 +118,11 @@ def test_env_var_override(monkeypatch):
     explicit limit is passed.
     """
     from monee.solver import pyo as _pyo
-    from scare.base.solver_guard import install_solver_time_limit, installed_limit_s
+
+    from scare.base.runtime.solver_guard import (
+        install_solver_time_limit,
+        installed_limit_s,
+    )
 
     monkeypatch.setenv("SCARE_SOLVER_TIMELIMIT_S", "15")
     _pyo.PER_SOLVER_OPTIONS.pop("scip", None)
@@ -125,7 +138,8 @@ def test_install_survives_missing_monee():
     environment), the guard must no-op rather than crash.
     """
     import sys
-    from scare.base import solver_guard
+
+    from scare.base.runtime import solver_guard
 
     # Hide monee.solver.pyo for the duration of this test.
     real = sys.modules.get("monee.solver.pyo")

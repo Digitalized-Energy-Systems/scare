@@ -18,7 +18,6 @@ from experiment.eval.metrics import (
 )
 from scare.base.model import Sector
 
-
 # ---------------------------------------------------------------------------
 # Classifier logic
 # ---------------------------------------------------------------------------
@@ -37,16 +36,26 @@ class TestViolationClassifier:
 
     def test_loading_is_one_sided(self):
         over = _violation_row(
-            "branch", (1, 2), Sector.ELECTRICITY, "loading_percent",
-            114.0, -100.0, 100.0,
+            "branch",
+            (1, 2),
+            Sector.ELECTRICITY,
+            "loading_percent",
+            114.0,
+            -100.0,
+            100.0,
         )
         assert over["violated"] is True
         assert over["overshoot"] == pytest.approx(0.14)
         # The lower bound is a formula artefact — a "negative loading" must
         # never be flagged.
         under = _violation_row(
-            "branch", (1, 2), Sector.ELECTRICITY, "loading_percent",
-            -150.0, -100.0, 100.0,
+            "branch",
+            (1, 2),
+            Sector.ELECTRICITY,
+            "loading_percent",
+            -150.0,
+            -100.0,
+            100.0,
         )
         assert under["violated"] is False
         assert under["overshoot"] == 0.0
@@ -68,7 +77,7 @@ class TestViolationClassifier:
 
 
 def _build_grid():
-    from experiment.restoration import GRIDS
+    from experiment.scenarios import GRIDS
 
     name = "simbench_lv_low" if "simbench_lv_low" in GRIDS else next(iter(GRIDS))
     return GRIDS[name]()
@@ -91,9 +100,25 @@ class TestScanOnRealGrid:
         assert cv["passed"] is False
         assert cv["n_violations"] >= 1
         assert cv["by_sector"]["electricity"]["n_violations"] >= 1
+        # Per-variable-type tally: the overvoltage lands in the gating
+        # ``voltage`` bucket, separate from electricity's ``line_load`` bucket.
+        assert cv["by_variable"]["voltage"]["n_violations"] >= 1
+        assert cv["by_variable"]["voltage"]["gating"] is True
         worst = cv["violations"][0]
         assert worst["variable"] == "vm_pu"
         assert worst["value"] == pytest.approx(1.20)
+
+    def test_by_variable_separates_voltage_from_line_loading(self):
+        # Electricity carries two gating variables; the per-sector count
+        # conflates them but ``by_variable`` keeps them apart.
+        net = _build_grid()
+        cv = constraint_violations_final(net)
+        by_var = cv["by_variable"]
+        # A clean LV grid still *checks* voltage and line loading separately.
+        assert "voltage" in by_var
+        assert by_var["voltage"]["n_checked"] > 0
+        if "temperature" in by_var:
+            assert by_var["temperature"]["gating"] is False
 
     def test_disconnected_node_is_not_scanned(self):
         # A deactivated node must drop out of the scan entirely — its loads

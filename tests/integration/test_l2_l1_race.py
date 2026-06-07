@@ -11,28 +11,39 @@ with an in-flight L1 curtailment gossip.
 from __future__ import annotations
 
 import pytest
-
 from mango import RoleAgent, SimpleCommunicationSimulation, create_world
 from mango.express.topology import create_topology
 from mango.simulation.world import discrete_step_until
 
 from scare.base.model import Sector, StartBalanceNegotiation
-from scare.service.balance import EnergyBalanceNegotiator
+from scare.service.balance.balance import EnergyBalanceNegotiator
 from tests.conftest import MockBehavior, make_electricity_gen, make_electricity_load
 
 
-def _build_leader_with_two_loads(behavior: MockBehavior, *, comm_delay_s: float = 0.001):
+def _build_leader_with_two_loads(
+    behavior: MockBehavior, *, comm_delay_s: float = 0.001
+):
     """Leader (tier-0 gen) + 2 tier-2 loads, fully connected group topology."""
     world = create_world(
-        communication_sim=SimpleCommunicationSimulation(
-            default_delay_s=comm_delay_s
-        )
+        communication_sim=SimpleCommunicationSimulation(default_delay_s=comm_delay_s)
     )
 
     specs = [
-        {"aid": "leader-0", "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0), "priority": 0},
-        {"aid": "load-A", "obs": make_electricity_load(p_mw=3.0, regulation=1.0, priority=2), "priority": 2},
-        {"aid": "load-B", "obs": make_electricity_load(p_mw=2.0, regulation=1.0, priority=2), "priority": 2},
+        {
+            "aid": "leader-0",
+            "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0),
+            "priority": 0,
+        },
+        {
+            "aid": "load-A",
+            "obs": make_electricity_load(p_mw=3.0, regulation=1.0, priority=2),
+            "priority": 2,
+        },
+        {
+            "aid": "load-B",
+            "obs": make_electricity_load(p_mw=2.0, regulation=1.0, priority=2),
+            "priority": 2,
+        },
     ]
 
     agents = []
@@ -42,7 +53,9 @@ def _build_leader_with_two_loads(behavior: MockBehavior, *, comm_delay_s: float 
         behavior.set_obs(aid, spec["obs"])
         behavior.add_action(aid, "regulate")
         role = EnergyBalanceNegotiator(
-            behavior, Sector.ELECTRICITY, priority=spec["priority"],
+            behavior,
+            Sector.ELECTRICITY,
+            priority=spec["priority"],
         )
         agent = world.register(RoleAgent(), suggested_aid=aid)
         agent.add_role(role)
@@ -89,8 +102,12 @@ async def test_l2_supply_priority_lands_while_gossip_active():
     # dispatch, independent of the in-flight gossip.
     def shed_calls(aid: str):
         return [
-            c for c in behavior.action_log
-            if c[0] == aid and c[1] == "regulate" and c[2] and abs(float(c[2][0])) < 1e-3
+            c
+            for c in behavior.action_log
+            if c[0] == aid
+            and c[1] == "regulate"
+            and c[2]
+            and abs(float(c[2][0])) < 1e-3
         ]
 
     assert shed_calls("load-A"), (

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scare.service.gossip_math import (
+from scare.service.balance.gossip_math import (
     compute_lambda_seed,
     entry_responsiveness,
     ledger_merge,
@@ -20,22 +20,25 @@ _TIERS = 4
 # qp_primal — closed-form primal update
 # --------------------------------------------------------------------------- #
 
+
 def test_qp_primal_clamps_to_box():
-    assert qp_primal(2.0, 3.0, -1.0, 1.0) == 1.0      # a_i*lam=6 -> dmax
-    assert qp_primal(1.0, -5.0, -2.0, 2.0) == -2.0    # -> dmin
-    assert qp_primal(2.0, 0.1, -1.0, 1.0) == 0.2      # interior
+    assert qp_primal(2.0, 3.0, -1.0, 1.0) == 1.0  # a_i*lam=6 -> dmax
+    assert qp_primal(1.0, -5.0, -2.0, 2.0) == -2.0  # -> dmin
+    assert qp_primal(2.0, 0.1, -1.0, 1.0) == 0.2  # interior
 
 
 # --------------------------------------------------------------------------- #
 # qp_priority_weight / entry_responsiveness
 # --------------------------------------------------------------------------- #
 
+
 def test_priority_weight_matches_entry_responsiveness():
     # The receiver's Σa estimate must agree with each agent's own primal a_i.
     for prio in (1, 2, 3, 4):
         for sign in (-1, 1):
-            assert qp_priority_weight(prio, sign, priority_tiers=_TIERS) == \
-                entry_responsiveness(prio, sign, priority_tiers=_TIERS)
+            assert qp_priority_weight(
+                prio, sign, priority_tiers=_TIERS
+            ) == entry_responsiveness(prio, sign, priority_tiers=_TIERS)
 
 
 def test_priority_weight_curtailment_ordering():
@@ -51,16 +54,18 @@ def test_priority_weight_curtailment_ordering():
 # step_size — Robbins-Monro schedule
 # --------------------------------------------------------------------------- #
 
+
 def test_step_size_decays():
-    assert step_size(0.6, 0, step_decay_k0=20) == 0.6          # k=0 -> constant
-    assert step_size(0.6, 20, step_decay_k0=20) == 0.3         # k=k0 -> half
+    assert step_size(0.6, 0, step_decay_k0=20) == 0.6  # k=0 -> constant
+    assert step_size(0.6, 20, step_decay_k0=20) == 0.3  # k=k0 -> half
     seq = [step_size(0.6, k, step_decay_k0=20) for k in range(0, 40, 5)]
-    assert all(a > b for a, b in zip(seq, seq[1:]))            # strictly decreasing
+    assert all(a > b for a, b in zip(seq, seq[1:]))  # strictly decreasing
 
 
 # --------------------------------------------------------------------------- #
 # compute_lambda_seed
 # --------------------------------------------------------------------------- #
+
 
 def test_lambda_seed_sign_and_clamp():
     pos = compute_lambda_seed(10.0, 4, priority=2, priority_tiers=_TIERS)
@@ -80,6 +85,7 @@ def test_lambda_seed_fair_share_direction():
 # --------------------------------------------------------------------------- #
 # ledger arithmetic
 # --------------------------------------------------------------------------- #
+
 
 def test_ledger_total_delta():
     mem = {"a": (1.5, 3, 2, False), "b": (-0.5, 2, 3, True)}
@@ -108,7 +114,7 @@ def test_ledger_merge_byzantine_clip():
 def test_ledger_merge_tolerates_legacy_3tuple():
     mem: dict[str, tuple] = {}
     ledger_merge(mem, {"c": (0.5, 2, 4)}, byzantine_cap=100.0)
-    assert mem["c"] == (0.5, 2, 4, False)   # saturated defaults False
+    assert mem["c"] == (0.5, 2, 4, False)  # saturated defaults False
 
 
 def test_ledger_sum_responsiveness_excludes_saturated():
@@ -116,7 +122,7 @@ def test_ledger_sum_responsiveness_excludes_saturated():
     mem = {
         "free1": (0.1, 1, 2, False),
         "free2": (0.1, 1, 2, False),
-        "sat": (0.5, 1, 2, True),     # saturated -> excluded
+        "sat": (0.5, 1, 2, True),  # saturated -> excluded
     }
     got = ledger_sum_responsiveness(mem, 1, priority_tiers=_TIERS)
     assert abs(got - 2 * one) < 1e-9

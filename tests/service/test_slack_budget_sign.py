@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from scare.base.model import Sector, StartBalanceNegotiation
-from scare.service.slack_budget import SlackBudgetMonitor
+from scare.service.control.slack_budget import SlackBudgetMonitor
 
 
 class _Ctx:
@@ -57,8 +57,9 @@ def _run_monitor(*, obs_key, draw, budget, sector):
 
 def test_positive_import_slack_sheds_not_adds():
     # Gas slack: import encoded as POSITIVE mass_flow, 10x over budget.
-    tgt = _run_monitor(obs_key="mass_flow", draw=0.00135, budget=0.000135,
-                       sector=Sector.GAS)
+    tgt = _run_monitor(
+        obs_key="mass_flow", draw=0.00135, budget=0.000135, sector=Sector.GAS
+    )
     assert tgt is not None
     assert tgt < 0, f"over-importing slack must shed (negative target), got {tgt}"
     # Magnitude is the over-budget amount.
@@ -68,8 +69,9 @@ def test_positive_import_slack_sheds_not_adds():
 def test_negative_import_slack_unchanged():
     # Electricity slack: import encoded as NEGATIVE p_mw; target must be
     # the same -(|val|-budget) shed value as the positive-encoding case.
-    tgt = _run_monitor(obs_key="p_mw", draw=-0.19, budget=0.168,
-                       sector=Sector.ELECTRICITY)
+    tgt = _run_monitor(
+        obs_key="p_mw", draw=-0.19, budget=0.168, sector=Sector.ELECTRICITY
+    )
     assert tgt is not None
     assert tgt < 0
     assert tgt == pytest.approx(-(0.19 - 0.168))
@@ -77,6 +79,7 @@ def test_negative_import_slack_unchanged():
 
 def test_within_budget_no_override():
     # Draw within budget*(1+tol) → no violation, no override.
-    tgt = _run_monitor(obs_key="p_mw", draw=-0.17, budget=0.168,
-                       sector=Sector.ELECTRICITY)
+    tgt = _run_monitor(
+        obs_key="p_mw", draw=-0.17, budget=0.168, sector=Sector.ELECTRICITY
+    )
     assert tgt is None

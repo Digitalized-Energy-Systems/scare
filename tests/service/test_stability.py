@@ -1,12 +1,10 @@
 """Component tests for GenerationController role."""
 
 import pytest
-
 from mango import RoleAgent, create_world
-from mango.simulation.world import step_simulation
 
 from scare.base.model import NegotiationFinishedEvent, Sector
-from scare.service.stability import GenerationController
+from scare.service.control.stability import GenerationController
 from tests.conftest import MockBehavior, make_electricity_gen
 
 

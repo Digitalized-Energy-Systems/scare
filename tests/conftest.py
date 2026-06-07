@@ -6,9 +6,6 @@ from typing import Any
 
 import pytest
 
-from scare.base.model import Sector
-
-
 # ---------------------------------------------------------------------------
 # MockBehavior — stubs RestorationEnvironmentBehavior
 # ---------------------------------------------------------------------------
@@ -73,7 +70,12 @@ def make_electricity_load(
     vm_pu: float = 1.0,
     priority: int = 1,
 ) -> dict:
-    return {"p_mw": p_mw, "regulation": regulation, "vm_pu": vm_pu, "priority": priority}
+    return {
+        "p_mw": p_mw,
+        "regulation": regulation,
+        "vm_pu": vm_pu,
+        "priority": priority,
+    }
 
 
 def make_gas_obs(
@@ -81,7 +83,11 @@ def make_gas_obs(
     regulation: float = 0.5,
     pressure_pu: float = 1.0,
 ) -> dict:
-    return {"mass_flow": mass_flow, "regulation": regulation, "pressure_pu": pressure_pu}
+    return {
+        "mass_flow": mass_flow,
+        "regulation": regulation,
+        "pressure_pu": pressure_pu,
+    }
 
 
 def make_heat_obs(

@@ -5,10 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from distributed_resource_optimization import (
-    create_admm_sharing_data,
-    create_admm_start,
     create_sharing_target_distance_admm_coordinator,
-    start_coordinated_optimization,
 )
 from distributed_resource_optimization.carrier.mango import CoordinatorRole
 from mango import RoleAgent, behavior_in, connect_topologies, mark_as_connector
@@ -44,19 +41,7 @@ from monee.model.child import (
     Sink,
 )
 
-from scare.base import diagnostics as _diag
-from scare.base.admm import (
-    ScareDistributedOptimizationRole as DistributedOptimizationRole,
-)
 from scare.base.channel import SectorImbalanceBeacon
-from scare.base.community import (
-    communities_from_topology,
-    connected_component_partition,
-    label_propagation_partition,
-    modularity_of_partition,
-    modularity_partition,
-)
-from scare.base.comms import install_perturbation
 from scare.base.config import RestorationConfiguration
 from scare.base.model import (
     ConstraintViolation,
@@ -64,7 +49,19 @@ from scare.base.model import (
     Sector,
     SystemStrategy,
 )
-from scare.base.topology_mirror import GridTopologyMirror, mirror_from_monee
+from scare.base.optimization.admm import (
+    ScareDistributedOptimizationRole as DistributedOptimizationRole,
+)
+from scare.base.runtime import diagnostics as _diag
+from scare.base.runtime.comms import install_perturbation
+from scare.base.topology.community import (
+    communities_from_topology,
+    connected_component_partition,
+    label_propagation_partition,
+    modularity_of_partition,
+    modularity_partition,
+)
+from scare.base.topology.topology_mirror import mirror_from_monee
 from scare.base.util import (
     create_chp_admm_flex_actor,
     create_g2p_admm_flex_actor,
@@ -91,43 +88,43 @@ from scare.community.repartition import (
 from scare.community.role import PreAssignedCommunityRole
 from scare.community.summary import HolonSummaryRole
 from scare.detection.role import ProblemDetector
-from scare.service.balance import EnergyBalanceNegotiator, create_energy_balance_role
-from scare.service.constraints import GridConstraintMonitor
-from scare.service.cp import EnergyConverterRole, MultiCommunityCPRole
-from scare.service.cp_priority_admm_role import CPPriorityAdmmRole
-from scare.service.dynamic_connector import DynamicConnectorRole
-from scare.service.local_generation import LocalGenerationFallbackRole
-from scare.service.reconfiguration import GridReconfigurator, GridTieSwitchOperator
-from scare.service.slack_budget import SlackBudgetMonitor
-from scare.service.stability import GenerationController
-from scare.service.voltage_droop import (
+from scare.service.balance.balance import (
+    EnergyBalanceNegotiator,
+    create_energy_balance_role,
+)
+from scare.service.control.constraints import GridConstraintMonitor
+from scare.service.control.local_generation import LocalGenerationFallbackRole
+from scare.service.control.slack_budget import SlackBudgetMonitor
+from scare.service.control.stability import GenerationController
+from scare.service.control.voltage_droop import (
     COS_PHI_LARGE,
     COS_PHI_SMALL,
     COS_PHI_THRESHOLD_MVA,
     ReactivePowerDroopRole,
     vde_cos_phi_min,
 )
+from scare.service.coupling.cp import EnergyConverterRole, MultiCommunityCPRole
+from scare.service.coupling.cp_priority_admm_role import CPPriorityAdmmRole
+from scare.service.coupling.dynamic_connector import DynamicConnectorRole
+from scare.service.reconfiguration import GridReconfigurator, GridTieSwitchOperator
 
 logger = logging.getLogger(__name__)
 
 _SECTORS = [Sector.ELECTRICITY, Sector.GAS, Sector.HEAT]
-# Maps a sector to the monee grid-object name substring (PowerGrid /
-# GasGrid / WaterGrid) that ``topology_based_on_sector_grid`` matches on;
-# Sector.value alone would never match the grid repr.
+# Sector -> monee grid-object name substring matched by
+# ``topology_based_on_sector_grid`` (Sector.value won't match the repr).
 _SECTOR_GRID_MATCH: dict[Sector, str] = {
     Sector.ELECTRICITY: "power",
     Sector.GAS: "gas",
     Sector.HEAT: "water",
 }
 
-def _branch_sector_str(branch: Any, monee_net: Any) -> str:
-    """Sector tag for a physical branch, used by ``ProblemDetector`` to
-    decide which edges to traverse and at what cost.
 
-    Returns ``"electricity"`` / ``"gas"`` / ``"heat"`` for same-sector
-    pipes/lines, ``"cp"`` for cross-sector coupling plants (CHP, P2G,
-    G2P, P2H), or ``""`` when the sector is undeterminable (those edges
-    become non-traversable — the conservative choice).
+def _branch_sector_str(branch: Any, monee_net: Any) -> str:
+    """Sector tag for a branch (``ProblemDetector`` edge cost).
+
+    ``"electricity"``/``"gas"``/``"heat"`` for same-sector lines, ``"cp"``
+    for cross-sector plants, ``""`` when undeterminable (non-traversable).
     """
     if branch.model.is_cp():
         return "cp"
@@ -156,21 +153,14 @@ def _is_cp_branch(branch) -> bool:
 
 
 def _maybe_register_slack(behavior: Any, aid: str, child: Any) -> None:
-    """Register an ``ExtPowerGrid`` / ``ExtHydrGrid`` child as a slack
-    agent so the gossip obs helpers report its rated capacity (not the
-    LP's current operating point) and classify it as generator-class.
+    """Register an ExtPowerGrid/ExtHydrGrid child as a slack agent so
+    gossip reports its rated capacity and treats it as generator-class.
 
-    Rating comes from the Var bounds (``p_mw`` on ExtPowerGrid,
-    ``mass_flow`` on ExtHydrGrid): when one side is unbounded use the
-    other's magnitude; when both are unbounded leave the slack
-    unregistered (gossip then sees the LP's current value — safe).
+    Rating from the Var bounds; both bounds unbounded -> left unregistered.
     """
     m = child.model
-    # Prefer the operator soft budget stamped by ``_bound_external_slack``
-    # over the LP Var bounds: the LP bounds are widened to keep the
-    # energy-flow solve feasible, while the soft budget carries the
-    # operator's enforcement target. Fall back to the Var bounds (as the
-    # rating) when no budget was registered.
+    # Prefer the operator soft budget (enforcement target) over the LP Var
+    # bounds (widened for feasibility); fall back to Var bounds as rating.
     budget_attr: float | None = None
     var = None
     if isinstance(m, ExtPowerGrid):
@@ -188,7 +178,7 @@ def _maybe_register_slack(behavior: Any, aid: str, child: Any) -> None:
     if budget_attr is not None and float(budget_attr) > 0.0:
         rating = float(budget_attr)
     else:
-        # Positive rating magnitude from whichever bound is set.
+        # Rating magnitude from whichever bound is set.
         mags: list[float] = []
         if p_min is not None:
             mags.append(abs(float(p_min)))
@@ -201,11 +191,8 @@ def _maybe_register_slack(behavior: Any, aid: str, child: Any) -> None:
 
 
 def _slack_budget_for_child(child: Any) -> tuple[str, float] | None:
-    """Return ``(obs_key, budget)`` for a slack-class child carrying an
-    operator-policy budget; ``None`` for non-slack children and for
-    slack children left unbudgeted by ``apply_slack_budget`` (heat-side
-    ExtHydrGrid). Drives whether ``_populate_world`` installs a
-    ``SlackBudgetMonitor``.
+    """``(obs_key, budget)`` for a budgeted slack-class child, else
+    ``None``. Drives whether a ``SlackBudgetMonitor`` is installed.
     """
     m = child.model
     if isinstance(m, ExtPowerGrid):
@@ -222,9 +209,8 @@ def _slack_budget_for_child(child: Any) -> tuple[str, float] | None:
 
 
 def _is_power_generator(child: Any) -> bool:
-    """True when ``child`` is a monee ``PowerGenerator`` (every simbench
-    PV plant). Excludes PowerLoad (not inverter-coupled) and
-    ExtPowerGrid (slack whose Q is already an LP Var).
+    """True when ``child`` is a monee ``PowerGenerator`` (every PV plant).
+    Excludes PowerLoad and ExtPowerGrid (slack Q is already an LP Var).
     """
     return isinstance(child.model, PowerGenerator)
 
@@ -232,12 +218,8 @@ def _is_power_generator(child: Any) -> bool:
 def _is_heat_side_mass_flow_sink(child: Any, monee_net: Any) -> bool:
     """True when ``child`` is a ``Sink`` on a water/heat grid.
 
-    monee's supply-return convention represents each heat consumer as a
-    (HeatLoad, Sink) pair: the Sink withdraws the return-line mass flow
-    to close the loop and is a topology artifact, not a shedable demand
-    — its ``regulation < 1`` breaks junction mass balance and presolves
-    the LP infeasible. Excluding these from the agent layer keeps the
-    supply-priority ADMM from allocating quota to phantom demand.
+    Such Sinks close monee's supply-return loop (topology artifact, not
+    shedable demand): regulating them breaks mass balance / LP feasibility.
     Gas-sector Sinks are real consumption and stay load agents.
     """
     if not isinstance(child.model, Sink):
@@ -252,28 +234,21 @@ def _is_heat_side_mass_flow_sink(child: Any, monee_net: Any) -> bool:
 
 
 def _is_cp_subordinate_child(child: Any) -> bool:
-    """True when ``child`` is a coupling-point's subordinate output (a
-    ``SubHG``) rather than an independent device.
+    """True when ``child`` is a CP's subordinate ``SubHG`` output.
 
-    A CHPHG injects heat through a ``SubHG`` whose ``q_mw_heat`` is a Var
-    pinned by the control-node equation; it follows the control node and
-    is not independently controllable. SCARE controls and counts the CHP
-    at its control node, so treating ``SubHG`` as a standalone heat
-    generator would issue dead regulate writes and double-count its heat
-    in ``supply_by_sector[heat]``. Skip it at agent-build time; the
-    physical heat injection still happens via the Var.
+    Its heat follows the CHP control node (not independently controllable);
+    skipping it avoids dead regulate writes and double-counted heat. The
+    physical injection still happens via the Var.
     """
     return type(child.model).__name__ == "SubHG"
 
 
 def _inverter_s_nom_mva(child: Any) -> float | None:
-    """Return the inverter's rated apparent power in MVA.
+    """Inverter rated apparent power in MVA.
 
-    Prefers an explicit ``s_nom_mva`` on the model; otherwise reconstructs
-    from rated active power via the VDE-AR-N 4105 envelope
-    ``S_n = |p_n| / cos φ_min`` (cos φ_min = 0.95 for S_n ≤ 13.8 kVA, else
-    0.9). Two passes — small-inverter cos φ first, then re-check size — to
-    avoid a self-referential ``s_nom``.
+    Prefers explicit ``s_nom_mva``; else reconstructs from rated active
+    power via VDE-AR-N 4105 ``S_n = |p_n| / cos φ_min`` (two-pass to pick
+    the right cos φ without self-reference).
     """
     nominal = getattr(child.model, "s_nom_mva", None)
     if nominal is not None:
@@ -309,10 +284,8 @@ def _sectors_for_cp_type(cp_type: str) -> list[Sector]:
 def _cp_coupling_ratios(cp_type: str) -> dict[tuple[str, str], float]:
     """Static directional efficiencies per CP type.
 
-    Keyed by ``(in_sector_v, out_sector_v)``: ``coupling[(I, O)] = η``
-    means feeding 1 MW into sector I yields η MW in sector O. Static
-    priors used by L2.5 coalitions to size the implied cross-sector
-    transfer; L3 ADMM refines them.
+    ``coupling[(in_v, out_v)] = η``: 1 MW into sector in yields η MW out.
+    Priors for L2.5 coalition sizing; L3 ADMM refines them.
     """
     ct = cp_type.lower()
     el = Sector.ELECTRICITY.value
@@ -333,9 +306,7 @@ def _cp_coupling_ratios(cp_type: str) -> dict[tuple[str, str], float]:
 def _cp_rated_capacity_mw(obs: dict, cp_type: str) -> dict[str, float]:
     """Approximate per-sector rated output capacity of the CP in MW.
 
-    Reads the relevant obs key per driven sector. Serves as a
-    conservative upper bound on the coalition's cross-sector transfer;
-    L3 ADMM refines within these bounds.
+    Conservative upper bound on coalition transfer; L3 ADMM refines it.
     """
     out: dict[str, float] = {}
     ct = cp_type.lower()
@@ -358,8 +329,7 @@ def _cp_rated_capacity_mw(obs: dict, cp_type: str) -> dict[str, float]:
         if not (cap > 0 and cap < 1e9):
             continue
         if sec == Sector.GAS:
-            # kg/s to MW so sectors are comparable.
-            cap = kgps_to_mw(cap)
+            cap = kgps_to_mw(cap)  # kg/s to MW for comparability
         out[sec.value] = cap
     return out
 
@@ -376,13 +346,12 @@ def create_restoration_scenario_world(
     priorities = priorities or {}
     config = config or RestorationConfiguration()
 
-    # Warn when no priorities are supplied: obs_priority then defaults
-    # every load to tier 1, collapsing the priority-aware QP/ADMM layers
-    # to a uniform baseline. Count loads so the warning skips degenerate
-    # single-load test scenarios.
+    # No priorities -> obs_priority defaults every load to tier 1,
+    # collapsing the priority-aware layers. Skip the warning for 1-load tests.
     if not priorities:
         n_loads = sum(
-            1 for child in monee_net.childs
+            1
+            for child in monee_net.childs
             if obs_capacity(dict(child.model.values)) > 0
         )
         if n_loads > 1:
@@ -391,14 +360,13 @@ def create_restoration_scenario_world(
                 "will default every load to tier 1, collapsing the priority-"
                 "aware machinery (QP waterfall, holon ADMM S-pull, CP "
                 "consensus weights, PWSF metric) to a uniform baseline. "
-                "Use experiment.restoration.assign_load_priorities() or pass "
+                "Use experiment.scenarios.assign_load_priorities() or pass "
                 "an explicit priorities= dict.",
                 n_loads,
             )
 
-    # with_communication=True installs a 20 s/hop Poisson delay that
-    # overrides ``static_delay_s`` and makes ``base_delay_ms`` inert; keep
-    # it off so the configured static delay is what runs.
+    # Keep with_communication off: it would install a 20 s/hop Poisson
+    # delay overriding ``static_delay_s`` and making ``base_delay_ms`` inert.
     world = create_restoration_world(
         monee_net,
         with_communication=False,
@@ -406,12 +374,16 @@ def create_restoration_scenario_world(
     )
 
     behavior: RestorationEnvironmentBehavior = world.environment.behavior
-    # Stash on behavior so components can read config flags lazily without
-    # threading the full config through every constructor.
+    # Stash config so components read flags lazily without threading it through.
     behavior._scare_config = config
+    _cd_override = getattr(config, "energy_flow_cooldown_s_override", None)
+    if _cd_override is not None and hasattr(behavior, "_energy_flow_cooldown_s"):
+        behavior._energy_flow_cooldown_s = float(_cd_override)
+    _max_acts = getattr(config, "energy_flow_max_acts", None)
+    if _max_acts is not None and hasattr(behavior, "_energy_flow_max_acts"):
+        behavior._energy_flow_max_acts = int(_max_acts)
 
-    # Install comms perturbations before agents register so every
-    # subsequent send_message is covered.
+    # Install perturbations before agents register so every send is covered.
     install_perturbation(
         world,
         base_delay_s=base_delay_ms / 1000.0,
@@ -439,15 +411,13 @@ async def start_restoration_simulation(
 
     async with world:
         await discrete_step_until(world, max_advance_time_s=simulation_duration_s)
-        # Record still-active gossip as abandoned before the world context
-        # exits (role.context must still be valid).
+        # Flush in-flight gossip while role.context is still valid.
         _flush_pending_negotiations(world)
 
 
 def _flush_pending_negotiations(world: SimulationWorld) -> None:
-    """Drain in-flight gossip state into the negotiation diary so a short
-    ``simulation_duration_s`` doesn't leave abandoned negotiations
-    missing from the per-event account.
+    """Drain in-flight gossip into the diary so a short duration doesn't
+    drop abandoned negotiations from the per-event account.
     """
     for agent in world._agents.values():
         for role in getattr(agent, "roles", []):
@@ -458,10 +428,8 @@ def _flush_pending_negotiations(world: SimulationWorld) -> None:
 def _build_branch_sector_tables(
     monee_net: Any,
 ) -> tuple[dict[tuple, str], dict[Any, dict[Any, str]]]:
-    """Build the per-branch and per-node sector lookup tables the
-    ``ProblemDetector`` uses to cost grid edges without consulting the
-    global graph. Returns ``(branch_sector_by_id,
-    neighbour_sector_by_node)``.
+    """Per-branch and per-node sector lookup tables for ``ProblemDetector``
+    edge costing. Returns ``(branch_sector_by_id, neighbour_sector_by_node)``.
     """
     branch_sector_by_id: dict[tuple, str] = {}
     neighbour_sector_by_node: dict[Any, dict[Any, str]] = {}
@@ -485,50 +453,46 @@ def _populate_children(
 ) -> None:
     for child in monee_net.childs:
         aid = _child_aid(child.id)
-        # Read the network model directly: behavior.observe() needs
-        # energyflow to have run, which only happens once the sim starts.
+        # Read the model directly: observe() needs energyflow, which only
+        # runs once the sim starts.
         parent_node = monee_net.node_by_id(child.node_id)
         obs = {**dict(parent_node.model.values), **dict(child.model.values)}
         sector = sector_from_grid(parent_node.grid)
         register_sector(behavior, aid, sector)
-        # Register slack-class children so gossip reports their rated
-        # capacity (not the LP operating point) and treats them as
-        # generator-class regardless of import/export direction.
+        # Register slack-class children so gossip reports rated capacity
+        # and treats them as generator-class regardless of flow direction.
         _maybe_register_slack(behavior, aid, child)
         explicit_priority = priorities.get(aid)
-        # Force slacks to tier 0 (generator-class): a slack always
-        # absorbs/supplies at the boundary and is never shed. Without
-        # this, the construction-time obs_priority reads the LP p_mw sign
-        # and may misclassify the slack as a tier-1 load.
+        # Force slacks to tier 0: a slack is never shed. Otherwise
+        # obs_priority may read the LP p_mw sign and misclassify it as load.
         if explicit_priority is None:
             if lookup_slack(behavior, aid) is not None:
                 explicit_priority = 0
 
-        # Heat-side mass-flow Sinks are a topology artifact, not a
-        # curtailable demand; skipping registration keeps them out of the
-        # sector topology / community partition / holon membership so the
-        # dispatcher never tries to curtail them.
+        # Heat-side mass-flow Sinks are a topology artifact; skip so they
+        # stay out of topology/partition/holon and are never curtailed.
         if _is_heat_side_mass_flow_sink(child, monee_net):
             continue
 
-        # A CHP's SubHG heat output follows its control node; skip so it
-        # is neither separately regulated nor double-counted as a heat
-        # generator.
+        # A CHP's SubHG follows its control node; skip to avoid separate
+        # regulation and double-counting as a heat generator.
         if _is_cp_subordinate_child(child):
             continue
 
-        # Register the resolved priority on ``behavior`` so group-level
-        # aggregators get the correct per-aid tier instead of
-        # obs_priority's tier-1-for-all default. Slacks are already
-        # classified via the slack registry.
+        # Register the resolved priority so group aggregators get the right
+        # per-aid tier (not obs_priority's tier-1-for-all default).
         if explicit_priority is not None:
             register_priority(behavior, aid, int(explicit_priority))
 
         roles = []
         if sector is not None:
-            roles.append(_make_balance_role(behavior, sector, obs, config, priority=explicit_priority))
+            roles.append(
+                _make_balance_role(
+                    behavior, sector, obs, config, priority=explicit_priority
+                )
+            )
             roles.append(GenerationController(behavior, sector))
-            # Grid constraint monitoring (voltage / pressure / temperature).
+            # Voltage / pressure / temperature monitoring.
             roles.append(
                 GridConstraintMonitor(
                     behavior,
@@ -542,11 +506,12 @@ def _populate_children(
                     enable_multihop_constraint=config.enable_multihop_constraint,
                     enable_heat_frontier=config.enable_heat_frontier,
                     enable_heat_priority_waterfall=config.enable_heat_priority_waterfall,
+                    enable_qv_auction_coordination=config.enable_qv_auction_coordination,
+                    enable_qv_feeder_gate=config.enable_qv_feeder_gate,
                 )
             )
             # Slack-budget enforcement: only budgeted slack-class children
-            # get a monitor; ``_slack_budget_for_child`` returns None for
-            # everything else (including the unbudgeted heat ExtHydrGrid).
+            # get a monitor (helper returns None for everything else).
             if config.enable_slack_budget_monitor:
                 budget_info = _slack_budget_for_child(child)
                 if budget_info is not None:
@@ -562,14 +527,12 @@ def _populate_children(
                         )
                     )
 
-        # Passive handler that updates the child's CommunityAssignment
-        # when a leader-driven re-partition lands.
+        # Updates the child's CommunityAssignment on a leader re-partition.
         if sector is not None:
             roles.append(RepartitionHandlerRole())
 
-        # Local Q-V droop at every inverter-coupled PowerGenerator
-        # (VDE-AR-N 4105 §5.7.2). Lives at the device on a separate
-        # decision variable/timescale, orthogonal to the layers above.
+        # Local Q-V droop per inverter PowerGenerator (VDE-AR-N 4105
+        # §5.7.2), orthogonal to the layers above.
         if (
             config.enable_qv_droop
             and sector == Sector.ELECTRICITY
@@ -586,7 +549,9 @@ def _populate_children(
                     )
                 )
 
-        _register_agent(world, behavior, aid, roles, monee_id=child.id, monee_type="child")
+        _register_agent(
+            world, behavior, aid, roles, monee_id=child.id, monee_type="child"
+        )
 
 
 def _populate_nodes(
@@ -600,8 +565,8 @@ def _populate_nodes(
     for node in monee_net.nodes:
         aid = _node_aid(node.id)
         register_sector(behavior, aid, sector_from_grid(node.grid))
-        # Resolve addresses of children on this node so the detector can
-        # deliver FailureNotice locally (children already registered above).
+        # Child addresses on this node so the detector delivers
+        # FailureNotice locally (children already registered above).
         child_addrs: list[Any] = []
         for cid in getattr(node, "child_ids", []):
             child_aid = _child_aid(cid)
@@ -630,19 +595,20 @@ def _populate_nodes(
         cp_type = _detect_cp_type_for_node(node, monee_net)
         if cp_type is not None:
             if config.enable_cp_priority_admm:
-                # Install node-side only for node-hosted CPs (CHP). For
-                # branch-hosted CPs (P2G/G2P/P2H) the actuator lives on
-                # the branch agent (installed in ``_populate_branches``);
-                # a node-side role there has no ``regulate`` action so
-                # every commit silently no-ops.
+                # Node-side only for node-hosted CPs (CHP); branch-hosted
+                # CPs are actuated on the branch agent in _populate_branches.
                 if "chp" in cp_type.lower():
-                    _attach_cp_priority_admm_role(roles, behavior, aid, cp_type, obs, config)
+                    _attach_cp_priority_admm_role(
+                        roles, behavior, aid, cp_type, obs, config
+                    )
             elif config.enable_cp_admm:
                 _attach_cp_roles(roles, behavior, cp_type, obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
                 _attach_multi_community_cp_role(roles, behavior, cp_type, config)
 
-        _register_agent(world, behavior, aid, roles, monee_id=node.id, monee_type="node")
+        _register_agent(
+            world, behavior, aid, roles, monee_id=node.id, monee_type="node"
+        )
 
 
 def _populate_branches(
@@ -690,9 +656,8 @@ def _populate_branches(
             cent = get_by_branch_id(centrality, branch.id)
             roles.append(GridTieSwitchOperator(behavior, branch.id, centrality=cent))
 
-        # Line-loading monitor on electricity power lines (switchable or
-        # not). home_leader_addr is filled in after the groups topology
-        # is built.
+        # Line-loading monitor on electricity power lines;
+        # home_leader_addr is filled in after the groups topology is built.
         branch_sector = _branch_sector_str(branch, monee_net)
         if (
             config.enable_line_loading_constraint
@@ -716,7 +681,9 @@ def _populate_branches(
             )
 
         if roles:
-            _register_agent(world, behavior, aid, roles, monee_id=branch.id, monee_type="branch")
+            _register_agent(
+                world, behavior, aid, roles, monee_id=branch.id, monee_type="branch"
+            )
 
 
 def _populate_world(
@@ -727,7 +694,9 @@ def _populate_world(
     config: RestorationConfiguration,
 ) -> None:
     centrality = edge_centrality(monee_net)
-    branch_sector_by_id, neighbour_sector_by_node = _build_branch_sector_tables(monee_net)
+    branch_sector_by_id, neighbour_sector_by_node = _build_branch_sector_tables(
+        monee_net
+    )
     behavior._scare_branch_sector = branch_sector_by_id
     _populate_children(world, monee_net, behavior, priorities, config)
     _populate_nodes(
@@ -737,14 +706,11 @@ def _populate_world(
 
 
 def _detect_cp_type_for_node(node: Any, monee_net: Any) -> str | None:
-    """Return the CP plant type if *node* or any incident branch is a
-    cross-sector coupling model. Substrings match both legacy
-    (``chpmodel`` / ``powertogasmodel`` / ``gastopower``) and current
-    (``PowerToGas`` / ``PowerToHeatHG`` / ``GasToPower`` / ``Chp``) names.
+    """CP plant type if *node* or any incident branch is a coupling model;
+    substrings match both legacy and current model names.
     """
     # Check the node's own model first: a CHP is actuated through its
-    # ``chphgcontrolnode`` (a node, not a branch), so branch-only
-    # detection would miss it and leave the gas-throttle lever absent.
+    # ``chphgcontrolnode``, which branch-only detection would miss.
     own = _model_type_name(node)
     if any(s in own for s in ("chp", "powertogas", "gastopower", "powertoheat")):
         return own
@@ -763,9 +729,7 @@ def _make_balance_role(
     *,
     priority: int | None = None,
 ):
-    """``create_energy_balance_role`` with the per-scenario gossip flags
-    plumbed from *config*.
-    """
+    """``create_energy_balance_role`` with gossip flags from *config*."""
     return create_energy_balance_role(
         behavior,
         sector,
@@ -791,8 +755,8 @@ def _register_agent(
     monee_id: Any,
     monee_type: str,
 ) -> Any:
-    """Register a ``RoleAgent`` with *aid*, attach each role, and bind it
-    to its monee object via ``behavior.install``.
+    """Register a ``RoleAgent``, attach roles, and bind it to its monee
+    object via ``behavior.install``.
     """
     agent = world.register(RoleAgent(), suggested_aid=aid)
     for role in roles:
@@ -808,34 +772,22 @@ def _attach_cp_roles(
     obs: dict,
     priority: int,
 ) -> None:
-    """Append the three CP roles (``EnergyConverterRole`` +
-    ``DistributedOptimizationRole`` + ``CoordinatorRole``) to *roles*.
-    No-op when ``_build_cp_flex_actor`` returns ``None`` (unknown
-    *cp_type*).
+    """Append the three CP roles (converter + distributed-opt +
+    coordinator). No-op for unknown *cp_type*.
     """
     flex_actor, sectors = _build_cp_flex_actor(cp_type, obs, priority)
     if flex_actor is None:
         return
     roles.append(EnergyConverterRole(behavior, flex_actor, sectors))
     roles.append(DistributedOptimizationRole(flex_actor))
-    roles.append(
-        CoordinatorRole(create_sharing_target_distance_admm_coordinator())
-    )
+    roles.append(CoordinatorRole(create_sharing_target_distance_admm_coordinator()))
 
 
-def _cp_signed_capacity_by_sector(
-    cp_type: str, obs: dict
-) -> dict[str, float]:
-    """Load-convention signed per-sector effective capacities (MW) for a
-    CP, from its branch/node obs.
+def _cp_signed_capacity_by_sector(cp_type: str, obs: dict) -> dict[str, float]:
+    """Load-convention signed per-sector capacities (MW) for a CP.
 
-    Each CP has one input sector and one or two output sectors: input
-    capacity is read from the canonical obs key (``el_mw`` / ``gas_kgps``,
-    the latter converted to MW); output capacity is input scaled by η
-    (``eta_*`` falling back to ``efficiency`` then the defaults in
-    :func:`_cp_coupling_ratios`). Sign convention: positive = consumes
-    from the sector, negative = produces into it; the kernel's
-    ``x_i = r_i · c_i`` then honours each CP's physics automatically.
+    Input read from the canonical obs key; outputs are input scaled by η.
+    Sign: positive = consumes from sector, negative = produces into it.
     """
     ct = cp_type.lower()
     el = Sector.ELECTRICITY.value
@@ -850,9 +802,7 @@ def _cp_signed_capacity_by_sector(
 
     def _first_nonzero(*keys: str, default: float = 0.0) -> float:
         """First present, non-zero obs value across *keys*, else
-        *default*. Lets each CP class accept its model's rated-input key
-        (e.g. CHPHG ``mass_flow_setpoint``, PowerToHeatHG ``load_p_mw``)
-        as well as the canonical generic keys (``gas_kgps``, ``el_mw``)."""
+        *default* (accepts model-specific and generic input keys)."""
         for k in keys:
             v = _f(k, 0.0)
             if v != 0.0:
@@ -861,15 +811,8 @@ def _cp_signed_capacity_by_sector(
 
     out: dict[str, float] = {}
     if "chp" in ct:
-        # The CHP is actuated at its ``chphgcontrolnode`` (gas in →
-        # electricity + heat out all scale with the node's
-        # ``regulation``). Gas input rate is in ``gas_kgps`` (kg/s),
-        # ``mass_flow_setpoint`` is the compound-obs fallback; never
-        # ``mass_flow`` (a per-unit = 1 on the control node, not a rate).
-        # Heat sits on the CP since the control node is the device's
-        # controllability point; the SubHG that physically injects it is
-        # skipped as an agent to avoid double-counting (see
-        # ``_is_cp_subordinate_child``).
+        # CHP at its control node (gas in -> el + heat out). Gas rate from
+        # ``gas_kgps``; never ``mass_flow`` (per-unit). Heat sits on the CP.
         cap_in = kgps_to_mw(abs(_first_nonzero("gas_kgps", "mass_flow_setpoint")))
         if cap_in <= 0:
             return {}
@@ -889,13 +832,11 @@ def _cp_signed_capacity_by_sector(
         cap_in = kgps_to_mw(abs(_first_nonzero("gas_kgps", "mass_flow_setpoint")))
         if cap_in <= 0:
             return {}
-        eta = _first_nonzero("efficiency_power", "eta_el", "efficiency",
-                             default=0.45)
+        eta = _first_nonzero("efficiency_power", "eta_el", "efficiency", default=0.45)
         out[ga] = cap_in
         out[el] = -cap_in * eta
     elif "p2h" in ct or "powertoheat" in ct:
-        # PowerToHeatHG exposes ``load_p_mw`` (rated el input) and the
-        # generic ``efficiency`` — not ``el_mw`` / ``eta_heat``.
+        # PowerToHeatHG exposes ``load_p_mw`` + generic ``efficiency``.
         cap_in = abs(_first_nonzero("el_mw", "load_p_mw"))
         if cap_in <= 0:
             return {}
@@ -913,12 +854,9 @@ def _attach_cp_priority_admm_role(
     obs: dict,
     config: RestorationConfiguration,
 ) -> None:
-    """Install :class:`CPPriorityAdmmRole` (the sole L3 path under
-    ``enable_cp_priority_admm``) in place of the legacy
-    ``EnergyConverterRole`` / ``DistributedOptimizationRole`` /
-    ``CoordinatorRole`` triple. No-op when the CP's signed capacity
-    cannot be derived. The role's reachability filter, peer-CP address
-    book, and node-id table are injected later by the wire pass.
+    """Install :class:`CPPriorityAdmmRole` (sole L3 path under
+    ``enable_cp_priority_admm``). No-op when signed capacity can't be
+    derived; reachability filter and address books injected by the wire pass.
     """
     sectors = _sectors_for_cp_type(cp_type)
     if not sectors:
@@ -945,13 +883,9 @@ def _attach_multi_community_cp_role(
     cp_type: str,
     config: RestorationConfiguration,
 ) -> None:
-    """``component_level`` counterpart to :func:`_attach_cp_roles`.
-
-    Installs a single :class:`MultiCommunityCPRole` covering the sectors
-    the CP bridges, without the flex-actor / ADMM coordinator /
-    distributed-optimisation roles (unused in the baseline). Sector list
-    derived from *cp_type* so the role's per-sector EMA tracks exactly
-    the bridged sectors.
+    """``component_level`` counterpart to :func:`_attach_cp_roles`:
+    a single :class:`MultiCommunityCPRole` over the bridged sectors,
+    without the flex-actor/ADMM roles (unused in the baseline).
     """
     sectors = _sectors_for_cp_type(cp_type)
     if not sectors:
@@ -991,19 +925,15 @@ _LABEL_PROPAGATION_RADIUS: dict[Sector, int] = {
     Sector.HEAT: 2,
 }
 
-# Number of priority tiers (mirror of balance._PRIORITY_TIERS; local
-# copy to avoid a service-layer import).
+# Mirror of balance._PRIORITY_TIERS (local copy to avoid an import).
 _LINE_HOME_PRIORITY_TIERS = 10
 
 
 def _node_priority_weighted_demand(
     node_id: Any, monee_net: Any, priorities: dict[str, int]
 ) -> float:
-    """Sum of priority-weighted load capacity at a node.
-
-    A PowerLine branch is assigned to the endpoint with the *lower*
-    weighted demand so an overload-driven shed falls on the less-critical
-    side. Generators and zero-cap children are skipped.
+    """Sum of priority-weighted load capacity at a node (generators and
+    zero-cap children skipped). Lines home to the lower-demand endpoint.
     """
     try:
         node = monee_net.node_by_id(node_id)
@@ -1027,11 +957,9 @@ def _node_priority_weighted_demand(
     return total
 
 
-def _line_home_endpoint(
-    branch: Any, monee_net: Any, priorities: dict[str, int]
-) -> Any:
-    """Pick a PowerLine branch's home endpoint (lower priority-weighted
-    demand wins; ties break to the smaller node id for determinism).
+def _line_home_endpoint(branch: Any, monee_net: Any, priorities: dict[str, int]) -> Any:
+    """PowerLine home endpoint: lower priority-weighted demand wins,
+    ties break to the smaller node id.
     """
     a, b = branch.id[0], branch.id[1]
     pwd_a = _node_priority_weighted_demand(a, monee_net, priorities)
@@ -1040,16 +968,17 @@ def _line_home_endpoint(
         return a
     if pwd_b < pwd_a:
         return b
-    return a if (a < b if isinstance(a, int) and isinstance(b, int) else str(a) < str(b)) else b
+    return (
+        a
+        if (a < b if isinstance(a, int) and isinstance(b, int) else str(a) < str(b))
+        else b
+    )
+
 
 def _branch_downstream_load_addrs(monee_net: Any, world: Any) -> dict[str, list[Any]]:
-    """For every electricity PowerLine branch, the addresses of the loads
-    electrically downstream of it — the subtree disconnected from the
-    slack when the branch is removed. Shedding exactly those reduces the
-    branch's loading ~1:1; the branch-downstream curtailment auction uses
-    them as its bidder set. Branches whose removal does not cleanly split
-    one side off the slack (meshed/cyclic or already disconnected) get an
-    empty list and fall back to legacy endpoint relief.
+    """Per electricity PowerLine branch, addresses of the loads downstream
+    of it (the subtree cut off the slack when removed) — the bidder set for
+    the branch-downstream auction. Empty when removal yields no clean cut.
     """
     from collections import defaultdict, deque
 
@@ -1071,8 +1000,8 @@ def _branch_downstream_load_addrs(monee_net: Any, world: Any) -> dict[str, list[
         if ag is not None:
             node_loads[child.node_id].append(ag.addr)
 
-    # Undirected electricity adjacency keyed by branch aid so a single
-    # edge can be excluded during the cut test.
+    # Undirected electricity adjacency keyed by branch aid so one edge
+    # can be excluded during the cut test.
     adj: dict[Any, set[tuple[Any, str]]] = defaultdict(set)
     endpoints: dict[str, tuple[Any, Any]] = {}
     for branch in monee_net.branches:
@@ -1103,7 +1032,7 @@ def _branch_downstream_load_addrs(monee_net: Any, world: Any) -> dict[str, list[
         reach = _reach(slack_nodes, b_aid)  # nodes still fed without this branch
         a_up, b_up = a in reach, b in reach
         if a_up == b_up:
-            # Both sides still fed (cycle) or both cut off: no clean subtree.
+            # No clean subtree (both fed, or both cut off).
             result[b_aid] = []
             continue
         down_root = b if a_up else a
@@ -1123,10 +1052,9 @@ def _build_topologies(
     priorities: dict[str, int] | None = None,
 ) -> None:
     priorities = priorities or {}
-    # --- Per-sector physical topologies ---
-    # Each ``sector_grid_<sector>`` mirrors one network's physical
-    # adjacency; label propagation carves it into bounded sub-communities
-    # (Level-1 of the hierarchy).
+    # --- Per-sector physical topologies (Level-1) ---
+    # Each ``sector_grid_<sector>`` mirrors one network's adjacency; label
+    # propagation later carves it into bounded sub-communities.
     sector_grid_topos: dict[Sector, Topology] = {}
     for sector in _SECTORS:
         sector_str = _SECTOR_GRID_MATCH[sector]
@@ -1144,10 +1072,8 @@ def _build_topologies(
         sector_grid_topos[sector] = t
 
     # --- PowerLine home-endpoint resolution ---
-    # Each PowerLine branch joins exactly one endpoint group (the one
-    # with lower priority-weighted demand). Built before the groups loop
-    # so the augmentation can attach the branch agent to the right
-    # community.
+    # Each PowerLine joins one endpoint group (lower-demand). Built before
+    # the groups loop so it attaches to the right community.
     powerline_home_node: dict[str, Any] = {}
     powerline_branch_agent: dict[str, Any] = {}
     if config.enable_line_loading_constraint:
@@ -1166,25 +1092,24 @@ def _build_topologies(
             powerline_branch_agent[b_aid] = agent_obj
 
     # --- Groups topology: one cluster per sub-community ---
-    # ``communities_from_topology`` runs radius-bounded label propagation
-    # on the per-sector graph; each partition becomes one topology node
-    # holding all member agents (mutual NORMAL neighbours after
-    # injection, so gossip works unchanged).
+    # Each partition becomes one topology node holding all member agents
+    # (mutual NORMAL neighbours after injection, so gossip works unchanged).
     group_leaders_by_sector: dict[Sector, list] = {}
-    # Per-leader member list captured at formation time so
-    # ``DynamicRepartitionRole`` has the static member set to compare
+    # Static member set per leader for ``DynamicRepartitionRole`` to compare
     # against post-failure reachability.
     leader_to_members: dict[Any, list[Any]] = {}
     branch_to_leader: dict[str, Any] = {}
-    # Per-sector, per-coalition child aids, stashed on ``behavior`` so
-    # ``_register_recordings`` can emit per-coalition balance series.
-    # Keyed by sector value + sequential index for stable CSV columns.
+    # Per-sector, per-coalition child aids for per-coalition balance series;
+    # keyed by sector value + index for stable CSV columns.
     coalition_members_by_sector: dict[str, dict[int, list[str]]] = {
         s.value: {} for s in _SECTORS
     }
     with create_topology(tid="groups") as groups_topo:
         for sector in _SECTORS:
-            radius = config.community_label_propagation_radius or _LABEL_PROPAGATION_RADIUS.get(sector, 2)
+            radius = (
+                config.community_label_propagation_radius
+                or _LABEL_PROPAGATION_RADIUS.get(sector, 2)
+            )
             communities = communities_from_topology(
                 sector_grid_topos[sector],
                 max_radius=radius,
@@ -1195,9 +1120,8 @@ def _build_topologies(
             for members in communities:
                 if not members:
                     continue
-                # Augment electricity communities with PowerLine branch
-                # agents whose home endpoint sits in this community
-                # (single-home: branch joins exactly one group).
+                # Add PowerLine branch agents whose home endpoint is in
+                # this community (single-home: one group each).
                 if sector == Sector.ELECTRICITY and powerline_home_node:
                     member_aids = {m.aid for m in members}
                     for b_aid, home_node_id in list(powerline_home_node.items()):
@@ -1213,38 +1137,38 @@ def _build_topologies(
                             branch_agent = powerline_branch_agent.get(b_aid)
                             if branch_agent is not None and branch_agent not in members:
                                 members.append(branch_agent)
-                                # Mark the owning leader so the monitor's
-                                # home_leader_addr can be set below once
-                                # the leader is known.
+                                # Mark owner; home_leader_addr set below
+                                # once the leader is known.
                                 branch_to_leader[b_aid] = None
-                            # Single-home: drop so it isn't attached to the
-                            # other endpoint's group later.
+                            # Single-home: drop so it isn't attached again.
                             powerline_home_node.pop(b_aid, None)
                 node_id = groups_topo.add_node(*members)
                 leader = members[0]
                 leader_to_members[leader] = list(members)
                 groups_topo.set_characteristic(node_id, leader, "leader")
                 community_id = uuid4()
-                # Child aids in this coalition (skip branch agents — their
-                # observe() carries no ``regulation`` key). Index is the
-                # coalition's position within its sector for deterministic
-                # column ordering.
+                # Child aids in this coalition (branch agents skipped — no
+                # ``regulation`` key); index = position within the sector.
                 child_member_aids = [
                     m.aid for m in members if m.aid.startswith("child-")
                 ]
                 coalition_idx = len(coalition_members_by_sector[sector.value])
-                coalition_members_by_sector[sector.value][coalition_idx] = child_member_aids
+                coalition_members_by_sector[sector.value][coalition_idx] = (
+                    child_member_aids
+                )
                 for member in members:
                     member.add_role(PreAssignedCommunityRole(community_id))
-                    # Fill the home_leader pointer for branches just
-                    # attached to this community.
-                    if member.aid in branch_to_leader and branch_to_leader[member.aid] is None:
+                    # Fill home_leader for branches just attached here.
+                    if (
+                        member.aid in branch_to_leader
+                        and branch_to_leader[member.aid] is None
+                    ):
                         branch_to_leader[member.aid] = leader
                 group_leaders_by_sector.setdefault(sector, []).append(leader)
             sizes = sorted(len(c) for c in communities) if communities else []
             try:
-                # Recompute the per-node label dict for the modularity
-                # diagnostic (communities_from_topology discards it).
+                # Recompute the label dict for the modularity diagnostic
+                # (communities_from_topology discards it).
                 if config.community_partition_method == "modularity":
                     lbl = modularity_partition(
                         sector_grid_topos[sector].graph,
@@ -1252,15 +1176,14 @@ def _build_topologies(
                         resolution=config.community_modularity_resolution,
                     )
                 elif config.community_partition_method == "connected_component":
-                    lbl = connected_component_partition(
-                        sector_grid_topos[sector].graph
-                    )
+                    lbl = connected_component_partition(sector_grid_topos[sector].graph)
                 else:
                     lbl = label_propagation_partition(
                         sector_grid_topos[sector].graph, max_radius=radius
                     )
                 q_score = modularity_of_partition(
-                    sector_grid_topos[sector].graph, lbl,
+                    sector_grid_topos[sector].graph,
+                    lbl,
                     resolution=config.community_modularity_resolution,
                 )
             except Exception:
@@ -1277,9 +1200,7 @@ def _build_topologies(
                 q_score,
             )
 
-    # Patch every branch monitor's home_leader_addr now the community
-    # leaders are known (post-pass so it uses the leader actually chosen
-    # for the community).
+    # Patch each branch monitor's home_leader_addr now leaders are known.
     if branch_to_leader:
         for b_aid, leader in branch_to_leader.items():
             if leader is None:
@@ -1294,11 +1215,8 @@ def _build_topologies(
                 ):
                     role.home_leader_addr = leader.addr
 
-    # Branch-downstream relief: give each electricity branch monitor the
-    # loads that flow through it, so a line-overload auction sheds loads
-    # that relieve THAT line rather than the most-willing load in the
-    # component. Branches with no clean subtree keep legacy endpoint
-    # relief.
+    # Branch-downstream relief: give each branch monitor the loads through
+    # it so an overload auction relieves THAT line (else legacy endpoint relief).
     if config.enable_branch_downstream_relief and powerline_branch_agent:
         downstream = _branch_downstream_load_addrs(monee_net, world)
         attached = n_loads = 0
@@ -1318,24 +1236,20 @@ def _build_topologies(
                     n_loads += len(addrs)
         logger.info(
             "Branch-downstream relief: attached downstream load sets to %d "
-            "branch monitors (%d load-targets total)", attached, n_loads,
+            "branch monitors (%d load-targets total)",
+            attached,
+            n_loads,
         )
 
-    # Patch every SlackBudgetMonitor's home_leader_addr the same way.
-    # Otherwise its only escalation is a local ``BalanceProblem`` whose
-    # imbalance is dropped: ``trigger_balance_negotiation`` recomputes the
-    # target from the slack's operator target (not the over-budget draw),
-    # so gossip runs on ~0 and sheds nothing. Routing the over-budget
-    # magnitude via ``StartBalanceNegotiation(override_target)`` feeds the
-    # real imbalance into L1's QP curtailment. Required for single_level /
-    # component_level (no L2 ADMM); also helps SCARE when L2 is slow.
+    # Patch every SlackBudgetMonitor's home_leader_addr so it routes the
+    # over-budget magnitude into L1's QP curtailment (needed when there's no L2).
     for leader, members in leader_to_members.items():
         for member in members:
             for role in getattr(member, "roles", []):
                 if isinstance(role, SlackBudgetMonitor):
                     role.home_leader_addr = leader.addr
 
-    # Grid topology: node agents only, used by GridReconfigurator for path search.
+    # Grid topology: node agents only, for GridReconfigurator path search.
     with create_topology(tid="grid") as grid_topo:
         topology_based_on_grid(
             monee_net,
@@ -1357,10 +1271,8 @@ def _build_topologies(
             include_childs=False,
         )
 
-    # Per-leader maps for the dynamic re-partition role: own parent
-    # node_id, per-member node_id, per-member agent address, and
-    # per-sector branch adjacency. Recomputed here rather than threaded
-    # through ``_populate_world``.
+    # Per-leader maps for the dynamic re-partition role (node ids, member
+    # addresses, branch adjacency). Recomputed here, not threaded through.
     aid_to_node_id: dict[str, Any] = {
         f"child-{c.id}": c.node_id for c in monee_net.childs
     }
@@ -1377,23 +1289,21 @@ def _build_topologies(
             a, b = branch.id[0], branch.id[1]
             sector_branches_by_sector[sector_value_to_enum[sec]][branch.id] = (a, b)
 
-    # Central physical-grid mirror, built before the per-leader wiring so
-    # the L2 dynamic-holon and L3 dynamic-connector roles can share a
-    # reference. Passive structure; only ``set_on_branch_failure`` (below)
-    # mutates its state.
+    # Central grid mirror shared by the L2/L3 dynamic roles; only
+    # ``set_on_branch_failure`` (below) mutates it.
     mirror = mirror_from_monee(
         monee_net,
         branch_sector_resolver=lambda b: _branch_sector_str(b, monee_net),
     )
     behavior._scare_topology_mirror = mirror
 
-    # Sector-wide leader-aid → node-id lookup. L2 dynamic-holon needs it
-    # for every same-sector holon peer; L3 dynamic-connector needs the
-    # cross-sector union. Built once, partitioned by sector below.
+    # Leader-aid -> node-id lookup: per-sector for L2 dynamic-holon, with
+    # a cross-sector union below for L3 dynamic-connector.
     sector_leader_node_ids: dict[Sector, dict[str, Any]] = {}
     for sec, leaders in group_leaders_by_sector.items():
         sector_leader_node_ids[sec] = {
-            ldr.aid: aid_to_node_id.get(ldr.aid) for ldr in leaders
+            ldr.aid: aid_to_node_id.get(ldr.aid)
+            for ldr in leaders
             if aid_to_node_id.get(ldr.aid) is not None
         }
     # Cross-sector union for the L3 lookup.
@@ -1401,11 +1311,8 @@ def _build_topologies(
     for table in sector_leader_node_ids.values():
         all_leader_node_ids.update(table)
 
-    # CP metadata table ``{cp_aid: meta}``, built whenever CP ADMM is
-    # enabled so the L3 coord can (a) decide which CPs are in its
-    # multi-sector component (``node_id``), (b) build the gradient-step
-    # setpoint (``rated_capacity_mw``, ``coupling_ratios``), and (c)
-    # dispatch the allocation (``addr``). Empty when CP ADMM is off.
+    # CP metadata ``{cp_aid: meta}`` for the L3 coord (component membership,
+    # setpoint inputs, dispatch addr). Empty when CP ADMM is off.
     cp_meta_by_aid: dict[str, dict[str, Any]] = {}
     if config.enable_cp_admm or config.enable_cp_priority_admm:
         # Node-hosted CPs (e.g. CHP at a coupling node).
@@ -1440,15 +1347,12 @@ def _build_topologies(
                 "coupling_ratios": _cp_coupling_ratios(branch_type),
                 "rated_capacity_mw": _cp_rated_capacity_mw(obs, branch_type),
                 "addr": agent.addr,
-                # Branch CPs span two endpoints; use from_node
-                # (branch.id[0]). Either end gives the same active-
-                # component answer since the branch is an edge in it.
+                # Either endpoint gives the same component; use from_node.
                 "node_id": branch.id[0],
             }
 
-    # All CP host node ids, used by HolonicCommunityRole to decide
-    # whether to defer its L2 round to L3. Branch CPs register both
-    # endpoints so a leader reachable from either side sees the CP.
+    # All CP host node ids (HolonicCommunityRole uses them to decide
+    # whether to defer L2 to L3); branch CPs register both endpoints.
     cp_node_ids: set[Any] = set()
     if config.enable_cp_admm or config.enable_cp_priority_admm:
         for node in monee_net.nodes:
@@ -1459,26 +1363,20 @@ def _build_topologies(
                 cp_node_ids.add(branch.id[0])
                 cp_node_ids.add(branch.id[1])
 
-    # Per-sector leader address book used by the cross-sector
-    # coalition initiator to reach peer-sector leaders directly.
+    # Per-sector leader address book for the cross-sector coalition initiator.
     peer_leader_addrs: dict[Sector, dict[str, Any]] = {
         sec: {ldr.aid: ldr.addr for ldr in leaders}
         for sec, leaders in group_leaders_by_sector.items()
     }
 
-    # Attach Level-2 / fallback roles to each group leader and mark them
-    # as cross-topology connectors for the cps↔groups link.
-    # ``LocalGenerationFallbackRole`` always installs (safety net);
-    # ``HolonicCommunityRole`` is gated on ``enable_holonic``.
+    # Attach L2 / fallback roles to each leader and mark as connectors for
+    # the cps<->groups link. Fallback always installs; holonic is gated.
     for sector, leaders in group_leaders_by_sector.items():
         for leader in leaders:
             mark_as_connector(leader, connector_type=sector.value)
 
-            # L2 dynamic-holon filter, built before
-            # ``HolonicCommunityRole`` so it can be passed via
-            # ``live_member_filter`` and consulted at peer-iteration time.
-            # Only fires when a holon has formed and a later failure
-            # islands a member.
+            # L2 dynamic-holon filter, built before HolonicCommunityRole so
+            # it can be passed as ``live_member_filter``.
             dyn_holon_role = None
             leader_node = aid_to_node_id.get(leader.aid)
             if (
@@ -1494,14 +1392,10 @@ def _build_topologies(
                     mirror,
                 )
 
-            # One CoalitionConstraintStore per (leader, sector), shared
-            # between L2.5 (writer) and L2 (reader). Only built when
-            # coalitions are enabled.
+            # CoalitionConstraintStore per (leader, sector), shared between
+            # L2.5 (writer) and L2 (reader). Only when coalitions enabled.
             coalition_store = None
-            if (
-                config.enable_holon_summary
-                and config.enable_holon_coalition
-            ):
+            if config.enable_holon_summary and config.enable_holon_coalition:
                 coalition_store = CoalitionConstraintStore()
 
             if config.enable_holonic:
@@ -1527,15 +1421,13 @@ def _build_topologies(
                 leader.add_role(dyn_holon_role)
             leader.add_role(LocalGenerationFallbackRole(behavior, sector))
 
-            # Failure-driven dynamic re-partition. Each leader gets its
-            # sector's slice of the branch table and the parent-node map
-            # for every member of its initial community. Triggered by
-            # BranchFailureEvent (wired in ``_add_system_behaviors``).
+            # Failure-driven re-partition: each leader gets its sector's
+            # branch slice and member node map. Triggered by BranchFailureEvent.
             members = leader_to_members.get(leader, [leader])
-            member_node_ids = {m.aid: aid_to_node_id[m.aid] for m in members
-                               if m.aid in aid_to_node_id}
-            member_addrs = {m.aid: aid_to_addr.get(m.aid, m.addr)
-                            for m in members}
+            member_node_ids = {
+                m.aid: aid_to_node_id[m.aid] for m in members if m.aid in aid_to_node_id
+            }
+            member_addrs = {m.aid: aid_to_addr.get(m.aid, m.addr) for m in members}
             my_node_id = aid_to_node_id.get(leader.aid)
             if my_node_id is not None:
                 leader.add_role(
@@ -1549,22 +1441,16 @@ def _build_topologies(
                     )
                 )
 
-            # Periodic SectorImbalanceUpdate publisher so L3 (CP ADMM)
-            # can trigger from a local-imbalance predicate without waiting
-            # for an L1 NegotiationFinishedEvent that may never arrive.
+            # Periodic SectorImbalanceUpdate so L3 (CP ADMM) can trigger on
+            # local imbalance without waiting for an L1 event.
             if config.enable_cp_admm:
                 leader.add_role(SectorImbalanceBeacon(behavior, sector))
 
             # L2.5 cross-holon priority-inversion detector + coalition
-            # formation. Publishes per-tier served/demand on the sector-
-            # wide ``holon_summary_<sector>`` mesh and records inversions
-            # across holons.
+            # formation, publishing per-tier served/demand on the mesh.
             if config.enable_holon_summary:
-                # Spatial wiring for deliverability-aware coalition ADMM:
-                # the leader's node and per-member node-id map let the
-                # role build per-actor reachability via the shared
-                # ``mirror`` (shared so failures propagate consistently
-                # across L2/L2.5).
+                # Node map for deliverability-aware coalition ADMM, via the
+                # shared mirror (so failures propagate across L2/L2.5).
                 summary_member_nodes = {
                     m.aid: aid_to_node_id[m.aid]
                     for m in leader_to_members.get(leader, [leader])
@@ -1600,14 +1486,8 @@ def _build_topologies(
                     )
                 )
 
-    # Holons topology: partition same-sector group leaders into chunks of
-    # ``max_holon_size``, edges only within each chunk (Level-2). A single
-    # full clique would let only the lex-smallest leader initiate; chunked
-    # cliques give one initiator per chunk so every leader joins one
-    # holon. Empty when the holonic layer is disabled.
-    #
-    # Also collect the per-holon union of coalition memberships so the
-    # recording layer can emit a ``holon_balance__<sec>__<idx>`` series.
+    # Holons topology (L2): chunk same-sector leaders into ``max_holon_size``
+    # cliques (one initiator each); collect coalition unions per holon.
     holon_members_by_sector: dict[str, dict[int, list[str]]] = {
         s.value: {} for s in _SECTORS
     }
@@ -1619,39 +1499,36 @@ def _build_topologies(
                     continue
                 ordered = sorted(leaders, key=lambda a: a.aid)
                 for start in range(0, len(ordered), holon_chunk_size):
-                    chunk = ordered[start:start + holon_chunk_size]
+                    chunk = ordered[start : start + holon_chunk_size]
                     if len(chunk) < 2:
                         continue
                     chunk_nids = [holon_topo.add_node(member) for member in chunk]
                     for i, nid_a in enumerate(chunk_nids):
-                        for nid_b in chunk_nids[i + 1:]:
+                        for nid_b in chunk_nids[i + 1 :]:
                             holon_topo.add_edge(nid_a, nid_b)
-                    # Union of the chunk leaders' coalition memberships →
-                    # the holon's child aids. Dedup but preserve order.
+                    # Holon child aids = union of chunk coalitions (ordered,
+                    # deduped).
                     holon_child_aids: list[str] = []
                     seen_aids: set[str] = set()
                     for leader in chunk:
                         for member in leader_to_members.get(leader, [leader]):
                             aid = getattr(member, "aid", None)
-                            if aid and aid.startswith("child-") and aid not in seen_aids:
+                            if (
+                                aid
+                                and aid.startswith("child-")
+                                and aid not in seen_aids
+                            ):
                                 seen_aids.add(aid)
                                 holon_child_aids.append(aid)
                     holon_idx = len(holon_members_by_sector[sector.value])
                     holon_members_by_sector[sector.value][holon_idx] = holon_child_aids
 
-    # L2.5 holon-summary mesh: per-sector full clique of all group
-    # leaders, the broadcast channel for post-rebalance ``HolonSummary``
-    # publications. Surfaces cross-holon priority inversions so the
-    # coalition logic can convene an ad-hoc cross-chunk ADMM. O(N²) edges
-    # per sector but each message is only ``2 × n_tiers`` floats.
+    # L2.5 holon-summary mesh: per-sector full clique of leaders broadcasting
+    # ``HolonSummary`` (surfaces cross-holon inversions for cross-chunk ADMM).
     if config.enable_holonic and config.enable_holon_summary:
-        # CP agents bridging each sector also join the mesh so they
-        # receive HolonSummary under the L3 priority-ADMM cutover
-        # (CPPriorityAdmmRole reads leader supply/demand slices from it).
-        # Empty when the cutover flag is off (leader-only mesh).
-        cp_agents_by_sector: dict[Sector, list[Any]] = {
-            sec: [] for sec in _SECTORS
-        }
+        # CP agents bridging each sector join too under the L3 priority-ADMM
+        # cutover (CPPriorityAdmmRole reads supply/demand from HolonSummary).
+        cp_agents_by_sector: dict[Sector, list[Any]] = {sec: [] for sec in _SECTORS}
         if config.enable_cp_priority_admm:
             for aid_, meta in cp_meta_by_aid.items():
                 agent = world._agents.get(aid_)
@@ -1668,15 +1545,11 @@ def _build_topologies(
             with create_topology(tid=f"holon_summary_{sector.value}") as t:
                 nids = [t.add_node(a) for a in participants]
                 for i, nid_a in enumerate(nids):
-                    for nid_b in nids[i + 1:]:
+                    for nid_b in nids[i + 1 :]:
                         t.add_edge(nid_a, nid_b)
 
-    # CP-side topology wiring (connector marks + cps↔groups cross-link)
-    # is needed under CP ADMM (feeds the ``topology_connectors(tid="cps")``
-    # lookup :class:`EnergyConverterRole` uses to fan flex queries to
-    # leaders) and under the ``component_level`` baseline (routes per-
-    # community NegotiationFinishedEvent to :class:`MultiCommunityCPRole`).
-    # Skipped only when no CP role is installed on either path.
+    # CP-side topology wiring (connector marks + cps<->groups cross-link),
+    # needed under CP ADMM and the ``component_level`` baseline.
     if (
         config.enable_cp_admm
         or config.cps_join_communities
@@ -1707,11 +1580,8 @@ def _build_topologies(
         for sector in _SECTORS:
             connect_topologies(cps_topo, groups_topo, sector.value)
 
-    # Layer 3 dynamic CP-connector filter, built after the CP topology +
-    # connector marks so it can walk the already-populated
-    # ``EnergyConverterRole`` agents. Post-construction injection keeps
-    # ``_populate_world`` mirror-free and makes the L3 role purely
-    # additive (ablating it leaves the CP peer-iteration path unchanged).
+    # L3 dynamic CP-connector filter, built after the CP topology so it can
+    # walk the populated EnergyConverterRole agents. Purely additive.
     if config.enable_cp_admm and config.enable_dynamic_cp_topology:
         for agent in world._agents.values():
             cp_role = None
@@ -1723,9 +1593,8 @@ def _build_topologies(
                 continue
             cp_node_id = aid_to_node_id.get(agent.aid)
             if cp_node_id is None:
-                # Branch-hosted CP (P2G / G2P / P2H): use the first
-                # endpoint as reference (mirror's convention; reachability
-                # is symmetric so either endpoint gives the same classes).
+                # Branch-hosted CP: use the first endpoint (reachability is
+                # symmetric, so either gives the same classes).
                 for branch in monee_net.branches:
                     if create_branch_aid(branch.id) == agent.aid:
                         cp_node_id = branch.id[0]
@@ -1741,10 +1610,8 @@ def _build_topologies(
             agent.add_role(dyn_conn)
             cp_role._live_connector_filter = dyn_conn
 
-    # Wire the multi-sector L3 state on every CP role whenever
-    # ``enable_cp_admm`` is True (independent of the dynamic-CP-topology
-    # flag): L3 coord election + dispatch are core. Until this call the
-    # role stays in legacy per-CP mode.
+    # Wire multi-sector L3 state on every CP role under ``enable_cp_admm``
+    # (coord election + dispatch are core); before this it's legacy per-CP.
     if config.enable_cp_admm:
         for agent in world._agents.values():
             cp_role = None
@@ -1765,15 +1632,10 @@ def _build_topologies(
                 leader_node_ids=all_leader_node_ids,
             )
 
-    # Wire each :class:`CPPriorityAdmmRole` with the cross-sector mirror
-    # and the address books it needs to gossip ``CPSummary`` and filter
-    # peer CPs by reachability. Mirror-driven filtering replaces the
-    # legacy ``DynamicConnectorRole``; failures invalidate peer
-    # reachability via the same shared mirror update L2 uses.
+    # Wire each :class:`CPPriorityAdmmRole` with the mirror and address books
+    # to gossip ``CPSummary`` and filter peer CPs by reachability.
     if config.enable_cp_priority_admm:
-        peer_cp_addrs = {
-            aid_: meta["addr"] for aid_, meta in cp_meta_by_aid.items()
-        }
+        peer_cp_addrs = {aid_: meta["addr"] for aid_, meta in cp_meta_by_aid.items()}
         peer_cp_node_ids = {
             aid_: meta["node_id"] for aid_, meta in cp_meta_by_aid.items()
         }
@@ -1788,13 +1650,11 @@ def _build_topologies(
             meta = cp_meta_by_aid.get(agent.aid)
             if meta is None:
                 continue
-            # Inject home_node_id at wire time (not construction) so the
-            # role can be tested in isolation.
+            # Inject home_node_id at wire time so the role tests in isolation.
             cp_role.home_node_id = meta["node_id"]
             # Exclude self from the peer book.
             peers_excl_self = {
-                aid_: addr for aid_, addr in peer_cp_addrs.items()
-                if aid_ != agent.aid
+                aid_: addr for aid_, addr in peer_cp_addrs.items() if aid_ != agent.aid
             }
             cp_role.wire(
                 topology_mirror=mirror,
@@ -1802,17 +1662,26 @@ def _build_topologies(
                 peer_cp_node_ids=peer_cp_node_ids,
             )
 
-    # On every ``BranchFailureEvent`` mark the edge broken in both the
-    # grid topology (so GridReconfigurator routes only live edges) and the
-    # mirror (so reachability queries match). Both updates are idempotent.
+    # On each BranchFailureEvent mark the edge broken in both the grid
+    # topology and the mirror (idempotent).
     def _on_branch_failed(bid: tuple) -> None:
         mirror.mark_broken(tuple(bid))
         _mark_grid_edge_broken(grid_topo, bid)
+        # Topology just changed: the cached energy-flow is now wrong, but the
+        # cooldown would let agents react to stale pre-failure voltages.  Force
+        # one immediate recompute so the first post-failure control action sees
+        # the true state (one solve per failure; see enable_recompute_on_failure).
+        if getattr(config, "enable_recompute_on_failure", False):
+            _flush = getattr(behavior, "flush_energy_flow", None)
+            if callable(_flush):
+                try:
+                    _flush()
+                except Exception:  # noqa: BLE001 — never let a flush abort failure handling
+                    pass
 
     behavior.set_on_branch_failure(_on_branch_failed)
 
-    # Stash the coalition / holon membership maps on ``behavior`` so
-    # ``_register_recordings`` can emit one per-group balance series each.
+    # Stash coalition / holon maps for ``_register_recordings``.
     behavior._scare_coalitions = coalition_members_by_sector
     behavior._scare_holons = holon_members_by_sector
 
@@ -1835,10 +1704,8 @@ def _mark_grid_edge_broken(grid_topo: Topology, branch_id: tuple) -> None:
             break
 
     if from_nid is not None and to_nid is not None:
-        # Cross-sector CP branches connect nodes from different sector
-        # grids, so the same-sector ``grid`` topology may lack an edge
-        # between the endpoints even when both nodes appear. Guard the
-        # ``KeyError``: a missing CP edge just means nothing to mark.
+        # CP branches span sector grids, so the same-sector topology may
+        # lack the edge even when both nodes appear; missing = nothing to mark.
         edges = grid_topo.graph.edges
         if (from_nid, to_nid) in edges or (to_nid, from_nid) in edges:
             with modify_topology(grid_topo) as t:
@@ -1853,33 +1720,25 @@ def _add_system_behaviors(
     config: RestorationConfiguration,
 ) -> None:
     def _trigger_balance(role: EnergyBalanceNegotiator, event: Any) -> None:
-        # On heat, skip ``CustomFailureEvent`` / ``BranchFailureEvent``: a
-        # severed thermal corridor doesn't surface as a setpoint mismatch.
-        # ``ConstraintViolation`` (BalanceProblem path) is heat's canonical
-        # trigger and ``ReconfigurationCompletedEvent`` must re-explore
-        # newly reachable corridors — both fire on every sector.
+        # On heat, skip failure events (a severed corridor isn't a setpoint
+        # mismatch); ConstraintViolation / Reconfig are heat's triggers.
         if role.sector == Sector.HEAT and isinstance(
             event, (CustomFailureEvent, BranchFailureEvent)
         ):
             return
-        role.context.schedule_instant_task(
-            role.trigger_balance_negotiation()
-        )
+        role.context.schedule_instant_task(role.trigger_balance_negotiation())
 
     def _trigger_cp(role: EnergyConverterRole, event: Any) -> None:
         role.context.schedule_instant_task(role.trigger_cp_negotiation())
 
-    def _trigger_repartition(
-        role: DynamicRepartitionRole, event: Any
-    ) -> None:
+    def _trigger_repartition(role: DynamicRepartitionRole, event: Any) -> None:
         branch_id = getattr(event, "branch_id", None)
         if branch_id is None:
             return
         role.on_branch_failure(tuple(branch_id))
 
-    # Every failure feeds the leader's per-sector reachability view
-    # regardless of the FailureNotice propagation flag — repartition needs
-    # only the branch_id, not the propagated message.
+    # Every failure feeds repartition (needs only the branch_id),
+    # regardless of the FailureNotice propagation flag.
     behavior_in(
         world,
         _trigger_repartition,
@@ -1887,11 +1746,10 @@ def _add_system_behaviors(
         role_types=DynamicRepartitionRole,
     )
 
-    # Layer 2 / Layer 3 dynamic-topology triggers: the
-    # ``BranchFailureEvent`` schedules each role's debounced reassess
-    # against the shared mirror. When a feature is off its role isn't
-    # installed, so the role-type filter yields no listeners.
+    # L2/L3 dynamic-topology triggers: BranchFailureEvent schedules each
+    # role's debounced reassess. Off features install no role, so no listeners.
     if config.enable_holonic and config.enable_dynamic_holon_topology:
+
         def _trigger_dyn_holon(role: DynamicHolonRole, event: Any) -> None:
             branch_id = getattr(event, "branch_id", None)
             if branch_id is None:
@@ -1906,6 +1764,7 @@ def _add_system_behaviors(
         )
 
     if config.enable_cp_admm and config.enable_dynamic_cp_topology:
+
         def _trigger_dyn_connector(role: DynamicConnectorRole, event: Any) -> None:
             branch_id = getattr(event, "branch_id", None)
             if branch_id is None:
@@ -1919,13 +1778,11 @@ def _add_system_behaviors(
             role_types=DynamicConnectorRole,
         )
 
-    # ``component_level`` baseline: reset each MultiCommunityCPRole's
-    # per-sector EMA on a branch failure so stale signal from a possibly-
-    # islanded community doesn't bleed into the post-failure decision.
+    # ``component_level`` baseline: reset each MultiCommunityCPRole's EMA
+    # on a branch failure so stale (possibly islanded) signal doesn't bleed in.
     if config.cps_join_communities:
-        def _trigger_multi_community_cp(
-            role: MultiCommunityCPRole, event: Any
-        ) -> None:
+
+        def _trigger_multi_community_cp(role: MultiCommunityCPRole, event: Any) -> None:
             branch_id = getattr(event, "branch_id", None)
             if branch_id is None:
                 return
@@ -1938,13 +1795,11 @@ def _add_system_behaviors(
             role_types=MultiCommunityCPRole,
         )
 
-    # Invalidate coalition constraints on any ``BranchFailureEvent`` so
-    # the post-failure L2 ADMM round can redecide allocations without a
-    # stale coalition fraction from the pre-failure topology overriding it.
+    # Invalidate coalition constraints on a BranchFailureEvent so the L2
+    # ADMM round redecides without a stale pre-failure coalition fraction.
     if config.enable_holon_summary and config.enable_holon_coalition:
-        def _trigger_coalition_invalidation(
-            role: HolonSummaryRole, event: Any
-        ) -> None:
+
+        def _trigger_coalition_invalidation(role: HolonSummaryRole, event: Any) -> None:
             branch_id = getattr(event, "branch_id", None)
             if branch_id is None:
                 return
@@ -1958,19 +1813,16 @@ def _add_system_behaviors(
         )
 
     if strategy in (SystemStrategy.GROUP_TO_CP, SystemStrategy.SIMULTANEOUSLY):
-        # ``CustomFailureEvent`` always uses the centralised path: those
-        # failures need not map to a physical branch and can't propagate
-        # through the grid topology.
+        # CustomFailureEvent always uses the centralised path (no physical
+        # branch to propagate through).
         behavior_in(
             world,
             _trigger_balance,
             on_global_event=CustomFailureEvent,
             role_types=EnergyBalanceNegotiator,
         )
-        # ``BranchFailureEvent`` uses the centralised callback only when
-        # distributed ``FailureNotice`` propagation is disabled; otherwise
-        # the trigger flows ``ProblemDetector → FailureNotice →
-        # EnergyBalanceNegotiator``.
+        # BranchFailureEvent uses the centralised callback only when
+        # distributed FailureNotice propagation is disabled.
         if not config.enable_distributed_failure_notice:
             behavior_in(
                 world,
@@ -1996,8 +1848,7 @@ def _add_system_behaviors(
             role_types=EnergyConverterRole,
         )
 
-    # Constraint violations trigger rebalancing so the group can shed
-    # load or adjust generation to restore feasibility.
+    # Constraint violations trigger rebalancing to restore feasibility.
     behavior_in(
         world,
         _trigger_balance,
@@ -2005,8 +1856,8 @@ def _add_system_behaviors(
         role_types=EnergyBalanceNegotiator,
     )
 
-    # After grid reconfiguration closes tie switches, new resources may
-    # become reachable — trigger balance negotiation to exploit them.
+    # After reconfiguration closes tie switches, rebalance to exploit
+    # newly reachable resources.
     behavior_in(
         world,
         _trigger_balance,
@@ -2038,11 +1889,8 @@ def _register_recordings(
     record_world(world, "gas_balance", lambda: _sum_regulation(gas_child_aids))
     record_world(world, "heat_balance", lambda: _sum_regulation(heat_child_aids))
 
-    # External-grid slack trajectory: one ``slack__<sector>__<aid>``
-    # column per ExtPowerGrid (``p_mw``) / ExtHydrGrid (``mass_flow``)
-    # child carrying the LP operating point per tick. Confirms the MAS
-    # drives the slack toward the operator's budgeted infeed rather than
-    # absorbing everything.
+    # Slack trajectory: one ``slack__<sector>__<aid>`` column per
+    # ExtPowerGrid/ExtHydrGrid child, the LP operating point per tick.
     def _slack_obs(aid: str, key: str) -> float:
         obs = behavior.observe(aid)
         if not obs or key not in obs:
@@ -2064,30 +1912,24 @@ def _register_recordings(
             node = monee_net.node_by_id(child.node_id)
             sector = sector_from_grid(node.grid)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("slack recording: sector lookup failed for %s: %s",
-                         child.id, exc)
+            logger.debug(
+                "slack recording: sector lookup failed for %s: %s", child.id, exc
+            )
             continue
         if sector is None:
             continue
         aid = _child_aid(child.id)
         col = f"slack__{sector.value}__{aid}"
-        # Capture ``aid`` / ``obs_key`` per child via default args
-        # (avoid late-binding to the loop's last values).
+        # Default args capture per-child values (avoid late-binding).
         record_world(world, col, lambda a=aid, k=obs_key: _slack_obs(a, k))
 
-    # Per-coalition (Level-1) and per-holon (Level-2) regulation sums,
-    # emitted as ``coalition_balance__<sec>__<idx>`` /
-    # ``holon_balance__<sec>__<idx>`` so plots can show whether each
-    # coalition / holon trends to equilibrium independently (the per-
-    # sector aggregate hides "one flat-lines while its neighbour
-    # oscillates"). Empty dicts make these no-ops when the topology
-    # builder didn't run.
+    # Per-coalition (L1) and per-holon (L2) regulation sums, so plots show
+    # each group converging independently (the aggregate hides that).
     coalitions = getattr(behavior, "_scare_coalitions", {}) or {}
     holons = getattr(behavior, "_scare_holons", {}) or {}
 
     def _make_sum(aids: list[str]):
-        # Capture ``aids`` explicitly to avoid late-binding to the loop's
-        # last list.
+        # Capture ``aids`` to avoid late-binding.
         return lambda: _sum_regulation(aids)
 
     for sec_value, by_idx in coalitions.items():
@@ -2109,17 +1951,11 @@ def _register_recordings(
                 _make_sum(member_aids),
             )
 
-    # Per-(sector, tier) regulation sum — ``tier_balance__<sector>__<tier>``.
-    # The per-sector aggregate can't distinguish a correct priority-ordered
-    # low-tier shed from a regret switch; per-(sector, tier) lets
-    # ``_check_monotonic_progress`` flag only the latter (a higher-tier drop
-    # while a lower tier in the SAME sector is still served). Same-sector so
-    # cross-sector independence isn't mis-flagged. Restrict to consumer
-    # loads (PowerLoad / HeatLoad): summing over all children folds in
-    # generators / sources / converters / slack — noise that would mis-flag
-    # a meaningless gas-tier drop.
+    # Per-(sector, tier) regulation sum (loads only, to exclude generator/
+    # slack noise) so a higher-tier drop with a lower tier still served flags.
     load_aids = {
-        _child_aid(c.id) for c in monee_net.childs
+        _child_aid(c.id)
+        for c in monee_net.childs
         if isinstance(c.model, (PowerLoad, HeatLoad))
     }
     sector_aids = {
@@ -2150,9 +1986,8 @@ def _register_recordings(
         lambda agent: float((behavior.observe(agent.aid) or {}).get("regulation", 0.0)),
     )
 
-    # Constraint metrics where the obs expose them. Average is the
-    # population mean; min/max surface the extremes that actually trigger
-    # a violation (the average hides them).
+    # Constraint metrics: avg is the mean; min/max surface the violating
+    # extremes the average hides.
     def _constraint_values(child_aids: list[str], key: str) -> list[float]:
         vals: list[float] = []
         for aid in child_aids:
@@ -2174,19 +2009,23 @@ def _register_recordings(
         return max(vals) if vals else 0.0
 
     for prefix, aids, key in (
-        ("vm_pu",       el_child_aids,   "vm_pu"),
-        ("pressure_pu", gas_child_aids,  "pressure_pu"),
-        ("t_k",         heat_child_aids, "t_k"),
+        ("vm_pu", el_child_aids, "vm_pu"),
+        ("pressure_pu", gas_child_aids, "pressure_pu"),
+        ("t_k", heat_child_aids, "t_k"),
     ):
-        record_world(world, f"avg_{prefix}", lambda a=aids, k=key: _avg_constraint(a, k))
-        record_world(world, f"min_{prefix}", lambda a=aids, k=key: _min_constraint(a, k))
-        record_world(world, f"max_{prefix}", lambda a=aids, k=key: _max_constraint(a, k))
+        record_world(
+            world, f"avg_{prefix}", lambda a=aids, k=key: _avg_constraint(a, k)
+        )
+        record_world(
+            world, f"min_{prefix}", lambda a=aids, k=key: _min_constraint(a, k)
+        )
+        record_world(
+            world, f"max_{prefix}", lambda a=aids, k=key: _max_constraint(a, k)
+        )
 
     # --- Line-loading aggregates ---
-    # Per-tick max / p95 / avg of electricity branch loading_percent
-    # across all power lines — one thermal-stress panel without a column
-    # per branch. obs_constraint_values normalises monee's
-    # GenericPowerBranch fraction-vs-percent quirk.
+    # Per-tick max / p95 / avg of electricity branch loading_percent — one
+    # thermal-stress panel without a column per branch.
     el_branch_aids: list[str] = []
     for branch in monee_net.branches:
         try:
@@ -2237,14 +2076,8 @@ def _register_recordings(
         record_world(world, "p95_line_loading_percent", _p95_loading)
 
     # --- Per-tier demand fulfillment over time ---
-    # Per priority tier, emit ``tier_demand_mw__<tier>`` (static demand
-    # sum) and ``tier_served_mw__<tier>`` (clamped served per tick); the
-    # plot derives the served fraction from these.
-    #
-    # Classify against ``child.model.values`` not ``behavior.observe``:
-    # the first net-results snapshot is built by the initial solve, which
-    # runs after ``_register_recordings`` returns, so observe would hit a
-    # None ``_net_results``.
+    # ``tier_demand_mw`` / ``tier_served_mw`` per tier. Classify via
+    # ``child.model.values`` not observe (net-results not built until t=0 solve).
     load_aids_by_tier: dict[int, list[str]] = {}
     _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
     for child in monee_net.childs:
@@ -2294,13 +2127,8 @@ def _register_recordings(
         )
 
     # --- Net-results freshness tracking ---
-    # The behavior keeps the previous ``_net_results`` when a recompute is
-    # infeasible, silently freezing every obs-based metric at the last-
-    # feasible state. A new ``SolverResult`` is built on each accepted
-    # solve, so ``id(behavior._net_results)`` drifts on every successful
-    # recompute. Recording the timestamp of the last change as
-    # ``last_feasible_solve_t`` lets plots mask the stale segment instead
-    # of drawing a misleading flat envelope. Initialised to the t=0 solve.
+    # An infeasible recompute reuses the old ``_net_results`` (frozen metrics);
+    # ``id()`` drifts on each accepted solve, so record the last-change time.
     _freshness_state = {
         "id": id(behavior._net_results) if behavior._net_results is not None else None,
         "t": float(world.clock.time),
@@ -2318,20 +2146,19 @@ def _register_recordings(
     record_world(world, "last_feasible_solve_t", _last_feasible_solve_t)
 
     # --- Emergent metrics ---
-    # Per-sector event counts polled from the diagnostics ledger that
-    # ``record_event`` / ``record_negotiation`` feed. A
-    # ``behavior_in(on_global_event=...)`` hook would never fire here —
-    # the emits are role-local while that hook only triggers on
-    # ``environment.emit_global_event`` — so read the ledger directly.
+    # Per-sector event counts read directly from the diagnostics ledger
+    # (emits are role-local, so a global-event hook would never fire).
     def _local_gen_request_count(sec_value: str) -> int:
         return sum(
-            1 for r in _diag.event_log()
+            1
+            for r in _diag.event_log()
             if r.kind == "local_gen_request" and r.sector == sec_value
         )
 
     def _negotiations_finished_count(sec_value: str) -> int:
         return sum(
-            1 for r in _diag.negotiation_log()
+            1
+            for r in _diag.negotiation_log()
             if r.event == "finished" and r.sector == sec_value
         )
 

@@ -19,13 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 class PreAssignedCommunityRole(Role):
-    """Writes a pre-computed ``CommunityAssignment`` into the agent's
-    context at startup.
+    """Writes a pre-computed ``CommunityAssignment`` into the agent context at
+    startup.
 
-    Groups are formed offline (label-propagation in the scenario
-    builder) and primed into the ``CommunityAssignment`` model at
-    setup so downstream roles like :class:`HolonicCommunityRole` can
-    find a non-empty community immediately.
+    Groups are formed offline (label-propagation) and primed at setup so
+    downstream roles see a non-empty community immediately.
     """
 
     def __init__(self, community_id: UUID) -> None:
@@ -50,6 +48,7 @@ class Community(Role):
         def _wrap(coro_fn):
             def _sync(msg, meta):
                 self.context.schedule_instant_task(coro_fn(msg, meta))
+
             return _sync
 
         self.context.subscribe_message(
@@ -68,7 +67,7 @@ class Community(Role):
     ) -> None:
         expected = len(topology_neighbors(self, tid="groups"))
 
-        nid = "current"  # simplified: track single active negotiation
+        nid = "current"  # track a single active negotiation
         self._collected.setdefault(nid, []).append(message)
 
         if len(self._collected[nid]) >= expected:

@@ -15,13 +15,12 @@ designated home group leader.  Verifies:
 """
 
 import pytest
-
 from mango import RoleAgent, SimpleCommunicationSimulation, create_world
 from mango.express.topology import create_topology
 from mango.simulation.world import discrete_step_until
 
 from scare.base.model import Sector, StartBalanceNegotiation
-from scare.service.constraints import GridConstraintMonitor
+from scare.service.control.constraints import GridConstraintMonitor
 from tests.conftest import MockBehavior
 
 
@@ -39,7 +38,7 @@ class _RecordingHomeLeader:
     """A mango Role that captures incoming StartBalanceNegotiation."""
 
     def __init__(self):
-        from mango import Role
+
         # Compose dynamically so we don't import Role at module top.
         self._role = None
         self.received: list[StartBalanceNegotiation] = []

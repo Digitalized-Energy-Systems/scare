@@ -11,7 +11,7 @@ mango context:
 from __future__ import annotations
 
 from scare.base.model import Sector
-from scare.base.topology_mirror import GridTopologyMirror
+from scare.base.topology.topology_mirror import GridTopologyMirror
 from scare.community.repartition import _bfs_reachable
 
 
@@ -88,12 +88,15 @@ def test_repartition_handler_rewrites_slack_budget_home_leader() -> None:
         the class name (not isinstance), so only the name and
         ``home_leader_addr`` matter.
         """
+
         def __init__(self) -> None:
             self.home_leader_addr = "original-leader"
+
     _StubMonitor.__name__ = "SlackBudgetMonitor"
 
     class _OtherRole:
         """An unrelated role that must NOT be touched."""
+
         def __init__(self) -> None:
             self.home_leader_addr = "untouched"
 
@@ -109,9 +112,14 @@ def test_repartition_handler_rewrites_slack_budget_home_leader() -> None:
             self._events: list = []
 
         def get_or_create_model(self, _cls):
-            return self._models.setdefault("ca", SimpleNamespace(
-                community_id=None, neighbors=[], leader_addr=None,
-            ))
+            return self._models.setdefault(
+                "ca",
+                SimpleNamespace(
+                    community_id=None,
+                    neighbors=[],
+                    leader_addr=None,
+                ),
+            )
 
         def update(self, _model):
             pass

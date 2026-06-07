@@ -3,13 +3,13 @@
 import pytest
 
 from scare.base.model import (
+    SECTOR_CONSTRAINTS,
+    SECTOR_TIMESCALE,
     ConstraintViolation,
     EnergyData,
     EnergyNegotiationMessage,
     LocalGenerationRequest,
     NegotiationFinishedEvent,
-    SECTOR_CONSTRAINTS,
-    SECTOR_TIMESCALE,
     Sector,
 )
 
@@ -28,7 +28,9 @@ class TestSectorEnum:
 class TestSectorConstraints:
     def test_all_sectors_present(self):
         assert set(SECTOR_CONSTRAINTS.keys()) == {
-            Sector.ELECTRICITY, Sector.GAS, Sector.HEAT,
+            Sector.ELECTRICITY,
+            Sector.GAS,
+            Sector.HEAT,
         }
 
     def test_electricity_bounds(self):
@@ -47,13 +49,17 @@ class TestSectorConstraints:
 class TestSectorTimescale:
     def test_all_sectors_present(self):
         assert set(SECTOR_TIMESCALE.keys()) == {
-            Sector.ELECTRICITY, Sector.GAS, Sector.HEAT,
+            Sector.ELECTRICITY,
+            Sector.GAS,
+            Sector.HEAT,
         }
 
     def test_electricity_fastest(self):
-        assert SECTOR_TIMESCALE[Sector.ELECTRICITY]["poll_period_s"] < \
-               SECTOR_TIMESCALE[Sector.GAS]["poll_period_s"] < \
-               SECTOR_TIMESCALE[Sector.HEAT]["poll_period_s"]
+        assert (
+            SECTOR_TIMESCALE[Sector.ELECTRICITY]["poll_period_s"]
+            < SECTOR_TIMESCALE[Sector.GAS]["poll_period_s"]
+            < SECTOR_TIMESCALE[Sector.HEAT]["poll_period_s"]
+        )
 
 
 class TestEnergyData:

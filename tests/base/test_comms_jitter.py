@@ -10,11 +10,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from mango.simulation.communication import MessagePackage
 
-from scare.base.comms import install_perturbation
+from scare.base.runtime.comms import install_perturbation
 
 
 def _make_sim(*, base_delay_s=0.02, jitter_ms=200.0, loss_pct=0.0):
@@ -29,7 +27,9 @@ def _make_sim(*, base_delay_s=0.02, jitter_ms=200.0, loss_pct=0.0):
 
 
 def _pkg(sender, receiver, t):
-    return MessagePackage(sender_id=sender, receiver_id=receiver, sent_time=t, content=None)
+    return MessagePackage(
+        sender_id=sender, receiver_id=receiver, sent_time=t, content=None
+    )
 
 
 def test_jitter_delay_is_deterministic_per_package():

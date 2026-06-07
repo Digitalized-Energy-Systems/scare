@@ -42,7 +42,9 @@ def _python_bin(slurm: SlurmConfig) -> str:
     return str(venv) if venv.exists() else sys.executable
 
 
-def _plot_command(campaign_dir: Path, slurm: SlurmConfig, skip_aggregate: bool, log_dir: Path) -> list[str]:
+def _plot_command(
+    campaign_dir: Path, slurm: SlurmConfig, skip_aggregate: bool, log_dir: Path
+) -> list[str]:
     job_name = (slurm.job_name or f"scare-restore-{campaign_dir.name}") + "-plot"
     plot_sh = _REPO_ROOT / "scripts" / "plot.sh"
     env_prefix = "SKIP_AGGREGATE=1 " if skip_aggregate else ""
@@ -62,7 +64,8 @@ def _plot_command(campaign_dir: Path, slurm: SlurmConfig, skip_aggregate: bool, 
             flags.append(f"--{k}={v}")
     flags.extend(slurm.extra_sbatch_args)
     return [
-        "sbatch", "--parsable",
+        "sbatch",
+        "--parsable",
         f"--job-name={job_name}",
         f"--output={log_dir}/plot-%j.out",
         f"--error={log_dir}/plot-%j.err",
@@ -98,25 +101,39 @@ def submit_plot(campaign_dir: Path, skip_aggregate: bool, dry_run: bool) -> int:
     logger.info("  overrides:   %s", cfg.slurm_eval or "<none — using slurm block>")
     logger.info("  aggregate:   %s", "skip" if skip_aggregate else "run")
 
-    job = _run_sbatch(_plot_command(campaign_dir, slurm, skip_aggregate, log_dir), dry_run)
+    job = _run_sbatch(
+        _plot_command(campaign_dir, slurm, skip_aggregate, log_dir), dry_run
+    )
     logger.info("  plot job:    %s", job)
     return 0
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+    )
     p.add_argument("campaign_dir", type=Path)
-    p.add_argument("--skip-aggregate", action="store_true",
-                   help="Skip the aggregation step (summary.csv already current)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the sbatch command instead of running it")
+    p.add_argument(
+        "--skip-aggregate",
+        action="store_true",
+        help="Skip the aggregation step (summary.csv already current)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the sbatch command instead of running it",
+    )
     return p.parse_args()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s"
+    )
     args = _parse_args()
-    sys.exit(submit_plot(args.campaign_dir.resolve(), args.skip_aggregate, args.dry_run))
+    sys.exit(
+        submit_plot(args.campaign_dir.resolve(), args.skip_aggregate, args.dry_run)
+    )
 
 
 if __name__ == "__main__":

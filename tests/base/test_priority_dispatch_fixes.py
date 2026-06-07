@@ -6,13 +6,9 @@ over unsaturated entries only.
 
 from __future__ import annotations
 
-import pytest
-
-import scare.base.diagnostics as _diag
-from scare.base.diagnostics import arm
+import scare.base.runtime.diagnostics as _diag
 from scare.base.model import Sector
-
-
+from scare.base.runtime.diagnostics import arm
 from scare.base.util import (
     apply_regulate,
     clamp_to_constraints,
@@ -55,7 +51,7 @@ class TestTierAwareClamp:
         low_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=4)
         high_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
         assert abs(low_tier_result) < 5.0  # was throttled
-        assert high_tier_result == 5.0      # was not throttled (immune)
+        assert high_tier_result == 5.0  # was not throttled (immune)
 
     def test_no_tier_preserves_legacy_behaviour(self):
         # No tier arg → legacy 0.85 deadband.  vm_pu=1.04 (util=0.8) ⇒ no clamp.
@@ -69,8 +65,8 @@ class TestTierAwareClamp:
         obs = {"p_mw": 10.0, "vm_pu": 1.0499}
         tier1 = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
         tier2 = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=2)
-        assert tier1 == 5.0           # immune
-        assert abs(tier2) < 5.0       # was throttled
+        assert tier1 == 5.0  # immune
+        assert abs(tier2) < 5.0  # was throttled
 
 
 # ---------------------------------------------------------------------------
@@ -103,44 +99,92 @@ class TestCooldownBypass:
     def test_low_tier_suppressed_by_cooldown(self):
         b = _FakeBehavior(cooldown_s=1.0)
         # First write lands.
-        assert apply_regulate(
-            b, "child-4", 0.5, sector="electricity",
-            reason="test", timestamp=10.0, priority_tier=4,
-        ) is True
+        assert (
+            apply_regulate(
+                b,
+                "child-4",
+                0.5,
+                sector="electricity",
+                reason="test",
+                timestamp=10.0,
+                priority_tier=4,
+            )
+            is True
+        )
         # Second write within cooldown is suppressed.
-        assert apply_regulate(
-            b, "child-4", 0.6, sector="electricity",
-            reason="test", timestamp=10.5, priority_tier=4,
-        ) is False
+        assert (
+            apply_regulate(
+                b,
+                "child-4",
+                0.6,
+                sector="electricity",
+                reason="test",
+                timestamp=10.5,
+                priority_tier=4,
+            )
+            is False
+        )
         assert len(b.acts) == 1
-        events = [e for e in _drain_events() if e.kind == "regulate_suppressed_by_cooldown"]
+        events = [
+            e for e in _drain_events() if e.kind == "regulate_suppressed_by_cooldown"
+        ]
         assert len(events) == 1
         assert "tier=4" in events[0].detail
 
     def test_critical_tier_bypasses_cooldown(self):
         b = _FakeBehavior(cooldown_s=1.0)
-        assert apply_regulate(
-            b, "child-1", 0.5, sector="electricity",
-            reason="test", timestamp=10.0, priority_tier=1,
-        ) is True
+        assert (
+            apply_regulate(
+                b,
+                "child-1",
+                0.5,
+                sector="electricity",
+                reason="test",
+                timestamp=10.0,
+                priority_tier=1,
+            )
+            is True
+        )
         # Second write within cooldown DOES land because tier 1 bypasses.
-        assert apply_regulate(
-            b, "child-1", 0.6, sector="electricity",
-            reason="test", timestamp=10.5, priority_tier=1,
-        ) is True
+        assert (
+            apply_regulate(
+                b,
+                "child-1",
+                0.6,
+                sector="electricity",
+                reason="test",
+                timestamp=10.5,
+                priority_tier=1,
+            )
+            is True
+        )
         assert len(b.acts) == 2
 
     def test_no_tier_falls_back_to_cooldown(self):
         b = _FakeBehavior(cooldown_s=1.0)
-        assert apply_regulate(
-            b, "child-0", 0.5, sector="electricity",
-            reason="test", timestamp=10.0,
-        ) is True
+        assert (
+            apply_regulate(
+                b,
+                "child-0",
+                0.5,
+                sector="electricity",
+                reason="test",
+                timestamp=10.0,
+            )
+            is True
+        )
         # No tier given → not critical → suppressed.
-        assert apply_regulate(
-            b, "child-0", 0.6, sector="electricity",
-            reason="test", timestamp=10.5,
-        ) is False
+        assert (
+            apply_regulate(
+                b,
+                "child-0",
+                0.6,
+                sector="electricity",
+                reason="test",
+                timestamp=10.5,
+            )
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +287,12 @@ class TestHeatSinkGuard:
     def test_heat_side_sink_curtailment_is_blocked(self):
         b = self._build("Sink", "water-heat-supply")
         applied = apply_regulate(
-            b, "child-42", 0.0, sector="heat", reason="test", timestamp=1.0,
+            b,
+            "child-42",
+            0.0,
+            sector="heat",
+            reason="test",
+            timestamp=1.0,
         )
         assert applied is False
         assert b.acts == []
@@ -253,7 +302,12 @@ class TestHeatSinkGuard:
     def test_heat_side_sink_full_passthrough_is_allowed(self):
         b = self._build("Sink", "water-heat-supply")
         applied = apply_regulate(
-            b, "child-42", 1.0, sector="heat", reason="test", timestamp=1.0,
+            b,
+            "child-42",
+            1.0,
+            sector="heat",
+            reason="test",
+            timestamp=1.0,
         )
         assert applied is True
         assert b.acts == [("child-42", "regulate", 1.0)]
@@ -261,7 +315,12 @@ class TestHeatSinkGuard:
     def test_gas_sink_curtailment_is_allowed(self):
         b = self._build("Sink", "gas-supply")
         applied = apply_regulate(
-            b, "child-42", 0.3, sector="gas", reason="test", timestamp=1.0,
+            b,
+            "child-42",
+            0.3,
+            sector="gas",
+            reason="test",
+            timestamp=1.0,
         )
         assert applied is True
         assert b.acts == [("child-42", "regulate", 0.3)]
@@ -270,7 +329,12 @@ class TestHeatSinkGuard:
         # HeatLoad (or any non-Sink class) on the heat grid stays curtailable.
         b = self._build("HeatLoad", "water-heat-supply")
         applied = apply_regulate(
-            b, "child-42", 0.4, sector="heat", reason="test", timestamp=1.0,
+            b,
+            "child-42",
+            0.4,
+            sector="heat",
+            reason="test",
+            timestamp=1.0,
         )
         assert applied is True
         assert b.acts == [("child-42", "regulate", 0.4)]
@@ -317,8 +381,12 @@ class TestSlackClassGuard:
     def test_ext_power_grid_curtailment_blocked(self):
         b = self._build("ExtPowerGrid")
         applied = apply_regulate(
-            b, "child-42", 0.3, sector="electricity",
-            reason="test", timestamp=1.0,
+            b,
+            "child-42",
+            0.3,
+            sector="electricity",
+            reason="test",
+            timestamp=1.0,
         )
         assert applied is False
         assert b.acts == []
@@ -330,8 +398,12 @@ class TestSlackClassGuard:
         # never sees it — but the class check still protects it.
         b = self._build("ExtHydrGrid")
         applied = apply_regulate(
-            b, "child-42", 0.0, sector="heat",
-            reason="test", timestamp=1.0,
+            b,
+            "child-42",
+            0.0,
+            sector="heat",
+            reason="test",
+            timestamp=1.0,
         )
         assert applied is False
         assert b.acts == []
@@ -341,8 +413,12 @@ class TestSlackClassGuard:
     def test_ext_power_grid_full_passthrough_allowed(self):
         b = self._build("ExtPowerGrid")
         applied = apply_regulate(
-            b, "child-42", 1.0, sector="electricity",
-            reason="test", timestamp=1.0,
+            b,
+            "child-42",
+            1.0,
+            sector="electricity",
+            reason="test",
+            timestamp=1.0,
         )
         assert applied is True
         assert b.acts == [("child-42", "regulate", 1.0)]
@@ -361,7 +437,8 @@ class TestSlackClassGuard:
 class TestHeatSinkUpstreamSkip:
     def test_predicate_identifies_heat_side_sinks(self):
         from types import SimpleNamespace
-        from monee.model.child import Sink, HeatLoad
+
+        from monee.model.child import HeatLoad, Sink
 
         from scare.scenario.restoration import _is_heat_side_mass_flow_sink
 
@@ -409,7 +486,7 @@ class TestSaturationFilteredDual:
         # just 1. Tier 1 is avoided here because its QP weight is 0
         # (hard-locked off-QP), which would trivialise the test.
         memory = {
-            "a": (0.0, 10, 2, True),   # saturated tier-2 (weight 1e8)
+            "a": (0.0, 10, 2, True),  # saturated tier-2 (weight 1e8)
             "b": (0.0, 10, 2, True),
             "c": (0.0, 10, 2, True),
             "d": (0.0, 10, 2, True),
@@ -419,8 +496,7 @@ class TestSaturationFilteredDual:
         target_sign = 1
 
         sum_all = sum(
-            self._entry_responsiveness(int(v[2]), target_sign)
-            for v in memory.values()
+            self._entry_responsiveness(int(v[2]), target_sign) for v in memory.values()
         )
         sum_free = sum(
             self._entry_responsiveness(int(v[2]), target_sign)
@@ -429,7 +505,7 @@ class TestSaturationFilteredDual:
         )
 
         residual = 0.5  # arbitrary
-        gamma = 0.6     # convergence rate
+        gamma = 0.6  # convergence rate
         step_all_entries = gamma * residual / sum_all
         step_free_only = gamma * residual / sum_free
 
@@ -446,10 +522,7 @@ class TestSaturationFilteredDual:
             "b": (0.0, 10, 3, False),
             "c": (0.0, 10, 4, False),
         }
-        sum_all = sum(
-            self._entry_responsiveness(int(v[2]), 1)
-            for v in memory.values()
-        )
+        sum_all = sum(self._entry_responsiveness(int(v[2]), 1) for v in memory.values())
         sum_free = sum(
             self._entry_responsiveness(int(v[2]), 1)
             for v in memory.values()

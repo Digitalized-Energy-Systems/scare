@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`scare.base.topology_mirror`.
+"""Unit tests for :mod:`scare.base.topology.topology_mirror`.
 
 The mirror is a pure data structure — no mango, no async — so these
 tests build a small synthetic grid by hand and exercise the BFS
@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 
 from scare.base.model import Sector
-from scare.base.topology_mirror import GridTopologyMirror
+from scare.base.topology.topology_mirror import GridTopologyMirror
 
 
 def _grid() -> GridTopologyMirror:

@@ -26,10 +26,10 @@ import socket
 import subprocess
 import sys
 from collections.abc import Iterable
-from typing import Literal
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -39,14 +39,14 @@ from experiment.hpc.config import (
     TaskSpec,
     task_dir,
 )
-from experiment.restoration import GRIDS  # noqa: PLC0415  heavy import
+from experiment.scenarios import GRIDS  # noqa: PLC0415  heavy import
 
 logger = logging.getLogger(__name__)
 
 FilterMode = Literal["all", "ok", "failed", "timeout", "missing", "incomplete"]
 
 
-# ---- Manifest construction --------------------------------------------------
+# Manifest construction
 
 
 def derive_n_failures(seed: int, failure_lambda: float, max_failures: int) -> int:
@@ -118,9 +118,9 @@ def _build_eval_tasks(cfg: CampaignConfig) -> list[TaskSpec]:
                                     + run_idx
                                 )
                                 # Per-scenario failure-count overrides:
-                                #   - ``n_failures``     exact count, bypasses sampling
-                                #   - ``failure_lambda`` override Poisson lambda
-                                #   - ``max_failures``   override per-grid cap
+                                # ``n_failures``     exact count, bypasses sampling
+                                # ``failure_lambda`` override Poisson lambda
+                                # ``max_failures``   override per-grid cap
                                 sc_max = scenario.get("max_failures", max_f)
                                 if "n_failures" in scenario:
                                     n_fail = max(1, int(scenario["n_failures"]))
@@ -165,8 +165,12 @@ def create_campaign(
     (campaign_dir / CAMPAIGN_LAYOUT["tasks"]).mkdir()
 
     cfg.to_json(campaign_dir / CAMPAIGN_LAYOUT["config"])
-    if source_path is not None and Path(source_path).resolve() != (campaign_dir / CAMPAIGN_LAYOUT["config"]):
-        (campaign_dir / CAMPAIGN_LAYOUT["config_source"]).write_text(Path(source_path).read_text())
+    if source_path is not None and Path(source_path).resolve() != (
+        campaign_dir / CAMPAIGN_LAYOUT["config"]
+    ):
+        (campaign_dir / CAMPAIGN_LAYOUT["config_source"]).write_text(
+            Path(source_path).read_text()
+        )
 
     tasks = build_tasks(cfg)
     with (campaign_dir / CAMPAIGN_LAYOUT["manifest"]).open("w") as f:
@@ -190,7 +194,7 @@ def _log_breakdown(cfg: CampaignConfig, tasks: list[TaskSpec]) -> None:
         logger.info("  %-25s %s", g, breakdown)
 
 
-# ---- Manifest reading + filtering ------------------------------------------
+# Manifest reading + filtering
 
 
 def read_manifest(campaign_dir: Path) -> list[TaskSpec]:
@@ -265,17 +269,24 @@ def compress_ranges(ids: Iterable[int]) -> str:
     return ",".join(parts)
 
 
-# ---- Metadata --------------------------------------------------------------
+# Metadata
 
 
 def _git(repo_root: Path, *args: str) -> str | None:
     try:
         out = subprocess.run(
             ["git", "-C", str(repo_root), *args],
-            capture_output=True, text=True, check=True, timeout=5,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
         )
         return out.stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
         return None
 
 
@@ -299,7 +310,7 @@ def _write_metadata(campaign_dir: Path, cfg: CampaignConfig, n_tasks: int) -> No
     )
 
 
-# ---- Optional cache warm-up ------------------------------------------------
+# Optional cache warm-up
 
 
 def prebuild_grids(grid_names: list[str]) -> None:
@@ -315,9 +326,6 @@ def prebuild_grids(grid_names: list[str]) -> None:
         logger.info("  ok")
 
 
-# ---- CLI -------------------------------------------------------------------
-
-
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Build a campaign directory from a JSON config.",
@@ -325,24 +333,30 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("config", type=Path, help="Path to a campaign JSON config")
     p.add_argument(
-        "--no-timestamp", action="store_true",
+        "--no-timestamp",
+        action="store_true",
         help="Use the bare config name as the dir; default appends a UTC stamp",
     )
     p.add_argument(
-        "--prebuild", action="store_true",
+        "--prebuild",
+        action="store_true",
         help="Build every grid once locally to warm caches before submission",
     )
     return p.parse_args()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s"
+    )
     args = _parse_args()
     cfg = CampaignConfig.from_json(args.config)
     timestamp_dir = False if args.no_timestamp else None  # None → use cfg.timestamp_dir
     if args.prebuild:
         prebuild_grids([g.name for g in cfg.grids])
-    campaign_dir = create_campaign(cfg, source_path=args.config, timestamp_dir=timestamp_dir)
+    campaign_dir = create_campaign(
+        cfg, source_path=args.config, timestamp_dir=timestamp_dir
+    )
     print(campaign_dir)
 
 

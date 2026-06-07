@@ -14,10 +14,9 @@ from types import SimpleNamespace
 from typing import Any
 
 from scare.base.model import Sector
-from scare.base.topology_mirror import GridTopologyMirror
+from scare.base.topology.topology_mirror import GridTopologyMirror
 from scare.community.dynamic_holon import DynamicHolonRole
 from scare.community.holonic import HolonicCommunityRole
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

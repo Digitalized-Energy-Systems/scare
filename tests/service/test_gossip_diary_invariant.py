@@ -8,13 +8,12 @@ retired as ``abandoned`` so its ``started`` record does not leak.
 from __future__ import annotations
 
 import pytest
-
 from mango import RoleAgent, SimpleCommunicationSimulation, create_world
 from mango.express.topology import create_topology
 
-from scare.base import diagnostics
 from scare.base.model import Sector
-from scare.service.balance import EnergyBalanceNegotiator
+from scare.base.runtime import diagnostics
+from scare.service.balance.balance import EnergyBalanceNegotiator
 from tests.conftest import MockBehavior, make_electricity_gen, make_electricity_load
 
 
@@ -44,7 +43,8 @@ def _build_group(behavior: MockBehavior, specs):
 
 def _terminals(diary):
     return {
-        r.nid for r in diary
+        r.nid
+        for r in diary
         if r.event in ("finished", "timed_out", "cancelled", "abandoned", "stalled")
     }
 
@@ -57,10 +57,21 @@ async def test_start_gossip_retires_superseded_originator():
     """
     diagnostics.arm()
     behavior = MockBehavior()
-    world, roles = _build_group(behavior, [
-        {"aid": "leader-0", "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0), "priority": 0},
-        {"aid": "load-A", "obs": make_electricity_load(p_mw=3.0, regulation=1.0, priority=2), "priority": 2},
-    ])
+    world, roles = _build_group(
+        behavior,
+        [
+            {
+                "aid": "leader-0",
+                "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0),
+                "priority": 0,
+            },
+            {
+                "aid": "load-A",
+                "obs": make_electricity_load(p_mw=3.0, regulation=1.0, priority=2),
+                "priority": 2,
+            },
+        ],
+    )
     leader = roles[0]
 
     async with world:
@@ -90,10 +101,21 @@ async def test_diary_counts_balance_after_supersede():
     """End-to-end count check: started total equals terminal total."""
     diagnostics.arm()
     behavior = MockBehavior()
-    world, roles = _build_group(behavior, [
-        {"aid": "leader-0", "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0), "priority": 0},
-        {"aid": "load-A", "obs": make_electricity_load(p_mw=3.0, regulation=1.0, priority=2), "priority": 2},
-    ])
+    world, roles = _build_group(
+        behavior,
+        [
+            {
+                "aid": "leader-0",
+                "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0),
+                "priority": 0,
+            },
+            {
+                "aid": "load-A",
+                "obs": make_electricity_load(p_mw=3.0, regulation=1.0, priority=2),
+                "priority": 2,
+            },
+        ],
+    )
     leader = roles[0]
 
     async with world:
@@ -105,7 +127,8 @@ async def test_diary_counts_balance_after_supersede():
     diary = diagnostics.negotiation_log()
     started = sum(1 for r in diary if r.event == "started")
     terminals = sum(
-        1 for r in diary
+        1
+        for r in diary
         if r.event in ("finished", "timed_out", "cancelled", "abandoned", "stalled")
     )
     assert started == terminals, (

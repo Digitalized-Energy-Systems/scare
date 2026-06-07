@@ -20,10 +20,16 @@ from experiment.eval.claims import (
     evaluate_task,
 )
 
-
 _CONSTRAINTS_COLS = (
-    "kind", "id", "sector", "variable",
-    "value", "lo", "hi", "overshoot", "violated",
+    "kind",
+    "id",
+    "sector",
+    "variable",
+    "value",
+    "lo",
+    "hi",
+    "overshoot",
+    "violated",
 )
 
 
@@ -32,8 +38,16 @@ def _write_constraints_final(path: Path, rows: list[dict]) -> Path:
 
 
 _SBL_COLS = (
-    "aid", "sector", "tier", "node_id", "component",
-    "demand", "served", "fraction", "disconnected", "constraint_allowed",
+    "aid",
+    "sector",
+    "tier",
+    "node_id",
+    "component",
+    "demand",
+    "served",
+    "fraction",
+    "disconnected",
+    "constraint_allowed",
 )
 
 
@@ -42,20 +56,22 @@ def _write_served_by_load(path: Path, loads: list[dict]) -> Path:
     for ld in loads:
         demand = ld["demand"]
         served = ld["served"]
-        rows.append({
-            "aid": ld.get("aid", "x"),
-            # Heat is excluded from the priority-ordering claim, so default
-            # to electricity for the mechanics tests (throttle/strand).
-            "sector": ld.get("sector", "electricity"),
-            "tier": ld["tier"],
-            "node_id": ld.get("node_id", 0),
-            "component": ld.get("component", "0"),
-            "demand": demand,
-            "served": served,
-            "fraction": served / demand if demand else 0.0,
-            "disconnected": ld.get("disconnected", 0),
-            "constraint_allowed": ld.get("constraint_allowed", 1.0),
-        })
+        rows.append(
+            {
+                "aid": ld.get("aid", "x"),
+                # Heat is excluded from the priority-ordering claim, so default
+                # to electricity for the mechanics tests (throttle/strand).
+                "sector": ld.get("sector", "electricity"),
+                "tier": ld["tier"],
+                "node_id": ld.get("node_id", 0),
+                "component": ld.get("component", "0"),
+                "demand": demand,
+                "served": served,
+                "fraction": served / demand if demand else 0.0,
+                "disconnected": ld.get("disconnected", 0),
+                "constraint_allowed": ld.get("constraint_allowed", 1.0),
+            }
+        )
     return _write_csv(path, _SBL_COLS, rows)
 
 
@@ -70,13 +86,17 @@ def _write_csv(path: Path, cols: tuple[str, ...], rows: list[dict]) -> Path:
 
 def _write_diary(path: Path, events: list[str]) -> Path:
     return _write_csv(
-        path, ("event",), [{"event": ev} for ev in events],
+        path,
+        ("event",),
+        [{"event": ev} for ev in events],
     )
 
 
 def _write_events(path: Path, rows: list[dict]) -> Path:
     return _write_csv(
-        path, ("t", "kind", "aid", "sector", "detail"), rows,
+        path,
+        ("t", "kind", "aid", "sector", "detail"),
+        rows,
     )
 
 
@@ -135,7 +155,8 @@ class TestDiaryInvariant:
     def test_stalled_counts_as_terminal(self, tmp_path):
         # ``stalled`` is a recognized terminal state.
         diary = _write_diary(
-            tmp_path / "diary.csv", ["started", "stalled"],
+            tmp_path / "diary.csv",
+            ["started", "stalled"],
         )
         res = _check_diary_invariant(diary)
         assert res["passed"] is True
@@ -159,7 +180,9 @@ class TestMonotonicProgress:
         rows = [(t * 0.5, 1.0) for t in range(0, 20)]
         rows.append((10.5, 0.2))  # 80 % aggregate drop
         ts = _write_timeseries(
-            tmp_path / "timeseries.csv", ("electrical_balance",), rows,
+            tmp_path / "timeseries.csv",
+            ("electrical_balance",),
+            rows,
         )
         ev = _write_events(tmp_path / "events.csv", [])
         res = _check_monotonic_progress(ts, ev)
@@ -172,11 +195,21 @@ class TestMonotonicProgress:
         rows = [(t * 0.5, 1.0) for t in range(0, 20)]
         rows.append((10.5, 0.2))
         ts = _write_timeseries(
-            tmp_path / "timeseries.csv", ("electrical_balance",), rows,
+            tmp_path / "timeseries.csv",
+            ("electrical_balance",),
+            rows,
         )
         ev = _write_events(
             tmp_path / "events.csv",
-            [{"t": 10.0, "kind": "branch_failure", "aid": "", "sector": "", "detail": ""}],
+            [
+                {
+                    "t": 10.0,
+                    "kind": "branch_failure",
+                    "aid": "",
+                    "sector": "",
+                    "detail": "",
+                }
+            ],
         )
         res = _check_monotonic_progress(ts, ev)
         assert res["passed"] is True
@@ -198,19 +231,29 @@ class TestMonotonicProgress:
         rows = [(t * 1.0, 1.0) for t in range(0, 6)]
         rows.append((6.0, 0.3))
         ts = _write_timeseries(
-            tmp_path / "timeseries.csv", ("electrical_balance",), rows,
+            tmp_path / "timeseries.csv",
+            ("electrical_balance",),
+            rows,
         )
         ev = _write_events(
             tmp_path / "events.csv",
-            [{"t": 5.5, "kind": "constraint_violation",
-              "aid": "", "sector": "electricity", "detail": ""}],
+            [
+                {
+                    "t": 5.5,
+                    "kind": "constraint_violation",
+                    "aid": "",
+                    "sector": "electricity",
+                    "detail": "",
+                }
+            ],
         )
         res = _check_monotonic_progress(ts, ev)
         assert res["passed"] is True
 
     def test_no_timeseries_passes_vacuously(self, tmp_path):
         res = _check_monotonic_progress(
-            tmp_path / "missing.csv", tmp_path / "events.csv",
+            tmp_path / "missing.csv",
+            tmp_path / "events.csv",
         )
         assert res["passed"] is True
 
@@ -229,10 +272,20 @@ class TestSlackBudgetCompliance:
         ev = _write_events(
             tmp_path / "events.csv",
             [
-                {"t": 1.0, "kind": "regulate", "aid": "child-1",
-                 "sector": "electricity", "detail": "factor=0.5"},
-                {"t": 2.0, "kind": "branch_failure", "aid": "",
-                 "sector": "", "detail": "(3,4)"},
+                {
+                    "t": 1.0,
+                    "kind": "regulate",
+                    "aid": "child-1",
+                    "sector": "electricity",
+                    "detail": "factor=0.5",
+                },
+                {
+                    "t": 2.0,
+                    "kind": "branch_failure",
+                    "aid": "",
+                    "sector": "",
+                    "detail": "(3,4)",
+                },
             ],
         )
         res = _check_slack_budget(ev)
@@ -244,9 +297,13 @@ class TestSlackBudgetCompliance:
         ev = _write_events(
             tmp_path / "events.csv",
             [
-                {"t": 1.5, "kind": "slack_budget_violation",
-                 "aid": "child-7", "sector": "electricity",
-                 "detail": "p_mw=12.3 budget=10.0"},
+                {
+                    "t": 1.5,
+                    "kind": "slack_budget_violation",
+                    "aid": "child-7",
+                    "sector": "electricity",
+                    "detail": "p_mw=12.3 budget=10.0",
+                },
             ],
         )
         res = _check_slack_budget(ev)
@@ -257,9 +314,13 @@ class TestSlackBudgetCompliance:
 
     def test_multiple_violations_reports_first_and_last(self, tmp_path):
         rows = [
-            {"t": str(t), "kind": "slack_budget_violation",
-             "aid": "child-1", "sector": "electricity",
-             "detail": f"p_mw={10 + t}"}
+            {
+                "t": str(t),
+                "kind": "slack_budget_violation",
+                "aid": "child-1",
+                "sector": "electricity",
+                "detail": f"p_mw={10 + t}",
+            }
             for t in range(1, 8)
         ]
         ev = _write_events(tmp_path / "events.csv", rows)
@@ -277,8 +338,15 @@ class TestSlackBudgetSteadyState:
     window from timeseries.csv against slack_meta.json budgets."""
 
     def _slack_meta(self, tmp_path, budget=10.0, sector="electricity", aid="child-7"):
-        meta = {aid: {"sector": sector, "obs_key": "p_mw", "budget": budget,
-                      "lp_envelope": budget * 10, "node_id": 1}}
+        meta = {
+            aid: {
+                "sector": sector,
+                "obs_key": "p_mw",
+                "budget": budget,
+                "lp_envelope": budget * 10,
+                "node_id": 1,
+            }
+        }
         p = tmp_path / "slack_meta.json"
         p.write_text(json.dumps(meta))
         return p, f"slack__{sector}__{aid}"
@@ -288,15 +356,30 @@ class TestSlackBudgetSteadyState:
         # settling window → should PASS.
         meta, col = self._slack_meta(tmp_path, budget=10.0)
         ts = _write_timeseries(
-            tmp_path / "timeseries.csv", (col,),
-            [(0.5, -13.0), (1.0, -12.0), (2.0, -10.4),
-             (8.5, -9.8), (9.0, -9.7), (10.0, -9.6)],
+            tmp_path / "timeseries.csv",
+            (col,),
+            [
+                (0.5, -13.0),
+                (1.0, -12.0),
+                (2.0, -10.4),
+                (8.5, -9.8),
+                (9.0, -9.7),
+                (10.0, -9.6),
+            ],
         )
         # An event was recorded for the early spike, but it recovered.
-        ev = _write_events(tmp_path / "events.csv", [
-            {"t": 0.5, "kind": "slack_budget_violation", "aid": "child-7",
-             "sector": "electricity", "detail": "p_mw=-13.0 budget=10.0"},
-        ])
+        ev = _write_events(
+            tmp_path / "events.csv",
+            [
+                {
+                    "t": 0.5,
+                    "kind": "slack_budget_violation",
+                    "aid": "child-7",
+                    "sector": "electricity",
+                    "detail": "p_mw=-13.0 budget=10.0",
+                },
+            ],
+        )
         res = _check_slack_budget(ev, timeseries_path=ts, slack_meta_path=meta)
         assert res["passed"] is True, res["detail"]
         assert res["detail"]["mode"] == "steady_state"
@@ -306,7 +389,8 @@ class TestSlackBudgetSteadyState:
         # Over threshold (budget*1.05=10.5) through the settling window.
         meta, col = self._slack_meta(tmp_path, budget=10.0)
         ts = _write_timeseries(
-            tmp_path / "timeseries.csv", (col,),
+            tmp_path / "timeseries.csv",
+            (col,),
             [(0.5, -11.0), (2.0, -10.8), (8.5, -10.8), (9.0, -10.9), (10.0, -10.85)],
         )
         ev = _write_events(tmp_path / "events.csv", [])
@@ -319,7 +403,8 @@ class TestSlackBudgetSteadyState:
         # Draw at budget*1.04 < threshold budget*1.05 → within tol.
         meta, col = self._slack_meta(tmp_path, budget=10.0)
         ts = _write_timeseries(
-            tmp_path / "timeseries.csv", (col,),
+            tmp_path / "timeseries.csv",
+            (col,),
             [(8.5, -10.4), (9.0, -10.3), (10.0, -10.4)],
         )
         ev = _write_events(tmp_path / "events.csv", [])
@@ -328,10 +413,18 @@ class TestSlackBudgetSteadyState:
 
     def test_falls_back_to_legacy_without_timeseries(self, tmp_path):
         # No timeseries/meta → legacy "any event fails" path.
-        ev = _write_events(tmp_path / "events.csv", [
-            {"t": 1.5, "kind": "slack_budget_violation", "aid": "child-7",
-             "sector": "electricity", "detail": "p_mw=-13"},
-        ])
+        ev = _write_events(
+            tmp_path / "events.csv",
+            [
+                {
+                    "t": 1.5,
+                    "kind": "slack_budget_violation",
+                    "aid": "child-7",
+                    "sector": "electricity",
+                    "detail": "p_mw=-13",
+                },
+            ],
+        )
         res = _check_slack_budget(ev)
         assert res["passed"] is False
         assert res["detail"]["mode"] == "legacy"
@@ -345,11 +438,32 @@ class TestPriorityInvariantConstraintThrottle:
     def test_throttled_high_tier_excluded_physics_aware(self, tmp_path):
         # tier-2 physically capped at 0.0, tier-3 fully served. Strict sees
         # an inversion; physics-aware excludes the throttled tier-2 load.
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.0, "constraint_allowed": 0.0},
-            {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-            {"aid": "c", "tier": 3, "demand": 1.0, "served": 0.4, "constraint_allowed": 1.0},
-        ])
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                {
+                    "aid": "a",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 0.0,
+                    "constraint_allowed": 0.0,
+                },
+                {
+                    "aid": "b",
+                    "tier": 3,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+                {
+                    "aid": "c",
+                    "tier": 3,
+                    "demand": 1.0,
+                    "served": 0.4,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
         strict = _check_priority_invariant(p, exclude_constraint_throttled=False)
         physical = _check_priority_invariant(p, exclude_constraint_throttled=True)
         assert strict["passed"] is False
@@ -359,34 +473,95 @@ class TestPriorityInvariantConstraintThrottle:
     def test_priority_shed_below_cap_still_counts(self, tmp_path):
         # tier-2 served 0.2 below its physical cap of 0.9 → a real shed,
         # kept even in physics-aware mode; tier-3 full ⇒ inversion stands.
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 0.9},
-            {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-        ])
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                {
+                    "aid": "a",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 0.2,
+                    "constraint_allowed": 0.9,
+                },
+                {
+                    "aid": "b",
+                    "tier": 3,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
         physical = _check_priority_invariant(p, exclude_constraint_throttled=True)
         assert physical["passed"] is False
         assert physical["detail"]["n_loads_throttled"] == 0
 
     def test_unconstrained_inversion_counts_both_modes(self, tmp_path):
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "a", "tier": 2, "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
-            {"aid": "b", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-        ])
-        assert _check_priority_invariant(p, exclude_constraint_throttled=False)["passed"] is False
-        assert _check_priority_invariant(p, exclude_constraint_throttled=True)["passed"] is False
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                {
+                    "aid": "a",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 0.5,
+                    "constraint_allowed": 1.0,
+                },
+                {
+                    "aid": "b",
+                    "tier": 3,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
+        assert (
+            _check_priority_invariant(p, exclude_constraint_throttled=False)["passed"]
+            is False
+        )
+        assert (
+            _check_priority_invariant(p, exclude_constraint_throttled=True)["passed"]
+            is False
+        )
 
     def test_legacy_csv_without_column_falls_back(self, tmp_path):
         # No constraint_allowed column → physics-aware mode behaves like
         # strict (no exclusion) and never crashes.
-        cols = ("aid", "sector", "tier", "node_id", "component",
-                "demand", "served", "fraction", "disconnected")
+        cols = (
+            "aid",
+            "sector",
+            "tier",
+            "node_id",
+            "component",
+            "demand",
+            "served",
+            "fraction",
+            "disconnected",
+        )
         rows = [
-            {"aid": "a", "sector": "electricity", "tier": 2, "node_id": 0,
-             "component": "0", "demand": 1.0, "served": 0.5, "fraction": 0.5,
-             "disconnected": 0},
-            {"aid": "b", "sector": "electricity", "tier": 3, "node_id": 0,
-             "component": "0", "demand": 1.0, "served": 1.0, "fraction": 1.0,
-             "disconnected": 0},
+            {
+                "aid": "a",
+                "sector": "electricity",
+                "tier": 2,
+                "node_id": 0,
+                "component": "0",
+                "demand": 1.0,
+                "served": 0.5,
+                "fraction": 0.5,
+                "disconnected": 0,
+            },
+            {
+                "aid": "b",
+                "sector": "electricity",
+                "tier": 3,
+                "node_id": 0,
+                "component": "0",
+                "demand": 1.0,
+                "served": 1.0,
+                "fraction": 1.0,
+                "disconnected": 0,
+            },
         ]
         p = _write_csv(tmp_path / "served_by_load.csv", cols, rows)
         res = _check_priority_invariant(p, exclude_constraint_throttled=True)
@@ -401,10 +576,27 @@ class TestPriorityInvariantHeatExcluded:
     def test_heat_inversion_does_not_fail_claim(self, tmp_path):
         # A heat inversion must not flip the gating claim — heat is
         # skipped by default.
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "a", "sector": "heat", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 1.0},
-            {"aid": "b", "sector": "heat", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-        ])
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                {
+                    "aid": "a",
+                    "sector": "heat",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 0.2,
+                    "constraint_allowed": 1.0,
+                },
+                {
+                    "aid": "b",
+                    "sector": "heat",
+                    "tier": 3,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
         res = _check_priority_invariant(p)
         assert res["passed"] is True
         assert res["detail"]["n_loads_sector_skipped"] == 2
@@ -412,22 +604,72 @@ class TestPriorityInvariantHeatExcluded:
 
     def test_electricity_inversion_still_fails_with_heat_present(self, tmp_path):
         # Heat skipped, but a genuine electricity inversion still fails.
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "h1", "sector": "heat", "tier": 2, "demand": 1.0, "served": 0.0, "constraint_allowed": 1.0},
-            {"aid": "h2", "sector": "heat", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-            {"aid": "e1", "sector": "electricity", "tier": 2, "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
-            {"aid": "e2", "sector": "electricity", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-        ])
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                {
+                    "aid": "h1",
+                    "sector": "heat",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 0.0,
+                    "constraint_allowed": 1.0,
+                },
+                {
+                    "aid": "h2",
+                    "sector": "heat",
+                    "tier": 3,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+                {
+                    "aid": "e1",
+                    "sector": "electricity",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 0.5,
+                    "constraint_allowed": 1.0,
+                },
+                {
+                    "aid": "e2",
+                    "sector": "electricity",
+                    "tier": 3,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
         res = _check_priority_invariant(p)
         assert res["passed"] is False
-        assert all(inv["sector"] == "electricity" for inv in res["detail"]["inversions"])
+        assert all(
+            inv["sector"] == "electricity" for inv in res["detail"]["inversions"]
+        )
 
     def test_explicit_empty_skip_set_restores_heat_check(self, tmp_path):
         # skip_sectors=frozenset() opts back into checking heat.
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "a", "sector": "heat", "tier": 2, "demand": 1.0, "served": 0.2, "constraint_allowed": 1.0},
-            {"aid": "b", "sector": "heat", "tier": 3, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-        ])
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                {
+                    "aid": "a",
+                    "sector": "heat",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 0.2,
+                    "constraint_allowed": 1.0,
+                },
+                {
+                    "aid": "b",
+                    "sector": "heat",
+                    "tier": 3,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
         res = _check_priority_invariant(p, skip_sectors=frozenset())
         assert res["passed"] is False
 
@@ -438,12 +680,29 @@ class TestHeatPriorityDiagnostic:
     diff."""
 
     def test_reports_per_tier_feasible_and_flags_inversion(self, tmp_path):
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            # tier-1 feasible but shed to 0.3; tier-2 fully served →
-            # controllable inversion against tier-1.
-            {"aid": "a", "sector": "heat", "tier": 1, "demand": 1.0, "served": 0.3, "constraint_allowed": 1.0},
-            {"aid": "b", "sector": "heat", "tier": 2, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-        ])
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                # tier-1 feasible but shed to 0.3; tier-2 fully served →
+                # controllable inversion against tier-1.
+                {
+                    "aid": "a",
+                    "sector": "heat",
+                    "tier": 1,
+                    "demand": 1.0,
+                    "served": 0.3,
+                    "constraint_allowed": 1.0,
+                },
+                {
+                    "aid": "b",
+                    "sector": "heat",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
         res = _check_heat_priority(p)
         assert res["passed"] is False
         assert res["detail"]["n_feasible_inversions"] == 1
@@ -452,21 +711,47 @@ class TestHeatPriorityDiagnostic:
     def test_temperature_infeasible_load_excluded_from_feasible(self, tmp_path):
         # A temperature-capped tier-1 load (constraint_allowed<1) drops out
         # of the feasible subset → no controllable inversion flagged.
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "a", "sector": "heat", "tier": 1, "demand": 1.0, "served": 0.0, "constraint_allowed": 0.0},
-            {"aid": "b", "sector": "heat", "tier": 2, "demand": 1.0, "served": 1.0, "constraint_allowed": 1.0},
-        ])
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                {
+                    "aid": "a",
+                    "sector": "heat",
+                    "tier": 1,
+                    "demand": 1.0,
+                    "served": 0.0,
+                    "constraint_allowed": 0.0,
+                },
+                {
+                    "aid": "b",
+                    "sector": "heat",
+                    "tier": 2,
+                    "demand": 1.0,
+                    "served": 1.0,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
         res = _check_heat_priority(p)
         assert res["passed"] is True
         assert res["detail"]["n_heat_loads_feasible"] == 1
 
     def test_no_heat_loads_passes_vacuously(self, tmp_path):
-        p = _write_served_by_load(tmp_path / "served_by_load.csv", [
-            {"aid": "e", "sector": "electricity", "tier": 1, "demand": 1.0, "served": 0.5, "constraint_allowed": 1.0},
-        ])
+        p = _write_served_by_load(
+            tmp_path / "served_by_load.csv",
+            [
+                {
+                    "aid": "e",
+                    "sector": "electricity",
+                    "tier": 1,
+                    "demand": 1.0,
+                    "served": 0.5,
+                    "constraint_allowed": 1.0,
+                },
+            ],
+        )
         res = _check_heat_priority(p)
         assert res["passed"] is True
-
 
 
 class TestConstraintCompliance:
@@ -481,46 +766,148 @@ class TestConstraintCompliance:
         assert res["passed"] is True
 
     def test_all_in_bounds_passes(self, tmp_path):
-        _write_constraints_final(tmp_path / "constraints_final.csv", [
-            {"kind": "node", "id": 1, "sector": "electricity",
-             "variable": "vm_pu", "value": 1.01, "lo": 0.95, "hi": 1.05,
-             "overshoot": 0.0, "violated": 0},
-            {"kind": "branch", "id": "(1, 2)", "sector": "electricity",
-             "variable": "loading_percent", "value": 80.0, "lo": -100.0,
-             "hi": 100.0, "overshoot": 0.0, "violated": 0},
-        ])
+        _write_constraints_final(
+            tmp_path / "constraints_final.csv",
+            [
+                {
+                    "kind": "node",
+                    "id": 1,
+                    "sector": "electricity",
+                    "variable": "vm_pu",
+                    "value": 1.01,
+                    "lo": 0.95,
+                    "hi": 1.05,
+                    "overshoot": 0.0,
+                    "violated": 0,
+                },
+                {
+                    "kind": "branch",
+                    "id": "(1, 2)",
+                    "sector": "electricity",
+                    "variable": "loading_percent",
+                    "value": 80.0,
+                    "lo": -100.0,
+                    "hi": 100.0,
+                    "overshoot": 0.0,
+                    "violated": 0,
+                },
+            ],
+        )
         res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
         assert res["passed"] is True
         assert res["detail"]["n_violations"] == 0
         assert res["detail"]["n_checked"] == 2
 
-    def test_any_violation_fails_and_ranks_worst_first(self, tmp_path):
-        _write_constraints_final(tmp_path / "constraints_final.csv", [
-            {"kind": "node", "id": 1, "sector": "electricity",
-             "variable": "vm_pu", "value": 1.08, "lo": 0.95, "hi": 1.05,
-             "overshoot": 0.6, "violated": 1},
-            {"kind": "node", "id": 7, "sector": "heat",
-             "variable": "t_k", "value": 240.0, "lo": 313.15, "hi": 403.15,
-             "overshoot": 1.626, "violated": 1},
-            {"kind": "node", "id": 2, "sector": "gas",
-             "variable": "pressure_pu", "value": 1.0, "lo": 0.9, "hi": 1.1,
-             "overshoot": 0.0, "violated": 0},
-        ])
+    def test_gating_violation_fails_and_ranks_worst_first(self, tmp_path):
+        # A GATING (electricity/gas) violation fails the run; the heat ``t_k``
+        # breach is NON-GATING (already penalised via served load) so it is
+        # tracked but does not flip ``passed`` and is kept out of the gating
+        # ``violations`` ranking.
+        _write_constraints_final(
+            tmp_path / "constraints_final.csv",
+            [
+                {
+                    "kind": "node",
+                    "id": 1,
+                    "sector": "electricity",
+                    "variable": "vm_pu",
+                    "value": 1.08,
+                    "lo": 0.95,
+                    "hi": 1.05,
+                    "overshoot": 0.6,
+                    "violated": 1,
+                },
+                {
+                    "kind": "node",
+                    "id": 7,
+                    "sector": "heat",
+                    "variable": "t_k",
+                    "value": 240.0,
+                    "lo": 313.15,
+                    "hi": 403.15,
+                    "overshoot": 1.626,
+                    "violated": 1,
+                },
+                {
+                    "kind": "node",
+                    "id": 2,
+                    "sector": "gas",
+                    "variable": "pressure_pu",
+                    "value": 1.0,
+                    "lo": 0.9,
+                    "hi": 1.1,
+                    "overshoot": 0.0,
+                    "violated": 0,
+                },
+            ],
+        )
         res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
         assert res["passed"] is False
-        assert res["detail"]["n_violations"] == 2
-        # Worst (largest overshoot) first.
-        assert res["detail"]["violations"][0]["variable"] == "t_k"
+        # Gating count excludes the t_k breach; it is surfaced separately.
+        assert res["detail"]["n_violations"] == 1
+        assert res["detail"]["n_nongating_violations"] == 1
+        # Worst GATING violation first (t_k, larger overshoot, is excluded).
+        assert res["detail"]["violations"][0]["variable"] == "vm_pu"
+        assert res["detail"]["nongating_violations"][0]["variable"] == "t_k"
+        # by_sector still tracks the t_k breach for visibility.
         assert res["detail"]["by_sector"]["heat"]["worst_overshoot"] == 1.626
+        assert res["detail"]["by_sector"]["heat"]["n_violations"] == 1
         assert res["detail"]["by_sector"]["gas"]["n_violations"] == 0
+        # Per-variable-type tally: voltage gating, temperature non-gating.
+        by_var = res["detail"]["by_variable"]
+        assert by_var["voltage"]["n_violations"] == 1
+        assert by_var["voltage"]["gating"] is True
+        assert by_var["temperature"]["n_violations"] == 1
+        assert by_var["temperature"]["gating"] is False
+        assert by_var["pressure"]["n_violations"] == 0
+        assert by_var["pressure"]["n_checked"] == 1
+
+    def test_heat_temperature_alone_is_non_gating(self, tmp_path):
+        # A heat ``t_k`` breach with NO electricity/gas breach PASSES: the cold
+        # node already serves no load (constraint_allowed collapses), so the
+        # served-fraction metric penalises it — gating here would double-count.
+        _write_constraints_final(
+            tmp_path / "constraints_final.csv",
+            [
+                {
+                    "kind": "node",
+                    "id": 7,
+                    "sector": "heat",
+                    "variable": "t_k",
+                    "value": 305.0,
+                    "lo": 313.15,
+                    "hi": 403.15,
+                    "overshoot": 0.09,
+                    "violated": 1,
+                },
+            ],
+        )
+        res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
+        assert res["passed"] is True
+        assert res["detail"]["n_violations"] == 0
+        assert res["detail"]["n_nongating_violations"] == 1
+        # Still visible in the per-sector breakdown.
+        assert res["detail"]["by_sector"]["heat"]["n_violations"] == 1
+        assert res["detail"]["nongating_violations"][0]["variable"] == "t_k"
 
     def test_wired_into_evaluate_task(self, tmp_path):
         # A violated row surfaces as a failing claim through evaluate_task.
-        _write_constraints_final(tmp_path / "constraints_final.csv", [
-            {"kind": "node", "id": 1, "sector": "electricity",
-             "variable": "vm_pu", "value": 1.08, "lo": 0.95, "hi": 1.05,
-             "overshoot": 0.6, "violated": 1},
-        ])
+        _write_constraints_final(
+            tmp_path / "constraints_final.csv",
+            [
+                {
+                    "kind": "node",
+                    "id": 1,
+                    "sector": "electricity",
+                    "variable": "vm_pu",
+                    "value": 1.08,
+                    "lo": 0.95,
+                    "hi": 1.05,
+                    "overshoot": 0.6,
+                    "violated": 1,
+                },
+            ],
+        )
         out = evaluate_task(tmp_path)
         assert "constraint_compliance" in out
         assert out["constraint_compliance"]["passed"] is False

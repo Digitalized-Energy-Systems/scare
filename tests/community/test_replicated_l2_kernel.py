@@ -121,9 +121,7 @@ def test_replicated_kernel_no_coordinator_self_dispatch_only() -> None:
     asyncio.run(role_b._run_replicated_kernel())  # type: ignore[attr-defined]
 
     payloads = [m.payload for m in ctx_b.sent]
-    assert not any(
-        type(p).__name__ == "ComponentAllocation" for p in payloads
-    ), (
+    assert not any(type(p).__name__ == "ComponentAllocation" for p in payloads), (
         "replicated kernel must not send ComponentAllocation; got: "
         f"{[type(p).__name__ for p in payloads]}"
     )

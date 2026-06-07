@@ -19,12 +19,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from distributed_resource_optimization.algorithm.admm.core import ADMMMessage
 from distributed_resource_optimization.carrier.mango import _CarrierRequest
 
-from scare.base.admm import ScareDistributedOptimizationRole
-
+from scare.base.optimization.admm import ScareDistributedOptimizationRole
 
 # ---------------------------------------------------------------------------
 # 1) Direct handler spy
@@ -109,9 +107,7 @@ async def test_admm_handler_unwraps_carrier_request_through_scheduler():
 _FORBIDDEN = re.compile(
     r"\b(asyncio\.(?:create_task|ensure_future)|loop\.create_task)\b"
 )
-_TIME_FORBIDDEN = re.compile(
-    r"\b(time\.(?:time|monotonic|perf_counter)|loop\.time)\("
-)
+_TIME_FORBIDDEN = re.compile(r"\b(time\.(?:time|monotonic|perf_counter)|loop\.time)\(")
 
 
 def _iter_scare_sources() -> list[Path]:
@@ -141,15 +137,17 @@ def test_no_bare_create_task_in_scare_source():
         text = _strip_comments_and_strings(path.read_text(encoding="utf-8"))
         for match in _FORBIDDEN.finditer(text):
             # Recover the original line number from the unstripped source.
-            line = path.read_text(encoding="utf-8").count(
-                "\n", 0, _locate_in_original(path, match.group(0))
-            ) + 1
+            line = (
+                path.read_text(encoding="utf-8").count(
+                    "\n", 0, _locate_in_original(path, match.group(0))
+                )
+                + 1
+            )
             offenders.append(f"{path}:{line}: {match.group(0)}")
 
     assert not offenders, (
         "Found scheduler-bypassing calls in src/scare. Replace with "
-        "self.context.schedule_instant_task(...).\n  "
-        + "\n  ".join(offenders)
+        "self.context.schedule_instant_task(...).\n  " + "\n  ".join(offenders)
     )
 
 
@@ -168,8 +166,7 @@ def test_no_wallclock_time_in_scare_source():
 
     assert not offenders, (
         "Found wall-clock time probes in src/scare. Use "
-        "self.context.current_timestamp instead.\n  "
-        + "\n  ".join(offenders)
+        "self.context.current_timestamp instead.\n  " + "\n  ".join(offenders)
     )
 
 

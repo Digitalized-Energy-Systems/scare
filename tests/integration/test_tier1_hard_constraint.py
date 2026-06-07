@@ -8,13 +8,12 @@ Both branches are exercised end-to-end through a real mango world.
 """
 
 import pytest
-
 from mango import RoleAgent, SimpleCommunicationSimulation, create_world
 from mango.express.topology import create_topology
 from mango.simulation.world import discrete_step_until
 
 from scare.base.model import Sector
-from scare.service.balance import EnergyBalanceNegotiator
+from scare.service.balance.balance import EnergyBalanceNegotiator
 from tests.conftest import MockBehavior, make_electricity_gen, make_electricity_load
 
 
@@ -61,8 +60,7 @@ def _has_reason(behavior: MockBehavior, aid: str, reason_substr: str) -> bool:
     the ``reason`` kwarg, so a call's presence proxies for the pre-step
     having engaged on this aid."""
     return any(
-        entry[0] == aid and entry[1] == "regulate"
-        for entry in behavior.action_log
+        entry[0] == aid and entry[1] == "regulate" for entry in behavior.action_log
     )
 
 
@@ -76,15 +74,28 @@ async def test_tier1_feasible_locked_at_one_qp_runs_for_lower_tiers():
     tier-3 (entire remaining pool).
     """
     behavior = MockBehavior()
-    world, _agents, roles = _build_group(behavior, [
-        {"aid": "gen-0", "obs": make_electricity_gen(p_mw=-2.0, regulation=1.0), "priority": 0},
-        {"aid": "load-1", "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=1), "priority": 1},
-        {"aid": "load-3", "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=3), "priority": 3},
-    ])
+    world, _agents, roles = _build_group(
+        behavior,
+        [
+            {
+                "aid": "gen-0",
+                "obs": make_electricity_gen(p_mw=-2.0, regulation=1.0),
+                "priority": 0,
+            },
+            {
+                "aid": "load-1",
+                "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=1),
+                "priority": 1,
+            },
+            {
+                "aid": "load-3",
+                "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=3),
+                "priority": 3,
+            },
+        ],
+    )
     async with world:
-        roles[0].context.schedule_instant_task(
-            roles[0].trigger_balance_negotiation()
-        )
+        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=30.0)
 
     f_t1 = _last_factor(behavior, "load-1")
@@ -111,16 +122,33 @@ async def test_tier1_infeasible_pro_rata_lower_tiers_zero_no_qp():
     tier-3 is shed to factor 0; the gossip QP does not run.
     """
     behavior = MockBehavior()
-    world, _agents, roles = _build_group(behavior, [
-        {"aid": "gen-0", "obs": make_electricity_gen(p_mw=-0.5, regulation=1.0), "priority": 0},
-        {"aid": "load-1a", "obs": make_electricity_load(p_mw=0.5, regulation=0.0, priority=1), "priority": 1},
-        {"aid": "load-1b", "obs": make_electricity_load(p_mw=0.5, regulation=0.0, priority=1), "priority": 1},
-        {"aid": "load-3", "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=3), "priority": 3},
-    ])
+    world, _agents, roles = _build_group(
+        behavior,
+        [
+            {
+                "aid": "gen-0",
+                "obs": make_electricity_gen(p_mw=-0.5, regulation=1.0),
+                "priority": 0,
+            },
+            {
+                "aid": "load-1a",
+                "obs": make_electricity_load(p_mw=0.5, regulation=0.0, priority=1),
+                "priority": 1,
+            },
+            {
+                "aid": "load-1b",
+                "obs": make_electricity_load(p_mw=0.5, regulation=0.0, priority=1),
+                "priority": 1,
+            },
+            {
+                "aid": "load-3",
+                "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=3),
+                "priority": 3,
+            },
+        ],
+    )
     async with world:
-        roles[0].context.schedule_instant_task(
-            roles[0].trigger_balance_negotiation()
-        )
+        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=30.0)
 
     f_t1a = _last_factor(behavior, "load-1a")
@@ -148,15 +176,28 @@ async def test_tier1_no_deficit_all_loads_served():
     tier-1 pre-locked at 1.0; tier-3 served by the QP up to full demand.
     """
     behavior = MockBehavior()
-    world, _agents, roles = _build_group(behavior, [
-        {"aid": "gen-0", "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0), "priority": 0},
-        {"aid": "load-1", "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=1), "priority": 1},
-        {"aid": "load-3", "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=3), "priority": 3},
-    ])
+    world, _agents, roles = _build_group(
+        behavior,
+        [
+            {
+                "aid": "gen-0",
+                "obs": make_electricity_gen(p_mw=-10.0, regulation=1.0),
+                "priority": 0,
+            },
+            {
+                "aid": "load-1",
+                "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=1),
+                "priority": 1,
+            },
+            {
+                "aid": "load-3",
+                "obs": make_electricity_load(p_mw=1.0, regulation=0.0, priority=3),
+                "priority": 3,
+            },
+        ],
+    )
     async with world:
-        roles[0].context.schedule_instant_task(
-            roles[0].trigger_balance_negotiation()
-        )
+        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=30.0)
 
     f_t1 = _last_factor(behavior, "load-1")

@@ -46,9 +46,7 @@ def _write_task(
     t = np.linspace(0.0, duration_s, n)
     bal = (1.0 - eta_curve) * 100.0  # imbalance = 100 * (1 - eta)
     cols = ["time_s", "electrical_balance", "gas_balance", "heat_balance"]
-    rows = "\n".join(
-        f"{t[i]},{bal[i]},{bal[i]},{bal[i]}" for i in range(n)
-    )
+    rows = "\n".join(f"{t[i]},{bal[i]},{bal[i]},{bal[i]}" for i in range(n))
     (task_dir / "timeseries.csv").write_text(",".join(cols) + "\n" + rows + "\n")
 
     (task_dir / "served.csv").write_text(
@@ -81,7 +79,8 @@ def sweep_root(tmp_path: Path) -> Path:
                 served = 0.55 - 0.03 * (nf - 5) + rng.normal(0, 0.05)
             served = float(np.clip(served, 0.0, 1.0))
             _write_task(
-                root, taskid,
+                root,
+                taskid,
                 n_failures=nf,
                 eta_curve=eta,
                 served_total=served,
@@ -138,9 +137,7 @@ def test_cluster_synchronisation_with_trajectories(tmp_path: Path):
     task_dir.mkdir(parents=True)
     (task_dir / "config.json").write_text(json.dumps({"task_id": "001"}))
     (task_dir / "timeseries.csv").write_text("time_s\n0.0\n")
-    (task_dir / "served.csv").write_text(
-        "sector,tier,demand,served,fraction\n"
-    )
+    (task_dir / "served.csv").write_text("sector,tier,demand,served,fraction\n")
     (task_dir / "events.csv").write_text("t,kind,aid,sector,detail\n")
 
     n = 100
@@ -148,9 +145,7 @@ def test_cluster_synchronisation_with_trajectories(tmp_path: Path):
     a = np.sin(t)
     b = np.sin(t) + 0.1 * np.random.default_rng(0).standard_normal(n)
     c = np.cos(t)
-    rows = "\n".join(
-        f"{t[i]},{a[i]},{b[i]},{c[i]}" for i in range(n)
-    )
+    rows = "\n".join(f"{t[i]},{a[i]},{b[i]},{c[i]}" for i in range(n))
     traj = task_dir / "trajectories.csv"
     traj.write_text("time_s,dev_a,dev_b,dev_c\n" + rows + "\n")
 
@@ -158,9 +153,7 @@ def test_cluster_synchronisation_with_trajectories(tmp_path: Path):
 
     run = load_task(task_dir)
     assert run is not None
-    result = cluster_synchronisation(
-        run, threshold=0.6, aid_traj_csv=traj
-    )
+    result = cluster_synchronisation(run, threshold=0.6, aid_traj_csv=traj)
     assert result.n_devices == 3
     # dev_a and dev_b should cluster together, dev_c separate.
     assert result.cluster_assignment["dev_a"] == result.cluster_assignment["dev_b"]

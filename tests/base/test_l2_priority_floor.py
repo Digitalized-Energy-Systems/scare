@@ -12,10 +12,10 @@ import pytest
 
 from scare.base.model import Sector
 from scare.base.util import (
+    _l2_floor_store,
     apply_regulate,
     constraint_allowed_fraction,
     l2_effective_floor,
-    _l2_floor_store,
 )
 
 
@@ -46,6 +46,7 @@ class _Cfg:
 
 # --- constraint_allowed_fraction ---------------------------------------
 
+
 def test_allowed_fraction_no_pressure_is_one():
     obs = {"p_mw": 10.0, "vm_pu": 1.0}
     assert constraint_allowed_fraction(obs, Sector.ELECTRICITY, tier=3) == 1.0
@@ -63,6 +64,7 @@ def test_allowed_fraction_drops_under_pressure():
 
 
 # --- l2_effective_floor ------------------------------------------------
+
 
 def test_effective_floor_none_without_allocation():
     b = _Behavior()
@@ -89,17 +91,32 @@ def test_effective_floor_capped_by_constraint():
 
 # --- apply_regulate enforcement ----------------------------------------
 
+
 def test_l2_write_sets_floor_then_stability_is_clamped_up():
     cfg = _Cfg(floor=True)
     obs = {"p_mw": 1.0, "vm_pu": 1.0}
     b = _Behavior(config=cfg, obs=obs)
     # L2 allocates 0.6 to a tier-3 load.
-    apply_regulate(b, "load-1", 0.6, sector="electricity",
-                   reason="holon_supply_priority", timestamp=1.0, priority_tier=3)
+    apply_regulate(
+        b,
+        "load-1",
+        0.6,
+        sector="electricity",
+        reason="holon_supply_priority",
+        timestamp=1.0,
+        priority_tier=3,
+    )
     assert _l2_floor_store(b)["load-1"] == pytest.approx(0.6)
     # A stability shed to 0.0 must be clamped up to the 0.6 floor.
-    apply_regulate(b, "load-1", 0.0, sector="electricity",
-                   reason="stability", timestamp=1.1, priority_tier=3)
+    apply_regulate(
+        b,
+        "load-1",
+        0.0,
+        sector="electricity",
+        reason="stability",
+        timestamp=1.1,
+        priority_tier=3,
+    )
     assert b.acted[-1] == ("load-1", pytest.approx(0.6))
 
 
@@ -107,10 +124,24 @@ def test_floor_disabled_lets_stability_shed():
     cfg = _Cfg(floor=False)
     obs = {"p_mw": 1.0, "vm_pu": 1.0}
     b = _Behavior(config=cfg, obs=obs)
-    apply_regulate(b, "load-1", 0.6, sector="electricity",
-                   reason="holon_supply_priority", timestamp=1.0, priority_tier=3)
-    apply_regulate(b, "load-1", 0.0, sector="electricity",
-                   reason="stability", timestamp=1.1, priority_tier=3)
+    apply_regulate(
+        b,
+        "load-1",
+        0.6,
+        sector="electricity",
+        reason="holon_supply_priority",
+        timestamp=1.0,
+        priority_tier=3,
+    )
+    apply_regulate(
+        b,
+        "load-1",
+        0.0,
+        sector="electricity",
+        reason="stability",
+        timestamp=1.1,
+        priority_tier=3,
+    )
     assert b.acted[-1] == ("load-1", pytest.approx(0.0))
 
 
@@ -122,15 +153,36 @@ def test_tier1_stability_is_floored_hardlock():
     cfg = _Cfg(floor=True)
     obs = {"p_mw": 1.0, "vm_pu": 1.0}
     b = _Behavior(config=cfg, obs=obs)
-    apply_regulate(b, "load-1", 1.0, sector="electricity",
-                   reason="holon_supply_priority", timestamp=1.0, priority_tier=1)
-    apply_regulate(b, "load-1", 0.0, sector="electricity",
-                   reason="stability", timestamp=1.1, priority_tier=1)
+    apply_regulate(
+        b,
+        "load-1",
+        1.0,
+        sector="electricity",
+        reason="holon_supply_priority",
+        timestamp=1.0,
+        priority_tier=1,
+    )
+    apply_regulate(
+        b,
+        "load-1",
+        0.0,
+        sector="electricity",
+        reason="stability",
+        timestamp=1.1,
+        priority_tier=1,
+    )
     assert b.acted[-1] == ("load-1", pytest.approx(1.0))
 
     # ...but a constraint-driven curtail can still shed tier 1.
-    applied = apply_regulate(b, "load-1", 0.0, sector="electricity",
-                             reason="curtail", timestamp=1.2, priority_tier=1)
+    applied = apply_regulate(
+        b,
+        "load-1",
+        0.0,
+        sector="electricity",
+        reason="curtail",
+        timestamp=1.2,
+        priority_tier=1,
+    )
     assert applied is True
     assert b.acted[-1] == ("load-1", pytest.approx(0.0))
 
@@ -141,16 +193,31 @@ def test_constraint_relaxes_floor_for_stability():
     cfg = _Cfg(floor=True)
     obs = {"p_mw": 1.0, "vm_pu": 1.09}
     b = _Behavior(config=cfg, obs=obs)
-    apply_regulate(b, "load-1", 1.0, sector="electricity",
-                   reason="holon_supply_priority", timestamp=1.0, priority_tier=4)
+    apply_regulate(
+        b,
+        "load-1",
+        1.0,
+        sector="electricity",
+        reason="holon_supply_priority",
+        timestamp=1.0,
+        priority_tier=4,
+    )
     eff = constraint_allowed_fraction(obs, Sector.ELECTRICITY, tier=4)
-    apply_regulate(b, "load-1", 0.0, sector="electricity",
-                   reason="stability", timestamp=1.1, priority_tier=4)
+    apply_regulate(
+        b,
+        "load-1",
+        0.0,
+        sector="electricity",
+        reason="stability",
+        timestamp=1.1,
+        priority_tier=4,
+    )
     # Clamped up only to the constraint-allowed fraction, not to 1.0.
     assert b.acted[-1][1] == pytest.approx(eff)
 
 
 # --- note_actuated_factor (gossip → apply_regulate dedup sync) ---------
+
 
 def test_external_write_unsticks_apply_regulate_dedup():
     """A gossip ``_apply_setpoint`` write bypasses apply_regulate; without
@@ -161,15 +228,28 @@ def test_external_write_unsticks_apply_regulate_dedup():
 
     b = _Behavior(config=_Cfg(floor=False), obs={"p_mw": 1.0})
     # L2 set the load to 1.0 via apply_regulate (cache := 1.0).
-    apply_regulate(b, "load-1", 1.0, sector="electricity",
-                   reason="holon_supply_priority", timestamp=1.0, priority_tier=3)
+    apply_regulate(
+        b,
+        "load-1",
+        1.0,
+        sector="electricity",
+        reason="holon_supply_priority",
+        timestamp=1.0,
+        priority_tier=3,
+    )
     # Gossip sheds it to 0.0 via a direct actuator write + cache sync.
     b.act("load-1", "regulate", 0.0)
     note_actuated_factor(b, "load-1", 0.0)
     # L2 re-dispatches the allocation (1.0).  Must actuate, not dedup.
-    applied = apply_regulate(b, "load-1", 1.0, sector="electricity",
-                             reason="holon_supply_priority", timestamp=2.0,
-                             priority_tier=3)
+    applied = apply_regulate(
+        b,
+        "load-1",
+        1.0,
+        sector="electricity",
+        reason="holon_supply_priority",
+        timestamp=2.0,
+        priority_tier=3,
+    )
     assert applied is True
     assert b.acted[-1] == ("load-1", 1.0)
 
@@ -182,6 +262,13 @@ def test_dedup_still_fires_when_cache_truthful():
     b = _Behavior(config=_Cfg(floor=False), obs={"p_mw": 1.0})
     b.act("load-1", "regulate", 0.5)
     note_actuated_factor(b, "load-1", 0.5)
-    applied = apply_regulate(b, "load-1", 0.5, sector="electricity",
-                             reason="stability", timestamp=2.0, priority_tier=3)
+    applied = apply_regulate(
+        b,
+        "load-1",
+        0.5,
+        sector="electricity",
+        reason="stability",
+        timestamp=2.0,
+        priority_tier=3,
+    )
     assert applied is False  # same value → deduped

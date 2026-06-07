@@ -20,7 +20,7 @@ from scare.base.model import (
     NegotiationFinishedEvent,
     Sector,
 )
-from scare.service.cp import MultiCommunityCPRole
+from scare.service.coupling.cp import MultiCommunityCPRole
 from tests.conftest import MockBehavior
 
 
@@ -101,9 +101,7 @@ async def test_first_event_seeds_ema_and_commits():
 
 @pytest.mark.asyncio
 async def test_second_event_blends_via_ema():
-    role, behavior, _, world = _make_role(
-        ema_alpha=0.3, min_interval_s=0.0, p_mw=2.0
-    )
+    role, behavior, _, world = _make_role(ema_alpha=0.3, min_interval_s=0.0, p_mw=2.0)
     async with world:
         await step_simulation(world, step_size_s=0.1)
         # Seed with 1.0 then blend in 0.0; EMA at α=0.3 gives 0.7.
@@ -155,9 +153,7 @@ async def test_deadband_suppresses_small_drift():
 
 @pytest.mark.asyncio
 async def test_cooldown_blocks_rapid_commits():
-    role, behavior, _, world = _make_role(
-        deadband_mw=0.0, min_interval_s=5.0, p_mw=2.0
-    )
+    role, behavior, _, world = _make_role(deadband_mw=0.0, min_interval_s=5.0, p_mw=2.0)
     async with world:
         await step_simulation(world, step_size_s=0.1)
         # First commit lands.

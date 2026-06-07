@@ -13,15 +13,14 @@ artefacts.
 from __future__ import annotations
 
 import csv
-import json
 import math
 from pathlib import Path
 from typing import Any
 
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+from experiment.eval.metrics import (
+    NON_GATING_CONSTRAINT_VARIABLES,
+    _variable_tally_entry,
+)
 
 
 def evaluate_task(task_dir: Path) -> dict[str, Any]:
@@ -68,9 +67,7 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
     return out
 
 
-# ---------------------------------------------------------------------------
 # Diary invariant
-# ---------------------------------------------------------------------------
 
 
 def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
@@ -92,9 +89,7 @@ def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
 # Priority invariant
-# ---------------------------------------------------------------------------
 
 
 # A load is physically constraint-throttled (excluded from the physics-aware
@@ -215,7 +210,10 @@ def _check_priority_invariant(
             except (TypeError, ValueError):
                 allowed = 1.0
             frac = served / demand if demand > 0 else 1.0
-            if allowed < 1.0 - _THROTTLE_CAP_TOL and frac >= allowed - _THROTTLE_CAP_TOL:
+            if (
+                allowed < 1.0 - _THROTTLE_CAP_TOL
+                and frac >= allowed - _THROTTLE_CAP_TOL
+            ):
                 n_loads_throttled += 1
                 throttled_demand_mw += demand
                 continue
@@ -254,14 +252,16 @@ def _check_priority_invariant(
             # fully served is mid-ramp, not shed in favour of the lower one.
             if near_full_exempt and f_prev >= _NEAR_FULL_FRAC:
                 continue
-            inversions.append({
-                "sector": sec,
-                "component": comp,
-                "tier_prev": t_prev,
-                "frac_prev": f_prev,
-                "tier_cur": t_cur,
-                "frac_cur": f_cur,
-            })
+            inversions.append(
+                {
+                    "sector": sec,
+                    "component": comp,
+                    "tier_prev": t_prev,
+                    "frac_prev": f_prev,
+                    "tier_cur": t_cur,
+                    "frac_cur": f_cur,
+                }
+            )
     return {
         "passed": not inversions,
         "detail": {
@@ -353,16 +353,24 @@ def _check_heat_priority(by_load_path: Path) -> dict[str, Any]:
         t_prev, t_cur = tiers[i - 1], tiers[i]
         f_prev, f_cur = per_tier_feasible[t_prev], per_tier_feasible[t_cur]
         if f_cur > f_prev + 1e-3:
-            inversions.append({
-                "tier_prev": t_prev, "frac_prev": round(f_prev, 4),
-                "tier_cur": t_cur, "frac_cur": round(f_cur, 4),
-            })
+            inversions.append(
+                {
+                    "tier_prev": t_prev,
+                    "frac_prev": round(f_prev, 4),
+                    "tier_cur": t_cur,
+                    "frac_cur": round(f_cur, 4),
+                }
+            )
 
     return {
         "passed": not inversions,
         "detail": {
-            "per_tier_served_feasible": {str(t): round(v, 4) for t, v in per_tier_feasible.items()},
-            "per_tier_served_all": {str(t): round(v, 4) for t, v in per_tier_all.items()},
+            "per_tier_served_feasible": {
+                str(t): round(v, 4) for t, v in per_tier_feasible.items()
+            },
+            "per_tier_served_all": {
+                str(t): round(v, 4) for t, v in per_tier_all.items()
+            },
             "n_heat_loads_feasible": n_feasible,
             "n_heat_loads_total": n_total,
             "feasible_inversions": inversions,
@@ -392,13 +400,15 @@ def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
             t_prev, f_prev = entries[i - 1]
             t_cur, f_cur = entries[i]
             if f_cur > f_prev + 1e-3:
-                inversions.append({
-                    "sector": sec,
-                    "tier_prev": t_prev,
-                    "frac_prev": f_prev,
-                    "tier_cur": t_cur,
-                    "frac_cur": f_cur,
-                })
+                inversions.append(
+                    {
+                        "sector": sec,
+                        "tier_prev": t_prev,
+                        "frac_prev": f_prev,
+                        "tier_cur": t_cur,
+                        "frac_cur": f_cur,
+                    }
+                )
     return {
         "passed": not inversions,
         "detail": {
@@ -409,9 +419,7 @@ def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
 # Monotonic progress
-# ---------------------------------------------------------------------------
 
 
 _WARMUP_S: float = 1.0
@@ -459,9 +467,7 @@ def _check_monotonic_progress(
         return {"passed": True, "detail": "empty timeseries"}
 
     violations_by_sec = _violation_windows(events_path) if events_path.exists() else {}
-    failure_windows = (
-        _failure_windows(events_path) if events_path.exists() else []
-    )
+    failure_windows = _failure_windows(events_path) if events_path.exists() else []
 
     # Line-overload exemption (electricity): while a power line is over its
     # thermal rating, the line-relief lever sheds through-load to restore
@@ -492,7 +498,7 @@ def _check_monotonic_progress(
             return True
         return False
 
-    # --- Primary: per-(sector, tier) priority-order check ---------------
+    # Primary: per-(sector, tier) priority-order check
     by_sector_tier: dict[str, dict[int, tuple[list[float], list[float]]]] = {}
     for col, (t, ys) in series.items():
         if not col.startswith("tier_balance__"):
@@ -553,7 +559,7 @@ def _check_monotonic_progress(
             },
         }
 
-    # --- Fallback: legacy per-sector aggregate drop ---------------------
+    # Fallback: legacy per-sector aggregate drop
     # Heat omitted: its shedding tracks local temperature feasibility, not
     # tier order.
     sectors = {
@@ -608,7 +614,12 @@ def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
     windows: list[tuple[float, float]] = []
     for r in rows:
         kind = r.get("kind", "")
-        if kind not in ("branch_failure", "node_failure", "custom_failure", "line_failure"):
+        if kind not in (
+            "branch_failure",
+            "node_failure",
+            "custom_failure",
+            "line_failure",
+        ):
             continue
         try:
             t = float(r.get("t", ""))
@@ -618,9 +629,7 @@ def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
     return windows
 
 
-# ---------------------------------------------------------------------------
 # Slack budget compliance
-# ---------------------------------------------------------------------------
 
 
 # Settling window: the slack draw must be within budget at steady state, not
@@ -665,7 +674,7 @@ def _check_slack_budget(
         else {}
     )
 
-    # --- Steady-state path (preferred) -------------------------------
+    # Steady-state path (preferred)
     if budgets and series:
         # Settling window taken from the longest slack series.
         t_end = 0.0
@@ -694,13 +703,15 @@ def _check_slack_budget(
                 "violated": peak > threshold,
             }
             if peak > threshold:
-                breaches.append({
-                    "slack": col,
-                    "steady_peak": round(peak, 6),
-                    "budget": round(budget, 6),
-                    "threshold": round(threshold, 6),
-                    "over_pct": round(100.0 * (peak / budget - 1.0), 1),
-                })
+                breaches.append(
+                    {
+                        "slack": col,
+                        "steady_peak": round(peak, 6),
+                        "budget": round(budget, 6),
+                        "threshold": round(threshold, 6),
+                        "over_pct": round(100.0 * (peak / budget - 1.0), 1),
+                    }
+                )
         return {
             "passed": not breaches,
             "detail": {
@@ -714,7 +725,7 @@ def _check_slack_budget(
             },
         }
 
-    # --- Legacy fallback: any violation event fails ------------------
+    # Legacy fallback: any violation event fails
     if not events_path.exists():
         return {"passed": True, "detail": "no events.csv (claim vacuous)"}
     if not rows:
@@ -726,12 +737,14 @@ def _check_slack_budget(
         }
     peaks: list[dict[str, Any]] = []
     for r in violations[:5]:
-        peaks.append({
-            "t": r.get("t"),
-            "aid": r.get("aid"),
-            "sector": r.get("sector"),
-            "detail": (r.get("detail") or "")[:120],
-        })
+        peaks.append(
+            {
+                "t": r.get("t"),
+                "aid": r.get("aid"),
+                "sector": r.get("sector"),
+                "detail": (r.get("detail") or "")[:120],
+            }
+        )
     return {
         "passed": False,
         "detail": {
@@ -744,24 +757,30 @@ def _check_slack_budget(
     }
 
 
-# ---------------------------------------------------------------------------
 # Constraint compliance (end-of-sim grid feasibility)
-# ---------------------------------------------------------------------------
 
 
 def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
     """End-of-sim hard-bound feasibility must hold: no active, connected node
-    or branch may breach its ``SECTOR_CONSTRAINTS`` envelope (voltage,
-    pressure, junction temperature, line/transformer loading).
+    or branch may breach its GATING ``SECTOR_CONSTRAINTS`` envelope (voltage,
+    pressure, line/transformer loading).
 
     Reads ``constraints_final.csv`` (one row per checked variable, off the
-    final solved network).  Passed iff no row is flagged ``violated``.
+    final solved network).  Passed iff no GATING row is flagged ``violated``.
+
+    Heat junction temperature (``t_k``) is NON-GATING (see
+    ``NON_GATING_CONSTRAINT_VARIABLES``): a temperature-infeasible heat node
+    already serves no load (its ``constraint_allowed`` collapses to ~0), so the
+    served-fraction metric already penalises it.  Counting the ``t_k`` breach
+    here as well would punish the heat grid twice for the same local physics.
+    The ``t_k`` breaches are still reported in the detail (``by_sector`` and
+    ``nongating_violations``) but do not affect ``passed``.
 
     Grid-feasibility companion to ``slack_budget_compliance``: together they
     make a run "compliant" only when it honoured both the operator slack budget
-    and the physical envelope the oracle LP enforces by construction.  Without
-    this gate a variant could post a higher PWSF by leaving voltages /
-    temperatures / lines out of bounds — feasibility the oracle cannot buy.
+    and the gating physical envelope the oracle LP enforces by construction.
+    Without this gate a variant could post a higher PWSF by leaving voltages /
+    lines out of bounds — feasibility the oracle cannot buy.
 
     Vacuously True when the artefact is absent / empty.
     """
@@ -772,13 +791,24 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
         return {"passed": True, "detail": "empty constraints_final.csv (claim vacuous)"}
 
     by_sector: dict[str, dict[str, Any]] = {}
-    violations: list[dict[str, Any]] = []
+    by_variable: dict[str, dict[str, Any]] = {}
+    gating: list[dict[str, Any]] = []
+    nongating: list[dict[str, Any]] = []
     for r in rows:
         sec = r.get("sector", "")
+        var = r.get("variable", "")
         entry = by_sector.setdefault(
-            sec, {"n_checked": 0, "n_violations": 0, "worst_overshoot": 0.0}
+            sec,
+            {
+                "n_checked": 0,
+                "n_violations": 0,
+                "worst_overshoot": 0.0,
+                "n_nongating_violations": 0,
+            },
         )
+        var_entry = _variable_tally_entry(by_variable, var)
         entry["n_checked"] += 1
+        var_entry["n_checked"] += 1
         if (r.get("violated") or "0").strip() not in ("1", "true", "True"):
             continue
         try:
@@ -787,23 +817,43 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
             overshoot = 0.0
         entry["n_violations"] += 1
         entry["worst_overshoot"] = max(entry["worst_overshoot"], overshoot)
-        violations.append({
+        var_entry["n_violations"] += 1
+        var_entry["worst_overshoot"] = max(var_entry["worst_overshoot"], overshoot)
+        rec = {
             "kind": r.get("kind", ""),
             "id": r.get("id", ""),
             "sector": sec,
-            "variable": r.get("variable", ""),
+            "variable": var,
             "value": r.get("value", ""),
             "overshoot": round(overshoot, 6),
-        })
+        }
+        # Temperature (t_k) breaches are tracked but do NOT gate the run — the
+        # cold node is already penalised via the served-load metric.
+        if var in NON_GATING_CONSTRAINT_VARIABLES:
+            entry["n_nongating_violations"] += 1
+            nongating.append(rec)
+        else:
+            gating.append(rec)
 
-    violations.sort(key=lambda d: d["overshoot"], reverse=True)
+    gating.sort(key=lambda d: d["overshoot"], reverse=True)
+    nongating.sort(key=lambda d: d["overshoot"], reverse=True)
     return {
-        "passed": not violations,
+        "passed": not gating,
         "detail": {
             "n_checked": len(rows),
-            "n_violations": len(violations),
+            # ``n_violations`` is the GATING count (drives ``passed``); the
+            # non-gating (``t_k``) breaches are surfaced separately.
+            "n_violations": len(gating),
+            "n_nongating_violations": len(nongating),
+            "nongating_variables": sorted(NON_GATING_CONSTRAINT_VARIABLES),
             "by_sector": by_sector,
-            "violations": violations[:5],
+            # Per-variable-type tally (voltage / pressure / temperature /
+            # line_load) — a compliance-accompanying diagnostic; ``temperature``
+            # is non-gating. Slack violations are tallied by the separate
+            # ``slack_budget_compliance`` claim.
+            "by_variable": by_variable,
+            "violations": gating[:5],
+            "nongating_violations": nongating[:5],
         },
     }
 
@@ -816,6 +866,7 @@ def _load_slack_budgets(slack_meta_path: Path | None) -> dict[str, float]:
         return {}
     try:
         import json
+
         meta = json.loads(slack_meta_path.read_text())
     except Exception:  # noqa: BLE001
         return {}
@@ -830,11 +881,6 @@ def _load_slack_budgets(slack_meta_path: Path | None) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return out
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -874,12 +920,14 @@ def _load_timeseries(path: Path) -> dict[str, tuple[list[float], list[float]]]:
     return out
 
 
-_DISRUPTION_KINDS = frozenset({
-    "constraint_violation",
-    "line_failure",
-    "node_failure",
-    "branch_failure",
-})
+_DISRUPTION_KINDS = frozenset(
+    {
+        "constraint_violation",
+        "line_failure",
+        "node_failure",
+        "branch_failure",
+    }
+)
 
 
 _DISRUPTION_GRACE_S = 2.0
