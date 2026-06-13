@@ -99,18 +99,18 @@ def apply_microgrid_islanding(
         elif isinstance(m, Source):
             # Sources live on both gas and water nodes; route by parent
             # grid so the right carrier is counted and anchored.
-            mass_max = max(1e-6, abs(float(getattr(m, "mass_flow", 0.0) or 0.0)))
+            mass_max = max(1e-6, abs(float(getattr(m, "mass_flow_kgs", 0.0) or 0.0)))
             if "gas" in grid_name and "gas" in carrier_set:
                 child.model = GridFormingSource(
                     pressure_pu=1.0,
-                    mass_flow_max=mass_max,
+                    mass_flow_max_kgs=mass_max,
                 )
                 counters["gas"] += 1
             elif "water" in grid_name and "water" in carrier_set:
                 child.model = GridFormingSource(
                     pressure_pu=1.0,
                     t_k=356.0,
-                    mass_flow_max=mass_max,
+                    mass_flow_max_kgs=mass_max,
                 )
                 counters["water"] += 1
 
@@ -227,16 +227,16 @@ def apply_slack_budget(mes, fraction: float) -> None:
                 grid_name = ""
             if "gas" in grid_name:
                 if isinstance(m, Sink):
-                    total_gas_mass_kgs += abs(getattr(m, "mass_flow", 0.0))
+                    total_gas_mass_kgs += abs(getattr(m, "mass_flow_kgs", 0.0))
                 else:
-                    total_gas_source_kgs += abs(getattr(m, "mass_flow", 0.0))
+                    total_gas_source_kgs += abs(getattr(m, "mass_flow_kgs", 0.0))
     # Gas-drawing cross-sector converters (CHP) are modeled at node level
     # (CHPHGControlNode), not as Sink/Source children, so the loop above
     # misses them. Their gas input is normal slack demand.
     for node in mes.nodes:
         nm = node.model
         if type(nm).__name__ == "CHPHGControlNode":
-            total_gas_conv_kgs += abs(getattr(nm, "gas_kgps", 0.0))
+            total_gas_conv_kgs += abs(getattr(nm, "gas_mass_flow_kgs", 0.0))
 
     cap_p_mw = max(1e-3, fraction * (total_p_mw + total_p_gen_mw))
     cap_gas_mass_kgs = max(
@@ -268,8 +268,8 @@ def apply_slack_budget(mes, fraction: float) -> None:
             m._scare_slack_budget_mw = cap_p_mw
         elif (
             isinstance(m, ExtHydrGrid)
-            and hasattr(m, "mass_flow")
-            and hasattr(m.mass_flow, "min")
+            and hasattr(m, "mass_flow_kgs")
+            and hasattr(m.mass_flow_kgs, "min")
         ):
             try:
                 grid_name = str(
@@ -278,8 +278,8 @@ def apply_slack_budget(mes, fraction: float) -> None:
             except Exception:
                 grid_name = ""
             if "gas" in grid_name:
-                m.mass_flow.min = -lp_gas_mass_kgs
-                m.mass_flow.max = lp_gas_mass_kgs
+                m.mass_flow_kgs.min = -lp_gas_mass_kgs
+                m.mass_flow_kgs.max = lp_gas_mass_kgs
                 m._scare_slack_budget_kgs = cap_gas_mass_kgs
             # heat-side ExtHydrGrid left unbounded
 

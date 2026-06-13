@@ -19,11 +19,11 @@ _CAPACITY_KEYS = (
     "q_mw_heat",  # heat load capacity [MW]
     "q_mw_set",  # heat exchanger setpoint [MW]
     "q_mw",  # heat branch actual power [MW]
-    "mass_flow",
+    "mass_flow_kgs",
     "p_kw",
     "q_mvar",
     "p_mw_capacity",
-    "mass_flow_capacity",
+    "mass_flow_capacity_kgs",
 )
 
 
@@ -929,7 +929,7 @@ def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
     ``loading_percent`` comes as a fraction ([0,1]) or actual percent;
     ``SECTOR_CONSTRAINTS`` wants percent, so values ≤ 5 (only the fraction
     form) are scaled ×100. When the bare key is missing (it's a property,
-    not in ``model.values``) fall back to max of ``loading_from/to_percent``.
+    not in ``model.values``) fall back to max of ``loading_from/to_pu``.
     """
     keys = _CONSTRAINT_OBS_KEYS.get(sector, {})
     result: dict[str, float] = {}
@@ -938,8 +938,8 @@ def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
         if obs_key in obs:
             raw = float(obs[obs_key])
         elif var == "loading_percent":
-            lf = obs.get("loading_from_percent")
-            lt = obs.get("loading_to_percent")
+            lf = obs.get("loading_from_pu")
+            lt = obs.get("loading_to_pu")
             if lf is not None or lt is not None:
                 raw = max(
                     abs(float(lf)) if lf is not None else 0.0,

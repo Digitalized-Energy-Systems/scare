@@ -250,7 +250,7 @@ def write_slack_meta(path: Path, monee_net: Any) -> None:
         {
           "<aid>": {
             "sector":       "electricity" | "gas" | "heat",
-            "obs_key":      "p_mw" | "mass_flow",
+            "obs_key":      "p_mw" | "mass_flow_kgs",
             "budget":       <float | null>,   # |operator policy|, null = heat
             "lp_envelope":  <float | null>,   # |LP Var bound|, null = unbounded
             "node_id":      <child's parent node id>
@@ -272,9 +272,9 @@ def write_slack_meta(path: Path, monee_net: Any) -> None:
             budget = getattr(m, "_scare_slack_budget_mw", None)
             var = getattr(m, "p_mw", None)
         elif isinstance(m, ExtHydrGrid):
-            obs_key = "mass_flow"
+            obs_key = "mass_flow_kgs"
             budget = getattr(m, "_scare_slack_budget_kgs", None)
-            var = getattr(m, "mass_flow", None)
+            var = getattr(m, "mass_flow_kgs", None)
         else:
             continue
         try:

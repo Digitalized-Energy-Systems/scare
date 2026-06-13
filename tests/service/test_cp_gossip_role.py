@@ -263,7 +263,7 @@ async def test_run_gossip_round_bumps_round_id():
         peer_addrs={},
     )
     # Manually install participant + carrier (setup() not invoked).
-    from distributed_resource_optimization.algorithm.gossip_lexicographic_cascade.core import (
+    from distributed_resource_optimization.algorithm.admm.lexicographic import (
         create_gossip_cascade_participant,
     )
 

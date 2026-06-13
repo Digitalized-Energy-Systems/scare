@@ -84,7 +84,7 @@ def make_gas_obs(
     pressure_pu: float = 1.0,
 ) -> dict:
     return {
-        "mass_flow": mass_flow,
+        "mass_flow_kgs": mass_flow,
         "regulation": regulation,
         "pressure_pu": pressure_pu,
     }
@@ -103,5 +103,5 @@ def make_heat_mass_flow_obs(
     regulation: float = 0.5,
     t_k: float = 363.15,
 ) -> dict:
-    """Heat junction that carries mass_flow (disambiguated from gas by t_k)."""
-    return {"mass_flow": mass_flow, "regulation": regulation, "t_k": t_k}
+    """Heat junction that carries mass_flow_kgs (disambiguated from gas by t_k)."""
+    return {"mass_flow_kgs": mass_flow, "regulation": regulation, "t_k": t_k}

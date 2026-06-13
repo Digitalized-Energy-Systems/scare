@@ -56,9 +56,9 @@ def _run_monitor(*, obs_key, draw, budget, sector):
 
 
 def test_positive_import_slack_sheds_not_adds():
-    # Gas slack: import encoded as POSITIVE mass_flow, 10x over budget.
+    # Gas slack: import encoded as POSITIVE mass_flow_kgs, 10x over budget.
     tgt = _run_monitor(
-        obs_key="mass_flow", draw=0.00135, budget=0.000135, sector=Sector.GAS
+        obs_key="mass_flow_kgs", draw=0.00135, budget=0.000135, sector=Sector.GAS
     )
     assert tgt is not None
     assert tgt < 0, f"over-importing slack must shed (negative target), got {tgt}"

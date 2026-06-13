@@ -16,7 +16,7 @@ from typing import Any
 
 from monee import run_energy_flow_optimization
 from monee.model.child import ExtHydrGrid, ExtPowerGrid
-from monee.model.formulation import make_mccormick_dhs_formulation
+from monee.model.formulation import make_heat_convex_milp_formulation
 from monee.problem import (
     WEIGHT_DEMAND,
     create_min_load_shedding_problem,
@@ -205,7 +205,7 @@ def _slack_budget_summary(monee_net: Any) -> dict[str, Any]:
             if cap is None:
                 continue
             try:
-                draw = abs(float(vals.get("mass_flow", 0.0) or 0.0))
+                draw = abs(float(vals.get("mass_flow_kgs", 0.0) or 0.0))
             except (TypeError, ValueError):
                 draw = 0.0
             out[f"child-{child.id}"] = {
@@ -264,7 +264,10 @@ def run_oracle(
     # the factory, so only the oracle LP is affected; the net is oracle-dedicated
     # so the in-place swap is safe.
     monee_net.apply_formulation(
-        make_mccormick_dhs_formulation(num_partitions=_ORACLE_MCCORMICK_PARTITIONS)
+        make_heat_convex_milp_formulation(
+            num_partitions=_ORACLE_MCCORMICK_PARTITIONS,
+            include_heat_exchangers=False,
+        )
     )
     # Enforce the operator slack budget on the LP itself via
     # ``create_min_load_shedding_problem``'s native ``ext_grid_*_bounds`` (no
@@ -316,13 +319,13 @@ def run_oracle(
     # t_k = (313.15, 403.15) via monee's water-grid t_ref = 356 K -> t_pu.
     prob = create_min_load_shedding_problem(
         weight_for_load=weight_for_load,
-        ext_grid_el_bounds=ext_grid_el_bounds,
-        ext_grid_gas_bounds=ext_grid_gas_bounds,
-        ext_grid_heat_bounds=ext_grid_heat_bounds,
-        bounds_el=(0.95, 1.05),
-        bounds_gas=(0.90, 1.10),
-        bounds_heat=(0.8796, 1.1325),
-        check_line_loading=True,
+        bounds_ext_el=ext_grid_el_bounds,
+        bounds_ext_gas=ext_grid_gas_bounds,
+        bounds_ext_heat=ext_grid_heat_bounds,
+        bounds_vm=(0.95, 1.05),
+        bounds_pressure=(0.90, 1.10),
+        bounds_t=(0.8796, 1.1325),
+        check_lp=True,
         max_line_loading=1.0,
     )
     if weight_for_load is not None:

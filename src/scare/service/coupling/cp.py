@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # Sector -> obs key holding that sector's current setpoint.
 _ACCESS_KEYS: dict[Sector, str] = {
     Sector.ELECTRICITY: "el_mw",
-    Sector.GAS: "gas_kgps",
+    Sector.GAS: "gas_mass_flow_kgs",
     Sector.HEAT: "heat_mw",
 }
 

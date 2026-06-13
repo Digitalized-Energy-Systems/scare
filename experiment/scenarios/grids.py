@@ -8,7 +8,7 @@ from statistics import median
 import monee.express as mx
 import simbench
 from monee.io.from_pandapower import from_pandapower_net
-from monee.model.formulation import MISOCP_NETWORK_FORMULATION
+from monee.model.formulation import EL_MISOCP_FORMULATION
 from monee.network import generate_supply_return_mes_based_on_power_net
 
 logger = logging.getLogger(__name__)
@@ -72,10 +72,14 @@ def create_large_lv_simbench(
             },
             heat_kwargs={"node_based_heat_loads": True},
         )
-        mes.apply_formulation(MISOCP_NETWORK_FORMULATION)
+        mes.apply_formulation(EL_MISOCP_FORMULATION)
         # McCormick is unneeded for energy flow and can make failures
         # infeasible via envelope bounds.
-        # mes.apply_formulation(make_mccormick_dhs_formulation(num_partitions=16))
+        # mes.apply_formulation(
+        #     make_heat_convex_milp_formulation(
+        #         num_partitions=16, include_heat_exchangers=False
+        #     )
+        # )
 
         if backup_lines_per_sector > 0:
             add_backup_lines(

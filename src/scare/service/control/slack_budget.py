@@ -54,7 +54,7 @@ class SlackBudgetMonitor(Role):
     record an event and emit a BalanceProblem.
 
     Args:
-        obs_key: ``"p_mw"`` (ExtPowerGrid) or ``"mass_flow"`` (ExtHydrGrid).
+        obs_key: ``"p_mw"`` (ExtPowerGrid) or ``"mass_flow_kgs"`` (ExtHydrGrid).
         budget: positive per-sector allowance.
         tol: relative tolerance; trigger threshold is ``budget·(1+tol)``.
         home_leader_addr: when set, an excursion also sends

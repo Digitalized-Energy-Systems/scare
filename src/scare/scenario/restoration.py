@@ -167,7 +167,7 @@ def _maybe_register_slack(behavior: Any, aid: str, child: Any) -> None:
         var = getattr(m, "p_mw", None)
         budget_attr = getattr(m, "_scare_slack_budget_mw", None)
     elif isinstance(m, ExtHydrGrid):
-        var = getattr(m, "mass_flow", None)
+        var = getattr(m, "mass_flow_kgs", None)
         budget_attr = getattr(m, "_scare_slack_budget_kgs", None)
     else:
         return
@@ -204,7 +204,7 @@ def _slack_budget_for_child(child: Any) -> tuple[str, float] | None:
         budget = getattr(m, "_scare_slack_budget_kgs", None)
         if budget is None:
             return None
-        return ("mass_flow", float(budget))
+        return ("mass_flow_kgs", float(budget))
     return None
 
 
@@ -317,7 +317,7 @@ def _cp_rated_capacity_mw(obs: dict, cp_type: str) -> dict[str, float]:
         elif sec == Sector.HEAT:
             v = obs.get("q_mw_set") or obs.get("q_mw_heat") or obs.get("q_mw")
         elif sec == Sector.GAS:
-            v = obs.get("mass_flow_capacity") or obs.get("mass_flow")
+            v = obs.get("mass_flow_capacity_kgs") or obs.get("mass_flow_kgs")
         else:
             v = None
         if v is None:
@@ -812,8 +812,11 @@ def _cp_signed_capacity_by_sector(cp_type: str, obs: dict) -> dict[str, float]:
     out: dict[str, float] = {}
     if "chp" in ct:
         # CHP at its control node (gas in -> el + heat out). Gas rate from
-        # ``gas_kgps``; never ``mass_flow`` (per-unit). Heat sits on the CP.
-        cap_in = kgps_to_mw(abs(_first_nonzero("gas_kgps", "mass_flow_setpoint")))
+        # ``gas_mass_flow_kgs``; never the hydraulic ``mass_flow_kgs``. Heat
+        # sits on the CP.
+        cap_in = kgps_to_mw(
+            abs(_first_nonzero("gas_mass_flow_kgs", "mass_flow_setpoint_kgs"))
+        )
         if cap_in <= 0:
             return {}
         eta_el = _first_nonzero("efficiency_power", "eta_el", default=0.35)
@@ -829,7 +832,9 @@ def _cp_signed_capacity_by_sector(cp_type: str, obs: dict) -> dict[str, float]:
         out[el] = cap_in
         out[ga] = -cap_in * eta
     elif "g2p" in ct or "gastopower" in ct:
-        cap_in = kgps_to_mw(abs(_first_nonzero("gas_kgps", "mass_flow_setpoint")))
+        cap_in = kgps_to_mw(
+            abs(_first_nonzero("gas_mass_flow_kgs", "mass_flow_setpoint_kgs"))
+        )
         if cap_in <= 0:
             return {}
         eta = _first_nonzero("efficiency_power", "eta_el", "efficiency", default=0.45)
@@ -1905,7 +1910,7 @@ def _register_recordings(
         if isinstance(m, ExtPowerGrid):
             obs_key = "p_mw"
         elif isinstance(m, ExtHydrGrid):
-            obs_key = "mass_flow"
+            obs_key = "mass_flow_kgs"
         else:
             continue
         try:

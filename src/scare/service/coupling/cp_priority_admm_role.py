@@ -17,14 +17,12 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from distributed_resource_optimization.algorithm.distributed_lexicographic_cascade.core import (  # noqa: E501
-    solve_cp_distributed_lexicographic_cascade,
-)
-from distributed_resource_optimization.algorithm.gossip_lexicographic_cascade.core import (  # noqa: E501
+from distributed_resource_optimization.algorithm.admm.lexicographic import (
     GossipCascadeInit,
     GossipIter,
     create_gossip_cascade_participant,
     create_gossip_cascade_start,
+    solve_cp_distributed_lexicographic_cascade,
 )
 from distributed_resource_optimization.carrier.mango import MangoCarrier
 from mango import Role

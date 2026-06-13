@@ -90,10 +90,10 @@ def test_oracle_with_priorities_sheds_low_priority_first():
     """End-to-end LP test: with no failure nothing should shed; under a
     forced deficit the lower-priority load is shed at least as deeply as
     the higher-priority one."""
-    from monee.model.formulation import MISOCP_NETWORK_FORMULATION
+    from monee.model.formulation import EL_MISOCP_FORMULATION
 
     net = fetch_example_net()
-    net.apply_formulation(MISOCP_NETWORK_FORMULATION)
+    net.apply_formulation(EL_MISOCP_FORMULATION)
 
     # Pick two PowerLoads to compare.
     power_loads = [

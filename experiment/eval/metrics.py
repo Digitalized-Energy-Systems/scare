@@ -188,7 +188,7 @@ def _line_feasibility_factor(monee_net: Any) -> dict[Any, float]:
             continue
         a, b = branch.id[0], branch.id[1]
         try:
-            loading = float(branch.model.loading_percent)
+            loading = float(branch.model.loading_pu)
         except Exception:
             loading = 0.0
         # Unit normalisation: GenericPowerBranch / MISOCP reports loading as a
@@ -676,17 +676,17 @@ def _model_value(model: Any, key: str) -> float | None:
 def _branch_loading_percent(branch: Any) -> float | None:
     """Worst (from/to) thermal loading of a branch in *percent*.
 
-    ``loading_percent`` is a Python property (not in ``model.values``), so fall
-    back to the per-side ``loading_{from,to}_percent`` Vars. Applies the same
+    ``loading_pu`` is a Python property (not in ``model.values``), so fall
+    back to the per-side ``loading_{from,to}_pu`` Vars. Applies the same
     fraction->percent normalisation as ``_line_feasibility_factor``.
     """
     model = getattr(branch, "model", None)
     if model is None:
         return None
-    lp = _model_value(model, "loading_percent")
+    lp = _model_value(model, "loading_pu")
     if lp is None:
-        lf = _model_value(model, "loading_from_percent")
-        lt = _model_value(model, "loading_to_percent")
+        lf = _model_value(model, "loading_from_pu")
+        lt = _model_value(model, "loading_to_pu")
         mags = [abs(x) for x in (lf, lt) if x is not None]
         if not mags:
             return None

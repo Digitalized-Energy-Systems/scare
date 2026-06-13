@@ -277,7 +277,7 @@ class TestHeatSinkGuard:
         if child_cls_name == "Sink":
             from monee.model.child import Sink
 
-            model = Sink(mass_flow=0.05)
+            model = Sink(mass_flow_kgs=0.05)
         else:
             model = SimpleNamespace()  # any non-Sink object
         child = SimpleNamespace(id=42, node_id=7, model=model)
@@ -449,8 +449,8 @@ class TestHeatSinkUpstreamSkip:
             def node_by_id(self, _nid):
                 return SimpleNamespace(grid=self._grid)
 
-        heat_sink = SimpleNamespace(id=1, node_id=10, model=Sink(mass_flow=0.04))
-        gas_sink = SimpleNamespace(id=2, node_id=10, model=Sink(mass_flow=0.04))
+        heat_sink = SimpleNamespace(id=1, node_id=10, model=Sink(mass_flow_kgs=0.04))
+        gas_sink = SimpleNamespace(id=2, node_id=10, model=Sink(mass_flow_kgs=0.04))
         heat_load = SimpleNamespace(id=3, node_id=10, model=HeatLoad(q_mw=0.05))
 
         assert _is_heat_side_mass_flow_sink(heat_sink, _Net("water-heat-supply"))

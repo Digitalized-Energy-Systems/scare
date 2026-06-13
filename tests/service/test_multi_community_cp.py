@@ -28,14 +28,14 @@ def _cp_obs(p_mw: float = 1.0, regulation: float = 1.0) -> dict:
     """Synthetic CP obs.
 
     The CP role reads sector-specific keys via ``_ACCESS_KEYS``
-    (``el_mw`` / ``gas_kgps`` / ``heat_mw``); we stamp both these and
+    (``el_mw`` / ``gas_mass_flow_kgs`` / ``heat_mw``); we stamp both these and
     the generic ``p_mw`` so the role can resolve a non-zero
     capacity regardless of which sector's path it walks.
     """
     return {
         "p_mw": p_mw,
         "el_mw": p_mw,
-        "gas_kgps": p_mw,
+        "gas_mass_flow_kgs": p_mw,
         "heat_mw": p_mw,
         "regulation": regulation,
     }

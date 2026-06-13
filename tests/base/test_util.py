@@ -43,9 +43,9 @@ class TestObsSector:
         assert obs_sector({}) is None
 
     def test_mass_flow_alone_is_ambiguous(self):
-        # Gas and water junctions share obs shape (mass_flow / pressure_pu),
+        # Gas and water junctions share obs shape (mass_flow_kgs / pressure_pu),
         # so the heuristic cannot distinguish them and must return None.
-        assert obs_sector({"mass_flow": 0.1, "pressure_pu": 1.0}) is None
+        assert obs_sector({"mass_flow_kgs": 0.1, "pressure_pu": 1.0}) is None
 
 
 # ===================================================================
@@ -61,13 +61,13 @@ class TestObsCapacity:
         assert obs_capacity({"q_w_set": 1000.0}) == 1000.0
 
     def test_mass_flow(self):
-        assert obs_capacity({"mass_flow": 0.3}) == 0.3
+        assert obs_capacity({"mass_flow_kgs": 0.3}) == 0.3
 
     def test_missing_returns_zero(self):
         assert obs_capacity({}) == 0.0
 
     def test_p_mw_takes_precedence(self):
-        assert obs_capacity({"p_mw": 3.0, "mass_flow": 0.5}) == 3.0
+        assert obs_capacity({"p_mw": 3.0, "mass_flow_kgs": 0.5}) == 3.0
 
 
 # ===================================================================
