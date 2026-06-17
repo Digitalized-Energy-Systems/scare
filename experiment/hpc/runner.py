@@ -70,6 +70,7 @@ from scare.base.runtime.infeasibility_capture import (
     disarm_infeasibility_capture,
 )
 from scare.base.runtime.solver_guard import install_solver_time_limit
+from scare.base.runtime.trace import SimTimeLogFilter
 from scare.base.util import create_failures
 from scare.scenario.restoration import (
     _flush_pending_negotiations,
@@ -81,7 +82,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_TIMEOUT = 2
 
-LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+LOG_FORMAT = "%(asctime)s t=%(sim_t)8.3f %(levelname)s [%(name)s] %(message)s"
 
 
 class _SolverFailureCounter(logging.Filter):
@@ -138,9 +139,14 @@ class _SolverFailureCounter(logging.Filter):
 
 
 def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureCounter]:
+    # Stamp every record with the current sim time (record.sim_t) so the
+    # LOG_FORMAT's t=... field is always populated, including third-party logs.
+    sim_time_filter = SimTimeLogFilter()
+
     handler = logging.FileHandler(log_path, mode="w")
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    handler.addFilter(sim_time_filter)
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
@@ -153,6 +159,7 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
     stderr = logging.StreamHandler(sys.stderr)
     stderr.setLevel(logging.WARNING)
     stderr.setFormatter(logging.Formatter(LOG_FORMAT))
+    stderr.addFilter(sim_time_filter)
     root.addHandler(stderr)
 
     # Suppress third-party DEBUG/INFO chatter (mango alone emits ~60k lines

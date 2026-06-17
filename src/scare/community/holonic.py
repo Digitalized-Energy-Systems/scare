@@ -66,6 +66,7 @@ from scare.community.holon_flex import (
     aggregate_holon_flex,
     extract_demand_sectors_tiers,
 )
+from scare.base.runtime.trace import optimization
 from scare.community.supply_priority_admm import allocate_supply_priority
 
 logger = logging.getLogger(__name__)
@@ -1084,7 +1085,14 @@ class HolonicCommunityRole(Role):
         start_msg = create_admm_start(create_admm_sharing_data(total_T.tolist()))
 
         try:
-            await start_coordinated_optimization(actors, coordinator, start_msg)
+            with optimization(
+                "admm_holon",
+                logger=logger,
+                aid=self.context.aid,
+                n_actors=len(actors),
+                sectors=all_sectors,
+            ):
+                await start_coordinated_optimization(actors, coordinator, start_msg)
             results = [a.x.tolist() for a in actors]
             logger.info(
                 "[%s] holon ADMM result (sectors=%s): %s (T=%s)",
@@ -1244,17 +1252,24 @@ class HolonicCommunityRole(Role):
                 actor_ub_overrides = None
 
         try:
-            service_fraction, _per_actor_x, meta = await allocate_supply_priority(
-                sectors=sectors,
-                tiers=tiers,
-                actor_supplies=actor_supplies,
-                actor_demands=actor_demands,
-                actor_ub_overrides=actor_ub_overrides,
-                priority_tiers=self.priority_tiers,
-                max_iters=int(self.admm_max_iters),
-                abs_tol=float(self.admm_abs_tol),
-                enable_priority_weighting=self.enable_priority_allocation,
-            )
+            with optimization(
+                "admm_supply_priority",
+                logger=logger,
+                scope="holon",
+                aid=self.context.aid,
+                n_actors=len(actor_supplies),
+            ):
+                service_fraction, _per_actor_x, meta = await allocate_supply_priority(
+                    sectors=sectors,
+                    tiers=tiers,
+                    actor_supplies=actor_supplies,
+                    actor_demands=actor_demands,
+                    actor_ub_overrides=actor_ub_overrides,
+                    priority_tiers=self.priority_tiers,
+                    max_iters=int(self.admm_max_iters),
+                    abs_tol=float(self.admm_abs_tol),
+                    enable_priority_weighting=self.enable_priority_allocation,
+                )
         except Exception as exc:
             logger.error(
                 "[%s] supply-priority holon ADMM failed: %s",
@@ -1605,17 +1620,24 @@ class HolonicCommunityRole(Role):
             return
 
         try:
-            service_fraction, _per_actor_x, meta = await allocate_supply_priority(
-                sectors=sectors,
-                tiers=tiers,
-                actor_supplies=actor_supplies,
-                actor_demands=actor_demands,
-                actor_ub_overrides=None,
-                priority_tiers=self.priority_tiers,
-                max_iters=int(self.admm_max_iters),
-                abs_tol=float(self.admm_abs_tol),
-                enable_priority_weighting=self.enable_priority_allocation,
-            )
+            with optimization(
+                "admm_supply_priority",
+                logger=logger,
+                scope="component",
+                aid=self.context.aid,
+                n_actors=len(actor_supplies),
+            ):
+                service_fraction, _per_actor_x, meta = await allocate_supply_priority(
+                    sectors=sectors,
+                    tiers=tiers,
+                    actor_supplies=actor_supplies,
+                    actor_demands=actor_demands,
+                    actor_ub_overrides=None,
+                    priority_tiers=self.priority_tiers,
+                    max_iters=int(self.admm_max_iters),
+                    abs_tol=float(self.admm_abs_tol),
+                    enable_priority_weighting=self.enable_priority_allocation,
+                )
         except Exception as exc:
             logger.error(
                 "[%s] component-scope ADMM failed: %s",

@@ -38,6 +38,7 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.runtime.diagnostics import record_event
+from scare.base.runtime.trace import optimization
 from scare.base.topology.topology_mirror import LivePeerFilter
 from scare.base.util import (
     apply_regulate,
@@ -542,9 +543,10 @@ class EnergyConverterRole(Role):
         )
 
         try:
-            await start_coordinated_optimization(
-                [self.flex_actor], coordinator, start_msg
-            )
+            with optimization("admm_cp", logger=logger, aid=self.context.aid):
+                await start_coordinated_optimization(
+                    [self.flex_actor], coordinator, start_msg
+                )
             result = self._clamp_to_envelope(list(self.flex_actor.x))
             # _apply_result must run before emit_event: with no subscriber,
             # emit_event raises KeyError that would discard the result.

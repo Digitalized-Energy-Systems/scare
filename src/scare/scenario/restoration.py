@@ -54,6 +54,7 @@ from scare.base.optimization.admm import (
 )
 from scare.base.runtime import diagnostics as _diag
 from scare.base.runtime.comms import install_perturbation
+from scare.base.runtime.trace import set_sim_time
 from scare.base.topology.community import (
     communities_from_topology,
     connected_component_partition,
@@ -408,6 +409,19 @@ async def start_restoration_simulation(
 
     for failure in failures:
         schedule_failure(behavior, world, failure)
+
+    # Mirror the sim clock into the log filter so every log line carries the
+    # current simulation time (t=...). Wrap the instance's set_time so each
+    # discrete-step advance updates the global before any handler logs run.
+    set_sim_time(world.clock.time)
+    _orig_set_time = world.clock.set_time
+
+    def _tracking_set_time(*args, _orig=_orig_set_time, **kwargs):
+        if args:
+            set_sim_time(args[0])
+        return _orig(*args, **kwargs)
+
+    world.clock.set_time = _tracking_set_time
 
     async with world:
         await discrete_step_until(world, max_advance_time_s=simulation_duration_s)

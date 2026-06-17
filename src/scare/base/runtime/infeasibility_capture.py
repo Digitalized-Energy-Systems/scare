@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from scare.base.runtime.trace import optimization
 from mango_energy_environments.environments.restoration import (
     multi_energy_monee as _host,
 )
@@ -137,7 +138,12 @@ def arm_infeasibility_capture(
         def _wrapped(monee_net):
             original = _CaptureCtx["original"]
             assert original is not None
-            result = original(monee_net)
+            try:
+                n_childs = len(monee_net.childs)
+            except Exception:  # noqa: BLE001
+                n_childs = "?"
+            with optimization("energyflow", solver="gurobi", n_childs=n_childs):
+                result = original(monee_net)
             try:
                 if (
                     _CaptureCtx["armed"]
