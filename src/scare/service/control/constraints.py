@@ -12,6 +12,7 @@ from mango import sender_addr as mango_sender_addr
 from mango.express.topology import topology_neighbors
 
 from scare.base.model import (
+    DEENERGISED_PRESSURE_PU,
     PROACTIVE_WARNING_FRACTION,
     SECTOR_CONSTRAINTS,
     SECTOR_TIMESCALE,
@@ -31,13 +32,13 @@ from scare.base.runtime.diagnostics import record_event
 from scare.base.util import (
     apply_regulate,
     constraint_utilization,
+    feeder_max_voltage,
     has_heat_curtail_lock,
     lookup_priority,
     obs_capacity,
     obs_constraint_values,
     obs_priority,
     obs_setpoint,
-    feeder_max_voltage,
     publish_node_voltage,
     qv_relief_avail,
     refresh_line_curtail_lock,
@@ -496,9 +497,18 @@ class GridConstraintMonitor(Role):
         self._update_sensitivity(obs)
 
         for var, val in values.items():
-            # Skip readings the solver hasn't populated (isolated nodes report
-            # t_k=0 / NaN post-failure).
-            if not math.isfinite(val) or (var == "t_k" and val <= 0.0):
+            # Skip readings the solver hasn't populated or that signal a
+            # de-energised junction: isolated heat nodes report t_k=0 / NaN
+            # post-failure, and a gas region cut off from its source collapses
+            # to pressure_pu~0 (see DEENERGISED_PRESSURE_PU). Neither is an
+            # actionable breach (no curtailment lever re-pressurises a
+            # source-isolated region); genuine under-pressure is well above the
+            # floor, so it still fires.
+            if (
+                not math.isfinite(val)
+                or (var == "t_k" and val <= 0.0)
+                or (var == "pressure_pu" and val <= DEENERGISED_PRESSURE_PU)
+            ):
                 continue
 
             lo, hi = bounds.get(var, (float("-inf"), float("inf")))
@@ -818,11 +828,15 @@ class GridConstraintMonitor(Role):
                     # Phase-2 feeder gate: never defer to local reactive while
                     # another node on the feeder is over-voltage — the retained
                     # active PV is what's holding the feeder over, so shed it.
-                    feeder_over = self.enable_qv_feeder_gate and self._feeder_overvoltage(
-                        hi
+                    feeder_over = (
+                        self.enable_qv_feeder_gate and self._feeder_overvoltage(hi)
                     )
                     cnt = self._qv_defer_count.get(variable, 0)
-                    if improving and not feeder_over and cnt < _QV_MAX_CONSECUTIVE_DEFERS:
+                    if (
+                        improving
+                        and not feeder_over
+                        and cnt < _QV_MAX_CONSECUTIVE_DEFERS
+                    ):
                         self._qv_defer_count[variable] = cnt + 1
                         self._qv_last_value[variable] = value
                         self._curtail_inflight.pop(variable, None)

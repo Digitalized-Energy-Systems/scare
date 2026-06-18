@@ -465,7 +465,6 @@ def feeder_max_voltage(
     return mx
 
 
-
 def has_heat_curtail_lock(behavior: Any, aid: str) -> bool:
     """True iff *aid* is held by a temperature-driven curtailment lock (vs an
     L2 priority shed, which has no lock). Lets the frontier controller restore
@@ -701,8 +700,7 @@ def apply_regulate(
                     kind="gen_curtail_lock_released_to_qv",
                     aid=str(aid),
                     sector=str(sector),
-                    detail=f"reason={reason} stepped_factor={factor:.4f} "
-                    f"v={_qv_v:.4f}",
+                    detail=f"reason={reason} stepped_factor={factor:.4f} v={_qv_v:.4f}",
                 )
                 # fall through: the bounded restore step applies this tick.
             else:

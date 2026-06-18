@@ -16,7 +16,7 @@ from typing import Any
 
 from monee import run_energy_flow_optimization
 from monee.model.child import ExtHydrGrid, ExtPowerGrid
-from monee.model.formulation import make_heat_convex_milp_formulation
+from monee.model.formulation import make_heat_convex_milp_formulation, GAS_NONCONVEX_MIQCQP_FORMULATION
 from monee.problem import (
     WEIGHT_DEMAND,
     create_min_load_shedding_problem,
@@ -47,12 +47,6 @@ _ORACLE_MCCORMICK_PARTITIONS = 16
 def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
     """Apply every failure to the network the same way the live simulation's
     ``apply_failures`` does, so the oracle solves the same post-failure topology.
-
-    Branches: ``branch.active = False`` (and ``on_off = 0``; both routes honoured
-    by the solver's edge-removal). Nodes: ``node.active = False``. Custom
-    (generator/compound deactivation): invoke the closure so ``net.deactivate``
-    runs. Handling all three is required, else generator-failure scenarios solve
-    on an unfailed network and return PWSF=1.0.
     """
     for failure in failures:
         for branch_id in getattr(failure, "branch_ids", []) or []:
@@ -269,6 +263,9 @@ def run_oracle(
             include_heat_exchangers=False,
         )
     )
+    monee_net.apply_formulation(
+        GAS_NONCONVEX_MIQCQP_FORMULATION
+    )
     # Enforce the operator slack budget on the LP itself via
     # ``create_min_load_shedding_problem``'s native ``ext_grid_*_bounds`` (no
     # Var.min/max mutation). The factory keeps the LP envelope at 10x budget for
@@ -323,7 +320,7 @@ def run_oracle(
         bounds_ext_gas=ext_grid_gas_bounds,
         bounds_ext_heat=ext_grid_heat_bounds,
         bounds_vm=(0.95, 1.05),
-        bounds_pressure=(0.90, 1.10),
+        bounds_pressure=(0.85, 1.25),
         bounds_t=(0.8796, 1.1325),
         check_lp=True,
         max_line_loading=1.0,

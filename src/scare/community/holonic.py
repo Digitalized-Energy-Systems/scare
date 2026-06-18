@@ -57,6 +57,7 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.runtime.diagnostics import record_event
+from scare.base.runtime.trace import optimization
 from scare.base.topology.topology_mirror import LivePeerFilter
 from scare.base.util import (
     compute_priority_weighted_shares,
@@ -66,7 +67,6 @@ from scare.community.holon_flex import (
     aggregate_holon_flex,
     extract_demand_sectors_tiers,
 )
-from scare.base.runtime.trace import optimization
 from scare.community.supply_priority_admm import allocate_supply_priority
 
 logger = logging.getLogger(__name__)

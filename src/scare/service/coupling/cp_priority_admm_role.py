@@ -36,6 +36,7 @@ from scare.service.coupling.cp_priority_admm import (
     SectorDemand,
 )
 
+
 class _ReachableCPCarrier(MangoCarrier):
     """DRO :class:`MangoCarrier` with the gossip broadcast set restricted to CP
     peers currently reachable across the cross-sector graph (post-failure). This

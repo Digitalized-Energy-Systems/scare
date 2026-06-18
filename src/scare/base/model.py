@@ -30,7 +30,7 @@ SECTOR_CONSTRAINTS: dict[Sector, dict[str, tuple[float, float]]] = {
         "loading_percent": (-100.0, 100.0),
     },
     Sector.GAS: {
-        "pressure_pu": (0.90, 1.10),  # junction pressure [p.u.]
+        "pressure_pu": (0.85, 1.25),  # junction pressure [p.u.]
     },
     Sector.HEAT: {
         # DHS envelope: one pair must admit both supply (~80–130 °C) and
@@ -38,6 +38,18 @@ SECTOR_CONSTRAINTS: dict[Sector, dict[str, tuple[float, float]]] = {
         "t_k": (313.15, 403.15),  # junction temperature [K] (40–130 °C)
     },
 }
+
+# Gas junction pressure (p.u.) at or below which a node is treated as
+# DE-ENERGISED rather than under-pressure: a gas region cut off from its
+# ExtHydrGrid collapses to ~0 (the supply/return loop keeps it graph-connected,
+# so neither monee's ``find_ignored_nodes`` nor ours excludes it, yet the LP
+# drives its pressure to 0). Such a reading is not an actionable breach — no
+# curtailment lever re-pressurises a source-isolated region — so both the
+# constraint scan and the live monitor skip it. Sits well inside the empirical
+# gap between the collapsed cluster (~0) and the lowest genuinely-served
+# junction (~0.54), so real under-pressure (e.g. 0.7 vs the 0.85 floor) still
+# gates.
+DEENERGISED_PRESSURE_PU: float = 0.1
 
 # Fraction of feasible range at which an agent warns neighbours it nears a limit.
 PROACTIVE_WARNING_FRACTION: float = 0.85

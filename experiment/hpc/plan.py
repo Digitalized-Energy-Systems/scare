@@ -46,9 +46,6 @@ logger = logging.getLogger(__name__)
 FilterMode = Literal["all", "ok", "failed", "timeout", "missing", "incomplete"]
 
 
-# Manifest construction
-
-
 def derive_n_failures(seed: int, failure_lambda: float, max_failures: int) -> int:
     rng = np.random.default_rng(seed)
     n = 1 + int(rng.poisson(failure_lambda))

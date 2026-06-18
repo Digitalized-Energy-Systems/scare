@@ -120,6 +120,47 @@ class TestScanOnRealGrid:
         if "temperature" in by_var:
             assert by_var["temperature"]["gating"] is False
 
+    def _gas_junction(self, net):
+        from experiment.eval.metrics import sector_from_grid
+
+        return next(
+            n
+            for n in net.nodes
+            if type(n.model).__name__ == "Junction"
+            and sector_from_grid(getattr(n, "grid", None)) == Sector.GAS
+        )
+
+    def test_deenergised_gas_junction_is_not_flagged(self):
+        # A gas region cut off from its ExtHydrGrid stays graph-connected via
+        # the supply/return loop (so it isn't an "ignored" node), yet the LP
+        # collapses its pressure to ~0. That is de-energisation, not an
+        # actionable under-pressure breach — it must drop out of the scan.
+        net = _build_grid()
+        node = self._gas_junction(net)
+        node.model.pressure_pu = 0.0
+
+        rows = constraint_rows(net)
+        assert all(
+            r["id"] != node.id or r["variable"] != "pressure_pu" for r in rows
+        )
+
+    def test_genuine_under_pressure_still_gates(self):
+        # A junction that is pressurised but below the 0.85 floor is a real
+        # breach (well above the de-energised floor) and must still gate.
+        net = _build_grid()
+        node = self._gas_junction(net)
+        node.model.pressure_pu = 0.70
+
+        cv = constraint_violations_final(net)
+        assert cv["passed"] is False
+        assert cv["by_sector"]["gas"]["n_violations"] >= 1
+        flagged = [
+            r
+            for r in constraint_rows(net)
+            if r["id"] == node.id and r["variable"] == "pressure_pu"
+        ]
+        assert flagged and flagged[0]["violated"] is True
+
     def test_disconnected_node_is_not_scanned(self):
         # A deactivated node must drop out of the scan entirely — its loads
         # already count as served=0 and the oracle excludes it too, so a

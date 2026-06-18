@@ -5,6 +5,7 @@ from monee import run_energy_flow
 from experiment.scenarios import GRIDS
 
 if __name__ == "__main__":
+    """
     for key, grid in GRIDS.items():
         start = time.time()
         g = grid()
@@ -18,3 +19,8 @@ if __name__ == "__main__":
 
         print(key)
         print(result.success)
+    """
+    net = GRIDS["simbench_lv"]()
+    res = run_energy_flow(net)
+    print(res.dataframes["Junction"])
+    print(res.dataframes["Bus"])

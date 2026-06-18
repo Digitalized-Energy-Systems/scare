@@ -39,7 +39,7 @@ class TestSectorConstraints:
 
     def test_gas_bounds(self):
         lo, hi = SECTOR_CONSTRAINTS[Sector.GAS]["pressure_pu"]
-        assert lo == 0.90 and hi == 1.10
+        assert lo == 0.85 and hi == 1.25
 
     def test_heat_bounds(self):
         lo, hi = SECTOR_CONSTRAINTS[Sector.HEAT]["t_k"]

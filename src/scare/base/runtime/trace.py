@@ -2,23 +2,18 @@
 
 Two facilities:
 
-* **Simulation-time log enrichment** — :class:`SimTimeLogFilter` stamps every
-  log record with the current sim clock time (``record.sim_t``), kept current
-  by the sim driver via :func:`set_sim_time`. The runner's log format prints it
-  so every line carries ``t=<sim_seconds>``.
-
-* **Optimization bracket logging** — :func:`optimization` wraps a (possibly
-  hanging) solve with ``SOLVE-START`` / ``SOLVE-DONE`` / ``SOLVE-FAIL`` lines.
-  If a monee energyflow or a distributed/ADMM solve is entered and never
-  returns (the clock-freeze failure mode), the log ends on a ``SOLVE-START``
-  with no matching ``SOLVE-DONE`` — naming exactly which solve hung.
+* **Simulation-time log enrichment**
+* **Optimization bracket logging**
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import io
 import logging
 import time
+from collections import Counter
 
 # --- current simulation time (updated by the sim driver) -------------------
 _SIM_T: dict[str, float] = {"t": 0.0}
@@ -48,7 +43,6 @@ class SimTimeLogFilter(logging.Filter):
         return True
 
 
-# --- optimization bracket logging ------------------------------------------
 _solve_logger = logging.getLogger("scare.solve")
 
 
@@ -80,3 +74,114 @@ def optimization(label: str, *, logger: logging.Logger | None = None, **ctx):
         raise
     else:
         log.info("SOLVE-DONE  %s in %.3fs", label, time.monotonic() - t0)
+
+
+# --- discrete-event clock-freeze watchdog ----------------------------------
+_stall_logger = logging.getLogger("scare.stall")
+
+
+def _unsettled_scheduled_tasks(world):
+    """Yield (aid, source, coro, asyncio_task) for every scheduled agent task
+    that is neither sleeping nor done — i.e. the tasks that keep mango's
+    ``tasks_complete_or_sleeping`` from returning and freeze the clock.
+    """
+    for aid_key, agent in list(getattr(world, "_agents", {}).items()):
+        sched = getattr(agent, "scheduler", None) or getattr(agent, "_scheduler", None)
+        if sched is None:
+            continue
+        entries = list(getattr(sched, "_scheduled_tasks", [])) + list(
+            getattr(sched, "_scheduled_process_tasks", [])
+        )
+        for entry in entries:
+            scheduled_task, atask, coro, src = entry[0], entry[1], entry[2], entry[3]
+            try:
+                if scheduled_task._is_sleeping.done() or scheduled_task._is_done.done():
+                    continue
+            except AttributeError:
+                continue
+            aid = getattr(getattr(agent, "context", None), "aid", aid_key)
+            yield aid, src, coro, atask
+
+
+def _inbox_backlog(world) -> tuple[int, int]:
+    """(container_inbox, summed agent inbox) backlog — detects message churn."""
+    container_q = 0
+    cib = getattr(world, "inbox", None)
+    if cib is not None and hasattr(cib, "qsize"):
+        with contextlib.suppress(Exception):
+            container_q = cib.qsize()
+    agent_q = 0
+    for agent in list(getattr(world, "_agents", {}).values()):
+        ib = getattr(agent, "inbox", None)
+        if ib is not None and hasattr(ib, "qsize"):
+            with contextlib.suppress(Exception):
+                agent_q += ib.qsize()
+    return container_q, agent_q
+
+
+async def sim_stall_watchdog(
+    world,
+    *,
+    interval_s: float = 10.0,
+    min_freeze_s: float = 60.0,
+    report_every_s: float = 60.0,
+    max_stuck_dumped: int = 12,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Real-time watchdog that logs *why* the sim clock is frozen.
+    """
+    log = logger or _stall_logger
+    last_t: float | None = None
+    static_s = 0.0
+    last_report_s = 0.0
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            now_t = float(world.clock.time)
+        except Exception:  # noqa: BLE001
+            return
+
+        if last_t is None or now_t != last_t:
+            last_t = now_t
+            static_s = 0.0
+            last_report_s = 0.0
+            continue
+
+        # Clock unchanged since the last tick.
+        static_s += interval_s
+        if static_s < min_freeze_s:
+            continue  # likely just a slow step; not yet a freeze
+        if static_s - last_report_s < report_every_s and last_report_s > 0:
+            continue
+        last_report_s = static_s
+
+        unsettled = list(_unsettled_scheduled_tasks(world))
+        container_q, agent_q = _inbox_backlog(world)
+        log.warning(
+            "watchdog: SIM CLOCK FROZEN at t=%.3f for ~%.0fs | unsettled_tasks=%d "
+            "container_inbox=%d agent_inbox=%d",
+            now_t,
+            static_s,
+            len(unsettled),
+            container_q,
+            agent_q,
+        )
+        if unsettled:
+            by_src = Counter(src for _, src, _, _ in unsettled)
+            log.warning("watchdog: unsettled by source: %s", dict(by_src))
+            for aid, src, coro, atask in unsettled[:max_stuck_dumped]:
+                buf = io.StringIO()
+                with contextlib.suppress(Exception):
+                    atask.print_stack(limit=12, file=buf)
+                log.warning(
+                    "watchdog: STUCK agent=%s src=%s coro=%r\n%s",
+                    aid,
+                    src,
+                    coro,
+                    buf.getvalue().rstrip(),
+                )
+        else:
+            log.warning(
+                "watchdog: no unsettled scheduled tasks — clock-advance/"
+                "convergence-loop stall, not a never-settling task"
+            )

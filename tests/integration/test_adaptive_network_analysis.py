@@ -14,7 +14,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from experiment.eval.adaptive_network_analysis import (
     cluster_synchronisation,
     continue_bifurcation,

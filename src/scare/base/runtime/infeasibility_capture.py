@@ -13,10 +13,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from scare.base.runtime.trace import optimization
 from mango_energy_environments.environments.restoration import (
     multi_energy_monee as _host,
 )
+
+from scare.base.runtime.trace import optimization
 
 logger = logging.getLogger(__name__)
 

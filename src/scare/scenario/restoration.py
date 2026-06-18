@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 from uuid import uuid4
@@ -54,7 +55,7 @@ from scare.base.optimization.admm import (
 )
 from scare.base.runtime import diagnostics as _diag
 from scare.base.runtime.comms import install_perturbation
-from scare.base.runtime.trace import set_sim_time
+from scare.base.runtime.trace import set_sim_time, sim_stall_watchdog
 from scare.base.topology.community import (
     communities_from_topology,
     connected_component_partition,
@@ -424,7 +425,15 @@ async def start_restoration_simulation(
     world.clock.set_time = _tracking_set_time
 
     async with world:
-        await discrete_step_until(world, max_advance_time_s=simulation_duration_s)
+        # Wall-clock watchdog: if the discrete-event clock freezes (the timeout
+        # failure mode), log the unsettled request/reply tasks keeping mango's
+        # termination detection from returning. Plain asyncio task → invisible
+        # to settle detection; ticks on real time so it fires during the hang.
+        _watchdog = asyncio.ensure_future(sim_stall_watchdog(world, interval_s=10.0))
+        try:
+            await discrete_step_until(world, max_advance_time_s=simulation_duration_s)
+        finally:
+            _watchdog.cancel()
         # Flush in-flight gossip while role.context is still valid.
         _flush_pending_negotiations(world)
 

@@ -71,15 +71,9 @@ def create_large_lv_simbench(
                 "replace_primary_generation": replace_primary_generation,
             },
             heat_kwargs={"node_based_heat_loads": True},
+            gas_kwargs={"auto_diameter": True, "auto_min_diameter_m": 0.03},
         )
         mes.apply_formulation(EL_MISOCP_FORMULATION)
-        # McCormick is unneeded for energy flow and can make failures
-        # infeasible via envelope bounds.
-        # mes.apply_formulation(
-        #     make_heat_convex_milp_formulation(
-        #         num_partitions=16, include_heat_exchangers=False
-        #     )
-        # )
 
         if backup_lines_per_sector > 0:
             add_backup_lines(

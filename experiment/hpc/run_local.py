@@ -61,9 +61,7 @@ def run_campaign(
     for start in range(0, total, batch):
         chunk = task_ids[start : start + batch]
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            futures = {
-                ex.submit(_worker, str(campaign_dir), tid): tid for tid in chunk
-            }
+            futures = {ex.submit(_worker, str(campaign_dir), tid): tid for tid in chunk}
             for fut in as_completed(futures):
                 tid, code = fut.result()
                 done += 1

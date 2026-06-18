@@ -16,7 +16,7 @@ from mango.simulation.world import WorldRecording
 from monee.model.child import ExtPowerGrid, HeatLoad, PowerLoad
 from monee.solver.core import find_ignored_nodes
 
-from scare.base.model import SECTOR_CONSTRAINTS, Sector
+from scare.base.model import DEENERGISED_PRESSURE_PU, SECTOR_CONSTRAINTS, Sector
 from scare.base.util import (
     constraint_allowed_fraction,
     constraint_utilization,
@@ -769,9 +769,15 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
             val = _model_value(node.model, var)
             if val is None or not math.isfinite(val):
                 continue
-            # Solver-unpopulated / isolated junctions report t_k~0; not a real
-            # breach (the live monitor skips them the same way).
-            if var == "t_k" and val <= 0.0:
+            # Solver-unpopulated / de-energised junctions are not real breaches
+            # (the live monitor skips them the same way): an isolated heat
+            # junction reports t_k~0, and a gas region cut off from its
+            # ExtHydrGrid collapses to pressure_pu~0. See DEENERGISED_PRESSURE_PU
+            # for why a small floor (not 0) is needed and why genuine
+            # under-pressure still gates.
+            if (var == "t_k" and val <= 0.0) or (
+                var == "pressure_pu" and val <= DEENERGISED_PRESSURE_PU
+            ):
                 continue
             rows.append(_violation_row("node", node.id, sec, var, val, lo, hi))
 

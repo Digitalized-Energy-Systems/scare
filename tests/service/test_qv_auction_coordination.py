@@ -141,9 +141,7 @@ async def test_auction_defers_when_reactive_covers_overshoot():
     # No auction opened; the in-flight slot is cleared so a later poll retries.
     assert m._open_auctions == {}
     assert "vm_pu" not in m._curtail_inflight
-    assert any(
-        e.kind == "curtail_deferred_to_qv_relief" and e.aid == "pv" for e in new
-    )
+    assert any(e.kind == "curtail_deferred_to_qv_relief" and e.aid == "pv" for e in new)
 
 
 @pytest.mark.asyncio
