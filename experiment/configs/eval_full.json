@@ -31,7 +31,10 @@
       "$comment": "Pillar 1 — Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
       "name": "functional_baseline",
       "grids": [
-        "simbench_lv"
+        "simbench_lv",
+        "simbench_lv_cp_heavy_dependent",
+        "simbench_lv_small",
+        "simbench_lv_medium"
       ],
       "n_seeds": 30,
       "variants": [
@@ -110,7 +113,10 @@
       "$comment": "Pillar 3 — variant comparison: scare vs single-level (gossip only) vs oracle.",
       "name": "variant_comparison",
       "grids": [
-        "simbench_lv"
+        "simbench_lv",
+        "simbench_lv_cp_heavy_dependent",
+        "simbench_lv_small",
+        "simbench_lv_medium"
       ],
       "n_seeds": 30,
       "variants": [

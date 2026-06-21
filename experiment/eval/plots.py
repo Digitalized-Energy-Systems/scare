@@ -3007,6 +3007,90 @@ def slack_trajectory(
     return _save(_apply_theme(fig, title=title, height=height), out_path)
 
 
+def gas_slack_pressure_trajectory(
+    timeseries: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Gas ext-grid regulator — slack pressure setpoint over time",
+    failure_t: float | None = None,
+) -> Path:
+    """Single-panel trajectory of the gas slack pressure setpoint — one line
+    per gas ``ExtHydrGrid``, the ``GasPressureRegulator``'s layer-0 lever.
+    Reads the ``slack_pressure__gas__<aid>`` columns from
+    ``_register_recordings``. The operating band (``SECTOR_CONSTRAINTS`` gas
+    ``pressure_pu``) is shaded with dotted boundaries; a dashed vline marks the
+    first failure. Style mirrors ``slack_trajectory``.
+    """
+    if timeseries.empty or "time_s" not in timeseries.columns:
+        return _save(_empty_fig("no timeseries", title), out_path)
+
+    cols = sorted(
+        c for c in timeseries.columns if c.startswith("slack_pressure__gas__")
+    )
+    if not cols:
+        return _save(
+            _empty_fig("no slack_pressure__gas__* columns", title), out_path
+        )
+
+    x = timeseries["time_s"].values
+    x_span = [float(x[0]), float(x[-1])] if len(x) else [0.0, 1.0]
+    lo, hi = _sector_envelope_bounds()["avg_pressure_pu"]
+    base = _SECTOR_COLOR.get("gas", "#2CA02C")
+
+    fig = go.Figure()
+    # Operating band: shaded envelope + dotted boundaries (neutral grey).
+    fig.add_trace(
+        go.Scatter(
+            x=x_span + x_span[::-1],
+            y=[hi, hi, lo, lo],
+            fill="toself",
+            fillcolor=_ENVELOPE_FILL_RGBA,
+            line=dict(color=_ENVELOPE_GRAY, width=0),
+            name="operating band",
+            hoverinfo="skip",
+        )
+    )
+    for b in (lo, hi):
+        fig.add_trace(
+            go.Scatter(
+                x=x_span,
+                y=[b, b],
+                mode="lines",
+                line=dict(color=_ENVELOPE_GRAY, dash="dot", width=1),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    opacity = 0.55 if len(cols) > 6 else 0.85
+    for i, col in enumerate(cols):
+        aid = col.split("__", 2)[-1]
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=timeseries[col].astype(float).values,
+                mode="lines",
+                line=dict(color=base, width=1.4),
+                opacity=opacity,
+                name=aid,
+                showlegend=(i < 10),
+                hovertemplate=(
+                    f"<b>gas slack {aid}</b><br>"
+                    "t: %{x:.2f}s<br>setpoint: %{y:.4f} pu<extra></extra>"
+                ),
+            )
+        )
+
+    if failure_t is not None:
+        fig.add_vline(
+            x=float(failure_t),
+            line=dict(color="#888888", dash="dash", width=1),
+        )
+    fig.update_yaxes(title="slack pressure setpoint (p.u.)")
+    fig.update_xaxes(title="simulation time (s)")
+    return _save(_apply_theme(fig, title=title), out_path)
+
+
 def coalition_balance_lines(
     timeseries: pd.DataFrame,
     out_path: Path,

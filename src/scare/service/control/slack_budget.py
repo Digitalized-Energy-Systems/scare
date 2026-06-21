@@ -22,7 +22,7 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.runtime.diagnostics import record_event
-from scare.base.util import set_slack_eff_budget
+from scare.base.util import set_slack_cp_reserve, set_slack_eff_budget
 
 if TYPE_CHECKING:
     from mango import AgentAddress
@@ -73,6 +73,8 @@ class SlackBudgetMonitor(Role):
         tol: float = 0.05,
         home_leader_addr: AgentAddress | None = None,
         enable_feedback: bool = True,
+        cp_aware: bool = False,
+        restore: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -82,6 +84,14 @@ class SlackBudgetMonitor(Role):
         self.tol = float(tol)
         self.home_leader_addr = home_leader_addr
         self.enable_feedback = bool(enable_feedback)
+        # CP-aware slack supply (opt-in): publish the measured over-draw so the
+        # holon supply pool debits the slack's budget by it (routes the deficit
+        # through holonic balancing). See enable_cp_aware_slack_supply.
+        self.cp_aware = bool(cp_aware)
+        # Restore lever (opt-in): when under budget, ask the leader to restore
+        # load up to B (positive override). See enable_slack_restore.
+        self.restore = bool(restore)
+        self._restore_emit_t: float = float("-inf")
         self._violation_active: bool = False
         self._last_emit_t: float = float("-inf")
         # Last observed draw; poll skips when unchanged and no active violation.
@@ -147,6 +157,13 @@ class SlackBudgetMonitor(Role):
         magnitude = abs(val)
         threshold = self.budget * (1.0 + self.tol)
         now = float(self.context.current_timestamp)
+        # CP-aware reserve: publish the over-draw EVERY over-budget poll (not
+        # cooldown-gated) so the holon supply pool tracks the latest excess and
+        # the shed converges to draw == B. Cleared below when in-budget.
+        if self.cp_aware:
+            set_slack_cp_reserve(
+                self.behavior, self.context.aid, max(0.0, magnitude - self.budget)
+            )
         if magnitude > threshold:
             if (
                 not self._violation_active
@@ -221,3 +238,42 @@ class SlackBudgetMonitor(Role):
         else:
             # Cleared: re-arm so the next over-budget excursion fires again.
             self._violation_active = False
+            if self.cp_aware:
+                set_slack_cp_reserve(self.behavior, self.context.aid, 0.0)
+            # Restore / serve-more lever: when genuinely UNDER budget (below the
+            # lower deadband edge), there is unused import headroom; ask the
+            # leader to restore load up to B. Positive override_target =>
+            # restoration (highest priority first). Deadband-gated (only below
+            # B*(1-tol)) and cooldown-gated so it can't oscillate with the shed
+            # path. Restore toward the lower deadband edge, leaving a tol margin
+            # so a restore does not immediately bounce into an over-budget shed.
+            if (
+                self.restore
+                and self.home_leader_addr is not None
+                and magnitude < self.budget * (1.0 - self.tol)
+                and (now - self._restore_emit_t) >= _REFIRE_COOLDOWN_S
+            ):
+                headroom = self.budget * (1.0 - self.tol) - magnitude
+                if headroom > _MONITOR_DELTA_TOL:
+                    self._restore_emit_t = now
+                    record_event(
+                        t=now,
+                        kind="slack_budget_restore",
+                        aid=self.context.aid,
+                        sector=self.sector.value,
+                        detail=(
+                            f"{self.obs_key}={val:.4f} budget={self.budget:.4f} "
+                            f"restore_headroom={headroom:.4f}"
+                        ),
+                    )
+                    try:
+                        await self.context.send_message(
+                            StartBalanceNegotiation(override_target=headroom),
+                            receiver_addr=self.home_leader_addr,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "[%s] slack-budget restore send failed: %s",
+                            self.context.aid,
+                            exc,
+                        )

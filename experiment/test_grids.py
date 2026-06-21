@@ -20,7 +20,9 @@ if __name__ == "__main__":
         print(key)
         print(result.success)
     """
-    net = GRIDS["simbench_lv"]()
+    net = GRIDS["simbench_lv_cp_heavy_dependent"]()
     res = run_energy_flow(net)
-    print(res.dataframes["Junction"])
-    print(res.dataframes["Bus"])
+    print(res.dataframes["Junction"].to_string())
+    print(res.dataframes["Sink"].to_string())
+    print(res.dataframes["ExtHydrGrid"].to_string())
+    print(res.dataframes["PowerToGas"].to_string())

@@ -6,7 +6,15 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 
 from scare.base.model import SECTOR_TIMESCALE, NegotiationFinishedEvent, Sector
-from scare.base.util import apply_regulate, lookup_priority, obs_capacity
+from scare.base.util import (
+    apply_regulate,
+    constraint_allowed_fraction,
+    has_gen_curtail_lock,
+    lookup_priority,
+    lookup_slack,
+    obs_capacity,
+    obs_setpoint,
+)
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -50,7 +58,11 @@ class GenerationController(Role):
     """
 
     def __init__(
-        self, behavior: RestorationEnvironmentBehavior, sector: Sector
+        self,
+        behavior: RestorationEnvironmentBehavior,
+        sector: Sector,
+        *,
+        ramp_to_full: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -59,11 +71,86 @@ class GenerationController(Role):
         self._last_factor: float | None = None
         self._last_t: float | None = None
         self._floor: float = 0.0
+        # Ramp-to-full lever (opt-in): periodically drive this generator toward
+        # rated output so idle local supply is used (see enable_gen_ramp_to_full).
+        self.ramp_to_full = bool(ramp_to_full)
 
     def setup(self) -> None:
         self.context.subscribe_event(
             self, NegotiationFinishedEvent, self._on_negotiation_finished
         )
+        # Electricity-only: the lever targets the electricity slack/oracle gap,
+        # and the electricity gen curtail-lock covers GEN_RESTORE_REASONS (so the
+        # ramp defers under over-voltage); the HEAT curtail-lock does NOT defer
+        # GEN_RESTORE, so ramping heat gens would only be guarded by the local
+        # t_k cap — out of scope and less safe, so skip it.
+        if self.ramp_to_full and self.sector is Sector.ELECTRICITY:
+            poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
+            self.context.schedule_periodic_task(self._ramp_to_full, delay=poll)
+
+    _RAMP_TOL: float = 1e-3
+    # Respect a recent gossip/stability dispatch: if the dispatch path regulated
+    # this generator DOWN within this window, don't ramp it back up — else the
+    # ramp fights a legitimate over-supply/stability shed (a bounded but wasteful
+    # limit cycle). The ramp only lifts generators dispatch is not actively
+    # holding down.
+    _RAMP_RESPECT_DISPATCH_S: float = 3.0
+
+    async def _ramp_to_full(self) -> None:
+        """Ramp a dispatchable generator toward rated output (reg→1.0), capped by
+        the local constraint-allowed fraction. Routed through ``apply_regulate``
+        with a GEN_RESTORE reason so the over-voltage curtail-ramp interlock
+        defers it while the auction holds the generator down. No-op for
+        loads/slacks and for generators already at (or constrained below) full.
+        """
+        try:
+            obs = self.behavior.observe(self.context.aid)
+        except (AttributeError, KeyError):
+            return
+        if not obs:
+            return
+        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
+        if cap >= 0:
+            return  # only dispatchable generators (cap < 0)
+        if lookup_slack(self.behavior, self.context.aid) is not None:
+            return  # slack injector, not a dispatchable generator
+        now = float(self.context.current_timestamp)
+        if has_gen_curtail_lock(self.behavior, self.context.aid, now):
+            return  # over-voltage auction owns it — don't ramp into a violation
+        rated = abs(cap)
+        cur_factor = abs(obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid))
+        cur_factor = cur_factor / rated if rated > 0 else 1.0
+        # Local-physics cap: don't ramp into a local over-voltage / overload.
+        allowed = constraint_allowed_fraction(obs, self.sector, tier=0)
+        target = min(1.0, allowed)
+        if target <= cur_factor + self._RAMP_TOL:
+            return  # already at full (or constrained below it) — nothing to do
+        # Respect a recent dispatch that held this generator below target (a
+        # stability / MW-balance over-supply shed): don't ramp it back up inside
+        # the respect window, else the two loops thrash. Only ramp generators
+        # dispatch is not actively holding down.
+        if (
+            self._last_t is not None
+            and self._last_factor is not None
+            and (now - self._last_t) < self._RAMP_RESPECT_DISPATCH_S
+            and self._last_factor < target - self._RAMP_TOL
+        ):
+            return
+        applied = apply_regulate(
+            self.behavior,
+            self.context.aid,
+            target,
+            sector=self.sector.value,
+            reason="gen_ramp_to_full",
+            timestamp=now,
+        )
+        if applied:
+            logger.debug(
+                "[%s] gen ramp-to-full: %.2f -> %.2f",
+                self.context.aid,
+                cur_factor,
+                target,
+            )
 
     def _on_negotiation_finished(
         self, event: NegotiationFinishedEvent, _src: Any

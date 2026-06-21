@@ -29,16 +29,25 @@ from scare.base.util import (
 logger = logging.getLogger(__name__)
 
 
-# Priority-tier weight schedule ``w(tier) = 2^(P - tier)`` (P=10 => tier 1
-# weighs 512x, tier 10 weighs 1x). Tier 0 (generators) weighs 0; only loads
-# count toward the served metric.
-_P = 10
+# Priority-tier weight schedule for the served-MAGNITUDE metric (PWSF):
+# moderate geometric ``w(tier) = 2^(Pi - tier)`` over Pi=4 tiers => {1:8, 2:4,
+# 3:2, 4:1} (8:1 across the range). Deliberately NOT a strict-priority weight
+# (e.g. 1e12/1e8/1e4/1): a tier-1-dominant weight collapses PWSF to ~the tier-1
+# fraction (since tier-1 is ~always served), erasing the tier 2-4 differences
+# that distinguish configs. PWSF answers "how much priority-weighted load was
+# served" (resolved across tiers); the SEPARATE gating ``priority_invariant``
+# claim answers "was it served in priority order" — order is policed there, not
+# by collapsing this scalar. PWSF is a weighted RATIO so only inter-tier ratios
+# matter (this is identical to the legacy 2^(10-tier)). Tier 0 (generators)
+# weighs 0; tiers clamp to [1, Pi].
+_PI = 4
 
 
 def _tier_weight(tier: int) -> float:
     if tier <= 0:
         return 0.0
-    return 2.0 ** max(0, _P - tier)
+    t = min(int(tier), _PI)
+    return 2.0 ** (_PI - t)
 
 
 # Final served fractions

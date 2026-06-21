@@ -36,7 +36,15 @@ class RestorationConfiguration:
 
     # L3 kernel: ``"gossip"`` (default) = coordinator-free peer-to-peer sharing
     # ADMM, crash-fault tolerant; ``"lexicographic"`` = replicated full-problem
-    # solve keeping own row (ablation).
+    # solve keeping own row. NOTE: the gossip cascade was previously inert (its
+    # commit callback never fired in sim time, so the CP converter-curtailment
+    # actuator was dead and the electricity slack over-drew on cp-heavy grids).
+    # Fixed by (a) the initiator in-flight-round guard (GossipParticipant.
+    # is_round_active) so rounds aren't perpetually cancelled before committing,
+    # and (b) sim-cadence round/iter timeouts (2.0s/0.2s) so each round commits
+    # within the sim. Validated on cp_heavy_dependent @0.15: gossip == lexico
+    # (electricity slack 2.1xB -> ~0.4xB, compliant). See
+    # project_slack_compliance_rootcause.
     cp_admm_algorithm: str = "gossip"
 
     # Proximal step-damping α ≥ 0 for the lexicographic cascade's projection.
@@ -260,6 +268,17 @@ class RestorationConfiguration:
     # legacy equal-share / priority-gated update. Share saturation/stall/decay.
     enable_qp_gossip: bool = True
 
+    # Fix 2 (opt-in): size the holon's load-serving supply pool at the slack's
+    # nominal operator budget B (== abs(cap), the same hard ext-grid bound the
+    # oracle uses) instead of the SlackBudgetMonitor's loss-compensation
+    # eff_budget. The eff_budget feedback winds DOWN toward 0 whenever physical
+    # import exceeds budget (e.g. irreducible CP coupling draw on cp-heavy
+    # grids), shrinking the pool below what the network can physically serve and
+    # over-shedding feasible load. The eff_budget still governs the slack's own
+    # setpoint; with this flag it no longer also caps serviceable supply. False:
+    # unchanged eff_budget behaviour. See root-cause "cp-dependent over-shed".
+    enable_nominal_slack_supply: bool = False
+
     # Branch-side line-loading monitor. True: every PowerLine branch watches
     # loading_percent and, on overload, sends a relief-MW override to its home
     # leader (lower priority-weighted side) + ConstraintStateMessage to both
@@ -281,6 +300,59 @@ class RestorationConfiguration:
     # a tightened effective budget (B − losses) so actual draw converges to the
     # operator budget. False: advertises the nominal budget.
     enable_slack_budget_feedback: bool = True
+
+    # Restore / serve-more lever (opt-in). The SlackBudgetMonitor normally only
+    # sheds when OVER budget; nothing restores load when the slack sits UNDER
+    # budget, so after curtailment the import headroom is left unused and load is
+    # over-shed (the oracle uses 100% of the budget; SCARE ~54%). True: when the
+    # draw is below ``budget*(1-tol)`` the monitor sends a POSITIVE
+    # override_target (= headroom to B) to the home leader, whose L1 gossip
+    # restores load (highest priority first) up to the budget. Symmetric with the
+    # shed path and deadband-gated so it can't oscillate. False: shed-only.
+    # See project_oracle_quality_gap.
+    enable_slack_restore: bool = False
+
+    # Generation ramp-to-full lever (opt-in). Generators are often left below
+    # full output (mean reg ~0.78 vs the oracle's 1.0), wasting local supply that
+    # would displace slack import and free budget to serve more load. True: each
+    # generator's GenerationController periodically ramps its own setpoint toward
+    # rated (reg=1.0) via apply_regulate with a GEN_RESTORE reason, so the
+    # over-voltage curtail-ramp interlock still defers it when the auction holds
+    # the generator down. Local per-generator (no reachability dependence).
+    # False: generators only follow gossip/stability dispatch. See
+    # project_oracle_quality_gap.
+    enable_gen_ramp_to_full: bool = False
+
+    # CP-aware slack supply (opt-in correctness fix). On cp-heavy grids the
+    # cross-sector converter (power-to-heat / CHP) electricity draw rides the
+    # electricity slack but is invisible to the L2 holon balance (it is not a
+    # PowerLoad / community member), so the holon serves native load up to
+    # ``gen + B`` while the physical slack draws ``B + CP_draw`` — over budget.
+    # True: the SlackBudgetMonitor's measured over-draw is debited from the
+    # slack's credited supply in the holon pool, so the holon balances native
+    # load against the budget NET of the CP draw and sheds native load until the
+    # physical slack lands at B (the deficit is routed through holonic balancing
+    # before CP, as intended). False: legacy (CP draw uncounted). Default OFF:
+    # forensics showed this debits a CROSS-sector converter draw against the
+    # SAME-sector native-electricity pool, so it over-sheds native load without
+    # touching the converter draw (the real lever is CP converter curtailment —
+    # see enable_cp_budget_curtailment). See project_slack_compliance_rootcause.
+    enable_cp_aware_slack_supply: bool = False
+
+    # Layer-0 gas pressure regulator on each gas ExtHydrGrid slack. True: the
+    # slack autonomously drives its ``pressure_pu`` setpoint (the regulator-
+    # station lever) to hold downstream junction pressure inside the band,
+    # sensed via the constraint mesh — tried BEFORE shedding. Flow-neutral in
+    # this model (loads fix withdrawals), so a near-free lever. When the profile
+    # spread exceeds the band the setpoint saturates and the residual is left to
+    # the existing pressure-violation shedding path. False: no regulator role
+    # (legacy — pressure handled only by shedding). Gas-only.
+    enable_gas_pressure_regulator: bool = True
+
+    # Feedback step fraction toward the target setpoint per poll for the gas
+    # pressure regulator. <1 because the Weymouth map is nonlinear (one-shot
+    # overshoots); the loop converges over a few gas ticks.
+    gas_pressure_regulator_gain: float = 0.5
 
     # GridReconfigurator path ranking by line loading. True: buffer results in a
     # window and pick the path with the lowest peak loading. False: legacy

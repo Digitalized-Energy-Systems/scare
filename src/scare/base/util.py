@@ -225,6 +225,50 @@ def lookup_slack_eff_budget(behavior: Any, aid: str) -> float | None:
     return _slack_eff_budget_store(behavior).get(aid)
 
 
+def _slack_cp_reserve_store(behavior: Any) -> dict[str, float]:
+    return _get_behavior_store(behavior, "_scare_slack_cp_reserve")
+
+
+def set_slack_cp_reserve(behavior: Any, aid: str, mw: float) -> None:
+    """Record the MW of a slack's budget already consumed beyond it — the
+    measured over-draw the SlackBudgetMonitor sees. The holon supply pool debits
+    the slack's credited budget by this so the electricity holon balances native
+    load against the budget NET of the cross-sector (CP) draw + losses riding
+    the slack, and sheds native load until the physical draw lands at B (the CP
+    draw is otherwise invisible to the holon — see project_slack_compliance_rootcause)."""
+    _slack_cp_reserve_store(behavior)[str(aid)] = max(0.0, float(mw))
+
+
+def lookup_slack_cp_reserve(behavior: Any, aid: str) -> float | None:
+    return _slack_cp_reserve_store(behavior).get(str(aid))
+
+
+def _slack_pressure_store(behavior: Any) -> dict[str, float]:
+    return _get_behavior_store(behavior, "_scare_slack_pressure")
+
+
+def set_slack_pressure(behavior: Any, aid: str, value: float) -> None:
+    """Command a gas slack's pressure setpoint — the regulator lever.
+
+    Writes the ``ExtHydrGrid.pressure_pu`` boundary through the environment's
+    ``set_pressure`` action (marks the net dirty; the next energy-flow solve
+    re-pins the slack node, see ``ExtHydrGrid.overwrite``) and records the
+    commanded value so the regulator role and the slack recorder can read the
+    current setpoint. No-op on a child without the action (non-gas-slack) — the
+    store is written only when the action actually fires, so ``lookup`` never
+    reports a setpoint that was never applied."""
+    if behavior.has_action(aid, "set_pressure"):
+        behavior.act(aid, "set_pressure", float(value))
+        _slack_pressure_store(behavior)[aid] = float(value)
+
+
+def lookup_slack_pressure(behavior: Any, aid: str) -> float | None:
+    """Last commanded slack pressure setpoint [p.u.], or ``None`` if the
+    regulator has not actuated this slack yet (its boundary is still the
+    ``ExtHydrGrid`` construction default)."""
+    return _slack_pressure_store(behavior).get(aid)
+
+
 def _priority_store(behavior: Any) -> dict[str, int]:
     return _get_behavior_store(behavior, "_scare_priorities")
 
@@ -268,7 +312,7 @@ HEAT_RECOVERY_REASON: str = "heat_recovery"
 # Both ramp a generator UP; while the auction holds it down for a local
 # violation they must DEFER — see the gen curtail-lock in ``apply_regulate``.
 GEN_RESTORE_REASONS: frozenset[str] = frozenset(
-    {"self_local_gen", "local_gen_fallback"}
+    {"self_local_gen", "local_gen_fallback", "gen_ramp_to_full"}
 )
 
 

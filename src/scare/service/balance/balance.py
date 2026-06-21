@@ -46,6 +46,7 @@ from scare.base.util import (
     constraint_utilization,
     l2_effective_floor,
     lookup_slack,
+    lookup_slack_cp_reserve,
     lookup_slack_eff_budget,
     note_actuated_factor,
     obs_capacity,
@@ -250,6 +251,8 @@ class EnergyBalanceNegotiator(Role):
         enable_qp_gossip: bool = True,
         enable_l2_priority_floor: bool = True,
         enable_actuated_ledger_writeback: bool = True,
+        enable_nominal_slack_supply: bool = False,
+        enable_cp_aware_slack_supply: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -277,6 +280,13 @@ class EnergyBalanceNegotiator(Role):
         # Ablation flag: True = primal-dual QP gossip, else equal-share update.
         # Only the per-agent update rule differs.
         self.enable_qp_gossip = enable_qp_gossip
+        # Fix 2 (opt-in): credit a slack's supply contribution at the nominal
+        # operator budget B (abs(cap)) rather than the wound-down eff_budget.
+        self.enable_nominal_slack_supply = bool(enable_nominal_slack_supply)
+        # CP-aware slack supply (opt-in): debit the slack's credited budget by
+        # the SlackBudgetMonitor's measured over-draw so the holon balances
+        # native load NET of the cross-sector (CP) draw riding the slack.
+        self.enable_cp_aware_slack_supply = bool(enable_cp_aware_slack_supply)
 
         # Sector-specific convergence rate unless overridden.
         ts = SECTOR_TIMESCALE.get(sector, {})
@@ -1470,10 +1480,35 @@ class EnergyBalanceNegotiator(Role):
             # can't inflate the pool. Slacks instead use the budgeted rating.
             if cap < 0:
                 if lookup_slack(self.behavior, aid) is not None:
-                    # Slack: effective budget if loss-compensation set one
-                    # (targets ``B - losses``), else nominal.
-                    eff = lookup_slack_eff_budget(self.behavior, aid)
-                    gen_supply = float(eff) if eff is not None else abs(cap)
+                    if self.enable_cp_aware_slack_supply:
+                        # CP-aware: single-controller form B - reserve. Base off
+                        # the nominal budget B (== abs(cap); see
+                        # _maybe_register_slack) and debit the budget already
+                        # consumed by the cross-sector (CP) draw + losses riding
+                        # this slack (the monitor's measured over-draw). The holon
+                        # then balances native load against the budget NET of the
+                        # CP draw and sheds native load until the physical slack
+                        # lands at B (re-measured each monitor poll => converges).
+                        # NB base off B, NOT eff_budget: the eff_budget feedback
+                        # ALSO winds down on the same over-draw, so eff_budget -
+                        # reserve would double-subtract the excess and over-shed.
+                        reserve = lookup_slack_cp_reserve(self.behavior, aid) or 0.0
+                        gen_supply = max(0.0, abs(cap) - float(reserve))
+                    elif self.enable_nominal_slack_supply:
+                        # Fix 2: nominal operator budget B (== abs(cap); see
+                        # _maybe_register_slack, which registers the slack at its
+                        # _scare_slack_budget_mw). The eff_budget the
+                        # SlackBudgetMonitor maintains is wound DOWN below B
+                        # whenever physical import exceeds budget (irreducible CP
+                        # draw on cp-heavy grids), shrinking the serviceable pool
+                        # and over-shedding feasible load; B is the same hard
+                        # bound the oracle serves against.
+                        gen_supply = abs(cap)
+                    else:
+                        # Slack: effective budget if loss-compensation set one
+                        # (targets ``B - losses``), else nominal.
+                        eff = lookup_slack_eff_budget(self.behavior, aid)
+                        gen_supply = float(eff) if eff is not None else abs(cap)
                 else:
                     gen_supply = abs(sp)  # generator: deliverable, not rated
                 supply_by_sector[sec_key] = (
@@ -2006,6 +2041,8 @@ def create_energy_balance_role(
     enable_qp_gossip: bool = True,
     enable_l2_priority_floor: bool = True,
     enable_actuated_ledger_writeback: bool = True,
+    enable_nominal_slack_supply: bool = False,
+    enable_cp_aware_slack_supply: bool = False,
 ) -> EnergyBalanceNegotiator:
     if priority is None:
         priority = obs_priority(obs)
@@ -2022,4 +2059,6 @@ def create_energy_balance_role(
         enable_qp_gossip=enable_qp_gossip,
         enable_l2_priority_floor=enable_l2_priority_floor,
         enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,
+        enable_nominal_slack_supply=enable_nominal_slack_supply,
+        enable_cp_aware_slack_supply=enable_cp_aware_slack_supply,
     )

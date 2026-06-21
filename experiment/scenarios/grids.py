@@ -9,9 +9,17 @@ import monee.express as mx
 import simbench
 from monee.io.from_pandapower import from_pandapower_net
 from monee.model.formulation import EL_MISOCP_FORMULATION
+from monee.model.grid import STANDARD_ATMOSPHERE_PA
 from monee.network import generate_supply_return_mes_based_on_power_net
 
 logger = logging.getLogger(__name__)
+
+_GAS_KWARGS = {
+    "pressure_ref_pa": 0.3e5,  # 300 mbar nominal (gauge)
+    "pressure_ambient_pa": STANDARD_ATMOSPHERE_PA,  # gauge convention
+    "diameter_tiers": [(20, 0.110), (5, 0.063), (0, 0.032)],
+    "gas_gen_share": 0.0,  # single-fed; P2G CPs carry distributed injection
+}
 
 
 def create_large_lv_simbench(
@@ -71,7 +79,7 @@ def create_large_lv_simbench(
                 "replace_primary_generation": replace_primary_generation,
             },
             heat_kwargs={"node_based_heat_loads": True},
-            gas_kwargs={"auto_diameter": True, "auto_min_diameter_m": 0.03},
+            gas_kwargs=_GAS_KWARGS,
         )
         mes.apply_formulation(EL_MISOCP_FORMULATION)
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from monee import run_energy_flow_optimization
@@ -23,10 +24,16 @@ from monee.problem import (
 )
 from monee.solver.pyo import PyomoSolver
 
+from experiment.eval.claims import heat_priority_from_rows
 from experiment.eval.metrics import (
     constraint_violations_final,
     restoration_breakdown,
     served_breakdown,
+    served_by_load,
+)
+from experiment.eval.results import (
+    write_served_by_load_csv,
+    write_served_csv,
 )
 from experiment.scenarios import (
     GRIDS,
@@ -314,13 +321,32 @@ def run_oracle(
     # ``bounds_*`` mirror SCARE's ``SECTOR_CONSTRAINTS`` so the LP solves on the
     # same voltage / pressure / temperature envelope. Heat converts SCARE's
     # t_k = (313.15, 403.15) via monee's water-grid t_ref = 356 K -> t_pu.
+    bounds_pressure_pu = (0.85, 1.25)
+    # Give the oracle the SAME regulator-setpoint lever the MAS now has: let each
+    # gas slack outlet pressure be an optimizable decision var within the band,
+    # not a single fixed pin. Without this the oracle is a LOOSER bound — SCARE's
+    # GasPressureRegulator could raise its setpoint to hold nodes in band where a
+    # fixed-setpoint oracle would have to shed. Gas-only (the heat-side
+    # ExtHydrGrid is governed by t_k, not pressure).
+    for child in monee_net.childs:
+        m = child.model
+        if not isinstance(m, ExtHydrGrid):
+            continue
+        try:
+            grid_name = str(
+                getattr(monee_net.node_by_id(child.node_id).grid, "name", "")
+            ).lower()
+        except Exception:
+            grid_name = ""
+        if "gas" in grid_name:
+            m.free_pressure_bounds = bounds_pressure_pu
     prob = create_min_load_shedding_problem(
         weight_for_load=weight_for_load,
         bounds_ext_el=ext_grid_el_bounds,
         bounds_ext_gas=ext_grid_gas_bounds,
         bounds_ext_heat=ext_grid_heat_bounds,
         bounds_vm=(0.95, 1.05),
-        bounds_pressure=(0.85, 1.25),
+        bounds_pressure=bounds_pressure_pu,
         bounds_t=(0.8796, 1.1325),
         check_lp=True,
         max_line_loading=1.0,
@@ -341,11 +367,6 @@ def run_oracle(
         len(monee_net.childs),
         len(monee_net.branches),
     )
-    # ``exclude_unconnected_nodes=True`` is mandatory: otherwise the solver
-    # assembles equations for the disconnected component, the LP goes
-    # structurally infeasible (e.g. mass-balance on a heat node with no inflow
-    # and non-zero load), and monee returns with ``regulation`` left at the
-    # default 1.0 — which the metric reads as "everything served".
     result = run_energy_flow_optimization(
         monee_net,
         prob,
@@ -356,23 +377,12 @@ def run_oracle(
     lp_success = bool(getattr(result, "success", True))
     logger.info("oracle: solve done (success=%s).", lp_success)
 
-    # Read the metric off ``result.network`` — the solver's internal copy,
-    # where the LP's optimal ``regulation`` values live as Pyomo Vars. On the
-    # input ``monee_net``, ``regulation`` starts as a plain float 1.0 and is
-    # promoted to a Var only on the copy, so monee's back-write (Var-only) skips
-    # it; the input net would read every load at regulation 1.0 (= fully served).
-    # Slack ``p_mw`` does back-write (Var on both nets), so
-    # ``_slack_budget_summary`` works on either.
     solved_net = getattr(result, "network", monee_net)
     behavior = _adapter_observe(solved_net)
     served = served_breakdown(solved_net, behavior, priorities=priorities)
 
-    # Oracle has no time-series; report a zero integral for schema uniformity.
     integral = {"electricity": 0.0, "gas": 0.0, "heat": 0.0}
 
-    # Per-child regulation off the solved copy. Use ``model.values`` (resolves
-    # via ``pyomo.value(var)``); a direct ``float(regulation)`` raises because
-    # ``regulation`` is a Var on the solved network.
     regulations: dict[str, float] = {}
     for child in solved_net.childs:
         vals = child.model.values if hasattr(child.model, "values") else {}
@@ -380,10 +390,6 @@ def run_oracle(
 
     slack_summary = _slack_budget_summary(solved_net)
 
-    # End-of-sim hard-bound feasibility on the solved LP network. The LP enforces
-    # the envelope by construction, so this should pass; scanning it anyway keeps
-    # the oracle's ``constraint_compliance`` claim on SCARE's measurement path and
-    # surfaces any residual numerical excursion.
     constraints_final = constraint_violations_final(solved_net)
 
     return {
@@ -393,6 +399,8 @@ def run_oracle(
         "regulations": regulations,
         "lp_success": lp_success,
         "slack_budget_summary": slack_summary,
+        "solved_net": solved_net,
+        "behavior": behavior,
     }
 
 
@@ -496,13 +504,41 @@ def compose_oracle_result(
     solver: str | None = None,
     priorities: dict[str, int] | None = None,
     baseline_served: dict[str, Any] | None = None,
+    out_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build a result.json payload identical in shape to the scare
-    composer so the aggregator can read both off the same schema."""
+    composer so the aggregator can read both off the same schema.
+
+    When ``out_dir`` is given, also writes the oracle's ``served.csv`` and
+    ``served_by_load.csv`` (the per-load detail the MAS variants emit) so the
+    report can compare SCARE against the oracle per (sector, tier, load) and the
+    oracle-relative ``heat_priority`` diagnostic can be calibrated.
+    """
     out = run_oracle(monee_net, failures, solver=solver, priorities=priorities)
     served = out["served"]
     integral = out["constraint_violation_integral"]
     restoration = restoration_breakdown(served, baseline_served)
+
+    # Per-load detail off the SAME solved network the served breakdown used (the
+    # input ``monee_net`` reads every load at regulation 1.0; see ``run_oracle``).
+    solved_net = out["solved_net"]
+    behavior = out["behavior"]
+    load_rows = served_by_load(solved_net, behavior, priorities=priorities)
+    if out_dir is not None:
+        write_served_csv(
+            Path(out_dir) / "served.csv", solved_net, behavior, priorities=priorities
+        )
+        write_served_by_load_csv(
+            Path(out_dir) / "served_by_load.csv",
+            solved_net,
+            behavior,
+            priorities=priorities,
+        )
+
+    # Oracle-relative heat-priority diagnostic (non-gating). Computed in-memory
+    # off ``load_rows`` so the oracle carries the same claim key the MAS variants
+    # do; previously absent, leaving all oracle tasks NaN for this check.
+    heat_priority_claim = heat_priority_from_rows(load_rows)
 
     # Slack budget compliance: the LP envelope is tightened to +-budget in
     # run_oracle, so a successful solve satisfies it by construction. Surfaced
@@ -562,6 +598,10 @@ def compose_oracle_result(
             # to invariant-check. Other variants populate it via evaluate_task.
             "slack_budget_compliance": slack_claim,
             "constraint_compliance": constraint_claim,
+            # Oracle-relative heat-priority diagnostic (non-gating): the
+            # achievable feasible-subset tier ordering the LP attains, the
+            # reference SCARE's controllable heat gap is measured against.
+            "heat_priority": heat_priority_claim,
         },
         "diary": {"invariant_holds": True},  # vacuous
         "events": {},

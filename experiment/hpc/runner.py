@@ -377,6 +377,7 @@ def _run_oracle(
     logger: logging.Logger,
     *,
     baseline_served: dict[str, Any] | None = None,
+    out_dir: Path | None = None,
 ):
     """Solve monee's minimal-load-shedding LP on the same failures the scare
     variant would see. Returns (net, failures, result_payload) — no agents.
@@ -404,6 +405,7 @@ def _run_oracle(
         wallclock_s=0.0,
         priorities=priorities,
         baseline_served=baseline_served,
+        out_dir=out_dir,
     )
     payload["wallclock_s"] = round(_time.monotonic() - started, 3)
     return net, failures, payload
@@ -605,7 +607,7 @@ def _write_oracle_outputs(
 ) -> None:
     """Run the centralized oracle LP and write its result/slack/failures."""
     net, failures, oracle_metrics = _run_oracle(
-        plan, task, logger, baseline_served=baseline_served
+        plan, task, logger, baseline_served=baseline_served, out_dir=out_dir
     )
     (out_dir / "failures.json").write_text(
         json.dumps(_serialize_failures(failures), indent=2)
@@ -614,6 +616,39 @@ def _write_oracle_outputs(
         json.dumps(oracle_metrics, indent=2, sort_keys=True, default=str)
     )
     write_slack_meta(out_dir / "slack_meta.json", net)
+
+
+def _exact_gas_solved_net(net: Any, logger: logging.Logger) -> Any:
+    """Re-solve the final network state with exact (nonconvex MIQCQP) gas Weymouth.
+
+    The relaxed Weymouth the live sim uses leaves gas pressure underdetermined
+    at zero-flow (load-shed) junctions: the epigraph ``m² ≤ m_sq`` lets the
+    solver inflate ``m_sq`` and park ``pressure_squared_pu`` at its box maximum,
+    reporting a spurious ``pressure_pu = √3``. The exact formulation (the same
+    ``GAS_NONCONVEX_MIQCQP`` the oracle uses) pins gas pressure so the constraint
+    check reads physical values. Returns the solved result network, or the
+    original ``net`` if the exact solve is unavailable/fails.
+    """
+    try:
+        from monee import run_energy_flow
+        from monee.model.formulation import GAS_NONCONVEX_MIQCQP_FORMULATION
+
+        net.apply_formulation(GAS_NONCONVEX_MIQCQP_FORMULATION)
+        res = run_energy_flow(net, solver="gurobi", exclude_unconnected_nodes=True)
+        result_net = getattr(res, "network", None)
+        if getattr(res, "success", False) and result_net is not None:
+            return result_net
+        logger.warning(
+            "Exact-gas constraint re-solve did not succeed; "
+            "keeping relaxed-Weymouth gas pressures."
+        )
+    except Exception:  # noqa: BLE001 — never let the constraint re-solve abort output
+        logger.warning(
+            "Exact-gas constraint re-solve failed; keeping relaxed-Weymouth "
+            "gas pressures.",
+            exc_info=True,
+        )
+    return net
 
 
 def _write_simulation_outputs(
@@ -660,7 +695,11 @@ def _write_simulation_outputs(
         behavior,
         priorities=priorities,
     )
-    write_constraints_final_csv(out_dir / "constraints_final.csv", net)
+    # Judge gas-pressure compliance on EXACT-Weymouth physics, not the relaxed
+    # formulation the sim solves with (which reports spurious √3 over-pressure
+    # at shed/zero-flow gas junctions). Served/control state above is unchanged.
+    constraint_net = _exact_gas_solved_net(net, logger)
+    write_constraints_final_csv(out_dir / "constraints_final.csv", constraint_net)
     write_diary_csv(out_dir / "diary.csv")
     write_events_csv(out_dir / "events.csv")
     write_slack_meta(out_dir / "slack_meta.json", net)

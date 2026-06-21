@@ -375,6 +375,18 @@ def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
             )
         )
     )
+    figs.append(
+        str(
+            plots.gas_slack_pressure_trajectory(
+                rep.timeseries,
+                out_dir / "gas_slack_pressure_trajectory.png",
+                title=(
+                    f"Gas ext-grid regulator — task {rep.task_id} ({rep.grid})"
+                ),
+                failure_t=failure_t,
+            )
+        )
+    )
     return figs
 
 

@@ -72,6 +72,7 @@ from scare.base.util import (
     get_by_branch_id,
     kgps_to_mw,
     lookup_slack,
+    lookup_slack_pressure,
     obs_capacity,
     obs_constraint_values,
     obs_setpoint,
@@ -95,6 +96,7 @@ from scare.service.balance.balance import (
     create_energy_balance_role,
 )
 from scare.service.control.constraints import GridConstraintMonitor
+from scare.service.control.gas_pressure import GasPressureRegulator
 from scare.service.control.local_generation import LocalGenerationFallbackRole
 from scare.service.control.slack_budget import SlackBudgetMonitor
 from scare.service.control.stability import GenerationController
@@ -514,7 +516,11 @@ def _populate_children(
                     behavior, sector, obs, config, priority=explicit_priority
                 )
             )
-            roles.append(GenerationController(behavior, sector))
+            roles.append(
+                GenerationController(
+                    behavior, sector, ramp_to_full=config.enable_gen_ramp_to_full
+                )
+            )
             # Voltage / pressure / temperature monitoring.
             roles.append(
                 GridConstraintMonitor(
@@ -547,8 +553,27 @@ def _populate_children(
                             budget=budget_value,
                             tol=config.slack_budget_violation_tol,
                             enable_feedback=config.enable_slack_budget_feedback,
+                            cp_aware=config.enable_cp_aware_slack_supply,
+                            restore=config.enable_slack_restore,
                         )
                     )
+
+            # Layer-0 gas regulator: the gas slack autonomously holds
+            # downstream pressure in band via its pressure_pu setpoint, tried
+            # before shedding. Gas ExtHydrGrid only (the heat-side slack uses
+            # t_k, not pressure).
+            if (
+                config.enable_gas_pressure_regulator
+                and sector is Sector.GAS
+                and isinstance(child.model, ExtHydrGrid)
+            ):
+                roles.append(
+                    GasPressureRegulator(
+                        behavior,
+                        sector,
+                        gain=config.gas_pressure_regulator_gain,
+                    )
+                )
 
         # Updates the child's CommunityAssignment on a leader re-partition.
         if sector is not None:
@@ -651,7 +676,11 @@ def _populate_branches(
 
         if "heatexchanger" in branch_type:
             roles.append(_make_balance_role(behavior, Sector.HEAT, obs, config))
-            roles.append(GenerationController(behavior, Sector.HEAT))
+            roles.append(
+                GenerationController(
+                    behavior, Sector.HEAT, ramp_to_full=config.enable_gen_ramp_to_full
+                )
+            )
 
         elif "powertogas" in branch_type:
             if config.enable_cp_priority_admm:
@@ -766,6 +795,8 @@ def _make_balance_role(
         enable_qp_gossip=config.enable_qp_gossip,
         enable_l2_priority_floor=config.enable_l2_priority_floor,
         enable_actuated_ledger_writeback=config.enable_actuated_ledger_writeback,
+        enable_nominal_slack_supply=config.enable_nominal_slack_supply,
+        enable_cp_aware_slack_supply=config.enable_cp_aware_slack_supply,
     )
 
 
@@ -1950,6 +1981,31 @@ def _register_recordings(
         col = f"slack__{sector.value}__{aid}"
         # Default args capture per-child values (avoid late-binding).
         record_world(world, col, lambda a=aid, k=obs_key: _slack_obs(a, k))
+
+    # Gas regulator control: the slack pressure setpoint per tick (the
+    # GasPressureRegulator's lever). Before the regulator first actuates,
+    # ``lookup_slack_pressure`` is None — fall back to the pinned node pressure.
+    def _slack_pressure_setpoint(aid: str) -> float:
+        sp = lookup_slack_pressure(behavior, aid)
+        if sp is not None:
+            return float(sp)
+        return _slack_obs(aid, "pressure_pu")
+
+    for child in monee_net.childs:
+        if not isinstance(child.model, ExtHydrGrid):
+            continue
+        try:
+            sector = sector_from_grid(monee_net.node_by_id(child.node_id).grid)
+        except Exception:  # noqa: BLE001
+            continue
+        if sector is not Sector.GAS:
+            continue
+        aid = _child_aid(child.id)
+        record_world(
+            world,
+            f"slack_pressure__gas__{aid}",
+            lambda a=aid: _slack_pressure_setpoint(a),
+        )
 
     # Per-coalition (L1) and per-holon (L2) regulation sums, so plots show
     # each group converging independently (the aggregate hides that).

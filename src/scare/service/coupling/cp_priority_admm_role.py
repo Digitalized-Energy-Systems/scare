@@ -449,13 +449,29 @@ class CPPriorityAdmmRole(Role):
             return
         if not self._am_gossip_initiator():
             return
+        # Don't supersede our own in-flight cascade: starting a new round here
+        # calls _begin_round, which cancels the running cascade before it can
+        # commit. Summaries / the watchdog re-trigger faster than a round
+        # completes, so without this guard every cascade is cancelled and the CP
+        # converter actuator never fires. Let the active round finish (it
+        # self-terminates at round_timeout_s and commits); the next dirty tick
+        # opens a fresh round on the updated state.
+        if self._gossip_participant.is_round_active():
+            return
         demands = self._build_demands()
         if not demands:
             return
         participants = sorted(self._reachable_peer_cp_ids() | {self.cp_id})
         self._gossip_round_id += 1
-        # Timeouts: a round can take seconds on large grids; round_timeout_s
-        # absorbs the tail, iter_timeout_s catches the per-iter broadcast median.
+        # Timeouts in SIM-seconds (carrier clock). They MUST be small relative
+        # to the task sim duration (~10s) and the rebalance cadence: the cascade
+        # only commits (fires apply_regulate) when a round completes, either by
+        # converging or by hitting round_timeout_s. The previous 30s round /1s
+        # iter never completed within a 10s sim, so the CP converter actuator
+        # never fired and the electricity slack over-drew. 2.0s/0.2s lets every
+        # round commit-on-timeout within the sim (the partially-solved factor
+        # still curtails effectively); paired with the in-flight guard above so
+        # rounds aren't perpetually cancelled before committing.
         start = create_gossip_cascade_start(
             round_id=self._gossip_round_id,
             participants=participants,
@@ -468,8 +484,8 @@ class CPPriorityAdmmRole(Role):
             adaptive_rho=True,
             rho_mu=10.0,
             rho_tau=2.0,
-            iter_timeout_s=1.0,
-            round_timeout_s=30.0,
+            iter_timeout_s=0.2,
+            round_timeout_s=2.0,
         )
         await self._gossip_participant.on_exchange_message(
             self._gossip_carrier,

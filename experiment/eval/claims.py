@@ -301,6 +301,19 @@ def _check_heat_priority(by_load_path: Path) -> dict[str, Any]:
     rows = _read_csv(by_load_path)
     if not rows:
         return {"passed": True, "detail": "empty served_by_load.csv"}
+    return heat_priority_from_rows(rows)
+
+
+def heat_priority_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Rows-based core of :func:`_check_heat_priority`.
+
+    Accepts the same per-load records ``served_by_load`` produces (str- or
+    number-typed ``sector``/``tier``/``demand``/``served``/``disconnected``/
+    ``constraint_allowed``), so the oracle path can compute the diagnostic
+    in-memory off its solved network without round-tripping through a CSV.
+    """
+    if not rows:
+        return {"passed": True, "detail": "empty served_by_load rows"}
 
     # Per-tier aggregation over feasible (non-throttled, connected) heat
     # loads, and separately over all heat loads (for the oracle diff).
@@ -317,7 +330,7 @@ def _check_heat_priority(by_load_path: Path) -> dict[str, Any]:
             served = float(r["served"])
         except (KeyError, ValueError):
             continue
-        disc_raw = (r.get("disconnected") or "0").strip()
+        disc_raw = str(r.get("disconnected") or "0").strip()
         if disc_raw in ("1", "true", "True"):
             continue
         n_total += 1
