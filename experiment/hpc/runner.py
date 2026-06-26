@@ -567,12 +567,22 @@ def _config_from_task(task: TaskSpec):
     return replace(base, **clean)
 
 
+_BASELINE_SOLVE_CAP_S = 60.0
+
+
 def _compute_baseline(task: TaskSpec, logger: logging.Logger) -> dict[str, Any] | None:
     """Solve the no-failure LP so restoration can be expressed as a ratio of
     pre-failure served. Returns ``None`` (logged) on failure so the task proceeds.
     """
     if task.grid not in GRIDS:
         return None
+    # The baseline solve runs BEFORE _run_simulation installs the per-solve cap.
+    # On reconfig grids the backup tie-line on_off binaries make it a MILP that,
+    # uncapped, can spin gurobi for the full default limit merely proving
+    # optimality of the (trivially feasible) radial incumbent — leaving the task
+    # with no baseline (baseline_available=False). Cap it here so it returns that
+    # incumbent. Idempotent with the smaller sim-phase cap installed later.
+    install_solver_time_limit(_BASELINE_SOLVE_CAP_S)
     try:
         # Throwaway net to enumerate loads, released before the heavy phase
         # so it doesn't double peak RAM (~1-3 GB on CP-heavy grids).

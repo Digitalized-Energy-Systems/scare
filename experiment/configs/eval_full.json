@@ -280,7 +280,7 @@
       "$comment_block": "Voltage support.  pv_peak pushes vm_pu past the 1.03 pu deadband so the Q-V droop role actually fires.",
       "name": "ablation_voltage",
       "grids": [
-        "simbench_lv"
+        "simbench_lv_small"
       ],
       "n_seeds": 15,
       "variants": [
@@ -506,7 +506,7 @@
       ],
       "name": "voltage_stress",
       "grids": [
-        "simbench_lv"
+        "simbench_lv_small"
       ],
       "n_seeds": 15,
       "variants": [

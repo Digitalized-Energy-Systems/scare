@@ -995,17 +995,24 @@ def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
     return result
 
 
-def constraint_utilization(value: float, bound_low: float, bound_high: float) -> float:
-    """Return 0..1 indicating how close *value* is to violating a bound.
+def constraint_utilization(
+    value: float, bound_low: float, bound_high: float, *, unclamped: bool = False
+) -> float:
+    """Return how close *value* is to violating a bound.
 
     0.0 = at the centre of the feasible range.
     1.0 = at or beyond a bound.
+
+    Clamped to ``[0, 1]`` by default. Pass ``unclamped=True`` to let values past a
+    bound exceed 1.0 (the fractional overshoot), e.g. for integrating the
+    out-of-bounds area; every other caller relies on the ``1.0`` ceiling.
     """
     span = bound_high - bound_low
     if span <= 0:
         return 1.0
     mid = (bound_low + bound_high) / 2.0
-    return min(1.0, abs(value - mid) / (span / 2.0))
+    u = abs(value - mid) / (span / 2.0)
+    return u if unclamped else min(1.0, u)
 
 
 def obs_priority(

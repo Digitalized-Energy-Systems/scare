@@ -627,11 +627,13 @@ def constraint_violation_integral(world: Any) -> dict[str, float]:
         ts_t = list(rec.time)
         if len(ts) < 2:
             continue
-        # Trapezoidal integration of max(0, util − 1) over time.
+        # Trapezoidal integration of max(0, util − 1) over time. The unclamped
+        # utilization lets out-of-bounds readings exceed 1.0 (the clamped form
+        # pins the integrand — and thus every integral — to 0).
         integral = 0.0
         for i in range(1, len(ts)):
-            u_a = constraint_utilization(float(ts[i - 1]), lo, hi)
-            u_b = constraint_utilization(float(ts[i]), lo, hi)
+            u_a = constraint_utilization(float(ts[i - 1]), lo, hi, unclamped=True)
+            u_b = constraint_utilization(float(ts[i]), lo, hi, unclamped=True)
             ov_a = max(0.0, u_a - 1.0)
             ov_b = max(0.0, u_b - 1.0)
             dt = float(ts_t[i]) - float(ts_t[i - 1])
