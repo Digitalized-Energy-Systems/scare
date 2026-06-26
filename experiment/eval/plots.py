@@ -2242,6 +2242,32 @@ def _stale_data_segment(
     return float(t[first_stale_idx]), int(stale_mask.sum())
 
 
+def _mask_deenergised(avg_col: str, vals: np.ndarray | None) -> np.ndarray | None:
+    """Mask de-energised solver-bound artefacts in a recorded min/max series.
+
+    Gas junctions cut off from supply read ``pressure_pu`` at a solver bound
+    (~0 or ~sqrt(3)~1.732); isolated heat junctions read ``t_k~0``. These are
+    not physical extremes, so blank them (NaN) — they were dropped at record
+    time for new runs, but older runs baked them into the aggregate. The true
+    energised extreme at those ticks was never persisted, so masked ticks gap.
+    """
+    if vals is None:
+        return None
+    from scare.base.model import (
+        DEENERGISED_PRESSURE_HIGH_PU,
+        DEENERGISED_PRESSURE_PU,
+    )
+
+    out = np.asarray(vals, dtype=float).copy()
+    if avg_col.endswith("pressure_pu"):
+        out[(out <= DEENERGISED_PRESSURE_PU) | (out >= DEENERGISED_PRESSURE_HIGH_PU)] = (
+            np.nan
+        )
+    elif avg_col.endswith("t_k"):
+        out[out <= 0.0] = np.nan
+    return out
+
+
 def constraint_envelope_trajectory(
     timeseries: pd.DataFrame,
     events: pd.DataFrame,
@@ -2424,6 +2450,14 @@ def constraint_envelope_trajectory(
         have_max = max_col in timeseries.columns
         min_vals = timeseries[min_col].astype(float).values if have_min else None
         max_vals = timeseries[max_col].astype(float).values if have_max else None
+        # Post-process: drop de-energised solver-bound artefacts so regenerated
+        # plots of runs recorded before the record-time filter don't draw
+        # spurious min/max lines. A gas region cut off from supply reads
+        # pressure_pu~0 or saturates to ~sqrt(3)~1.732, and an isolated heat
+        # junction reads t_k~0. The true energised extreme at those ticks was
+        # never persisted (only the aggregate), so masked points become gaps.
+        min_vals = _mask_deenergised(avg_col, min_vals)
+        max_vals = _mask_deenergised(avg_col, max_vals)
 
         # Min–max spread (translucent fill between min and max)
         if have_min and have_max:

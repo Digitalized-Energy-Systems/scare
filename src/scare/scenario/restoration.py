@@ -45,6 +45,7 @@ from monee.model.child import (
 from scare.base.channel import SectorImbalanceBeacon
 from scare.base.config import RestorationConfiguration
 from scare.base.model import (
+    DEENERGISED_PRESSURE_HIGH_PU,
     DEENERGISED_PRESSURE_PU,
     ConstraintViolation,
     ReconfigurationCompletedEvent,
@@ -2074,9 +2075,11 @@ def _register_recordings(
     # Constraint metrics: avg is the mean; min/max surface the violating
     # extremes the average hides. De-energised readings are dropped so the
     # series match the compliance gate: a gas region cut off from its
-    # ExtHydrGrid collapses to pressure_pu~0 and an isolated heat junction to
-    # t_k~0 — both are meaningless, not real extremes (see
-    # ``constraint_violations_final`` and DEENERGISED_PRESSURE_PU).
+    # ExtHydrGrid collapses to pressure_pu~0 OR saturates monee's
+    # pressure_squared_pu Var at its upper bound (pressure_pu~sqrt(3)~1.732),
+    # and an isolated heat junction reads t_k~0. All are solver-bound artefacts,
+    # not real extremes (see ``constraint_violations_final`` and the
+    # DEENERGISED_PRESSURE_* constants).
     def _constraint_values(child_aids: list[str], key: str) -> list[float]:
         vals: list[float] = []
         for aid in child_aids:
@@ -2084,7 +2087,9 @@ def _register_recordings(
             if not (obs and key in obs):
                 continue
             v = float(obs[key])
-            if key == "pressure_pu" and v <= DEENERGISED_PRESSURE_PU:
+            if key == "pressure_pu" and (
+                v <= DEENERGISED_PRESSURE_PU or v >= DEENERGISED_PRESSURE_HIGH_PU
+            ):
                 continue
             if key == "t_k" and v <= 0.0:
                 continue

@@ -51,6 +51,15 @@ SECTOR_CONSTRAINTS: dict[Sector, dict[str, tuple[float, float]]] = {
 # gates.
 DEENERGISED_PRESSURE_PU: float = 0.1
 
+# Upper companion to DEENERGISED_PRESSURE_PU. A de-energised junction can also
+# saturate monee's ``pressure_squared_pu`` solver Var at its upper bound (3.0)
+# instead of collapsing to 0, giving ``pressure_pu = sqrt(3) ~ 1.732``. Like the
+# ~0 collapse this is a solver-bound artefact, not a physical over-pressure
+# (genuinely served junctions stay at or below the 1.25 gas ceiling), so the
+# same scan/monitor/recording skip it. The threshold sits just below sqrt(3) so
+# only the saturated value is dropped and real over-pressure still gates.
+DEENERGISED_PRESSURE_HIGH_PU: float = 1.70
+
 # Fraction of feasible range at which an agent warns neighbours it nears a limit.
 PROACTIVE_WARNING_FRACTION: float = 0.85
 
