@@ -1211,8 +1211,6 @@ def restoration_trajectory(
         event_styles = {
             "line_failure": dict(color="#1A1A1A", dash="dash"),
             "reconfiguration_completed": dict(color="#9467BD", dash="dot"),
-            "local_gen_request": dict(color="#E07A1F", dash="dot"),
-            "local_gen_covered": dict(color="#2E7D32", dash="dot"),
             "constraint_violation": dict(color="#D62728", dash="dot"),
         }
         for kind, style in event_styles.items():
@@ -2333,7 +2331,6 @@ def constraint_envelope_trajectory(
         "line_failure": dict(color="#1A1A1A", dash="dash"),
         "branch_failure": dict(color="#1A1A1A", dash="dash"),
         "reconfiguration_completed": dict(color="#9467BD", dash="dot"),
-        "local_gen_request": dict(color="#E07A1F", dash="dot"),
         "constraint_violation": dict(color="#D62728", dash="dot"),
     }
     seen_kinds: set[str] = set()
@@ -3503,7 +3500,6 @@ def system_state_overview(
         "line_failure": dict(color="#1A1A1A", dash="dash"),
         "branch_failure": dict(color="#1A1A1A", dash="dash"),
         "reconfiguration_completed": dict(color="#9467BD", dash="dot"),
-        "local_gen_request": dict(color="#E07A1F", dash="dot"),
         "constraint_violation": dict(color="#D62728", dash="dot"),
     }
     seen_kinds: set[str] = set()

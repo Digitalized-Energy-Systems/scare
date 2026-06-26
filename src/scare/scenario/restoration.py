@@ -45,6 +45,7 @@ from monee.model.child import (
 from scare.base.channel import SectorImbalanceBeacon
 from scare.base.config import RestorationConfiguration
 from scare.base.model import (
+    DEENERGISED_PRESSURE_PU,
     ConstraintViolation,
     ReconfigurationCompletedEvent,
     Sector,
@@ -2071,13 +2072,23 @@ def _register_recordings(
     )
 
     # Constraint metrics: avg is the mean; min/max surface the violating
-    # extremes the average hides.
+    # extremes the average hides. De-energised readings are dropped so the
+    # series match the compliance gate: a gas region cut off from its
+    # ExtHydrGrid collapses to pressure_pu~0 and an isolated heat junction to
+    # t_k~0 — both are meaningless, not real extremes (see
+    # ``constraint_violations_final`` and DEENERGISED_PRESSURE_PU).
     def _constraint_values(child_aids: list[str], key: str) -> list[float]:
         vals: list[float] = []
         for aid in child_aids:
             obs = behavior.observe(aid)
-            if obs and key in obs:
-                vals.append(float(obs[key]))
+            if not (obs and key in obs):
+                continue
+            v = float(obs[key])
+            if key == "pressure_pu" and v <= DEENERGISED_PRESSURE_PU:
+                continue
+            if key == "t_k" and v <= 0.0:
+                continue
+            vals.append(v)
         return vals
 
     def _avg_constraint(child_aids: list[str], key: str) -> float:
