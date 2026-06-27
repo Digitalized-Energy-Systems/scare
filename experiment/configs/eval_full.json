@@ -575,6 +575,7 @@
       "variants": [
         "scare",
         "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -614,6 +615,7 @@
       "variants": [
         "scare",
         "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -733,6 +735,7 @@
       "variants": [
         "scare",
         "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -770,6 +773,7 @@
       "variants": [
         "scare",
         "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
