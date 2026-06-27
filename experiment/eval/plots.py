@@ -877,6 +877,15 @@ def ablation_impact_bar(df: pd.DataFrame, out_path: Path) -> Path:
 # Robustness curves (Pillar 5)
 
 
+def _compliant_share_by_x(parsed: pd.DataFrame) -> pd.Series | None:
+    """Per-``x`` fraction of runs passing the compliance gate (sorted by x),
+    or ``None`` when no compliance column is present so callers can suppress
+    the second curve."""
+    if _compliance_rate(parsed) is None:
+        return None
+    return _compliant_mask(parsed).groupby(parsed["x"]).mean().sort_index()
+
+
 def robustness_curve(
     df: pd.DataFrame,
     out_path: Path,
@@ -911,7 +920,7 @@ def robustness_curve(
     upper = (grouped["mean"] + grouped["ci"]).tolist()
     lower = (grouped["mean"] - grouped["ci"]).tolist()
 
-    fig = go.Figure()
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
     # CI ribbon.
     fig.add_trace(
         go.Scatter(
@@ -922,7 +931,8 @@ def robustness_curve(
             line=dict(color="rgba(0,0,0,0)"),
             hoverinfo="skip",
             showlegend=False,
-        )
+        ),
+        secondary_y=False,
     )
     fig.add_trace(
         go.Scatter(
@@ -941,9 +951,47 @@ def robustness_curve(
                 )
             ],
             hovertemplate="%{customdata}<extra></extra>",
-            name="scare",
-        )
+            name="served (compliant)",
+        ),
+        secondary_y=False,
     )
+
+    # Share of compliant runs per sweep point — right-hand axis. A sweep
+    # value that pushes the variant out of compliance shows here even where
+    # the (compliant-only) PWSF line drops out for lack of compliant rows.
+    share = _compliant_share_by_x(parsed)
+    if share is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=share.index.tolist(),
+                y=(share.values * 100).tolist(),
+                mode="lines+markers",
+                name="compliant runs",
+                line=dict(color=_VARIANT_COLOR["oracle"], width=2.0, dash="dot"),
+                marker=dict(
+                    size=8,
+                    color=_VARIANT_COLOR["oracle"],
+                    symbol="square",
+                    line=dict(color="white", width=1),
+                ),
+                hovertemplate=(
+                    f"{sweep_param}: %{{x}}<br>compliant runs: %{{y:.0f}}%"
+                    "<extra></extra>"
+                ),
+            ),
+            secondary_y=True,
+        )
+        fig.update_yaxes(
+            title="compliant runs (%)",
+            range=[0, 105],
+            color=_VARIANT_COLOR["oracle"],
+            secondary_y=True,
+            showgrid=False,
+            ticksuffix="%",
+            tickfont=dict(size=_TICK_FONT_SIZE),
+            title_font=dict(size=_AXIS_TITLE_FONT_SIZE),
+        )
+
     rate = _compliance_rate(parsed)
     if rate is not None:
         n_c_total = int(_compliant_mask(parsed).sum())
@@ -951,10 +999,11 @@ def robustness_curve(
     fig.update_yaxes(
         title="priority-weighted served fraction (compliant)",
         range=[0, 1.05],
+        color=_VARIANT_COLOR["scare"],
+        secondary_y=False,
         tickformat=".2f",
     )
     fig.update_xaxes(title=x_label)
-    fig.update_layout(showlegend=False)
     return _save(_apply_theme(fig, title=title), out_path)
 
 
@@ -1085,6 +1134,29 @@ def sweep_curve_dual(
         ),
         secondary_y=False,
     )
+
+    # Share of compliant runs per sweep point — shares the left (fraction)
+    # axis with the served line, since the right axis already carries
+    # wallclock.
+    share = _compliant_share_by_x(parsed)
+    if share is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=share.index.tolist(),
+                y=share.values.tolist(),
+                mode="lines+markers",
+                name="compliant share",
+                line=dict(color=_VARIANT_COLOR["oracle"], width=2.0, dash="dot"),
+                marker=dict(
+                    size=8,
+                    color=_VARIANT_COLOR["oracle"],
+                    symbol="diamond",
+                    line=dict(color="white", width=1),
+                ),
+                hovertemplate=f"{sweep_param}: %{{x}}<br>compliant share: %{{y:.0%}}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
 
     if "duration_s" in parsed.columns:
         wall = parsed.groupby("x")["duration_s"].mean().sort_index()

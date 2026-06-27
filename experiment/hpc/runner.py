@@ -303,8 +303,8 @@ async def _run_simulation(
         raise SystemExit(f"Unknown grid {task.grid!r}; available: {sorted(GRIDS)}")
 
     # Cap each MISOCP under the task budget so asyncio.wait_for can preempt at
-    # the next await (it can't interrupt a sync solve). Floor 30s, cap 60s.
-    per_solve_cap = max(30.0, min(plan.task_timeout_s / 4.0, 60.0))
+    # the next await (it can't interrupt a sync solve). Floor 30s, cap 300s.
+    per_solve_cap = max(30.0, min(plan.task_timeout_s / 4.0, 300.0))
     install_solver_time_limit(per_solve_cap)
 
     factory = GRIDS[task.grid]
@@ -567,7 +567,7 @@ def _config_from_task(task: TaskSpec):
     return replace(base, **clean)
 
 
-_BASELINE_SOLVE_CAP_S = 60.0
+_BASELINE_SOLVE_CAP_S = 300.0
 
 
 def _compute_baseline(task: TaskSpec, logger: logging.Logger) -> dict[str, Any] | None:

@@ -485,10 +485,19 @@ def compute_baseline_served(
         slack_budget_pct = scenario.get("slack_budget_pct")
         if slack_budget_pct is not None:
             apply_slack_budget(fresh, float(slack_budget_pct))
-    # Keep backup tie-lines on the baseline LP, as the post-failure oracle and
-    # SCARE do, so all three measure the same problem. The McCormick-DHS
-    # linearisation in ``run_oracle`` keeps the binary ``on_off`` term linear, so
-    # the backup branches need no flag-stripping.
+    # No-failure baseline: the backup tie-lines are normally-open and there is
+    # nothing to reroute around, so fix them open for THIS solve and clear the
+    # ``backup`` flag so ``controllable_backup_lines`` does not promote ``on_off``
+    # to a binary. Keeping them controllable turned the reconfig baseline into a
+    # 15-integer nonconvex MIQCQP that gurobi could not find a feasible point for
+    # within the per-solve cap (baseline_available=False for every reconfig run);
+    # the radial pre-failure operating point — tie-lines open — is also the
+    # physically correct reference. The post-failure oracle and SCARE keep them.
+    for branch in fresh.branches:
+        if getattr(branch.model, "backup", False):
+            branch.model.backup = False
+            if hasattr(branch.model, "on_off"):
+                branch.model.on_off = 0
     out = run_oracle(fresh, [], solver=solver, priorities=priorities)
     served = out["served"]
     _BASELINE_CACHE[cache_key] = copy.deepcopy(served)
