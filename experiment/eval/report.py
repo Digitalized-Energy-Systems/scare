@@ -148,14 +148,40 @@ def _restoration_time(campaign: CampaignData, out_dir: Path) -> list[str]:
     ]
 
 
-def _ablation(campaign: CampaignData, out_dir: Path) -> list[str]:
-    sub = campaign.by_experiment("ablation")
-    if sub.empty:
-        return []
-    sub = sub[sub["status"] == "ok"]
-    return [
-        str(plots.ablation_impact_bar(sub, out_dir / "ablation_impact.png")),
-    ]
+def _ablation_experiments(campaign: CampaignData) -> list[str]:
+    """Every experiment whose name marks it as an ablation matrix. The
+    eval_full campaign splits the matrix by theme (``ablation_core``,
+    ``ablation_voltage``, …) rather than a single ``ablation`` experiment."""
+    return [e for e in campaign.experiments() if e == "ablation" or e.startswith("ablation_")]
+
+
+def _ablation(
+    campaign: CampaignData,
+    plots_root: Path,
+) -> list[tuple[str, list[str]]]:
+    """One ablation-impact bar per ablation experiment, each in its own
+    ``plots/<experiment>/`` folder. Compares the per-flag PWSF against the
+    in-block ``default`` baseline — the actual ablation matrix, not the
+    one-bar served-by-variant fallback."""
+    out: list[tuple[str, list[str]]] = []
+    for exp_name in _ablation_experiments(campaign):
+        sub = campaign.by_experiment(exp_name)
+        sub = sub[sub["status"] == "ok"]
+        if sub.empty:
+            continue
+        out.append(
+            (
+                f"Ablation impact — {alias_experiment(exp_name)}",
+                [
+                    str(
+                        plots.ablation_impact_bar(
+                            sub, plots_root / exp_name / "ablation_impact.png"
+                        )
+                    )
+                ],
+            )
+        )
+    return out
 
 
 def _robustness(campaign: CampaignData, out_dir: Path) -> list[str]:
@@ -636,7 +662,6 @@ def _missing_experiment_sections(
         "functional_baseline",
         "optimality_gap",
         "variant_comparison",
-        "ablation",
         "robustness_packet_loss",
         "robustness_latency",
         "cascading",
@@ -644,12 +669,13 @@ def _missing_experiment_sections(
         "ttl_sweep",
         "holon_size_sweep",
     }
+    ablation_exps = set(_ablation_experiments(campaign))
     ok = df[df["status"] == "ok"]
     if ok.empty:
         return []
     out: list[tuple[str, list[str]]] = []
     for exp_name in sorted(ok["experiment"].dropna().unique()):
-        if exp_name in handled or not exp_name:
+        if exp_name in handled or exp_name in ablation_exps or not exp_name:
             continue
         sub = ok[ok["experiment"] == exp_name]
         if sub.empty:
@@ -773,7 +799,6 @@ def generate_report(
         ("Optimality gap", _optimality_gap, "optimality_gap"),
         ("Variant comparison", _variant_comparison, "variant_comparison"),
         ("Time to stabilise", _restoration_time, "restoration_time"),
-        ("Ablation impact", _ablation, "ablation"),
         ("Robustness", _robustness, "robustness"),
         ("Cascading", _cascading, "cascading"),
         ("Sensitivity sweeps", _sweeps, "sweeps"),
@@ -791,6 +816,14 @@ def generate_report(
             figs = []
         if figs:
             sections.append((label, figs))
+
+    # Ablation matrices — one impact bar per themed ablation experiment.
+    try:
+        for label, figs in _ablation(campaign, plots_root):
+            if figs:
+                sections.append((label, figs))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ablation section failed: %s — skipping", exc)
 
     # Auto-dispatched per-experiment sections for experiments with data in
     # summary.csv but no dedicated curve.
