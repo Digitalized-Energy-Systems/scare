@@ -38,7 +38,10 @@
       ],
       "n_seeds": 30,
       "variants": [
-        "scare"
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
       ],
       "scenarios": [
         {
@@ -357,7 +360,10 @@
       ],
       "n_seeds": 15,
       "variants": [
-        "scare"
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
       ],
       "ablations": [
         {},
@@ -542,7 +548,10 @@
       ],
       "n_seeds": 15,
       "variants": [
-        "scare"
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
       ],
       "ablations": [
         {},
@@ -692,7 +701,10 @@
       ],
       "n_seeds": 15,
       "variants": [
-        "scare"
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
       ],
       "scenarios": [
         {
