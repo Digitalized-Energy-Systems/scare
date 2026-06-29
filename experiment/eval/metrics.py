@@ -13,10 +13,15 @@ from typing import Any
 
 import networkx as nx
 from mango.simulation.world import WorldRecording
-from monee.model.child import ExtPowerGrid, HeatLoad, PowerLoad
+from monee.model.child import ExtPowerGrid, HeatLoad, PowerLoad, Sink
 from monee.solver.core import find_ignored_nodes
 
-from scare.base.model import DEENERGISED_PRESSURE_PU, SECTOR_CONSTRAINTS, Sector
+from scare.base.model import (
+    DEENERGISED_PRESSURE_PU,
+    DEENERGISED_VM_PU,
+    SECTOR_CONSTRAINTS,
+    Sector,
+)
 from scare.base.util import (
     constraint_allowed_fraction,
     constraint_utilization,
@@ -226,6 +231,24 @@ def _line_feasibility_factor(monee_net: Any) -> dict[Any, float]:
     return factor
 
 
+def _is_gas_consumer_sink(child: Any, monee_net: Any) -> bool:
+    """True when ``child`` is a ``Sink`` on a gas grid — a real terminal gas
+    consumer with shedable demand.
+
+    Mirror/inverse of ``scenario.restoration._is_heat_side_mass_flow_sink``:
+    water/heat-side Sinks close monee's supply-return loop (topology artifact,
+    excluded), but gas-sector Sinks are genuine consumption and must be counted
+    as served load. ``obs_capacity`` reads their ``mass_flow_kgs`` rating.
+    """
+    if not isinstance(child.model, Sink):
+        return False
+    try:
+        grid_name = str(getattr(monee_net.node_by_id(child.node_id).grid, "name", "")).lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return "gas" in grid_name
+
+
 def served_by_load(
     monee_net: Any,
     behavior: Any,
@@ -250,12 +273,18 @@ def served_by_load(
         for sec in Sector
     }
 
+    # PowerLoad / HeatLoad are the electricity / heat consumers; gas consumers
+    # are Sink children on a gas grid (heat-side return Sinks are excluded —
+    # see ``_is_gas_consumer_sink``).
     _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
     line_factor = _line_feasibility_factor(monee_net)
 
     rows: list[dict[str, Any]] = []
     for child in monee_net.childs:
-        if not isinstance(child.model, _LOAD_CLASSES):
+        if not (
+            isinstance(child.model, _LOAD_CLASSES)
+            or _is_gas_consumer_sink(child, monee_net)
+        ):
             continue
         aid = f"child-{child.id}"
         obs = behavior.observe(aid) or {}
@@ -341,6 +370,7 @@ def served_breakdown(
     by_tier_sector: dict[str, dict[int, dict[str, float]]] = {}
     by_sector: dict[str, dict[str, float]] = {}
     by_tier: dict[int, dict[str, float]] = {}
+    pw_by_sector: dict[str, dict[str, float]] = {}
     n_loads = 0
     n_zero = 0
     pw_demand = 0.0
@@ -348,13 +378,18 @@ def served_breakdown(
 
     disconnected = _disconnected_node_ids(monee_net)
     line_factor = _line_feasibility_factor(monee_net)
-    # Restrict to consumer loads. Sink (HE return side) and ExtHydrGrid /
-    # ExtPowerGrid (slack injectors) carry mass-flow / p_mw fields that
-    # ``obs_capacity`` would otherwise pick up, inflating served past demand.
+    # Restrict to consumer loads: PowerLoad / HeatLoad (electricity / heat) plus
+    # gas-grid Sinks (real gas consumers, see ``_is_gas_consumer_sink``). The
+    # heat-side return Sink and ExtHydrGrid / ExtPowerGrid (slack injectors)
+    # carry mass-flow / p_mw fields that ``obs_capacity`` would otherwise pick
+    # up, inflating served past demand — they stay excluded.
     _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
 
     for child in monee_net.childs:
-        if not isinstance(child.model, _LOAD_CLASSES):
+        if not (
+            isinstance(child.model, _LOAD_CLASSES)
+            or _is_gas_consumer_sink(child, monee_net)
+        ):
             continue
         aid = f"child-{child.id}"
         obs = behavior.observe(aid) or {}
@@ -426,8 +461,15 @@ def served_breakdown(
         by_tier_sector[sec_key][tier]["served"] += served
         by_tier_sector[sec_key][tier]["demand_disconnected"] += demand_disc
 
-        pw_demand += w * demand
-        pw_served += w * served
+        pw_by_sector.setdefault(sec_key, {"demand": 0.0, "served": 0.0})
+        pw_by_sector[sec_key]["demand"] += w * demand
+        pw_by_sector[sec_key]["served"] += w * served
+        # Cross-sector aggregate stays in MW (electricity + heat). Gas demand is
+        # mass-flow (kg/s), so it is reported per-sector only and never summed
+        # into the mixed-unit aggregate scalar.
+        if sec is not Sector.GAS:
+            pw_demand += w * demand
+            pw_served += w * served
         if served < 1e-9 and demand > 1e-9:
             n_zero += 1
 
@@ -449,9 +491,21 @@ def served_breakdown(
         "by_tier_sector": by_tier_sector,
         "by_sector": by_sector,
         "by_tier": by_tier,
+        # Aggregate PWSF: electricity + heat (MW), gas excluded (kg/s units).
         "priority_weighted_demand": pw_demand,
         "priority_weighted_served": pw_served,
         "priority_weighted_fraction": (pw_served / pw_demand if pw_demand > 0 else 1.0),
+        # Per-sector PWSF — the unit-safe way to read gas; no cross-sector mixing.
+        "priority_weighted_demand_by_sector": {
+            s: v["demand"] for s, v in pw_by_sector.items()
+        },
+        "priority_weighted_served_by_sector": {
+            s: v["served"] for s, v in pw_by_sector.items()
+        },
+        "priority_weighted_fraction_by_sector": {
+            s: (v["served"] / v["demand"] if v["demand"] > 0 else 1.0)
+            for s, v in pw_by_sector.items()
+        },
         "n_loads": n_loads,
         "n_loads_served_zero": n_zero,
     }
@@ -500,9 +554,18 @@ def restoration_breakdown(
 
     sector_baseline = baseline.get("by_sector", {})
     sector_post = post.get("by_sector", {})
-    total_demand = sum(s.get("demand", 0.0) for s in sector_baseline.values())
-    total_served_baseline = sum(s.get("served", 0.0) for s in sector_baseline.values())
-    total_served_post = sum(s.get("served", 0.0) for s in sector_post.values())
+    # Raw MW totals sum electricity + heat only; gas (by_sector) is mass-flow
+    # (kg/s) and is reported per-sector (ratio) rather than added to MW totals.
+    _mw_sectors = (Sector.ELECTRICITY.value, Sector.HEAT.value)
+    total_demand = sum(
+        s.get("demand", 0.0) for k, s in sector_baseline.items() if k in _mw_sectors
+    )
+    total_served_baseline = sum(
+        s.get("served", 0.0) for k, s in sector_baseline.items() if k in _mw_sectors
+    )
+    total_served_post = sum(
+        s.get("served", 0.0) for k, s in sector_post.items() if k in _mw_sectors
+    )
 
     by_tier_b = baseline.get("by_tier", {})
     by_tier_p = post.get("by_tier", {})
@@ -782,12 +845,15 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
                 continue
             # Solver-unpopulated / de-energised junctions are not real breaches
             # (the live monitor skips them the same way): an isolated heat
-            # junction reports t_k~0, and a gas region cut off from its
-            # ExtHydrGrid collapses to pressure_pu~0. See DEENERGISED_PRESSURE_PU
-            # for why a small floor (not 0) is needed and why genuine
-            # under-pressure still gates.
-            if (var == "t_k" and val <= 0.0) or (
-                var == "pressure_pu" and val <= DEENERGISED_PRESSURE_PU
+            # junction reports t_k~0, a gas region cut off from its ExtHydrGrid
+            # collapses to pressure_pu~0, and an electricity node cut off from
+            # its slack collapses to vm_pu~0. See DEENERGISED_* for why a small
+            # floor (not 0) is needed and why genuine under-bound readings still
+            # gate.
+            if (
+                (var == "t_k" and val <= 0.0)
+                or (var == "pressure_pu" and val <= DEENERGISED_PRESSURE_PU)
+                or (var == "vm_pu" and val <= DEENERGISED_VM_PU)
             ):
                 continue
             rows.append(_violation_row("node", node.id, sec, var, val, lo, hi))

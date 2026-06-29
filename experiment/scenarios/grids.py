@@ -8,7 +8,7 @@ from statistics import median
 import monee.express as mx
 import simbench
 from monee.io.from_pandapower import from_pandapower_net
-from monee.model.formulation import EL_MISOCP_FORMULATION
+from monee.model.formulation import EL_MISOCP_FORMULATION,GAS_NONCONVEX_MIQCQP_FORMULATION
 from monee.model.grid import STANDARD_ATMOSPHERE_PA
 from monee.network import generate_supply_return_mes_based_on_power_net
 
@@ -82,6 +82,7 @@ def create_large_lv_simbench(
             gas_kwargs=_GAS_KWARGS,
         )
         mes.apply_formulation(EL_MISOCP_FORMULATION)
+        mes.apply_formulation(GAS_NONCONVEX_MIQCQP_FORMULATION)
 
         if backup_lines_per_sector > 0:
             add_backup_lines(

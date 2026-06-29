@@ -13,6 +13,7 @@ from mango.express.topology import topology_neighbors
 
 from scare.base.model import (
     DEENERGISED_PRESSURE_PU,
+    DEENERGISED_VM_PU,
     PROACTIVE_WARNING_FRACTION,
     SECTOR_CONSTRAINTS,
     SECTOR_TIMESCALE,
@@ -499,15 +500,17 @@ class GridConstraintMonitor(Role):
         for var, val in values.items():
             # Skip readings the solver hasn't populated or that signal a
             # de-energised junction: isolated heat nodes report t_k=0 / NaN
-            # post-failure, and a gas region cut off from its source collapses
-            # to pressure_pu~0 (see DEENERGISED_PRESSURE_PU). Neither is an
-            # actionable breach (no curtailment lever re-pressurises a
-            # source-isolated region); genuine under-pressure is well above the
-            # floor, so it still fires.
+            # post-failure, a gas region cut off from its source collapses to
+            # pressure_pu~0, and an electricity node cut off from its slack
+            # collapses to vm_pu~0 (see DEENERGISED_*). None is an actionable
+            # breach (no curtailment lever re-energises a source-isolated
+            # region); genuine under-bound readings are well above the floor, so
+            # they still fire.
             if (
                 not math.isfinite(val)
                 or (var == "t_k" and val <= 0.0)
                 or (var == "pressure_pu" and val <= DEENERGISED_PRESSURE_PU)
+                or (var == "vm_pu" and val <= DEENERGISED_VM_PU)
             ):
                 continue
 

@@ -631,7 +631,15 @@ class HolonicCommunityRole(Role):
         Fired periodically and reactively; throttled by ``rebalance_min_gap_s``.
         """
         now = self.context.current_timestamp
-        if (now - self._last_rebalance_t) < self.rebalance_min_gap_s:
+        # Throttle bypassed under the change-only cascade: the upward change-
+        # detection (not this time fuse) bounds the holon→member→finished→holon
+        # loop, and the _maybe_schedule_rebalance deferred-retry path is skipped
+        # when the flag is on, so throttling here would silently drop a within-
+        # gap reactive trigger until the slow watchdog.
+        if (
+            not self.enable_change_only_dispatch
+            and (now - self._last_rebalance_t) < self.rebalance_min_gap_s
+        ):
             return
         if self._rebalance_active:
             logger.debug("[%s] rebalance skipped: active", self.context.aid)

@@ -220,6 +220,21 @@ class RestorationConfiguration:
     # staying on the cheap timer when the grid is quiet.  None/0 = disabled.
     energy_flow_max_acts: int | None = 8
 
+    # End-of-sim settle tail. The final flush_energy_flow() before metrics are
+    # written reveals the true converged power-flow, which can differ from the
+    # last (cooldown-/act-throttled) solve the controllers observed — so the
+    # constraints_final snapshot may record an over-voltage the droop/auction
+    # never reacted to (the reproduced end-of-sim observation desync). When ON,
+    # after the main run we alternate flush + a short discrete-step chunk up to
+    # ``end_of_sim_settle_max_rounds`` times so controllers act on the revealed
+    # state before the snapshot, breaking early once a flush leaves nothing
+    # dirty. Default OFF: it shifts the final state of EVERY task/sector, so it
+    # must be A/B-validated with the deterministic n=40 aggregate methodology
+    # (see ``project_pv_overvoltage_levers``) before becoming default.
+    enable_end_of_sim_settle: bool = False
+    end_of_sim_settle_max_rounds: int = 3
+    end_of_sim_settle_chunk_s: float = 2.0
+
     # Cold-load pickup ramp limit on regulation increases. False: factor jumps
     # not throttled.
     enable_clpu_ramp: bool = True

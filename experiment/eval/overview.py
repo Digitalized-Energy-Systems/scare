@@ -241,6 +241,7 @@ def _top_level_sections(plots_root: Path) -> list[tuple[str, list[Path]]]:
             "Variant comparison",
             [
                 p / "variant_comparison" / "served_by_variant.html",
+                p / "variant_comparison" / "pwsf_by_sector.html",
                 p / "restoration_time" / "time_to_stabilise.html",
                 p / "variant_comparison" / "regulates_by_reason.html",
                 p / "variant_comparison" / "diary_outcomes.html",

@@ -113,6 +113,14 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
                 title="Priority-weighted served by variant",
             )
         ),
+        # Per-sector breakdown of the headline PWSF (gas is excluded from the
+        # aggregate above as it is in mass-flow units; here it shows per sector).
+        str(
+            plots.pwsf_by_sector_bar(
+                sub,
+                out_dir / "pwsf_by_sector.png",
+            )
+        ),
         # Regulate trigger mix per variant — which control layer fires.
         str(
             plots.regulates_by_reason_bar(

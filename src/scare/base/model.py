@@ -60,6 +60,15 @@ DEENERGISED_PRESSURE_PU: float = 0.1
 # only the saturated value is dropped and real over-pressure still gates.
 DEENERGISED_PRESSURE_HIGH_PU: float = 1.70
 
+# Voltage companion to DEENERGISED_PRESSURE_PU. An electricity node that loses
+# its path to a grid-forming source but stays graph-connected (so neither
+# monee's ``find_ignored_nodes`` nor ours excludes it) collapses to vm_pu~0
+# rather than a physical under-voltage. Empirically de-energised nodes read
+# exactly 0.0; the lowest genuinely-served junction stays well above the 0.95
+# floor, so a 0.5 threshold drops only the collapsed reading while real
+# under-voltage (e.g. 0.9 vs the 0.95 floor) still gates.
+DEENERGISED_VM_PU: float = 0.5
+
 # Fraction of feasible range at which an agent warns neighbours it nears a limit.
 PROACTIVE_WARNING_FRACTION: float = 0.85
 

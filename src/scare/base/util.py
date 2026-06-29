@@ -792,7 +792,12 @@ def apply_regulate(
                     factor,
                     constraint_allowed_fraction(_obs, _sector, tier=int(priority_tier)),
                 )
-            _l2_floor_store(behavior)[aid] = factor
+            # Load-side construct only (tier >= 1). A generator dispatch (e.g.
+            # the R3 ramp, which passes priority_tier=None) must NOT leave a
+            # floor: a generator-keyed floor is clamped UP by the L1 consumer,
+            # pinning generation high and blocking back-down in reduction rounds.
+            if priority_tier is not None and int(priority_tier) >= 1:
+                _l2_floor_store(behavior)[aid] = factor
         elif (
             reason in L1_REACTIVE_SHED_REASONS
             and priority_tier is not None

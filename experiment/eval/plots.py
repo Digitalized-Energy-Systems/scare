@@ -659,6 +659,73 @@ def variant_comparison_bar(
     )
 
 
+def pwsf_by_sector_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    col_prefix: str = "outcomes__priority_weighted_fraction_by_sector__",
+    title: str = "Per-sector PWSF by variant (compliant runs)",
+) -> Path:
+    """Stacked per-sector PWSF: one bar per variant, a segment per sector.
+
+    Companion to the aggregate ``variant_comparison_bar`` (the single headline
+    electricity+heat PWSF). This breaks the metric out by sector so gas — kept
+    in its own mass-flow units and excluded from the aggregate — is visible.
+    The segments are INDEPENDENT fractions in [0, 1] (no cross-sector unit
+    mixing): the stack is a visual decomposition, NOT an additive total, so the
+    y-axis can exceed 1 and each segment is read on its own.
+    """
+    sectors = [
+        s for s in ("electricity", "gas", "heat") if f"{col_prefix}{s}" in df.columns
+    ]
+    if df.empty or not sectors or "variant" not in df.columns:
+        return _save(_empty_fig("no per-sector PWSF data", title), out_path)
+
+    compliant = df[_compliant_mask(df)]
+    variants = sorted(compliant["variant"].dropna().unique())
+    if not variants:
+        return _save(_empty_fig("no compliant runs", title), out_path)
+
+    fig = go.Figure()
+    for sec in sectors:
+        col = f"{col_prefix}{sec}"
+        means: list[float] = []
+        hover: list[str] = []
+        for v in variants:
+            vals = compliant.loc[compliant["variant"] == v, col].dropna().tolist()
+            m, ci = _mean_ci(vals)
+            means.append(m)
+            hover.append(
+                f"<b>{sec}</b><br>variant: {alias_variant(v)}<br>"
+                f"mean PWSF: {m:.4f}<br>95% CI: ±{ci:.4f}<br>n={len(vals)}"
+            )
+        fig.add_trace(
+            go.Bar(
+                name=sec,
+                x=[alias_variant(v) for v in variants],
+                y=means,
+                marker=_bar_marker(
+                    _SECTOR_COLOR.get(sec, "#888888"),
+                    pattern_shape=_SECTOR_PATTERN.get(sec, ""),
+                ),
+                hovertemplate="%{customdata}<extra></extra>",
+                customdata=hover,
+            )
+        )
+    fig.update_layout(barmode="stack", bargap=0.35)
+    fig.update_xaxes(title="variant")
+    fig.update_yaxes(
+        title="per-sector PWSF (segments independent, not additive)",
+        tickformat=".2f",
+    )
+    return _save(
+        _apply_theme(
+            fig, title=title, height=380, width=_BAR_FIG_WIDTH, legend_top=True
+        ),
+        out_path,
+    )
+
+
 # Optimality gap (Pillar 2)
 
 

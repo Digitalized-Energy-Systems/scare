@@ -32,6 +32,7 @@ from experiment.eval.metrics import (
     served_by_load,
 )
 from experiment.eval.results import (
+    write_constraints_final_csv,
     write_served_by_load_csv,
     write_served_csv,
 )
@@ -543,6 +544,12 @@ def compose_oracle_result(
             behavior,
             priorities=priorities,
         )
+        # Per-node constraint readings off the oracle's solved net, so the
+        # voltage/pressure comparison vs SCARE is non-vacuous (oracle tasks
+        # previously emitted no constraints_final.csv).
+        write_constraints_final_csv(
+            Path(out_dir) / "constraints_final.csv", solved_net
+        )
 
     # Oracle-relative heat-priority diagnostic (non-gating). Computed in-memory
     # off ``load_rows`` so the oracle carries the same claim key the MAS variants
@@ -573,8 +580,17 @@ def compose_oracle_result(
         "detail": {
             "n_checked": constraints_final.get("n_checked", 0),
             "n_violations": constraints_final.get("n_violations", 0),
+            "n_nongating_violations": constraints_final.get(
+                "n_nongating_violations", 0
+            ),
             "by_sector": constraints_final.get("by_sector", {}),
+            # Per-variable breakdown so the oracle populates the same
+            # by_variable__{voltage,pressure,...} summary columns SCARE does —
+            # without it the per-variable comparison (e.g. voltage n_checked) is
+            # vacuously 0 for every oracle task.
+            "by_variable": constraints_final.get("by_variable", {}),
             "violations": constraints_final.get("violations", []),
+            "nongating_violations": constraints_final.get("nongating_violations", []),
             "enforced_at_lp": True,
         },
     }
@@ -588,6 +604,9 @@ def compose_oracle_result(
             "priority_weighted_demand": served["priority_weighted_demand"],
             "priority_weighted_served": served["priority_weighted_served"],
             "priority_weighted_fraction": served["priority_weighted_fraction"],
+            "priority_weighted_fraction_by_sector": served.get(
+                "priority_weighted_fraction_by_sector", {}
+            ),
             "served_by_sector": served["by_sector"],
             "served_by_tier": served["by_tier"],
             "served_by_tier_sector": served["by_tier_sector"],

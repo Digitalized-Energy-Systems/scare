@@ -133,6 +133,26 @@ def test_stale_reports_dropped():
     assert not beh.acted  # only the fresh in-band 1.00 counts -> no raise
 
 
+def test_sqrt3_phantom_overpressure_ignored():
+    # A zero-flow / P2G junction can saturate monee's relaxed-Weymouth
+    # pressure_squared_pu box, reading pressure_pu ~ sqrt(3) ~ 1.732. The
+    # regulator must treat it as a de-energised artifact (like the ~0 collapse)
+    # and NOT chase it down — otherwise it walks the whole profile to the floor.
+    reg, beh = _make(own_p=1.00, reports={"p2g": 3.0**0.5, "n2": 0.95})
+    _run(reg)
+    # Energised profile = {1.00, 0.95}: in band -> no over-pressure walk-down.
+    assert not beh.acted
+
+
+def test_real_overpressure_below_artifact_still_acts():
+    # A genuine over-pressure (1.60 < the sqrt(3) artifact threshold) must still
+    # be acted on — the artifact guard only drops the saturated ~1.732 reading.
+    reg, beh = _make(own_p=1.20, reports={"n1": 1.60})
+    _run(reg)
+    sp = lookup_slack_pressure(beh, reg.context.aid)
+    assert sp is not None and sp < 1.20  # lowered toward band
+
+
 def test_overpressure_trap_not_blamed_on_shedding():
     # Spread exceeds band on the HIGH side: p_max=1.30>HI with p_min already at
     # LO. The saturated event must NOT claim shedding clears it.

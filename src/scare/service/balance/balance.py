@@ -1683,6 +1683,9 @@ class EnergyBalanceNegotiator(Role):
         # holon's priority decision the scalar would collapse.
         per_tier = getattr(message, "override_targets_by_sector_priority", None)
         if per_tier:
+            # A different L2 route drifts loads away from the last service
+            # fraction; invalidate so the unchanged-guard can't later match it.
+            self._last_dispatched_service_fraction = None
             self._yield_to_l2_authority("per_tier")
             self._active = True
             self.context.schedule_instant_task(
@@ -1693,6 +1696,7 @@ class EnergyBalanceNegotiator(Role):
         if override is not None and math.isfinite(override):
             # L2 ADMM computed this leader's share: skip the ask-energy round
             # and use it directly as the gossip target.
+            self._last_dispatched_service_fraction = None
             self._yield_to_l2_authority("override_target")
             self._active = True
             self.context.schedule_instant_task(self._start_gossip(float(override)))
@@ -1710,6 +1714,10 @@ class EnergyBalanceNegotiator(Role):
         # Record what we actually dispatch so an identical later allocation can
         # take the floor-refresh-only path (no gossip preemption).
         self._last_dispatched_service_fraction = service_fraction
+        # This dispatch may move our own setpoint out-of-band, so invalidate the
+        # upward-notify baseline: the next gossip finish must re-report rather
+        # than be suppressed for re-converging to a now-stale notified value.
+        self._last_notified_setpoint = None
         try:
             members = [self.context.aid]
             for neigh in self._live_neighbours():
@@ -2170,6 +2178,8 @@ class EnergyBalanceNegotiator(Role):
             timestamp=self.context.current_timestamp,
         )
         if applied:
+            # Out-of-band self actuation — invalidate the upward-notify baseline.
+            self._last_notified_setpoint = None
             logger.info(
                 "[%s] self local-gen: ramped to %.1f%% (deficit=%.4f)",
                 self.context.aid,

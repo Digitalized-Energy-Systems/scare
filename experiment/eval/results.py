@@ -96,6 +96,9 @@ def compose_result(
             "priority_weighted_demand": served["priority_weighted_demand"],
             "priority_weighted_served": served["priority_weighted_served"],
             "priority_weighted_fraction": served["priority_weighted_fraction"],
+            "priority_weighted_fraction_by_sector": served.get(
+                "priority_weighted_fraction_by_sector", {}
+            ),
             "served_by_sector": served["by_sector"],
             "served_by_tier": served["by_tier"],
             "served_by_tier_sector": served["by_tier_sector"],

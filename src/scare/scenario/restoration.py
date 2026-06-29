@@ -436,10 +436,43 @@ async def start_restoration_simulation(
         _watchdog = asyncio.ensure_future(sim_stall_watchdog(world, interval_s=10.0))
         try:
             await discrete_step_until(world, max_advance_time_s=simulation_duration_s)
+            await _settle_end_of_sim(world)
         finally:
             _watchdog.cancel()
         # Flush in-flight gossip while role.context is still valid.
         _flush_pending_negotiations(world)
+
+
+async def _settle_end_of_sim(world: SimulationWorld) -> None:
+    """Let controllers react to the true post-flush power-flow before the
+    end-of-sim snapshot.
+
+    The final ``flush_energy_flow()`` (in the runner) reveals the converged
+    voltages/pressures, which may differ from the throttled solve the
+    controllers last observed — leaving the constraints snapshot recording an
+    excursion no agent reacted to (the end-of-sim observation desync). This
+    alternates an immediate flush with a short discrete-step chunk so the
+    controllers observe the revealed state and act, breaking early once a flush
+    leaves the env clean (no pending acts to re-solve). Gated OFF by default —
+    it perturbs every task's final state and needs aggregate validation.
+    """
+    behavior: RestorationEnvironmentBehavior = world.environment.behavior
+    config = getattr(behavior, "_scare_config", None)
+    if config is None or not getattr(config, "enable_end_of_sim_settle", False):
+        return
+    rounds = int(getattr(config, "end_of_sim_settle_max_rounds", 3))
+    chunk_s = float(getattr(config, "end_of_sim_settle_chunk_s", 2.0))
+    flush = getattr(behavior, "flush_energy_flow", None)
+    if flush is None or rounds <= 0 or chunk_s <= 0:
+        return
+    for _ in range(rounds):
+        flush()  # reveal the true converged state to observers
+        horizon = world.clock.time + chunk_s
+        await discrete_step_until(world, max_advance_time_s=horizon)
+        # A clean env after the chunk means controllers issued no new setpoint
+        # changes — already converged, no point iterating further.
+        if not getattr(behavior, "_dirty", False):
+            break
 
 
 def _flush_pending_negotiations(world: SimulationWorld) -> None:

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 
 from scare.base.model import (
+    DEENERGISED_PRESSURE_HIGH_PU,
     DEENERGISED_PRESSURE_PU,
     SECTOR_CONSTRAINTS,
     SECTOR_TIMESCALE,
@@ -128,18 +129,30 @@ class GasPressureRegulator(Role):
             return None
         return obs or None
 
+    @staticmethod
+    def _is_energised_pressure(val: float) -> bool:
+        """True for a physically meaningful junction pressure. Excludes BOTH
+        de-energised artifacts: a source-isolated region collapses to ~0, and a
+        zero-flow / P2G junction can saturate monee's relaxed-Weymouth
+        ``pressure_squared_pu`` box at its upper bound, reading pressure_pu~sqrt(3).
+        Acting on the high artifact made the regulator chase a phantom
+        over-pressure and walk the whole profile down to the floor. The
+        scan/monitor drop both the same way — see DEENERGISED_PRESSURE_*."""
+        return DEENERGISED_PRESSURE_PU < val < DEENERGISED_PRESSURE_HIGH_PU
+
     def _fed_pressures(self, own_p: float | None, now: float) -> list[float]:
         """Energised pressures over the fed subtree: fresh mesh reports plus the
-        slack's own node. De-energised (source-isolated) readings are dropped —
-        no setpoint move re-pressurises a region cut off from its source."""
+        slack's own node. De-energised (source-isolated, ~0) and solver-saturated
+        (~sqrt(3)) readings are dropped — no setpoint move re-pressurises a region
+        cut off from its source, and the high artifact is not a real breach."""
         out: list[float] = []
         for val, t in self._reports.values():
-            if (now - t) <= self._freshness_s and val > DEENERGISED_PRESSURE_PU:
+            if (now - t) <= self._freshness_s and self._is_energised_pressure(val):
                 out.append(val)
         if (
             own_p is not None
             and math.isfinite(own_p)
-            and own_p > DEENERGISED_PRESSURE_PU
+            and self._is_energised_pressure(float(own_p))
         ):
             out.append(float(own_p))
         return out
