@@ -45,6 +45,7 @@ from scare.base.util import (
     constraint_allowed_fraction,
     constraint_utilization,
     l2_effective_floor,
+    set_l2_priority_floor,
     lookup_slack,
     lookup_slack_cp_reserve,
     lookup_slack_eff_budget,
@@ -104,6 +105,11 @@ _GOSSIP_TIMEOUT_BASE_S: dict[Sector, float] = {
 }
 _GOSSIP_TIMEOUT_DEFAULT_S = 15.0
 _GOSSIP_TIMEOUT_PER_AGENT_S = 0.5
+
+# Coordination overhaul: a converged setpoint within this of the last upward-
+# notified value counts as "unchanged" — the L1→L2/L3 notification is skipped so
+# the holon ADMM is not re-triggered for a no-op finish.
+_UPWARD_NOTIFY_TOL = 1e-3
 
 # Poll periods of silence before a peer counts as dead.
 _HEARTBEAT_MAX_AGE_MULTIPLE: float = 8.0
@@ -249,6 +255,8 @@ class EnergyBalanceNegotiator(Role):
         max_hops: int = _MAX_HOPS,
         step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
         enable_qp_gossip: bool = True,
+        enable_l2_generator_ramp: bool = True,
+        enable_change_only_dispatch: bool = True,
         enable_l2_priority_floor: bool = True,
         enable_actuated_ledger_writeback: bool = True,
         enable_nominal_slack_supply: bool = False,
@@ -280,6 +288,20 @@ class EnergyBalanceNegotiator(Role):
         # Ablation flag: True = primal-dual QP gossip, else equal-share update.
         # Only the per-agent update rule differs.
         self.enable_qp_gossip = enable_qp_gossip
+        # R3: ramp dispatchable DGs in the L2 service-fraction dispatch instead
+        # of shed-only enforcement (see config.enable_l2_generator_ramp).
+        self.enable_l2_generator_ramp = enable_l2_generator_ramp
+        # Coordination overhaul: gate the upward L1→L2/L3 notifications on the
+        # converged setpoint actually moving, so a gossip that re-converges to
+        # the same result does not re-trigger the holon ADMM — the cascade
+        # self-terminates at a fixed point (see config.enable_change_only_dispatch).
+        self.enable_change_only_dispatch = bool(enable_change_only_dispatch)
+        self._last_notified_setpoint: float | None = None
+        # Last service-fraction actually dispatched; an identical incoming
+        # allocation re-asserts the floor without preempting an in-flight gossip.
+        self._last_dispatched_service_fraction: dict[str, dict[int, float]] | None = (
+            None
+        )
         # Fix 2 (opt-in): credit a slack's supply contribution at the nominal
         # operator budget B (abs(cap)) rather than the wound-down eff_budget.
         self.enable_nominal_slack_supply = bool(enable_nominal_slack_supply)
@@ -1288,6 +1310,19 @@ class EnergyBalanceNegotiator(Role):
         )
         delta = self._gossip.current_delta if self._gossip else 0.0
         new_sp = starting_sp + delta
+        # Coordination overhaul: only propagate this finish UPWARD (to the holon
+        # ADMM at L2 and CP at L3, plus the local-leader L2 self-trigger) when
+        # the converged setpoint actually moved since the last notification — a
+        # gossip that re-converges to the same value must not re-trigger the
+        # cascade (this is what lets the time-throttle be removed).
+        prev_notified = self._last_notified_setpoint
+        notify_upward = (
+            not self.enable_change_only_dispatch
+            or prev_notified is None
+            or abs(new_sp - prev_notified) > _UPWARD_NOTIFY_TOL
+        )
+        if notify_upward:
+            self._last_notified_setpoint = new_sp
 
         if self._gossip is not None:
             total_delta = self._gossip_total_delta()
@@ -1350,9 +1385,12 @@ class EnergyBalanceNegotiator(Role):
                         )
                     )
 
-        self.context.emit_event(
-            NegotiationFinishedEvent(new_setpoint=new_sp, sector=self.sector)
-        )
+        # Local event: consumed by this agent's own L2 (_on_member_finished_local)
+        # and L3 (CP channel) — the upward self-trigger. Gate on change.
+        if notify_upward:
+            self.context.emit_event(
+                NegotiationFinishedEvent(new_setpoint=new_sp, sector=self.sector)
+            )
 
         # Broadcast convergence to gossip-capable neighbours so each emits its
         # own local event. ``new_setpoint`` carries the leader's converged sp so
@@ -1363,28 +1401,30 @@ class EnergyBalanceNegotiator(Role):
         for addr in neighbours:
             await self.context.send_message(finished_msg, receiver_addr=addr)
 
-        # L2 reactive trigger: notify holon peers so the holon leader schedules
-        # a holon-level ADMM round to redistribute residual. The priority-aware
+        # Upward L1→L2 / L1→L3 reactive triggers: notify holon peers (so the
+        # holon ADMM redistributes residual) and CP connectors. Gated on change
+        # so a no-op finish does not re-trigger the cascade. The priority-aware
         # payload is re-fetched in ``_try_rebalance``.
-        try:
-            holon_peers = topology_neighbors(self, tid="holons")
-        except KeyError:
-            holon_peers = []
-        for addr in holon_peers:
-            await self.context.send_message(finished_msg, receiver_addr=addr)
-
-        # Leader also notifies CP connectors
-        if topology_characteristic(self, tid="groups") == "leader":
-            cp_connectors = list(topology_connectors(self, tid="groups"))
-            if cp_connectors:
-                logger.info(
-                    "[%s] gossip finished: notifying %d CP connectors (new_sp=%.4f)",
-                    self.context.aid,
-                    len(cp_connectors),
-                    new_sp,
-                )
-            for addr in cp_connectors:
+        if notify_upward:
+            try:
+                holon_peers = topology_neighbors(self, tid="holons")
+            except KeyError:
+                holon_peers = []
+            for addr in holon_peers:
                 await self.context.send_message(finished_msg, receiver_addr=addr)
+
+            # Leader also notifies CP connectors
+            if topology_characteristic(self, tid="groups") == "leader":
+                cp_connectors = list(topology_connectors(self, tid="groups"))
+                if cp_connectors:
+                    logger.info(
+                        "[%s] gossip finished: notifying %d CP connectors (new_sp=%.4f)",
+                        self.context.aid,
+                        len(cp_connectors),
+                        new_sp,
+                    )
+                for addr in cp_connectors:
+                    await self.context.send_message(finished_msg, receiver_addr=addr)
 
         self._gossip = None
         self._active = False
@@ -1618,6 +1658,21 @@ class EnergyBalanceNegotiator(Role):
         # fractions applied per local-load-tier.
         service_frac = getattr(message, "service_fraction_by_sector_priority", None)
         if service_frac:
+            # Coordination overhaul: when the allocation is UNCHANGED and a
+            # gossip this agent originated is in flight, re-assert the per-load
+            # priority floor but do NOT abandon the gossip — let it converge.
+            # This cuts the dominant "yielding to L2" abandonment without staling
+            # the floor (every current member, incl. newly-relevant loads, is
+            # re-floored). Safe under the upward change-detection: any real
+            # change moves a setpoint → triggers a fresh, changed dispatch.
+            if (
+                self.enable_change_only_dispatch
+                and self._gossip is not None
+                and self._gossip.is_originator
+                and self._service_fraction_unchanged(service_frac)
+            ):
+                self._refresh_l2_floor(service_frac)
+                return
             self._yield_to_l2_authority("service_fraction")
             self._active = True
             self.context.schedule_instant_task(
@@ -1652,6 +1707,9 @@ class EnergyBalanceNegotiator(Role):
         ``service_fraction[sector][tier] ∈ [0, 1]`` becomes each matching load's
         regulation factor. Generators untouched; the LP routes freed supply.
         """
+        # Record what we actually dispatch so an identical later allocation can
+        # take the floor-refresh-only path (no gossip preemption).
+        self._last_dispatched_service_fraction = service_fraction
         try:
             members = [self.context.aid]
             for neigh in self._live_neighbours():
@@ -1659,10 +1717,26 @@ class EnergyBalanceNegotiator(Role):
 
             applied = 0
             shed_count = 0
+            served_by_sector: dict[str, float] = {}
+            gen_members: list[tuple[str, Sector, float, float]] = []
             for aid in members:
                 obs = self.behavior.observe(aid) or {}
                 cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
-                if cap <= 0:  # generator-class: leave alone
+                if cap <= 0:  # generator/slack source
+                    # R3: collect dispatchable DGs (cap<0, non-slack) to ramp
+                    # toward the served demand instead of shedding only. Slacks
+                    # are grid-following (no regulation knob) and excluded.
+                    if (
+                        self.enable_l2_generator_ramp
+                        and cap < 0
+                        and lookup_slack(self.behavior, aid) is None
+                    ):
+                        gsec = obs_sector(obs, behavior=self.behavior, aid=aid)
+                        if gsec is not None and gsec is not Sector.HEAT:
+                            gsp = obs_setpoint(
+                                obs, behavior=self.behavior, aid=aid
+                            )
+                            gen_members.append((aid, gsec, cap, gsp))
                     continue
                 sec = obs_sector(obs, behavior=self.behavior, aid=aid)
                 if sec is None:
@@ -1681,6 +1755,9 @@ class EnergyBalanceNegotiator(Role):
                     )
                 if factor < 1.0:
                     shed_count += 1
+                served_by_sector[sec.value] = (
+                    served_by_sector.get(sec.value, 0.0) + factor * cap
+                )
                 apply_regulate(
                     self.behavior,
                     aid,
@@ -1691,6 +1768,14 @@ class EnergyBalanceNegotiator(Role):
                     priority_tier=int(prio),
                 )
                 applied += 1
+
+            # R3: ramp dispatchable DGs toward their sector's served demand so
+            # enforcement realizes the holon-assumed supply rather than shedding
+            # to the un-ramped generation level.
+            if self.enable_l2_generator_ramp and gen_members:
+                applied += self._ramp_member_generators(
+                    gen_members, served_by_sector
+                )
 
             if applied:
                 logger.info(
@@ -1720,6 +1805,101 @@ class EnergyBalanceNegotiator(Role):
                         break
         finally:
             self._active = False
+
+    def _ramp_member_generators(
+        self,
+        gen_members: list[tuple[str, Sector, float, float]],
+        served_by_sector: dict[str, float],
+    ) -> int:
+        """R3: ramp dispatchable DGs toward covering their sector's served
+        demand, distributing the deficit (served demand minus current local
+        generation) across DGs in proportion to headroom. Reuses the
+        ``_try_self_dispatch`` ramp arithmetic; slacks are excluded by the
+        caller. The curtail/ramp interlock and actuator dedup are enforced
+        inside ``apply_regulate``. Returns the number of generators actuated.
+        """
+        by_sector: dict[str, list[tuple[str, float, float]]] = {}
+        for aid, sec, cap, sp in gen_members:
+            by_sector.setdefault(sec.value, []).append((aid, cap, sp))
+
+        ramped = 0
+        for sec_val, gens in by_sector.items():
+            served = served_by_sector.get(sec_val, 0.0)
+            if served <= 0.0:
+                continue
+            # Gap between served load and currently-delivered local generation;
+            # positive ⇒ the shortfall is being imported via the slack/grid, so
+            # ramping local DGs relieves the import (and the constraints it
+            # loads) instead of shedding to the un-ramped level.
+            current_gen = sum(abs(sp) for _, _, sp in gens)
+            deficit = served - current_gen
+            if deficit <= 1e-6:
+                continue
+            headrooms = [
+                (aid, cap, sp, abs(cap) - abs(sp)) for aid, cap, sp in gens
+            ]
+            total_headroom = sum(h for *_, h in headrooms if h > 1e-9)
+            if total_headroom <= 1e-9:
+                continue
+            for aid, cap, sp, headroom in headrooms:
+                if headroom <= 1e-9:
+                    continue
+                share = min(headroom, deficit * (headroom / total_headroom))
+                new_factor = min(1.0, (abs(sp) + share) / abs(cap))
+                if apply_regulate(
+                    self.behavior,
+                    aid,
+                    new_factor,
+                    sector=sec_val,
+                    reason="holon_supply_priority",
+                    timestamp=self.context.current_timestamp,
+                ):
+                    ramped += 1
+        return ramped
+
+    def _service_fraction_unchanged(
+        self, new: dict[str, dict[int, float]]
+    ) -> bool:
+        """True when *new* matches the last dispatched service fraction within
+        ``_UPWARD_NOTIFY_TOL`` (same sectors, same tiers, values within tol)."""
+        prev = self._last_dispatched_service_fraction
+        if prev is None or set(prev) != set(new):
+            return False
+        for sec in new:
+            pt, nt = prev[sec], new[sec]
+            if set(pt) != set(nt):
+                return False
+            if any(abs(pt[t] - nt[t]) > _UPWARD_NOTIFY_TOL for t in nt):
+                return False
+        return True
+
+    def _refresh_l2_floor(self, service_fraction: dict[str, dict[int, float]]) -> None:
+        """Re-assert the per-load L2 priority floor from an UNCHANGED allocation
+        without actuating or preempting an in-flight gossip. Mirrors the floor
+        write in ``_dispatch_service_fractions``/``apply_regulate`` (cap by the
+        local constraint fraction) but writes the floor store directly, so the
+        in-flight gossip keeps running and honours the refreshed floor.
+        """
+        if not self.enable_l2_priority_floor:
+            return
+        members = [self.context.aid]
+        for neigh in self._live_neighbours():
+            members.append(neigh.aid)
+        for aid in members:
+            obs = self.behavior.observe(aid) or {}
+            cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
+            if cap <= 0:  # loads only
+                continue
+            sec = obs_sector(obs, behavior=self.behavior, aid=aid)
+            if sec is None or sec is Sector.HEAT:
+                continue
+            prio = obs_priority(obs, behavior=self.behavior, aid=aid)
+            frac = service_fraction.get(sec.value, {}).get(prio)
+            if frac is None:
+                continue
+            factor = max(0.0, min(1.0, float(frac)))
+            factor = min(factor, constraint_allowed_fraction(obs, sec, tier=prio))
+            set_l2_priority_floor(self.behavior, aid, factor)
 
     async def _dispatch_per_tier_targets(
         self, per_tier: dict[str, dict[int, float]]
@@ -2039,6 +2219,8 @@ def create_energy_balance_role(
     max_hops: int = _MAX_HOPS,
     step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
     enable_qp_gossip: bool = True,
+    enable_l2_generator_ramp: bool = True,
+    enable_change_only_dispatch: bool = True,
     enable_l2_priority_floor: bool = True,
     enable_actuated_ledger_writeback: bool = True,
     enable_nominal_slack_supply: bool = False,
@@ -2057,6 +2239,8 @@ def create_energy_balance_role(
         max_hops=max_hops,
         step_decay_k0=step_decay_k0,
         enable_qp_gossip=enable_qp_gossip,
+        enable_l2_generator_ramp=enable_l2_generator_ramp,
+        enable_change_only_dispatch=enable_change_only_dispatch,
         enable_l2_priority_floor=enable_l2_priority_floor,
         enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,
         enable_nominal_slack_supply=enable_nominal_slack_supply,

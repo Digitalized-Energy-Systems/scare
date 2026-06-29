@@ -109,6 +109,7 @@ class HolonicCommunityRole(Role):
         priority_tiers: int = 4,
         admm_scope: str = "sector",
         enable_priority_allocation: bool = True,
+        enable_change_only_dispatch: bool = True,
         live_member_filter: LivePeerFilter | None = None,
         coalition_constraint_store: Any = None,
         my_node_id: Any = None,
@@ -143,6 +144,11 @@ class HolonicCommunityRole(Role):
         self.admm_scope = admm_scope
         # False ⇒ uniform per-tier weights (no-priority ablation).
         self.enable_priority_allocation = bool(enable_priority_allocation)
+        # Coordination overhaul: reactive cascade (see
+        # config.enable_change_only_dispatch). On the L2 side this only bypasses
+        # the rebalance_min_gap_s time-throttle; the change-detection that
+        # bounds the cascade lives on the UPWARD L1→L2 edge (balance.py).
+        self.enable_change_only_dispatch = bool(enable_change_only_dispatch)
         # Deliverability wiring (F6). When all three are present the supply-
         # priority ADMM caps each member's per-tier commitment at the demand
         # reachable from its home node, so L2 never allocates unroutable supply.
@@ -851,15 +857,16 @@ class HolonicCommunityRole(Role):
         if self._rebalance_active:
             return
         now = self.context.current_timestamp
-        gap_left = (self._last_rebalance_t + self.rebalance_min_gap_s) - now
-        if gap_left > 0:
-            # Throttled: schedule one deferred retry at gap-expiry.
-            if not self._rebalance_retry_pending:
-                self._rebalance_retry_pending = True
-                self.context.schedule_timestamp_task(
-                    self._deferred_rebalance(), timestamp=now + gap_left
-                )
-            return
+        if not self.enable_change_only_dispatch:
+            gap_left = (self._last_rebalance_t + self.rebalance_min_gap_s) - now
+            if gap_left > 0:
+                # Throttled: schedule one deferred retry at gap-expiry.
+                if not self._rebalance_retry_pending:
+                    self._rebalance_retry_pending = True
+                    self.context.schedule_timestamp_task(
+                        self._deferred_rebalance(), timestamp=now + gap_left
+                    )
+                return
         self.context.schedule_instant_task(self._try_rebalance())
 
     async def _deferred_rebalance(self) -> None:
@@ -1683,7 +1690,11 @@ class HolonicCommunityRole(Role):
         )
 
         # Dispatch the same ComponentAllocation to every leader (incl. self);
-        # each applies it via ``_handle_component_allocation``.
+        # each applies it via ``_handle_component_allocation``. The cascade is
+        # bounded by the UPWARD change-detection (L1 only notifies L2 when its
+        # converged setpoint moved), not by skipping this authoritative dispatch
+        # — skipping it would stale the per-load L2 priority floor (set inside
+        # ``apply_regulate``) and let a fresh L1 gossip invert priority.
         round_id = max(
             (self._component_report_buffer[a][0] for a in leader_aids),
             default="",
@@ -1729,7 +1740,10 @@ class HolonicCommunityRole(Role):
                 now,
             )
         # Send to SELF: the negotiator applies the fraction to every community
-        # member, covering loads outside any holon.
+        # member, covering loads outside any holon. This authoritative dispatch
+        # also refreshes the per-load L2 priority floor (in ``apply_regulate``);
+        # the cascade is bounded upstream by the L1→L2 change-detection, not by
+        # skipping it here.
         await self.context.send_message(
             StartBalanceNegotiation(
                 service_fraction_by_sector_priority=service_fraction,

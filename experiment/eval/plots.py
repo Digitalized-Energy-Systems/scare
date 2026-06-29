@@ -1311,7 +1311,7 @@ def restoration_trajectory(
 
     fig.update_xaxes(title="simulation time (s)")
     fig.update_yaxes(title="Σ regulation per sector")
-    return _save(_apply_theme(fig, title=title, height=360), out_path)
+    return _save(_apply_theme(fig, title=title, height=360, legend_top=True), out_path)
 
 
 # Claims pass-rate (Pillar 8)
@@ -2693,7 +2693,7 @@ def constraint_envelope_trajectory(
 
     fig.update_xaxes(title="simulation time (s)", row=len(present), col=1)
     height = max(_FIG_HEIGHT, 200 * len(present) + 100)
-    return _save(_apply_theme(fig, title=title, height=height), out_path)
+    return _save(_apply_theme(fig, title=title, height=height, legend_top=True), out_path)
 
 
 # Constraint-violation integral by sector × variant
@@ -2968,7 +2968,7 @@ def _group_balance_lines(
 
     fig.update_xaxes(title="simulation time (s)", row=len(sectors), col=1)
     height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
-    return _save(_apply_theme(fig, title=title, height=height), out_path)
+    return _save(_apply_theme(fig, title=title, height=height, legend_top=True), out_path)
 
 
 def slack_trajectory(
@@ -3107,7 +3107,7 @@ def slack_trajectory(
 
     fig.update_xaxes(title="simulation time (s)", row=len(sectors), col=1)
     height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
-    return _save(_apply_theme(fig, title=title, height=height), out_path)
+    return _save(_apply_theme(fig, title=title, height=height, legend_top=True), out_path)
 
 
 def gas_slack_pressure_trajectory(
@@ -3191,7 +3191,7 @@ def gas_slack_pressure_trajectory(
         )
     fig.update_yaxes(title="slack pressure setpoint (p.u.)")
     fig.update_xaxes(title="simulation time (s)")
-    return _save(_apply_theme(fig, title=title), out_path)
+    return _save(_apply_theme(fig, title=title, legend_top=True), out_path)
 
 
 def coalition_balance_lines(
@@ -3296,7 +3296,9 @@ def regulation_per_child_lines(
         subtitle = ""
     fig.update_xaxes(title="simulation time (s)")
     fig.update_yaxes(title="regulation factor", range=[-0.05, 1.5], tickformat=".2f")
-    return _save(_apply_theme(fig, title=title + subtitle, height=380), out_path)
+    return _save(
+        _apply_theme(fig, title=title + subtitle, height=380, legend_top=True), out_path
+    )
 
 
 # Per-task system-state overview (slack + control vars + lines + tiers)
@@ -3654,6 +3656,12 @@ def system_state_overview(
     fig.update_xaxes(title="simulation time (s)", row=rows, col=1)
     height = 180 * rows + 100
     return _save(
-        _apply_theme(fig, title=title, height=height, width=int(_FIG_WIDTH * 1.4)),
+        _apply_theme(
+            fig,
+            title=title,
+            height=height,
+            width=int(_FIG_WIDTH * 1.4),
+            legend_top=True,
+        ),
         out_path,
     )

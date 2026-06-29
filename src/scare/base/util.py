@@ -333,6 +333,14 @@ def _l2_floor_store(behavior: Any) -> dict[str, float]:
     return _get_behavior_store(behavior, "_scare_l2_floor")
 
 
+def set_l2_priority_floor(behavior: Any, aid: str, factor: float) -> None:
+    """Set the per-aid L2 priority floor directly, with NO actuation. Lets an
+    unchanged L2 allocation re-assert the floor (so a fresh/drifted L1 gossip
+    still honours the holon's priority decision) without re-dispatching and
+    abandoning an in-flight gossip."""
+    _l2_floor_store(behavior)[aid] = float(factor)
+
+
 def _heat_curtail_lock_store(behavior: Any) -> dict[str, float]:
     """Per-aid heat curtailment-auction lock (regulation level held for a
     live temperature violation). An entry means the auction owns the load

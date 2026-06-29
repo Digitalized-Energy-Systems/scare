@@ -268,6 +268,31 @@ class RestorationConfiguration:
     # legacy equal-share / priority-gated update. Share saturation/stall/decay.
     enable_qp_gossip: bool = True
 
+    # R3: L2 service-fraction dispatch (Route A) ramps dispatchable DGs toward
+    # covering the served demand instead of only shedding loads. Without it,
+    # enforcement is load-shed-only: the holon ADMM sizes service fractions
+    # assuming the full generator pool, but _dispatch_service_fractions never
+    # issues a generator setpoint, so load is shed to the un-ramped generation
+    # level (the 78%-gen / 54%-slack oracle gap). Slacks excluded (grid-
+    # following, no regulation knob). True: ramp; False: legacy shed-only.
+    enable_l2_generator_ramp: bool = True
+
+    # Coordination overhaul: reactive notify-on-change cascade. When True:
+    # (a) UPWARD — an L1 gossip notifies L2/L3 only when its converged setpoint
+    #     actually moved (balance.py _finish_negotiation), so a re-converged-to-
+    #     same gossip does not re-trigger the holon ADMM;
+    # (b) DOWNWARD — an unchanged L2 allocation re-asserts the per-load priority
+    #     floor (set_l2_priority_floor) WITHOUT abandoning the in-flight gossip,
+    #     instead of preempting it (the dominant "yielding to L2" abandonment);
+    # (c) the rebalance_min_gap_s time-throttle is bypassed — the change-
+    #     detection makes the holon→member→finished→holon cascade self-terminate
+    #     at a fixed point, so the time fuse is no longer needed.
+    # Local A/B (v3, 2026-06-29): abandon-rate −15.3pp, priority + diary
+    # invariants 12/12, no feedback-storm, served/violations flat (one wart: a
+    # few un-abandoned gossips run to their convergence timeout). False: legacy
+    # throttled re-broadcast with mid-flight L2 preemption.
+    enable_change_only_dispatch: bool = True
+
     # Fix 2 (opt-in): size the holon's load-serving supply pool at the slack's
     # nominal operator budget B (== abs(cap), the same hard ext-grid bound the
     # oracle uses) instead of the SlackBudgetMonitor's loss-compensation
