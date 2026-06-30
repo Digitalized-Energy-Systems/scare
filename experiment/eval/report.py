@@ -23,6 +23,7 @@ import pandas as pd
 
 from experiment.eval import plots
 from experiment.eval.aliases import alias_experiment, alias_variant
+from experiment.eval.compliance import compliant_mask, mean_ci95
 from experiment.eval.loader import CampaignData, load_campaign
 from experiment.eval.overview import write_overview
 
@@ -711,7 +712,9 @@ def _table_status(campaign: CampaignData) -> str:
         return "_(empty campaign)_"
     by_status = df["status"].value_counts().to_dict()
     parts = [f"- Total tasks: **{len(df)}**"]
-    for k in ("ok", "error", "timeout", "missing"):
+    # Include claims_failed (a large cohort — runs that completed but failed a
+    # fatal claim) and killed; omitting them understated the total accounted-for.
+    for k in ("ok", "claims_failed", "error", "timeout", "killed", "missing"):
         if k in by_status:
             parts.append(
                 f"  - {k}: {by_status[k]} ({100.0 * by_status[k] / len(df):.1f}%)"
@@ -720,21 +723,47 @@ def _table_status(campaign: CampaignData) -> str:
 
 
 def _table_variant_means(campaign: CampaignData) -> str:
+    """Per-variant PWSF on the COMPLIANT subset with 95% CI, matching the
+    campaign's primary methodology (compliance gate + CI; see
+    ``hpc.aggregate``). The earlier version reported an unpaired, un-gated,
+    no-CI mean over ``status=='ok'`` only, which both dropped the claims_failed
+    cohort asymmetrically (oracle is never claims_failed) and presented
+    non-comparable per-variant subsets as if comparable. This table is still
+    UNPAIRED and pooled across grids — for the apples-to-apples comparison see
+    the paired ``Variant vs oracle`` table in ``summary.md``. PWSF is
+    electricity+heat only (gas is in mass-flow units, reported per-sector).
+    """
     df = campaign.summary
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns:
         return "_(no priority-weighted served column)_"
-    ok = df[df["status"] == "ok"]
-    if ok.empty:
+    # PWSF is valid for any completed run (ok or claims_failed); error/timeout
+    # have no defined PWSF.
+    done = df[df["status"].isin(("ok", "claims_failed"))]
+    done = done[done[metric].notna()]
+    if done.empty:
         return "_(no successful runs)_"
-    rows = ok.groupby("variant")[metric].agg(["mean", "std", "count"])
-    if rows.empty:
-        return "_(no variant data)_"
-    lines = ["| variant | n | mean served | std |", "|---|---|---|---|"]
-    for variant, r in rows.iterrows():
+    lines = [
+        "_Compliant-subset PWSF (slack + grid feasibility), unpaired, pooled "
+        "across grids; electricity+heat only. Paired comparison: see "
+        "`summary.md`._",
+        "",
+        "| variant | n_compliant/n_total | compliance | mean PWSF | 95% CI |",
+        "|---|---|---|---|---|",
+    ]
+    for variant, g in done.groupby("variant"):
+        n_total = len(g)
+        comp = g[compliant_mask(g)]
+        n_comp = len(comp)
+        rate = 100.0 * n_comp / n_total if n_total else float("nan")
+        if n_comp == 0:
+            mean_str, ci_str = "—", "—"
+        else:
+            mean, ci = mean_ci95(comp[metric])
+            mean_str, ci_str = f"{mean:.4f}", f"±{ci:.4f}"
         lines.append(
-            f"| {alias_variant(str(variant))} | {int(r['count'])} | "
-            f"{r['mean']:.4f} | {r['std']:.4f} |"
+            f"| {alias_variant(str(variant))} | {n_comp}/{n_total} | "
+            f"{rate:.0f}% | {mean_str} | {ci_str} |"
         )
     return "\n".join(lines)
 
@@ -748,20 +777,26 @@ def _table_claims(campaign: CampaignData) -> str:
     ]
     if not cols:
         return ""
-    lines = [
-        "",
-        "## Claims compliance",
-        "",
-        "| claim | n | pass rate |",
-        "|---|---|---|",
-    ]
+    variants = sorted(df["variant"].dropna().unique()) if "variant" in df else []
+    if not variants:
+        return ""
+    # Per-variant pass rate (over GRADED rows only): pooling all variants
+    # conflated the system-under-test with the weak baselines, and the oracle is
+    # exempt from several claims (shown as "—", not counted as passing).
+    header = "| claim | " + " | ".join(alias_variant(v) for v in variants) + " |"
+    sep = "|---|" + "|".join(["---"] * len(variants)) + "|"
+    lines = ["", "## Claims compliance (pass rate by variant, graded rows)", "", header, sep]
     for col in cols:
-        s = df[col].dropna()
-        if s.empty:
-            continue
-        rate = float(s.astype(bool).sum()) / len(s)
         claim = col[len("claims__") : -len("__passed")]
-        lines.append(f"| {claim} | {len(s)} | {100.0 * rate:.1f}% |")
+        cells = []
+        for v in variants:
+            s = df.loc[df["variant"] == v, col].dropna()
+            if s.empty:
+                cells.append("—")
+            else:
+                rate = 100.0 * float(s.astype(bool).sum()) / len(s)
+                cells.append(f"{rate:.0f}% (n={len(s)})")
+        lines.append(f"| {claim} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 

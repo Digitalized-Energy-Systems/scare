@@ -21,7 +21,7 @@ from typing import Any
 
 import pandas as pd
 
-from experiment.eval.aliases import alias_grid, alias_variant
+from experiment.eval.aliases import alias_experiment, alias_grid, alias_variant
 from experiment.eval.compliance import (
     COMPLIANCE_COLS,
     compliance_rate,
@@ -619,6 +619,19 @@ def _format_eval_sections(
     parts.append(
         "## Variant comparison (priority-weighted served on compliant runs, mean ± 95% CI)"
     )
+    # Count tasks with no defined PWSF (error/timeout/killed/missing) per
+    # (grid, variant) from the FULL df, so silently-dropped runs — notably the
+    # oracle's MILP crashes (e.g. LV-recfg drops 65/105) — are disclosed in the
+    # ``dropped`` column instead of vanishing from an n that only sees completed
+    # runs.
+    df_vc = df[~df["experiment"].isin(mapped)] if "experiment" in df.columns else df
+    _DROPPED = ("error", "timeout", "killed", "missing")
+    dropped_counts = (
+        df_vc[df_vc["status"].isin(_DROPPED)]
+        .groupby(["grid", "variant"])
+        .size()
+        .to_dict()
+    )
     rows = []
     for (grid, variant), g in ok_vc.groupby(["grid", "variant"]):
         pwsf_c, rate, n_c, n_t = _compliant_split(g)
@@ -636,6 +649,7 @@ def _format_eval_sections(
                 alias_variant(variant),
                 f"{n_c}/{n_t}",
                 rate_str,
+                str(dropped_counts.get((grid, variant), 0)),
                 mean_str,
                 ci_str,
             ]
@@ -649,6 +663,7 @@ def _format_eval_sections(
                     "variant",
                     "n_compliant/n_total",
                     "compliance",
+                    "dropped",
                     "mean PWSF",
                     "95% CI",
                 ],
@@ -679,44 +694,72 @@ def _format_eval_sections(
     if "ablation" in abl.columns and abl["ablation"].nunique() > 1:
         parts.append("")
         parts.append("## Ablation impact (scare variant only, compliant runs)")
-        baseline_pwsf_c, _, _, _ = _compliant_split(abl[abl["ablation"] == "default"])
-        b_mean = (
-            float(baseline_pwsf_c.mean()) if not baseline_pwsf_c.empty else float("nan")
-        )
-        rows = []
-        for ablation_key, g in abl.groupby("ablation"):
-            pwsf_c, rate, n_c, n_t = _compliant_split(g)
-            if n_t == 0:
-                continue
-            mean = float(pwsf_c.mean()) if not pwsf_c.empty else float("nan")
-            diff = (
-                mean - b_mean
-                if not (pd.isna(b_mean) or pd.isna(mean))
-                else float("nan")
-            )
-            rate_str = "—" if pd.isna(rate) else f"{rate * 100:.0f}%"
-            rows.append(
-                [
-                    ablation_key,
-                    f"{n_c}/{n_t}",
-                    rate_str,
-                    "—" if pd.isna(mean) else f"{mean:.4f}",
-                    "—" if pd.isna(diff) else f"{diff:+.4f}",
-                ]
-            )
-        rows.sort(key=lambda r: (r[0] != "default", r[0]))
         parts.append(
-            _markdown_table(
-                [
-                    "ablation",
-                    "n_compliant/n_total",
-                    "compliance",
-                    "mean PWSF",
-                    "Δ vs default",
-                ],
-                rows,
-            )
+            "_Each ablation arm vs its OWN in-experiment `default` baseline "
+            "(same experiment + grid + scenario set). Pooling defaults across "
+            "experiments/grids — as a single combined table did — diffs an arm "
+            "against an unrelated population and manufactures spurious Δ. Read Δ "
+            "together with `n_compliant`: a Δ on a tiny compliant subset (e.g. "
+            "1/15) is a single-sample artefact, not an effect._"
         )
+        # One table PER ablation experiment; the ``default`` baseline is scoped to
+        # the SAME (experiment, grid) as each arm. Most ablation experiments are
+        # single-grid, but some (e.g. line_stress) span two grids with arms on
+        # different grids, so pooling the default across grids — even within one
+        # experiment — would still diff an arm against an unrelated baseline.
+        for exp_name in sorted(abl_experiments):
+            g_exp = abl[abl["experiment"] == exp_name]
+            if g_exp["ablation"].nunique() <= 1:
+                continue
+            multi_grid = g_exp["grid"].nunique() > 1
+            rows = []
+            for grid in sorted(g_exp["grid"].unique()):
+                g_grid = g_exp[g_exp["grid"] == grid]
+                if g_grid["ablation"].nunique() <= 1:
+                    continue
+                baseline_pwsf_c, _, _, _ = _compliant_split(
+                    g_grid[g_grid["ablation"] == "default"]
+                )
+                b_mean = (
+                    float(baseline_pwsf_c.mean())
+                    if not baseline_pwsf_c.empty
+                    else float("nan")
+                )
+                for ablation_key, g in g_grid.groupby("ablation"):
+                    pwsf_c, rate, n_c, n_t = _compliant_split(g)
+                    if n_t == 0:
+                        continue
+                    mean = float(pwsf_c.mean()) if not pwsf_c.empty else float("nan")
+                    diff = (
+                        mean - b_mean
+                        if not (pd.isna(b_mean) or pd.isna(mean))
+                        else float("nan")
+                    )
+                    rate_str = "—" if pd.isna(rate) else f"{rate * 100:.0f}%"
+                    row = [
+                        ablation_key,
+                        f"{n_c}/{n_t}",
+                        rate_str,
+                        "—" if pd.isna(mean) else f"{mean:.4f}",
+                        "—" if pd.isna(diff) else f"{diff:+.4f}",
+                    ]
+                    if multi_grid:
+                        row.insert(0, alias_grid(grid))
+                    rows.append(row)
+            if not rows:
+                continue
+            # Pin each grid's ``default`` row first within its grid block.
+            rows.sort(
+                key=lambda r: (r[0], r[1] != "default", r[1])
+                if multi_grid
+                else (r[0] != "default", r[0])
+            )
+            header = ["ablation", "n_compliant/n_total", "compliance", "mean PWSF", "Δ vs default"]
+            if multi_grid:
+                header = ["grid"] + header
+            parts.append("")
+            parts.append(f"### {alias_experiment(exp_name)}")
+            parts.append(_markdown_table(header, rows))
 
     # Sweep curves (target-mapped experiments owned by the justification
     # section below).

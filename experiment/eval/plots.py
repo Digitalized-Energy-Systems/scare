@@ -9,6 +9,7 @@ Returns the base path stem (``out_path`` without suffix).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,8 @@ from experiment.eval.compliance import (
 from experiment.eval.compliance import (
     mean_ci95 as _mean_ci,
 )
+
+logger = logging.getLogger(__name__)
 
 # Style — consistent palette + layout across the whole report
 
@@ -666,14 +669,15 @@ def pwsf_by_sector_bar(
     col_prefix: str = "outcomes__priority_weighted_fraction_by_sector__",
     title: str = "Per-sector PWSF by variant (compliant runs)",
 ) -> Path:
-    """Stacked per-sector PWSF: one bar per variant, a segment per sector.
+    """Grouped per-sector PWSF: one bar group per variant, a bar per sector.
 
     Companion to the aggregate ``variant_comparison_bar`` (the single headline
     electricity+heat PWSF). This breaks the metric out by sector so gas — kept
     in its own mass-flow units and excluded from the aggregate — is visible.
     The segments are INDEPENDENT fractions in [0, 1] (no cross-sector unit
-    mixing): the stack is a visual decomposition, NOT an additive total, so the
-    y-axis can exceed 1 and each segment is read on its own.
+    mixing), so they are shown GROUPED (not stacked): stacking three independent
+    [0,1] fractions produced a meaningless y-axis reaching ~2.3 that visually
+    overstated the variant. Each bar carries its 95% CI; read each on its own.
     """
     sectors = [
         s for s in ("electricity", "gas", "heat") if f"{col_prefix}{s}" in df.columns
@@ -690,11 +694,13 @@ def pwsf_by_sector_bar(
     for sec in sectors:
         col = f"{col_prefix}{sec}"
         means: list[float] = []
+        cis: list[float] = []
         hover: list[str] = []
         for v in variants:
             vals = compliant.loc[compliant["variant"] == v, col].dropna().tolist()
             m, ci = _mean_ci(vals)
             means.append(m)
+            cis.append(ci)
             hover.append(
                 f"<b>{sec}</b><br>variant: {alias_variant(v)}<br>"
                 f"mean PWSF: {m:.4f}<br>95% CI: ±{ci:.4f}<br>n={len(vals)}"
@@ -704,6 +710,7 @@ def pwsf_by_sector_bar(
                 name=sec,
                 x=[alias_variant(v) for v in variants],
                 y=means,
+                error_y={"type": "data", "array": cis, "visible": True},
                 marker=_bar_marker(
                     _SECTOR_COLOR.get(sec, "#888888"),
                     pattern_shape=_SECTOR_PATTERN.get(sec, ""),
@@ -712,11 +719,14 @@ def pwsf_by_sector_bar(
                 customdata=hover,
             )
         )
-    fig.update_layout(barmode="stack", bargap=0.35)
+    fig.update_layout(barmode="group", bargap=0.3, bargroupgap=0.1)
     fig.update_xaxes(title="variant")
     fig.update_yaxes(
-        title="per-sector PWSF (segments independent, not additive)",
+        title="per-sector PWSF",
         tickformat=".2f",
+        # Headroom above 1.0 so a mean+CI near full service is not silently
+        # clipped at the frame edge (per-sector PWSF is in [0, 1]).
+        range=[0, 1.1],
     )
     return _save(
         _apply_theme(
@@ -785,6 +795,19 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
 
     # Mean gap annotation.
     pivot["gap"] = pivot["oracle"] - pivot["scare"]
+    # Surface SCARE-beats-oracle pairs: the oracle is the constraint-respecting
+    # optimum, so a negative gap signals an oracle bug or scare credited above
+    # feasibility. (The scalar metrics.optimality_gap clips these to 0; this is
+    # the actual reporting site, so the warning belongs here too.)
+    n_neg = int((pivot["gap"] < -1e-9).sum())
+    if n_neg:
+        logger.warning(
+            "optimality_gap_scatter: %d/%d compliant scare/oracle pairs have "
+            "scare > oracle (negative gap, min %.4f) — oracle should dominate.",
+            n_neg,
+            len(pivot),
+            float(pivot["gap"].min()),
+        )
     mean_gap = float(pivot["gap"].mean())
     fig.add_annotation(
         xref="paper",
@@ -1398,10 +1421,14 @@ def claims_pass_rate(df: pd.DataFrame, out_path: Path) -> Path:
     for col in claim_cols:
         claim_name = col[len("claims__") : -len("__passed")]
         for variant, g in df.groupby("variant"):
-            n = g[col].dropna().shape[0]
+            vals = g[col].dropna()
+            n = vals.shape[0]
             if n == 0:
                 continue
-            rate = float(g[col].astype(bool).sum()) / n
+            # Count passes only among GRADED rows. ``astype(bool)`` on the raw
+            # column maps NaN (claim not evaluated, e.g. oracle) to True, which
+            # inflates the rate and can exceed 1.0; drop NaN first.
+            rate = float(vals.astype(bool).sum()) / n
             rows.append((claim_name, str(variant), rate, n))
     if not rows:
         return _save(_empty_fig("no claims data", title), out_path)
@@ -1868,7 +1895,10 @@ def restoration_ratio_by_variant_bar(
         )
     fig.add_vline(x=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
     fig.update_layout(barmode="group", bargap=0.32, bargroupgap=0.12)
-    fig.update_xaxes(title="raw restoration ratio", range=[0, 1.05], tickformat=".2f")
+    # Ratio can exceed 1 (post-restoration served above the no-failure baseline
+    # for a grid·variant mean, observed up to ~1.06); cap above 1.1 so such bars
+    # are not silently clipped at the frame edge.
+    fig.update_xaxes(title="raw restoration ratio", range=[0, 1.15], tickformat=".2f")
     fig.update_yaxes(title="grid")
     height = _hbar_height(len(grids), len(variants))
     return _save(
@@ -1979,12 +2009,21 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
     if df.empty:
         return _save(_empty_fig("no non-oracle diary data", title), out_path)
 
-    by_variant = df.groupby("variant")[[c[0] for c in cols]].sum()
+    # Normalise to per-task averages: variants have unequal task counts (~2x in
+    # the variant-comparison run, more in ablation campaigns), so raw count SUMS
+    # are not comparable (a variant with more tasks looks busier regardless of
+    # behaviour). Dividing by each variant's task count gives the mean number of
+    # negotiations of each outcome PER TASK, which is comparable.
+    n_tasks = df.groupby("variant").size()
+    by_variant = (
+        df.groupby("variant")[[c[0] for c in cols]].sum().div(n_tasks, axis=0)
+    )
     if by_variant.empty:
         return _save(_empty_fig("no diary data", title), out_path)
 
     fig = go.Figure()
     variants_lbl = _variants_display(list(by_variant.index))
+    n_by_variant = [int(n_tasks.loc[v]) for v in by_variant.index]
     for i, (col, label, color) in enumerate(cols):
         fig.add_trace(
             go.Bar(
@@ -1995,12 +2034,16 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
                 marker=_bar_marker(
                     color, pattern_shape=_PATTERN_SHAPES[i % len(_PATTERN_SHAPES)]
                 ),
-                hovertemplate=f"<b>{label}</b><br>variant: %{{y}}<br>count: %{{x}}<extra></extra>",
+                customdata=n_by_variant,
+                hovertemplate=(
+                    f"<b>{label}</b><br>variant: %{{y}}<br>"
+                    "per-task: %{x:.2f}<br>n_tasks=%{customdata}<extra></extra>"
+                ),
             )
         )
     fig.update_layout(barmode="stack", bargap=0.42)
     fig.update_yaxes(title="variant")
-    fig.update_xaxes(title="count", rangemode="tozero")
+    fig.update_xaxes(title="negotiations per task", rangemode="tozero")
     height = _hbar_height(len(variants_lbl)) + 30
     return _save(
         _apply_theme(
@@ -2395,6 +2438,7 @@ def _mask_deenergised(avg_col: str, vals: np.ndarray | None) -> np.ndarray | Non
     from scare.base.model import (
         DEENERGISED_PRESSURE_HIGH_PU,
         DEENERGISED_PRESSURE_PU,
+        DEENERGISED_VM_PU,
     )
 
     out = np.asarray(vals, dtype=float).copy()
@@ -2404,6 +2448,11 @@ def _mask_deenergised(avg_col: str, vals: np.ndarray | None) -> np.ndarray | Non
         )
     elif avg_col.endswith("t_k"):
         out[out <= 0.0] = np.nan
+    elif avg_col.endswith("vm_pu"):
+        # An electricity node cut off from its slack collapses to vm_pu~0; that
+        # is de-energisation, not an under-voltage violation, so blank it rather
+        # than plot a spurious dive through the operating band.
+        out[out <= DEENERGISED_VM_PU] = np.nan
     return out
 
 
@@ -2597,6 +2646,10 @@ def constraint_envelope_trajectory(
         # never persisted (only the aggregate), so masked points become gaps.
         min_vals = _mask_deenergised(avg_col, min_vals)
         max_vals = _mask_deenergised(avg_col, max_vals)
+        # Also mask the AVG line: a de-energised network collapses avg_vm_pu to
+        # ~0 etc., which otherwise draws a spurious dive through the operating
+        # band (the same de-energisation the violation integral now excludes).
+        avg_vals = _mask_deenergised(avg_col, avg_vals)
 
         # Min–max spread (translucent fill between min and max)
         if have_min and have_max:
@@ -2774,8 +2827,13 @@ def constraint_violation_integral_bar(
 ) -> Path:
     """Grouped bars: per-variant mean of the per-sector violation
     integral ``∫ max(0, util(t) − 1) dt`` (from
-    :func:`metrics.constraint_violation_integral`). Zero ⇔ the sector
-    never left its envelope on average; larger ⇔ longer/deeper excursions.
+    :func:`metrics.constraint_violation_integral`, de-energised samples
+    excluded). Zero ⇔ the sector never left its envelope on average; larger ⇔
+    longer/deeper excursions.
+
+    The ORACLE is excluded: it is a single static LP solve with no time series,
+    so its integral is a hardcoded 0 (never computed) — plotting it would imply a
+    perfect score and make the time-evolving MAS variants look spuriously worse.
     """
     sectors = ["electricity", "gas", "heat"]
     cols = {s: f"outcomes__constraint_violation_integral__{s}" for s in sectors}
@@ -2785,8 +2843,10 @@ def constraint_violation_integral_bar(
             _empty_fig("no constraint_violation_integral columns", title), out_path
         )
     sub = df.dropna(subset=["variant"]).copy()
+    # Drop the oracle: its integral is a vacuous hardcoded 0 (no time series).
+    sub = sub[sub["variant"] != "oracle"]
     if sub.empty:
-        return _save(_empty_fig("no rows with a variant", title), out_path)
+        return _save(_empty_fig("no non-oracle rows with a variant", title), out_path)
     for s in present:
         sub[cols[s]] = sub[cols[s]].fillna(0).astype(float)
 

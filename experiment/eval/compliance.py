@@ -46,8 +46,37 @@ def compliance_rate(df: pd.DataFrame) -> float | None:
     return float(compliant_mask(df).sum() / len(df))
 
 
+# Two-sided 95% Student-t critical values t_{0.975, df} for df = 1..30 (no scipy
+# dependency). Above df=30 the value descends slowly toward the normal 1.96, so a
+# few coarse bands suffice. The previous 3-bucket table (2.776/2.262/1.96) was
+# anti-conservative at very small n (used 2.776 for df=2 where t=4.303) and used
+# the normal z=1.96 for all n>30 (t=2.042 at df=30), understating every CI there.
+_T_975: dict[int, float] = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+    8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,
+    15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086, 21: 2.080,
+    22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056, 27: 2.052, 28: 2.048,
+    29: 2.045, 30: 2.042,
+}
+
+
+def _t_crit_95(df: int) -> float:
+    """Two-sided 95% t critical value for ``df`` degrees of freedom."""
+    if df <= 0:
+        return float("inf")
+    if df <= 30:
+        return _T_975[df]
+    if df <= 40:
+        return 2.021
+    if df <= 60:
+        return 2.000
+    if df <= 120:
+        return 1.980
+    return 1.96
+
+
 def mean_ci95(values: Iterable[float]) -> tuple[float, float]:
-    """Sample mean and 95% CI half-width via a coarse t-table (no scipy
+    """Sample mean and 95% CI half-width via a Student-t table (no scipy
     dependency, robust to small n). Accepts any iterable / Series; ``None`` and
     NaN entries are dropped. Returns ``(mean, half_width)`` — display as
     ``mean ± half_width``; ``(nan, 0.0)`` for empty input.
@@ -68,5 +97,4 @@ def mean_ci95(values: Iterable[float]) -> tuple[float, float]:
     mean = float(arr.mean())
     sd = float(arr.std(ddof=1))
     se = sd / math.sqrt(n)
-    t = 1.96 if n > 30 else 2.262 if n > 10 else 2.776
-    return mean, t * se
+    return mean, _t_crit_95(n - 1) * se

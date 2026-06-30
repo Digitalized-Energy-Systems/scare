@@ -17,6 +17,7 @@ from monee.model.child import ExtPowerGrid, HeatLoad, PowerLoad, Sink
 from monee.solver.core import find_ignored_nodes
 
 from scare.base.model import (
+    DEENERGISED_PRESSURE_HIGH_PU,
     DEENERGISED_PRESSURE_PU,
     DEENERGISED_VM_PU,
     SECTOR_CONSTRAINTS,
@@ -663,11 +664,35 @@ def restoration_breakdown(
 # Constraint violation integral
 
 
+def _is_deenergised_avg(var: str, val: float) -> bool:
+    """A sector-average reading low enough to mean the network (on average)
+    collapsed/de-energised rather than violated a bound. Mirrors the per-node
+    guards in ``constraint_rows`` (DEENERGISED_VM_PU / DEENERGISED_PRESSURE_PU /
+    t_k<=0) so the integral does not score a black-out as an over/under-voltage
+    violation — without this a fully de-energised run (avg_vm_pu~0.05) integrates
+    to a huge spurious value while the final scan reports zero violations.
+    """
+    if var == "vm_pu":
+        return val <= DEENERGISED_VM_PU
+    if var == "pressure_pu":
+        # Low floor = region cut off from supply; high saturation (~sqrt(3))
+        # = solver bound on an isolated region. Both are artefacts, not a real
+        # average over-/under-pressure (matches the plot/model de-energised masks).
+        return val <= DEENERGISED_PRESSURE_PU or val >= DEENERGISED_PRESSURE_HIGH_PU
+    if var == "t_k":
+        return val <= 0.0
+    return False
+
+
 def constraint_violation_integral(world: Any) -> dict[str, float]:
     """Per-sector ``integral of max(0, util(t) - 1) dt``, proxied by the
     recorded sector-average utilization series (avg_vm_pu / avg_pressure_pu /
     avg_t_k). Dimensionless; comparable across runs on the same grid. Being an
     average, it masks per-node violations (see ``constraint_violations_final``).
+
+    De-energised samples (sector average below the DEENERGISED_* floor, i.e. the
+    network collapsed) are NOT counted as violations — same convention as the
+    final scan — so a black-out does not masquerade as a bound violation.
     """
     recordings = getattr(world, "data_collections", {}) or {}
 
@@ -692,13 +717,21 @@ def constraint_violation_integral(world: Any) -> dict[str, float]:
             continue
         # Trapezoidal integration of max(0, util − 1) over time. The unclamped
         # utilization lets out-of-bounds readings exceed 1.0 (the clamped form
-        # pins the integrand — and thus every integral — to 0).
+        # pins the integrand — and thus every integral — to 0). A de-energised
+        # sample contributes 0 (a collapse is not a bound violation).
         integral = 0.0
         for i in range(1, len(ts)):
-            u_a = constraint_utilization(float(ts[i - 1]), lo, hi, unclamped=True)
-            u_b = constraint_utilization(float(ts[i]), lo, hi, unclamped=True)
-            ov_a = max(0.0, u_a - 1.0)
-            ov_b = max(0.0, u_b - 1.0)
+            va, vb = float(ts[i - 1]), float(ts[i])
+            ov_a = (
+                0.0
+                if _is_deenergised_avg(var, va)
+                else max(0.0, constraint_utilization(va, lo, hi, unclamped=True) - 1.0)
+            )
+            ov_b = (
+                0.0
+                if _is_deenergised_avg(var, vb)
+                else max(0.0, constraint_utilization(vb, lo, hi, unclamped=True) - 1.0)
+            )
             dt = float(ts_t[i]) - float(ts_t[i - 1])
             integral += 0.5 * (ov_a + ov_b) * dt
         out[sec.value] = integral
@@ -1067,10 +1100,21 @@ def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
 
 def optimality_gap(scare_pw_served: float, oracle_pw_served: float) -> float:
     """Relative gap ``(oracle - scare) / oracle`` clipped to ``[0, 1]``.
-    Negative inputs (oracle worse than scare) clip to 0."""
+    Negative inputs (oracle worse than scare) clip to 0 — but are logged: since
+    the oracle is the constraint-respecting optimum, scare > oracle signals
+    either an oracle bug (e.g. a priority-blind LP) or scare credited above
+    feasibility, both worth surfacing rather than silently flooring to a
+    'perfect' gap of 0."""
     if oracle_pw_served <= 0:
         return 0.0
     gap = (oracle_pw_served - scare_pw_served) / oracle_pw_served
     if not math.isfinite(gap):
         return 0.0
+    if gap < 0:
+        logger.warning(
+            "optimality_gap negative (scare %.4f > oracle %.4f): clipping to 0; "
+            "oracle should dominate — check oracle validity / feasibility.",
+            scare_pw_served,
+            oracle_pw_served,
+        )
     return max(0.0, min(1.0, gap))
