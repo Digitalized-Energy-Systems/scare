@@ -100,6 +100,17 @@ class ExperimentSpec:
     ablations: list[dict[str, Any]] = field(default_factory=lambda: [{}])
     sweeps: list[dict[str, Any]] = field(default_factory=lambda: [{}])
     scenarios: list[dict[str, Any]] = field(default_factory=lambda: [{"kind": "clean"}])
+    # Aggregation hint — NOT expanded into tasks. The flattened result column(s)
+    # the justification summary deltas for THIS experiment, and the row
+    # population they're measured over ("compliant" = pass slack+feasibility,
+    # "all" = every run). Lets a lever be judged on the metric it actually moves
+    # (e.g. a voltage-violation count over all runs) instead of the global
+    # PWSF-on-compliant headline that reads near-null for compliance-shaping
+    # levers. Empty => fall back to the legacy PWSF tables. The first metric is
+    # the primary (drives the effect screen). See experiment/configs/
+    # CONFIG_JUSTIFICATION.md.
+    target_metrics: list[str] = field(default_factory=list)
+    population: str = "compliant"  # "compliant" | "all"
     notes: str = ""
 
     @classmethod

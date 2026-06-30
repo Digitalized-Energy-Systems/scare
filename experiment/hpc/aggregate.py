@@ -22,7 +22,12 @@ from typing import Any
 import pandas as pd
 
 from experiment.eval.aliases import alias_grid, alias_variant
-from experiment.eval.compliance import COMPLIANCE_COLS, compliant_mask, mean_ci95
+from experiment.eval.compliance import (
+    COMPLIANCE_COLS,
+    compliance_rate,
+    compliant_mask,
+    mean_ci95,
+)
 from experiment.hpc.config import CAMPAIGN_LAYOUT
 from experiment.hpc.plan import read_manifest
 
@@ -125,7 +130,9 @@ def _markdown_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _format_md(df: pd.DataFrame) -> str:
+def _format_md(
+    df: pd.DataFrame, targets: dict[str, tuple[list[str], str]] | None = None
+) -> str:
     parts: list[str] = ["# Campaign summary", ""]
 
     n = len(df)
@@ -239,13 +246,229 @@ def _format_md(df: pd.DataFrame) -> str:
             rows = [[t, int(c)] for t, c in counts.items()]
             parts.append(_markdown_table(["type", "count"], rows))
 
-    parts.extend(_format_eval_sections(df))
+    parts.extend(_format_eval_sections(df, targets))
     return "\n".join(parts) + "\n"
 
 
 _PRIMARY_OUTCOME = "outcomes__priority_weighted_fraction"
 _TIME_TO_STABILISE = "outcomes__time_to_stabilise_s"
 _REGULATES_TOTAL = "outcomes__regulates_total"
+
+# Short labels for the justification table; fall back to the last two
+# ``__``-segments for anything not listed.
+_METRIC_ALIAS = {
+    "outcomes__priority_weighted_fraction": "PWSF",
+    "outcomes__priority_weighted_fraction_by_sector__electricity": "PWSF(el)",
+    "outcomes__priority_weighted_fraction_by_sector__heat": "PWSF(heat)",
+    "outcomes__priority_weighted_fraction_by_sector__gas": "PWSF(gas)",
+    "outcomes__constraint_violation_integral__electricity": "viol∫(el)",
+    "outcomes__constraint_violation_integral__gas": "viol∫(gas)",
+    "outcomes__constraint_violation_integral__heat": "viol∫(heat)",
+    "claims__constraint_compliance__passed": "feas-ok",
+    "claims__slack_budget_compliance__passed": "slack-ok",
+    "claims__priority_invariant__passed": "prio-inv",
+    "claims__constraint_compliance__detail__by_variable__voltage__n_violations": "volt n_viol",
+    "claims__constraint_compliance__detail__by_variable__pressure__n_violations": "press n_viol",
+    "claims__constraint_compliance__detail__by_variable__line_load__n_violations": "line n_viol",
+    "diary__abandoned": "abandoned",
+    "outcomes__regulates_total": "regulates",
+}
+
+
+def _short_metric(col: str) -> str:
+    if col in _METRIC_ALIAS:
+        return _METRIC_ALIAS[col]
+    seg = col.split("__")
+    return "·".join(seg[-2:]) if len(seg) >= 2 else col
+
+
+def _load_experiment_targets(campaign_dir: Path) -> dict[str, tuple[list[str], str]]:
+    """Read each experiment's ``target_metrics`` / ``population`` from the
+    resolved ``config.json``. Missing file / fields => empty map, and the
+    summary falls back to the legacy PWSF tables (eval_full stays unchanged).
+    """
+    data = _load_json(campaign_dir / CAMPAIGN_LAYOUT["config"])
+    out: dict[str, tuple[list[str], str]] = {}
+    if not data:
+        return out
+    for e in data.get("experiments", []) or []:
+        if not isinstance(e, dict):
+            continue
+        metrics = e.get("target_metrics") or []
+        if not metrics:
+            continue
+        out[e.get("name", "")] = (list(metrics), e.get("population") or "compliant")
+    return out
+
+
+def _metric_stats(
+    g: pd.DataFrame, col: str, population: str
+) -> tuple[float, float, int] | None:
+    """``(mean, ci95_halfwidth, n)`` for ``col`` over the chosen row
+    population, or ``None`` if the column is absent / empty. Booleans (claim
+    ``__passed`` flags) coerce to 0/1 so the mean is a pass-rate.
+
+    A ``__passed`` compliance flag is ALWAYS measured over all runs: a pass-rate
+    restricted to the compliant subset is a degenerate 1.0, so the
+    feasibility / slack-budget columns the campaign reports for every lever stay
+    meaningful even when the experiment's served metric is on the compliant
+    population.
+    """
+    if col not in g.columns:
+        return None
+    pop = "all" if col.endswith("__passed") else population
+    sub = g if pop == "all" else g[compliant_mask(g)]
+    s = pd.to_numeric(sub[col], errors="coerce").dropna()
+    if s.empty:
+        return None
+    mean, ci = mean_ci95(s)
+    return mean, ci, int(len(s))
+
+
+_PAIR_KEYS = ("grid", "scenario", "seed")
+
+
+def _paired_delta(
+    base: pd.DataFrame, row: pd.DataFrame, col: str, population: str
+) -> tuple[float, float, int] | None:
+    """Per-seed paired mean-difference of ``col`` (row − baseline) and its 95%
+    CI. Seeds are shared across ablation rows (plan.py derives seed from
+    (experiment, grid, run) only), so pairing on (grid, scenario, seed) removes
+    the between-seed scenario-difficulty variance that dominates the marginal
+    CIs — a far less conservative effect screen than comparing two independent
+    means. ``None`` if fewer than 2 shared, non-NaN pairs survive.
+
+    A ``__passed`` compliance flag is paired over all runs (a compliant-only
+    pass-rate is degenerate); other metrics honour ``population``, so a seed
+    compliant in one row but not the other drops from the pairing — hence the
+    paired n can be below the per-group n and is reported separately.
+    """
+    pop = "all" if col.endswith("__passed") else population
+    b = base if pop == "all" else base[compliant_mask(base)]
+    r = row if pop == "all" else row[compliant_mask(row)]
+    keys = [k for k in _PAIR_KEYS if k in b.columns and k in r.columns]
+    if not keys:
+        return None
+    bs = b[keys + [col]].copy()
+    rs = r[keys + [col]].copy()
+    bs[col] = pd.to_numeric(bs[col], errors="coerce").astype(float)
+    rs[col] = pd.to_numeric(rs[col], errors="coerce").astype(float)
+    j = bs.merge(rs, on=keys, suffixes=("_b", "_r")).dropna(
+        subset=[f"{col}_b", f"{col}_r"]
+    )
+    if len(j) < 2:
+        return None
+    d = j[f"{col}_r"] - j[f"{col}_b"]
+    mean_d, ci_d = mean_ci95(d)
+    return mean_d, ci_d, int(len(j))
+
+
+def _format_justification_sections(
+    ok: pd.DataFrame, targets: dict[str, tuple[list[str], str]]
+) -> list[str]:
+    """Per-experiment justification tables: for each experiment that declares
+    ``target_metrics``, paired-delta every target metric (over its declared
+    population) against the in-experiment ``default`` baseline, and screen
+    whether ANY of them moved beyond noise. Owns the target-mapped experiments so
+    the legacy PWSF tables skip them."""
+    body: list[str] = []
+    min_paired_n = None  # smallest paired n seen, surfaced in the caption
+    for exp_name in sorted(targets):
+        metrics, population = targets[exp_name]
+        g_exp = ok[ok["experiment"] == exp_name]
+        if g_exp.empty:
+            continue
+        if "ablation" in g_exp.columns and g_exp["ablation"].nunique() > 1:
+            axis, baseline_key = "ablation", "default"
+        elif "sweep" in g_exp.columns and g_exp["sweep"].nunique() > 1:
+            axis, baseline_key = "sweep", "default"
+        elif "variant" in g_exp.columns and g_exp["variant"].nunique() > 1:
+            # Architectural comparison: scare vs single_level vs component_level
+            # on a shared scenario; variants share seeds, so they pair too.
+            axis, baseline_key = "variant", "scare"
+        else:
+            continue
+        has_default = bool((g_exp[axis] == baseline_key).any())
+        base = g_exp[g_exp[axis] == baseline_key] if has_default else None
+        base_stats = (
+            {m: _metric_stats(base, m, population) for m in metrics}
+            if base is not None
+            else {}
+        )
+
+        header = [axis, "n", "compliance"]
+        for m in metrics:
+            header.append(_short_metric(m))
+            if has_default:
+                header.append("Δ")
+        if has_default:
+            header.append("effect?")
+
+        rows: list[list[str]] = []
+        for key, gk in g_exp.groupby(axis):
+            rate = compliance_rate(gk)
+            row = [str(key), str(len(gk)), "—" if rate is None else f"{rate * 100:.0f}%"]
+            sig: dict[str, bool] = {}
+            for m in metrics:
+                st = _metric_stats(gk, m, population)
+                row.append("—" if st is None else f"{st[0]:.4g}")
+                if not has_default:
+                    continue
+                bst = base_stats.get(m)
+                if key == baseline_key or bst is None or base is None:
+                    row.append("—")
+                    continue
+                pd_ = _paired_delta(base, gk, m, population)
+                if pd_ is None:
+                    row.append("—")
+                    continue
+                mean_d, ci_d, pn = pd_
+                min_paired_n = pn if min_paired_n is None else min(min_paired_n, pn)
+                # Magnitude-relative floor so FP noise on a constant metric
+                # (CI=0 on both sides) can't trip "yes".
+                scale = abs(bst[0]) + (abs(st[0]) if st else 0.0)
+                tol = 1e-9 * scale + 1e-12
+                row.append(f"{0.0 if abs(mean_d) <= tol else mean_d:+.3g}")
+                sig[m] = abs(mean_d) > tol and abs(mean_d) > ci_d
+            if has_default:
+                # Fire if ANY declared target metric moves — every metric in the
+                # list was chosen as relevant to the lever (priority-inversion /
+                # abandonment / compliance), not just the primary.
+                row.append(
+                    "—"
+                    if key == baseline_key
+                    else ("yes" if any(sig.values()) else "ns")
+                )
+            rows.append(row)
+        rows.sort(key=lambda r: (r[0] != baseline_key, r[0]))
+        pop_note = "all runs" if population == "all" else "compliant runs"
+        body.append("")
+        body.append(
+            f"### {exp_name} — {', '.join(_short_metric(m) for m in metrics)} "
+            f"over {pop_note}"
+        )
+        body.append(_markdown_table(header, rows))
+
+    if not body:
+        return []
+    paired_note = (
+        f" Smallest paired n across rows: {min_paired_n}."
+        if min_paired_n is not None
+        else ""
+    )
+    return [
+        "",
+        "## Config justification (per-experiment target metrics)",
+        "",
+        "_`Δ` is the per-seed paired mean‑difference vs the in‑experiment "
+        "`default` (paired on grid·scenario·seed); `effect?`=yes when ANY target "
+        "metric's |Δ| exceeds its paired 95% CI (a screen, not a confirmatory "
+        "test — read the sign against the expected direction in "
+        "CONFIG_JUSTIFICATION.md). `__passed` compliance flags are rates over "
+        "all runs; other metrics use the population in the heading, so their "
+        "paired n can be below the `n` column." + paired_note + "_",
+        *body,
+    ]
 
 
 def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
@@ -290,8 +513,12 @@ def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
     return pwsf_compliant, rate, n_compliant, n_total
 
 
-def _format_eval_sections(df: pd.DataFrame) -> list[str]:
+def _format_eval_sections(
+    df: pd.DataFrame, targets: dict[str, tuple[list[str], str]] | None = None
+) -> list[str]:
     parts: list[str] = []
+    targets = targets or {}
+    mapped = set(targets)
     if df.empty or "variant" not in df.columns:
         return parts
     # Include ``claims_failed`` runs: PWSF comes from a completed sim; the
@@ -304,11 +531,13 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
     # tasks (see ``_compliant_split``); ``compliance`` reports the
     # fraction honouring the operator's slack-budget policy.
     parts.append("")
+    # Mapped experiments own their variant rows in the justification section.
+    ok_vc = ok[~ok["experiment"].isin(mapped)] if "experiment" in ok.columns else ok
     parts.append(
         "## Variant comparison (priority-weighted served on compliant runs, mean ± 95% CI)"
     )
     rows = []
-    for (grid, variant), g in ok.groupby(["grid", "variant"]):
+    for (grid, variant), g in ok_vc.groupby(["grid", "variant"]):
         pwsf_c, rate, n_c, n_t = _compliant_split(g)
         if n_t == 0:
             continue
@@ -349,7 +578,9 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
     # and washes out the Δ). Restrict to scare-variant rows whose
     # experiment has >1 distinct ablation key, baselined on its own
     # in-experiment ``default``.
-    abl_all = ok[ok["variant"] == "scare"]
+    # Target-mapped experiments are owned by the justification section below;
+    # exclude them here so they aren't also reported on the PWSF headline.
+    abl_all = ok[(ok["variant"] == "scare") & (~ok["experiment"].isin(mapped))]
     abl_experiments = []
     if "experiment" in abl_all.columns and "ablation" in abl_all.columns:
         for exp_name, g in abl_all.groupby("experiment"):
@@ -402,14 +633,16 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
             )
         )
 
-    # Sweep curves.
-    if "sweep" in ok.columns and ok["sweep"].nunique() > 1:
+    # Sweep curves (target-mapped experiments owned by the justification
+    # section below).
+    ok_sw = ok[~ok["experiment"].isin(mapped)] if "experiment" in ok.columns else ok
+    if "sweep" in ok_sw.columns and ok_sw["sweep"].nunique() > 1:
         parts.append("")
         parts.append(
             "## Sensitivity sweeps (priority-weighted served on compliant runs)"
         )
         rows = []
-        for sweep_key, g in ok.groupby("sweep"):
+        for sweep_key, g in ok_sw.groupby("sweep"):
             pwsf_c, rate, n_c, n_t = _compliant_split(g)
             if n_t == 0:
                 continue
@@ -549,15 +782,17 @@ def _format_eval_sections(df: pd.DataFrame) -> list[str]:
             )
         )
 
+    parts.extend(_format_justification_sections(ok, targets))
     return parts
 
 
 def write_summary(campaign_dir: Path) -> tuple[Path, Path]:
     df = aggregate(campaign_dir)
+    targets = _load_experiment_targets(campaign_dir)
     csv_path = campaign_dir / CAMPAIGN_LAYOUT["summary_csv"]
     md_path = campaign_dir / CAMPAIGN_LAYOUT["summary_md"]
     df.to_csv(csv_path, index=False)
-    md_path.write_text(_format_md(df), encoding="utf-8")
+    md_path.write_text(_format_md(df, targets), encoding="utf-8")
 
     n = len(df)
     by_status = df["status"].value_counts().to_dict() if n else {}
