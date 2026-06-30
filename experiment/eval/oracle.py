@@ -91,16 +91,25 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
                 )
 
 
-_ORACLE_TIER_WEIGHT: dict[int, float] = {
-    # Dedicated 4-tier oracle schedule. Magnitude separation between tiers is
-    # large enough that the LP cannot tie tier 1 against any lower tier under
-    # numerical noise. (The L1 QP's schedule differs — it returns weight 0 for
-    # tier 1 because the leader hard-locks it off-QP, unusable for the LP.)
-    1: 1e12,
-    2: 1e8,
-    3: 1e4,
-    4: 1.0,
-}
+# Bounded near-strict priority ladder for the oracle LP objective. The oracle
+# minimises ``sum(weight_load * (1 - regulation))``, so per MW a higher tier is
+# preferred to a lower one whenever ``w(tier)`` is strictly decreasing — the
+# ordering is strict AT THE MARGIN for any decreasing ladder, independent of
+# demand sizes. This mirrors SCARE's own objective (tier-1 hard-locked, tiers 2-4
+# steep ``1e8/1e4/1``; base/util.tier_priority_weight) so the optimality gap
+# measures solver quality, not a policy mismatch — NOT the PWSF metric's moderate
+# 8:4:2:1, which would make the oracle trade tier-1 away and inflate the gap.
+#
+# The ONLY constraint is solver RESOLUTION: monee's ``auto_priority_floor`` lifts
+# the shed weights off the max objective coefficient, so a tier whose weight sits
+# far below the max is swamped below the optimality tolerance. That is exactly why
+# the legacy ``1e12/1e8/1e4/1`` ladder behaved priority-BLIND — tiers 3/4 were
+# 1e8-1e12x below tier 1, the LP tied them, and the oracle shed serveable tier-1
+# load under forced shedding. A span of 1e6 (adjacent ratio 100) is steep enough
+# to be effectively strict yet keeps the objective coefficient ratio (span x the
+# <=~40x in-sector demand range) within tolerance. Validated by a forced-shedding
+# oracle solve (see tests/eval/test_oracle_priority.py).
+_ORACLE_TIER_WEIGHT: dict[int, float] = {1: 1e6, 2: 1e4, 3: 1e2, 4: 1.0}
 
 
 def _weight_for_load_factory(
@@ -115,25 +124,35 @@ def _weight_for_load_factory(
 
     Returns ``model -> float | None``: ``base_demand_weight * tier_weight`` from
     the oracle ladder (``_ORACLE_TIER_WEIGHT``), or ``None`` to defer to monee's
-    default (generators / slack / unmapped models). Resolves models by
-    ``id(model)``. Returns ``None`` overall when no priorities are supplied, so
-    monee uses its flat-weight behaviour. Out-of-range tiers clamp onto [1, 4].
+    default (generators / slack / unmapped models). Returns ``None`` overall when
+    no priorities are supplied, so monee uses its flat-weight behaviour.
+    Out-of-range tiers clamp onto [1, 4].
+
+    The tier is STAMPED onto each load model as ``_scare_oracle_tier`` and the
+    closure resolves it via ``getattr``, NOT an ``id(model)`` map. monee's solver
+    deep-copies the network before building the objective
+    (``solver/core.py``: ``input_network.copy()``), so the objective sees COPIED
+    models whose ``id`` differs from the originals; an id-keyed map misses every
+    one, silently returns ``None`` for all loads, and renders the oracle
+    priority-BLIND (verified: reversing the ladder left the dispatch unchanged).
+    A model attribute survives the copy, so the weight resolves on the copy too.
     """
     if not priorities:
         return None
-    model_to_tier: dict[int, int] = {}
+    stamped = 0
     for child in monee_net.childs:
         aid = f"child-{child.id}"
         tier = priorities.get(aid)
         if tier is None or int(tier) <= 0:
             continue
-        model_to_tier[id(child.model)] = int(tier)
+        child.model._scare_oracle_tier = int(tier)
+        stamped += 1
 
-    if not model_to_tier:
+    if not stamped:
         return None
 
     def _w(model: Any) -> float | None:
-        tier = model_to_tier.get(id(model))
+        tier = getattr(model, "_scare_oracle_tier", None)
         if tier is None:
             return None  # let monee use its default
         t = max(1, min(4, int(tier)))

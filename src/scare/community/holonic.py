@@ -1747,6 +1747,20 @@ class HolonicCommunityRole(Role):
                 self.sector,
                 now,
             )
+            # Re-assert non-increasing-in-tier monotonicity AFTER the coalition
+            # merge. ``merge_into`` lets a per-tier store fraction win, which can
+            # lift a lower-priority tier above a higher one and reintroduce the
+            # exact inversion the coordinator's clamp removed (see the
+            # component-scope clamp above, ~L1677). Without this, a competing
+            # coalition override silently breaks component priority order (the
+            # observed gas tier-1-victim inversions). Clamp is priority-safe: it
+            # only ever lowers a lower tier to its higher tier's level.
+            merged = service_fraction.get(self.sector.value)
+            if merged:
+                cap = 1.0
+                for tier in sorted(t for t in merged if t >= 1):
+                    merged[tier] = min(merged[tier], cap)
+                    cap = merged[tier]
         # Send to SELF: the negotiator applies the fraction to every community
         # member, covering loads outside any holon. This authoritative dispatch
         # also refreshes the per-load L2 priority floor (in ``apply_regulate``);

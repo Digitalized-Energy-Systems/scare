@@ -41,7 +41,10 @@ def test_factory_returns_none_without_priorities():
 def test_factory_returns_per_tier_weights():
     """With priorities, the factory returns a callable emitting
     ``base × _ORACLE_TIER_WEIGHT[tier]`` for known loads and ``None``
-    for unmapped models (tier 1 → 1e12 ... tier 4 → 1)."""
+    for unmapped models. Weights are a bounded near-strict ladder
+    (tier 1 → 1e6 ... tier 4 → 1, adjacent ratio 100): strictly decreasing
+    so the LP prefers higher tiers per MW, but span-limited so no tier is
+    swamped below the solver tolerance (unlike the legacy 1e12 ladder)."""
     net = fetch_example_net()
     load_aids = [
         f"child-{c.id}" for c in net.childs if type(c.model).__name__ == "PowerLoad"
@@ -52,19 +55,24 @@ def test_factory_returns_per_tier_weights():
     wfn = _weight_for_load_factory(net, priorities, base_demand_weight=100.0)
     assert wfn is not None
 
-    # tier-1 model
+    # tier-1 model: base × 1e6
     aid_1 = load_aids[0]
     cid_1 = int(aid_1.split("-")[1])
     model_1 = next(c.model for c in net.childs if c.id == cid_1)
     w1 = wfn(model_1)
-    assert w1 == pytest.approx(100.0 * 1e12)
+    assert w1 == pytest.approx(100.0 * 1e6)
 
-    # tier-4 model
+    # tier-4 model: base × 1
     aid_4 = load_aids[1]
     cid_4 = int(aid_4.split("-")[1])
     model_4 = next(c.model for c in net.childs if c.id == cid_4)
     w4 = wfn(model_4)
     assert w4 == pytest.approx(100.0 * 1.0)
+
+    # strictly decreasing, bounded span (1e6) — strict at the margin but
+    # resolvable, unlike the legacy 1e12 ladder.
+    assert wfn(model_1) > wfn(model_4)
+    assert wfn(model_1) / wfn(model_4) == pytest.approx(1e6)
 
     # Unmapped model — return None so monee uses its default.
     other = next(
@@ -82,6 +90,25 @@ def test_factory_returns_per_tier_weights():
             base_demand_weight=100.0,
         )
         is None
+    )
+
+
+def test_weight_resolves_on_copied_network():
+    """Regression: monee's solver deep-copies the network before building the
+    objective (solver/core.py: input_network.copy()), so the weight closure must
+    resolve on COPIED load models. The previous ``id(model)`` map missed every
+    copied model, returned None for all loads, and made the oracle priority-BLIND
+    (reversing the tier ladder left the dispatch unchanged). The closure now
+    stamps ``_scare_oracle_tier`` on the model, which survives the copy."""
+    net = fetch_example_net()
+    cid = next(c.id for c in net.childs if type(c.model).__name__ == "PowerLoad")
+    wfn = _weight_for_load_factory(net, {f"child-{cid}": 1}, base_demand_weight=100.0)
+    assert wfn is not None
+    net_copy = net.copy()
+    model_copy = next(c.model for c in net_copy.childs if c.id == cid)
+    assert id(model_copy) != id(next(c.model for c in net.childs if c.id == cid))
+    assert wfn(model_copy) == pytest.approx(100.0 * 1e6), (
+        "weight must resolve on the copied model the solver actually optimises"
     )
 
 

@@ -513,6 +513,89 @@ def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
     return pwsf_compliant, rate, n_compliant, n_total
 
 
+def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
+    """Per-grid PWSF of each non-oracle variant vs the oracle, PAIRED on
+    identical task identity (every key but ``variant``) with BOTH sides
+    compliant and PWSF-defined.
+
+    The unpaired ``Variant comparison`` table above takes each variant's own
+    compliant-subset mean, which can manufacture inversions: a variant scored
+    on an easier surviving subset than the oracle (e.g. the oracle silently
+    dropping MILP-crash tasks, status=error => PWSF NaN) is not comparable.
+    Pairing on task identity and intersecting the compliant sets removes both
+    the unequal-task-set and unequal-compliant-subset confounds, so ``Δ vs
+    oracle`` is the honest optimality gap (negative => variant below oracle).
+    """
+    if ok_vc.empty or "variant" not in ok_vc.columns:
+        return []
+    if "oracle" not in set(ok_vc["variant"]) or _PRIMARY_OUTCOME not in ok_vc.columns:
+        return []
+    key = [
+        c
+        for c in ("seed", "scenario", "experiment", "ablation", "sweep")
+        if c in ok_vc.columns
+    ]
+    if not key:
+        return []
+    rows: list[list[str]] = []
+    for grid, g in ok_vc.groupby("grid"):
+        gc = g[compliant_mask(g) & g[_PRIMARY_OUTCOME].notna()]
+        orc = gc[gc["variant"] == "oracle"].drop_duplicates(key).set_index(key)[
+            _PRIMARY_OUTCOME
+        ]
+        if orc.empty:
+            continue
+        for variant, gv in gc.groupby("variant"):
+            if variant == "oracle":
+                continue
+            vv = gv.drop_duplicates(key).set_index(key)[_PRIMARY_OUTCOME]
+            common = vv.index.intersection(orc.index)
+            if len(common) == 0:
+                continue
+            v_arr = vv.loc[common]
+            o_arr = orc.loc[common]
+            vm, _ = mean_ci95(v_arr)
+            om, _ = mean_ci95(o_arr)
+            wins = int((v_arr.to_numpy() > o_arr.to_numpy() + 1e-9).sum())
+            rows.append(
+                [
+                    alias_grid(grid),
+                    alias_variant(variant),
+                    str(len(common)),
+                    f"{vm:.4f}",
+                    f"{om:.4f}",
+                    f"{vm - om:+.4f}",
+                    f"{wins}/{len(common)}",
+                ]
+            )
+    if not rows:
+        return []
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return [
+        "",
+        "## Variant vs oracle (paired on task identity, both compliant)",
+        "",
+        "_Each non-oracle variant against the oracle on the SAME tasks where "
+        "both are compliant and have a defined PWSF — the comparable optimality "
+        "gap. `Δ vs oracle` < 0 means the variant trails the oracle; a positive "
+        "Δ on a valid (rescaled-weight) oracle should be rare. Differs from the "
+        "unpaired table above, which can fabricate inversions when the oracle's "
+        "compliant/surviving subset differs from the variant's._",
+        _markdown_table(
+            [
+                "grid",
+                "variant",
+                "n_paired",
+                "mean PWSF",
+                "oracle PWSF",
+                "Δ vs oracle",
+                "variant>oracle",
+            ],
+            rows,
+        ),
+    ]
+
+
 def _format_eval_sections(
     df: pd.DataFrame, targets: dict[str, tuple[list[str], str]] | None = None
 ) -> list[str]:
@@ -572,6 +655,8 @@ def _format_eval_sections(
                 rows,
             )
         )
+
+    parts.extend(_paired_vs_oracle_section(ok_vc))
 
     # Ablation impact: only experiments that define an ablation matrix
     # (else the "default" baseline pools across non-ablation experiments
