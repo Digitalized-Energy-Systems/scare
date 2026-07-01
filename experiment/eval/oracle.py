@@ -324,12 +324,6 @@ def run_oracle(
         ext_grid_heat_bounds,
     )
 
-    # GEKKO (monee's default) hits "Max Equation Length" on large grids (the LP
-    # objective is one huge ``minimize(...)`` expression); Pyomo handles
-    # arbitrarily large objectives.
-    if solver is None:
-        solver = PyomoSolver()
-
     # With ``priorities``, attach a per-load weight closure so the LP objective
     # discriminates between tiers; without it the oracle minimises total unserved
     # MW with every load equal (a priority-blind bound, unfair vs the MAS).
@@ -390,8 +384,7 @@ def run_oracle(
     result = run_energy_flow_optimization(
         monee_net,
         prob,
-        solver=solver,
-        solver_name="gurobi",
+        solver="gurobi",
         exclude_unconnected_nodes=True,
     )
     lp_success = bool(getattr(result, "success", True))
