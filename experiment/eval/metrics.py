@@ -202,15 +202,10 @@ def _line_feasibility_factor(monee_net: Any) -> dict[Any, float]:
         if not _branch_carries_sector(branch, monee_net, "electricity"):
             continue
         a, b = branch.id[0], branch.id[1]
-        try:
-            loading = float(branch.model.loading_pu)
-        except Exception:
-            loading = 0.0
-        # Unit normalisation: GenericPowerBranch / MISOCP reports loading as a
-        # fraction (~1.14 for 114%); IntermediateEq reports a percent. A value
-        # <= 5 cannot be a real percent, so scale it to percent.
-        if 0.0 < loading <= 5.0:
-            loading *= 100.0
+        # Same exact-basis grading as the violation scan (``constraint_rows``)
+        # so the served de-rate and the compliance gate see identical loadings.
+        pct = _branch_loading_percent(branch, monee_net)
+        loading = pct if pct is not None and math.isfinite(pct) else 0.0
         edge_f = (
             min(1.0, 100.0 / loading)
             if loading > 100.0 + _LINE_LOADING_TOL_PCT
@@ -296,7 +291,8 @@ def served_by_load(
             not getattr(child, "active", True) or child.node_id in disconnected
         )
         sp = 0.0 if is_disconnected else obs_setpoint(obs)
-        served = max(0.0, min(cap, sp))
+        # min(cap, nan) returns cap — a NaN setpoint must not credit full served.
+        served = max(0.0, min(cap, sp)) if math.isfinite(sp) else 0.0
         node = monee_net.node_by_id(child.node_id)
         sec = sector_from_grid(node.grid)
         if sec is None:
@@ -356,7 +352,8 @@ def served_breakdown(
     ``{
         "by_tier_sector": {sector: {tier: {demand, served, fraction}}},
         "by_sector":      {sector: {demand, served, fraction}},
-        "by_tier":        {tier:   {demand, served, fraction, weight}},
+        "by_tier":        {tier:   {demand, served, fraction, weight}}
+                          (MW sectors only — gas is kg/s and stays per-sector),
         "priority_weighted_served": float,
         "priority_weighted_demand": float,
         "priority_weighted_fraction": float,
@@ -414,8 +411,9 @@ def served_breakdown(
             sp = obs_setpoint(obs)
         # Clamp to [0, cap]: a load can't consume more than rated demand, and
         # MAS variants may set regulation > 1.0. Without this, over-served loads
-        # mask genuine zero-served loads in the totals.
-        served = max(0.0, min(cap, sp))
+        # mask genuine zero-served loads in the totals. min(cap, nan) returns
+        # cap, so a NaN setpoint must be zeroed, not credited full served.
+        served = max(0.0, min(cap, sp)) if math.isfinite(sp) else 0.0
         demand = cap
         # Demand on disconnected nodes — the priority-blind share of the
         # per-tier loss; restoration_breakdown uses it to attribute losses.
@@ -426,12 +424,18 @@ def served_breakdown(
         if sec is None:
             continue
         # Don't credit heat served at an out-of-bounds node temperature.
+        served_pre_gate = served
         if served > 0.0 and not _heat_served_feasible(obs, sec):
             served = 0.0
         # De-rate electricity served through an overloaded line to the feasible
         # level (see ``_line_feasibility_factor``).
         if served > 0.0 and sec is Sector.ELECTRICITY:
             served *= line_factor.get(child.node_id, 1.0)
+        # Served the agents dispatched but the feasibility gates above removed —
+        # physics-throttled, not an agent shedding decision. Tracked per tier so
+        # restoration_breakdown can net it out of agent_shed (mirroring the
+        # constraint-throttled exclusion in claims.py's priority invariant).
+        served_constraint_capped = max(0.0, served_pre_gate - served)
         if priorities is not None and aid in priorities:
             tier = int(priorities[aid])
         else:
@@ -440,19 +444,37 @@ def served_breakdown(
 
         sec_key = sec.value
         by_sector.setdefault(
-            sec_key, {"demand": 0.0, "served": 0.0, "demand_disconnected": 0.0}
+            sec_key,
+            {
+                "demand": 0.0,
+                "served": 0.0,
+                "demand_disconnected": 0.0,
+                "served_constraint_capped": 0.0,
+            },
         )
         by_sector[sec_key]["demand"] += demand
         by_sector[sec_key]["served"] += served
         by_sector[sec_key]["demand_disconnected"] += demand_disc
+        by_sector[sec_key]["served_constraint_capped"] += served_constraint_capped
 
-        by_tier.setdefault(
-            tier,
-            {"demand": 0.0, "served": 0.0, "weight": w, "demand_disconnected": 0.0},
-        )
-        by_tier[tier]["demand"] += demand
-        by_tier[tier]["served"] += served
-        by_tier[tier]["demand_disconnected"] += demand_disc
+        # by_tier sums MW across sectors; gas demand/served is mass-flow (kg/s)
+        # and would corrupt the mixed-unit buckets — gas stays in the per-sector
+        # views (by_sector / by_tier_sector) only.
+        if sec is not Sector.GAS:
+            by_tier.setdefault(
+                tier,
+                {
+                    "demand": 0.0,
+                    "served": 0.0,
+                    "weight": w,
+                    "demand_disconnected": 0.0,
+                    "served_constraint_capped": 0.0,
+                },
+            )
+            by_tier[tier]["demand"] += demand
+            by_tier[tier]["served"] += served
+            by_tier[tier]["demand_disconnected"] += demand_disc
+            by_tier[tier]["served_constraint_capped"] += served_constraint_capped
 
         by_tier_sector.setdefault(sec_key, {})
         by_tier_sector[sec_key].setdefault(
@@ -538,13 +560,19 @@ def restoration_breakdown(
         "pwsf_post":               post.priority_weighted_fraction,
         "pwsf_restoration_ratio":  pwsf_post / pwsf_baseline,
         "by_tier":   per-tier {demand_baseline_mw, served_baseline_mw,
-                                served_post_mw, ratio (=post/baseline)},
-        "by_sector": per-sector {demand_baseline_mw, served_baseline_mw,
-                                  served_post_mw, ratio},
+                                served_post_mw, post_fraction (=post/demand),
+                                baseline_fraction, ratio (=post/baseline,
+                                clamped), ratio_unclamped, disconnect_lost_mw,
+                                constraint_lost_mw, agent_shed_mw,
+                                agent_only_ratio},
+        "by_sector": per-sector {same fields, minus weight},
     }``
 
     The ``raw_*`` fields are unweighted MW (absolute load lost) alongside the
-    priority-weighted fraction. ``by_tier.ratio`` surfaces per-tier restoration.
+    priority-weighted fraction. ``by_tier.post_fraction`` is the headline
+    per-tier view: the baseline-relative ``ratio`` divides by a priority-aware,
+    slack-budget-bounded baseline that already sheds low tiers, so its clamp
+    saturates them at 1.0 and can fabricate an apparent tier inversion.
     """
     if not baseline:
         return {"baseline_available": False}
@@ -577,11 +605,15 @@ def restoration_breakdown(
         d_b = float(tb.get("demand", 0.0))
         s_b = float(tb.get("served", 0.0))
         s_p = float(tp.get("served", 0.0))
-        # Split the per-tier loss: ``disconnect_lost`` is the priority-blind
-        # share (load that physically lost its path to a grid-former,
-        # irrecoverable); the rest is ``agent_shed`` (load the QP / ADMM chose
-        # to drop). Priority should drive agent_shed, not disconnect_lost.
+        # Split the per-tier loss three ways: ``disconnect_lost`` is the
+        # priority-blind share (load that physically lost its path to a
+        # grid-former, irrecoverable); ``constraint_lost`` is served the agents
+        # dispatched but the eval feasibility gates (heat t_k, line loading)
+        # removed — physics-throttled, no agent lever; the remainder is
+        # ``agent_shed`` (load the QP / ADMM chose to drop). Priority should
+        # drive agent_shed only.
         disc_p = float(tp.get("demand_disconnected", 0.0))
+        capped_p = float(tp.get("served_constraint_capped", 0.0))
         total_loss = max(0.0, s_b - s_p)
         disconnect_lost = max(0.0, min(disc_p, total_loss))
         # disconnect_lost > total_loss is arithmetically impossible; log + clamp
@@ -594,17 +626,23 @@ def restoration_breakdown(
                 disc_p,
                 total_loss,
             )
-        agent_shed = max(0.0, total_loss - disconnect_lost)
+        constraint_lost = max(0.0, min(capped_p, total_loss - disconnect_lost))
+        agent_shed = max(0.0, total_loss - disconnect_lost - constraint_lost)
         ratio = s_p / s_b if s_b > 1e-12 else (1.0 if d_b < 1e-12 else 0.0)
-        # Agent-only ratio: tier restoration excluding physical disconnect.
-        s_b_recoverable = max(1e-12, s_b - disconnect_lost)
-        agent_ratio = (s_b - total_loss + disconnect_lost) / s_b_recoverable
+        # Agent-only ratio: share of the controllable baseline (physical
+        # disconnect and gate-throttled load excluded) the agents kept.
+        s_b_recoverable = max(1e-12, s_b - disconnect_lost - constraint_lost)
+        agent_ratio = (s_b_recoverable - agent_shed) / s_b_recoverable
         by_tier_out[str(tier)] = {
             "demand_baseline_mw": d_b,
             "served_baseline_mw": s_b,
             "served_post_mw": s_p,
+            "post_fraction": (s_p / d_b if d_b > 1e-12 else 1.0),
+            "baseline_fraction": (s_b / d_b if d_b > 1e-12 else 1.0),
             "ratio": max(0.0, min(1.0, ratio)),
+            "ratio_unclamped": ratio,
             "disconnect_lost_mw": disconnect_lost,
+            "constraint_lost_mw": constraint_lost,
             "agent_shed_mw": agent_shed,
             "agent_only_ratio": max(0.0, min(1.0, agent_ratio)),
             "weight": float(tb.get("weight", 0.0)),
@@ -619,29 +657,48 @@ def restoration_breakdown(
         s_p = float(sp.get("served", 0.0))
         ratio = s_p / s_b if s_b > 1e-12 else 1.0
         disc_p = float(sp.get("demand_disconnected", 0.0))
+        capped_p = float(sp.get("served_constraint_capped", 0.0))
         total_loss = max(0.0, s_b - s_p)
         disconnect_lost = max(0.0, min(disc_p, total_loss))
-        agent_shed = max(0.0, total_loss - disconnect_lost)
+        constraint_lost = max(0.0, min(capped_p, total_loss - disconnect_lost))
+        agent_shed = max(0.0, total_loss - disconnect_lost - constraint_lost)
         by_sector_out[sec] = {
             "demand_baseline_mw": d_b,
             "served_baseline_mw": s_b,
             "served_post_mw": s_p,
+            "post_fraction": (s_p / d_b if d_b > 1e-12 else 1.0),
+            "baseline_fraction": (s_b / d_b if d_b > 1e-12 else 1.0),
             "ratio": max(0.0, min(1.0, ratio)),
+            "ratio_unclamped": ratio,
             "disconnect_lost_mw": disconnect_lost,
+            "constraint_lost_mw": constraint_lost,
             "agent_shed_mw": agent_shed,
         }
 
-    # Campaign-level disconnect vs agent split (sum of per-sector shares).
+    # Campaign-level disconnect / constraint / agent split (per-sector sums);
+    # gas is kg/s, so only MW sectors sum (same filter as the totals above).
     total_disconnect_lost = sum(
-        s.get("disconnect_lost_mw", 0.0) for s in by_sector_out.values()
+        s.get("disconnect_lost_mw", 0.0)
+        for k, s in by_sector_out.items()
+        if k in _mw_sectors
     )
-    total_agent_shed = sum(s.get("agent_shed_mw", 0.0) for s in by_sector_out.values())
+    total_constraint_lost = sum(
+        s.get("constraint_lost_mw", 0.0)
+        for k, s in by_sector_out.items()
+        if k in _mw_sectors
+    )
+    total_agent_shed = sum(
+        s.get("agent_shed_mw", 0.0)
+        for k, s in by_sector_out.items()
+        if k in _mw_sectors
+    )
 
     return {
         "baseline_available": True,
         "absolute_load_lost_mw": max(0.0, total_demand - total_served_post),
         "absolute_load_dropped_mw": max(0.0, total_served_baseline - total_served_post),
         "disconnect_lost_mw": total_disconnect_lost,
+        "constraint_lost_mw": total_constraint_lost,
         "agent_shed_mw": total_agent_shed,
         "total_demand_mw": total_demand,
         "total_served_baseline_mw": total_served_baseline,
@@ -667,8 +724,9 @@ def restoration_breakdown(
 def _is_deenergised_avg(var: str, val: float) -> bool:
     """A sector-average reading low enough to mean the network (on average)
     collapsed/de-energised rather than violated a bound. Mirrors the per-node
-    guards in ``constraint_rows`` (DEENERGISED_VM_PU / DEENERGISED_PRESSURE_PU /
-    t_k<=0) so the integral does not score a black-out as an over/under-voltage
+    guards in ``constraint_rows`` (DEENERGISED_VM_PU / DEENERGISED_PRESSURE_PU
+    low + DEENERGISED_PRESSURE_HIGH_PU high / t_k<=0) so the integral does not
+    score a black-out as an over/under-voltage
     violation — without this a fully de-energised run (avg_vm_pu~0.05) integrates
     to a huge spurious value while the final scan reports zero violations.
     """
@@ -752,7 +810,10 @@ def constraint_violation_integral(world: Any) -> dict[str, float]:
 # compliance gate and the served de-rating draw the line at the same place.
 _CONSTRAINT_ABS_TOL: dict[str, float] = {
     "vm_pu": 0.005,
-    "pressure_pu": 0.005,
+    # 0.01 (not 0.005) absorbs the MIQCQP solver residual on sqrt-derived
+    # pressure_pu: feasible oracle solves land 1e-4..8e-4 below lo - 0.005 and
+    # were ejected as non-compliant.
+    "pressure_pu": 0.01,
     "t_k": _HEAT_T_TOL_K,
     "loading_percent": _LINE_LOADING_TOL_PCT,
 }
@@ -780,12 +841,100 @@ def _model_value(model: Any, key: str) -> float | None:
         return None
 
 
-def _branch_loading_percent(branch: Any) -> float | None:
+def _branch_loading_mva_percent(model: Any) -> float | None:
+    """Worst-side loading in the MVA basis: ``100 * sqrt(p^2 + q^2) /
+    max_s_mva``. None when the rating or the solved p/q flows are
+    unavailable."""
+    try:
+        mva = float(getattr(model, "max_s_mva", None))
+    except (TypeError, ValueError):
+        return None
+    if not (mva > 0.0):
+        return None
+    s_sides: list[float] = []
+    for side in ("from", "to"):
+        p = _model_value(model, f"p_{side}_mw")
+        q = _model_value(model, f"q_{side}_mvar")
+        if p is not None and q is not None and math.isfinite(p) and math.isfinite(q):
+            s_sides.append(math.hypot(p, q))
+    if not s_sides:
+        return None
+    return 100.0 * max(s_sides) / mva
+
+
+# Mirrors monee problem/utils.py: max_i_ka at/above this sentinel means the LP
+# leaves the branch current unbounded, so there is no rating to grade against.
+_UNBOUND_MAX_I_KA: float = 999.0
+
+
+def _branch_loading_current_percent(branch: Any, monee_net: Any) -> float | None:
+    """Worst-side loading in the exact current basis: ``100 * sqrt(p^2 + q^2)
+    / (sqrt(3) * vm_pu * base_kv * max_i_ka)`` per side (S in MVA, voltage in
+    kV, current in kA). This is the current the solved power flows imply —
+    NOT the SOC-relaxed ``i_{from,to}_ka`` intermediates, which carry the
+    relaxation gap. None when the rating, flows, or an energised end-voltage
+    are unavailable."""
+    model = getattr(branch, "model", None)
+    try:
+        max_i_ka = float(getattr(model, "max_i_ka", None))
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < max_i_ka < _UNBOUND_MAX_I_KA):
+        return None
+    pcts: list[float] = []
+    for side, node_id in (
+        ("from", getattr(branch, "from_node_id", None)),
+        ("to", getattr(branch, "to_node_id", None)),
+    ):
+        p = _model_value(model, f"p_{side}_mw")
+        q = _model_value(model, f"q_{side}_mvar")
+        if p is None or q is None or not (math.isfinite(p) and math.isfinite(q)):
+            continue
+        try:
+            node_model = monee_net.node_by_id(node_id).model
+        except Exception:  # noqa: BLE001
+            continue
+        vm = _model_value(node_model, "vm_pu")
+        try:
+            base_kv = float(getattr(node_model, "base_kv", None))
+        except (TypeError, ValueError):
+            continue
+        if vm is None or not math.isfinite(vm) or vm <= DEENERGISED_VM_PU:
+            continue
+        if not (base_kv > 0.0):
+            continue
+        i_ka = math.hypot(p, q) / (math.sqrt(3.0) * vm * base_kv)
+        pcts.append(100.0 * i_ka / max_i_ka)
+    return max(pcts) if pcts else None
+
+
+def _branch_loading_exact_percent(branch: Any, monee_net: Any) -> float | None:
+    """Worst-side loading re-judged in the exact basis the oracle LP enforces:
+    the MVA basis when the branch carries ``max_s_mva``, else the current
+    basis monee's ``line_loading_limit`` falls back to (benchmark imports set
+    only ``max_i_ka``)."""
+    mva_pct = _branch_loading_mva_percent(getattr(branch, "model", None))
+    if mva_pct is not None:
+        return mva_pct
+    return _branch_loading_current_percent(branch, monee_net)
+
+
+def _branch_loading_percent(branch: Any, monee_net: Any) -> float | None:
     """Worst (from/to) thermal loading of a branch in *percent*.
 
-    ``loading_pu`` is a Python property (not in ``model.values``), so fall
-    back to the per-side ``loading_{from,to}_pu`` Vars. Applies the same
-    fraction->percent normalisation as ``_line_feasibility_factor``.
+    The reported ``loading_pu`` / ``loading_{from,to}_pu`` (per-unit fractions
+    in every formulation; ``loading_pu`` is a Python property, not in
+    ``model.values``, hence the per-side fallback) is the screen. An apparent
+    overload is then re-judged in the exact basis the oracle LP enforces —
+    MVA (``sqrt(p^2 + q^2) <= max_loading * max_s_mva``) when the branch is
+    MVA-rated, else the exact current implied by the solved flows and end
+    voltages against ``max_i_ka``: under MISOCP the loading intermediates
+    derive from the SOC-RELAXED current, which only OVERSTATES loading
+    (relaxation gap), so grading from them charged phantom overloads to
+    solutions satisfying the LP's cap — while a genuine overload always shows
+    in the screen. Re-judging (rather than grading the exact basis
+    unconditionally) also keeps unsolved nets, whose p/q sit at Var defaults,
+    from fabricating overloads.
     """
     model = getattr(branch, "model", None)
     if model is None:
@@ -796,11 +945,14 @@ def _branch_loading_percent(branch: Any) -> float | None:
         lt = _model_value(model, "loading_to_pu")
         mags = [abs(x) for x in (lf, lt) if x is not None]
         if not mags:
-            return None
+            return _branch_loading_exact_percent(branch, monee_net)
         lp = max(mags)
-    if 0.0 < lp <= 5.0:
-        lp *= 100.0
-    return lp
+    pct = abs(lp) * 100.0
+    if pct > 100.0 + _LINE_LOADING_TOL_PCT:
+        exact_pct = _branch_loading_exact_percent(branch, monee_net)
+        if exact_pct is not None:
+            return exact_pct
+    return pct
 
 
 def _bound_overshoot(val: float, lo: float, hi: float, *, one_sided: bool) -> float:
@@ -879,13 +1031,20 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
             # Solver-unpopulated / de-energised junctions are not real breaches
             # (the live monitor skips them the same way): an isolated heat
             # junction reports t_k~0, a gas region cut off from its ExtHydrGrid
-            # collapses to pressure_pu~0, and an electricity node cut off from
-            # its slack collapses to vm_pu~0. See DEENERGISED_* for why a small
-            # floor (not 0) is needed and why genuine under-bound readings still
-            # gate.
+            # collapses to pressure_pu~0 (or saturates at the relaxed-Weymouth
+            # solver bound ~sqrt(3) — same artefact, high side), and an
+            # electricity node cut off from its slack collapses to vm_pu~0. See
+            # DEENERGISED_* for why a small floor (not 0) is needed and why
+            # genuine out-of-bound readings still gate.
             if (
                 (var == "t_k" and val <= 0.0)
-                or (var == "pressure_pu" and val <= DEENERGISED_PRESSURE_PU)
+                or (
+                    var == "pressure_pu"
+                    and (
+                        val <= DEENERGISED_PRESSURE_PU
+                        or val >= DEENERGISED_PRESSURE_HIGH_PU
+                    )
+                )
                 or (var == "vm_pu" and val <= DEENERGISED_VM_PU)
             ):
                 continue
@@ -902,7 +1061,7 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
             a, b = branch.id[0], branch.id[1]
             if a in disconnected or b in disconnected:
                 continue
-            val = _branch_loading_percent(branch)
+            val = _branch_loading_percent(branch, monee_net)
             if val is None or not math.isfinite(val):
                 continue
             rows.append(
@@ -1071,24 +1230,27 @@ def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
         k: max(1e-6, 0.005 * max(abs(v) for v in ts)) for k, (_, ts) in series.items()
     }
 
-    # Common timestep grid (series share recording cadence); a step is stable
-    # only if every series' diff is below threshold.
-    ref_t, _ = next(iter(series.values()))
+    # Series share the recording cadence, but a dropped sample in one series
+    # desyncs positional indices — align on the shared timestamps instead. A
+    # step is stable only if every series' diff is below threshold.
+    common_t = sorted(set.intersection(*(set(t) for t, _ in series.values())))
+    if len(common_t) < 2:
+        return None
+    at_t = {k: dict(zip(t, ts)) for k, (t, ts) in series.items()}
 
     def step_stable(i: int) -> bool:
-        for k, (t, ts) in series.items():
-            if i >= len(ts) or i < 1:
-                return False
-            if abs(ts[i] - ts[i - 1]) > thresholds[k]:
+        for k in series:
+            vals = at_t[k]
+            if abs(vals[common_t[i]] - vals[common_t[i - 1]]) > thresholds[k]:
                 return False
         return True
 
     stable_since: float | None = None
-    for i in range(1, len(ref_t)):
+    for i in range(1, len(common_t)):
         if step_stable(i):
             if stable_since is None:
-                stable_since = ref_t[i]
-            elif ref_t[i] - stable_since >= hold_s:
+                stable_since = common_t[i]
+            elif common_t[i] - stable_since >= hold_s:
                 return float(stable_since)
         else:
             stable_since = None

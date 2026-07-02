@@ -450,7 +450,9 @@ async def test_handle_constraint_state_populates_heat_peer_cache():
 # ---------------------------------------------------------------------------
 
 
-def _gating_monitor(gating: bool, sector: Sector = Sector.HEAT):
+def _gating_monitor(
+    gating: bool, sector: Sector = Sector.HEAT, heat_frontier: bool = False
+):
     behavior = MockBehavior()
     behavior.set_obs("agent-0", {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 300.0})
     behavior.add_action("agent-0", "regulate")
@@ -462,18 +464,28 @@ def _gating_monitor(gating: bool, sector: Sector = Sector.HEAT):
         enable_curtailment_auction=True,
         enable_curtail_auction_gating=gating,
         enable_multihop_constraint=False,
-        enable_heat_frontier=False,
+        enable_heat_frontier=heat_frontier,
     )
     return behavior, monitor
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("gating,expect_fire", [(False, True), (True, False)])
-async def test_gating_scopes_auction_off_temperature(gating, expect_fire):
-    """The scope guard (a): with gating on, a ``t_k`` violation must NOT
-    arm the auction (temperature is the frontier controller's lever); with
-    gating off the legacy behaviour (auction fires on any var) is kept."""
-    behavior, monitor = _gating_monitor(gating=gating)
+@pytest.mark.parametrize(
+    "gating,heat_frontier,expect_fire",
+    [
+        (False, True, False),
+        (True, True, False),
+        (False, False, True),
+        (True, False, True),
+    ],
+)
+async def test_gating_scopes_auction_off_temperature(
+    gating, heat_frontier, expect_fire
+):
+    """``t_k`` is scoped off the auction only while the heat frontier owns it;
+    with the frontier disabled the auction is the remaining backstop and must
+    fire, independent of the progress-gating flag."""
+    behavior, monitor = _gating_monitor(gating=gating, heat_frontier=heat_frontier)
     world = create_world()
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)

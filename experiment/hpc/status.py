@@ -116,7 +116,7 @@ def report(campaign_dir: Path, show_failed: int) -> None:
                 exc_file = td / "exception.json"
                 if exc_file.exists():
                     try:
-                        d = json.loads(exc_file.read_text())
+                        d = json.loads(exc_file.read_text(encoding="utf-8"))
                         exc_type = str(d.get("type", ""))
                         exc_msg = str(d.get("message", ""))[:80]
                     except json.JSONDecodeError:

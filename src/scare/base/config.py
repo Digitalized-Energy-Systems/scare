@@ -63,9 +63,11 @@ class RestorationConfiguration:
     # physically unreachable through the cross-sector graph after a failure.
     enable_dynamic_cp_topology: bool = True
 
-    # L2.5 sector-wide holon-summary mesh + cross-holon inversion detection.
-    # Leaders publish per-tier summaries and flag inversions across peers.
-    # Cheap when off (no topology, no role).
+    # L2.5 cross-holon inversion detection: leaders publish per-tier summaries
+    # and flag inversions across peers. Off disables the HolonSummaryRole and
+    # coalition machinery only — the holon_summary_<sector> mesh itself is
+    # always built under enable_holonic because coordinator election and
+    # LeaderEmerged re-registration ride on it.
     enable_holon_summary: bool = True
 
     # Period (s) between HolonSummary publishes; also the invariant-check
@@ -375,8 +377,9 @@ class RestorationConfiguration:
     # before CP, as intended). False: legacy (CP draw uncounted). Default OFF:
     # forensics showed this debits a CROSS-sector converter draw against the
     # SAME-sector native-electricity pool, so it over-sheds native load without
-    # touching the converter draw (the real lever is CP converter curtailment —
-    # see enable_cp_budget_curtailment). See project_slack_compliance_rootcause.
+    # touching the converter draw (the real lever is the L3 CP converter
+    # curtailment via the CP priority ADMM — see enable_cp_priority_admm /
+    # cp_admm_algorithm). See project_slack_compliance_rootcause.
     enable_cp_aware_slack_supply: bool = False
 
     # Layer-0 gas pressure regulator on each gas ExtHydrGrid slack. True: the

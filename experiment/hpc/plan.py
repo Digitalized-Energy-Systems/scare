@@ -26,7 +26,7 @@ import socket
 import subprocess
 import sys
 from collections.abc import Iterable
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -88,7 +88,28 @@ def _build_legacy_tasks(cfg: CampaignConfig) -> list[TaskSpec]:
     return tasks
 
 
+def _validate_config_overrides(cfg: CampaignConfig) -> None:
+    """Fail planning on ablation/sweep keys that are not
+    ``RestorationConfiguration`` fields — the runner would otherwise silently
+    ignore them, degrading the arm to baseline."""
+    from scare.base.config import RestorationConfiguration
+
+    valid = {f.name for f in fields(RestorationConfiguration)}
+    for exp in cfg.experiments:
+        for axis, dicts in (("ablations", exp.ablations), ("sweeps", exp.sweeps)):
+            for d in dicts:
+                # $-prefixed keys are annotations (e.g. $label drives the
+                # aggregate arm labels), stripped by the config layer.
+                unknown = sorted(k for k in set(d) - valid if not k.startswith("$"))
+                if unknown:
+                    raise ValueError(
+                        f"experiment {exp.name!r}: unknown "
+                        f"RestorationConfiguration field(s) in {axis}: {unknown}"
+                    )
+
+
 def _build_eval_tasks(cfg: CampaignConfig) -> list[TaskSpec]:
+    _validate_config_overrides(cfg)
     tasks: list[TaskSpec] = []
     for e_idx, exp in enumerate(cfg.experiments):
         if not exp.grids:
@@ -166,22 +187,27 @@ def create_campaign(
         campaign_dir / CAMPAIGN_LAYOUT["config"]
     ):
         (campaign_dir / CAMPAIGN_LAYOUT["config_source"]).write_text(
-            Path(source_path).read_text()
+            Path(source_path).read_text(encoding="utf-8"), encoding="utf-8"
         )
 
     tasks = build_tasks(cfg)
-    with (campaign_dir / CAMPAIGN_LAYOUT["manifest"]).open("w") as f:
+    with (campaign_dir / CAMPAIGN_LAYOUT["manifest"]).open("w", encoding="utf-8") as f:
         for t in tasks:
             f.write(json.dumps(t.to_dict(), sort_keys=True) + "\n")
 
     _write_metadata(campaign_dir, cfg, len(tasks))
-    _log_breakdown(cfg, tasks)
+    _log_breakdown(tasks)
     logger.info("Campaign ready: %s", campaign_dir)
     return campaign_dir
 
 
-def _log_breakdown(cfg: CampaignConfig, tasks: list[TaskSpec]) -> None:
-    logger.info("Wrote %d task(s) across %d grid(s)", len(tasks), len(cfg.grids))
+def _log_breakdown(tasks: list[TaskSpec]) -> None:
+    # cfg.grids is empty in eval mode; count the grids the tasks actually use.
+    logger.info(
+        "Wrote %d task(s) across %d grid(s)",
+        len(tasks),
+        len({t.grid for t in tasks}),
+    )
     by_grid: dict[str, dict[int, int]] = {}
     for t in tasks:
         by_grid.setdefault(t.grid, {}).setdefault(t.n_failures, 0)
@@ -197,7 +223,7 @@ def _log_breakdown(cfg: CampaignConfig, tasks: list[TaskSpec]) -> None:
 def read_manifest(campaign_dir: Path) -> list[TaskSpec]:
     path = Path(campaign_dir) / CAMPAIGN_LAYOUT["manifest"]
     out: list[TaskSpec] = []
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -212,7 +238,7 @@ def task_status(campaign_dir: Path, task: TaskSpec) -> str:
     if not f.exists():
         return "missing"
     try:
-        return str(json.loads(f.read_text()).get("status", "missing"))
+        return str(json.loads(f.read_text(encoding="utf-8")).get("status", "missing"))
     except json.JSONDecodeError:
         return "missing"
 
@@ -224,8 +250,12 @@ def filter_task_ids(
 ) -> list[int]:
     """Pick task IDs whose on-disk status matches ``mode``.
 
-    ``incomplete`` is anything that isn't ``ok`` (crashed, timed-out, or
-    never-started) — the right default for "resubmit what didn't finish".
+    ``failed`` covers ``error`` and ``killed`` only. OOM-killed tasks never
+    write status.json and read as ``missing``; pick them up with ``missing``
+    / ``incomplete`` — but only after the Slurm array has drained, since a
+    still-queued task also reads as ``missing`` and resubmitting it
+    double-runs the task (mutual artifact scrubbing). ``incomplete`` is
+    anything that isn't ``ok`` (crashed, timed-out, or never-started).
     """
     if mode == "all":
         return [t.task_id for t in tasks]
@@ -303,7 +333,7 @@ def _write_metadata(campaign_dir: Path, cfg: CampaignConfig, n_tasks: int) -> No
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
     }
     (campaign_dir / CAMPAIGN_LAYOUT["metadata"]).write_text(
-        json.dumps(metadata, indent=2, sort_keys=True)
+        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
     )
 
 

@@ -523,6 +523,24 @@ def _check_monotonic_progress(
             continue
         by_sector_tier.setdefault(sec, {})[tier] = (t, ys)
 
+    def _legacy_worst_drop(sec: str, col: str) -> float | None:
+        """Worst excluded-window-filtered relative drop of the legacy
+        per-sector aggregate series, or None when the series is unusable."""
+        if col not in series:
+            return None
+        t, ys = series[col]
+        if len(ys) < 2:
+            return None
+        max_y = max(abs(y) for y in ys) or 1.0
+        worst = 0.0
+        for i in range(1, len(ys)):
+            if _excluded(sec, t[i]):
+                continue
+            drop = ys[i - 1] - ys[i]
+            if drop > worst:
+                worst = drop
+        return worst / max_y
+
     if by_sector_tier:
         violations: dict[str, dict[str, Any]] = {}
         skipped_sectors: list[str] = []
@@ -538,6 +556,9 @@ def _check_monotonic_progress(
                 for k, (_t, ys) in tier_series.items()
             }
             tiers_sorted = sorted(tier_series)
+            # _load_timeseries drops empty/NaN cells per column, so positional
+            # indices can desync across tiers — look lower tiers up by timestamp.
+            at_t = {j: dict(zip(*tier_series[j])) for j in tiers_sorted}
             for k in tiers_sorted:
                 t_k, ys_k = tier_series[k]
                 lower = [j for j in tiers_sorted if j > k]  # lower-priority tiers
@@ -549,8 +570,8 @@ def _check_monotonic_progress(
                         continue
                     # A lower-priority tier still served at this instant?
                     for j in lower:
-                        t_j, ys_j = tier_series[j]
-                        if i < len(ys_j) and ys_j[i] > _SHED_EPS * maxes[j]:
+                        y_j = at_t[j].get(t_k[i])
+                        if y_j is not None and y_j > _SHED_EPS * maxes[j]:
                             prev = violations.get(sec, {}).get("rel_drop", 0.0)
                             if rel_drop > prev:
                                 violations[sec] = {
@@ -560,6 +581,16 @@ def _check_monotonic_progress(
                                     "t": round(t_k[i], 3),
                                 }
                             break
+        # Gas tier series exist only on artifacts recorded with gas-sector
+        # Sink tiers; older artifacts fall back to the legacy aggregate check.
+        gas_drop: float | None = None
+        if "gas" not in by_sector_tier:
+            gas_drop = _legacy_worst_drop("gas", "gas_balance")
+            if gas_drop is not None and gas_drop >= _DROP_TOL:
+                violations["gas"] = {
+                    "rel_drop": round(gas_drop, 4),
+                    "legacy_aggregate": True,
+                }
         return {
             "passed": not violations,
             "detail": {
@@ -569,6 +600,11 @@ def _check_monotonic_progress(
                 "shed_eps": _SHED_EPS,
                 "warmup_s": _WARMUP_S,
                 "skipped_sectors": sorted(set(skipped_sectors)),
+                **(
+                    {"gas_legacy_relative_drop": round(gas_drop, 4)}
+                    if gas_drop is not None
+                    else {}
+                ),
             },
         }
 
@@ -581,20 +617,9 @@ def _check_monotonic_progress(
     }
     drops: dict[str, float] = {}
     for sec, col in sectors.items():
-        if col not in series:
-            continue
-        t, ys = series[col]
-        if len(ys) < 2:
-            continue
-        max_y = max(abs(y) for y in ys) or 1.0
-        worst = 0.0
-        for i in range(1, len(ys)):
-            if _excluded(sec, t[i]):
-                continue
-            drop = ys[i - 1] - ys[i]
-            if drop > worst:
-                worst = drop
-        drops[sec] = worst / max_y
+        d = _legacy_worst_drop(sec, col)
+        if d is not None:
+            drops[sec] = d
 
     passed = all(d < _DROP_TOL for d in drops.values())
     return {

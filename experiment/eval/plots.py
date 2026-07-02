@@ -30,6 +30,25 @@ from experiment.eval.compliance import (
 
 logger = logging.getLogger(__name__)
 
+# Statuses whose sim completed with valid metrics. ``claims_failed`` means a
+# fatal claim failed, not a missing measurement — excluding it is
+# variant-asymmetric (the oracle is almost never claims_failed) and inflates
+# weak baselines.
+_COMPLETED_STATUSES = ("ok", "claims_failed")
+
+
+def _completed(df: pd.DataFrame) -> pd.DataFrame:
+    if "status" not in df.columns:
+        return df
+    return df[df["status"].isin(_COMPLETED_STATUSES)]
+
+
+def _ci_label(ci: float) -> str:
+    """Hover/table text for a CI half-width; NaN (n=1, undefined) renders as
+    an em-dash rather than ``±nan``."""
+    return "—" if pd.isna(ci) else f"±{ci:.4f}"
+
+
 # Style — consistent palette + layout across the whole report
 
 
@@ -386,7 +405,7 @@ def _compliance_subtitle(rate: float | None, n_compliant: int, n_total: int) -> 
         return ""
     return (
         f"<span style='font-size:11px;color:{_MUTED_COLOR}'>"
-        f"compliant runs: {n_compliant}/{n_total} ({rate * 100:.0f}%)"
+        f"compliant runs: {n_compliant}/{n_total} completed ({rate * 100:.0f}%)"
         f"</span>"
     )
 
@@ -606,7 +625,7 @@ def variant_comparison_bar(
             n_t.append(len(vals_t))
         hover = [
             f"<b>{alias_variant(variant)}</b><br>grid: {g}<br>"
-            f"mean PWSF (compliant): {m:.4f}<br>95% CI: ±{c:.4f}<br>"
+            f"mean PWSF (compliant): {m:.4f}<br>95% CI: {_ci_label(c)}<br>"
             f"compliant: {nc}/{nt}" + (f" ({nc / nt * 100:.0f}%)" if nt else "")
             for g, m, c, nc, nt in zip(grids, means, cis, n_c, n_t)
         ]
@@ -703,7 +722,7 @@ def pwsf_by_sector_bar(
             cis.append(ci)
             hover.append(
                 f"<b>{sec}</b><br>variant: {alias_variant(v)}<br>"
-                f"mean PWSF: {m:.4f}<br>95% CI: ±{ci:.4f}<br>n={len(vals)}"
+                f"mean PWSF: {m:.4f}<br>95% CI: {_ci_label(ci)}<br>n={len(vals)}"
             )
         fig.add_trace(
             go.Bar(
@@ -739,16 +758,32 @@ def pwsf_by_sector_bar(
 # Optimality gap (Pillar 2)
 
 
+def _gap_pair_pivot(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """One row per single run pair: pivot on (grid, seed, scenario) — not
+    (grid, seed), which silently MEANS over the scenarios sharing a seed and,
+    with the compliance filter applied per row first, mixes asymmetric
+    scenario subsets between the two sides. Cells where either side is
+    missing or non-compliant are dropped."""
+    df = df[_compliant_mask(df)]
+    idx = ["grid", "seed"] + (["scenario"] if "scenario" in df.columns else [])
+    return df.pivot_table(index=idx, columns="variant", values=metric)
+
+
+def _pair_key_label(key: Any) -> str:
+    if isinstance(key, tuple):
+        return f"seed: {key[0]}<br>scenario: {key[1]}"
+    return f"seed: {key}"
+
+
 def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
     title = "Optimality gap: scare vs centralised oracle (compliant pairs)"
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
-    # Keep only rows where both variants are compliant — else an
+    # Keep only run pairs where both variants are compliant — else an
     # over-drawing scare reports a misleading "negative gap" against a
     # compliant oracle.
-    df = df[_compliant_mask(df)]
-    pivot = df.pivot_table(index=["grid", "seed"], columns="variant", values=metric)
+    pivot = _gap_pair_pivot(df, metric)
     if "scare" not in pivot.columns or "oracle" not in pivot.columns:
         return _save(
             _empty_fig("need both 'scare' and 'oracle' variants", title), out_path
@@ -772,7 +807,6 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
     grids = sorted(pivot.index.get_level_values("grid").unique())
     for i, grid in enumerate(grids):
         sub = pivot.xs(grid, level="grid")
-        seeds = list(sub.index)
         fig.add_trace(
             go.Scatter(
                 x=sub["oracle"],
@@ -786,8 +820,11 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
                     opacity=0.9,
                 ),
                 customdata=[
-                    f"grid: {alias_grid(grid)}<br>seed: {s}<br>oracle: {sub.loc[s, 'oracle']:.4f}<br>scare: {sub.loc[s, 'scare']:.4f}<br>gap: {(sub.loc[s, 'oracle'] - sub.loc[s, 'scare']):.4f}"
-                    for s in seeds
+                    f"<b>single run pair</b><br>grid: {alias_grid(grid)}<br>"
+                    f"{_pair_key_label(k)}<br>oracle: {r['oracle']:.4f}<br>"
+                    f"scare: {r['scare']:.4f}<br>"
+                    f"gap: {(r['oracle'] - r['scare']):.4f}"
+                    for k, r in sub.iterrows()
                 ],
                 hovertemplate="%{customdata}<extra></extra>",
             )
@@ -822,7 +859,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
         bordercolor="#CCCCCC",
         borderwidth=0.6,
         borderpad=5,
-        text=f"<b>mean gap</b> {mean_gap:+.4f}  ·  <b>n</b>={len(pivot)}",
+        text=f"<b>mean gap</b> {mean_gap:+.4f}  ·  <b>n</b>={len(pivot)} run pairs",
         font=dict(family=_FONT_FAMILY, size=_ANNOTATION_FONT_SIZE, color=_AXIS_COLOR),
     )
 
@@ -840,9 +877,9 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
-    # Same compliance filter as ``optimality_gap_scatter``.
-    df = df[_compliant_mask(df)]
-    pivot = df.pivot_table(index=["grid", "seed"], columns="variant", values=metric)
+    # Same per-run pairing + compliance intersection as
+    # ``optimality_gap_scatter``.
+    pivot = _gap_pair_pivot(df, metric)
     if "scare" not in pivot.columns or "oracle" not in pivot.columns:
         return _save(
             _empty_fig("need both 'scare' and 'oracle' variants", title), out_path
@@ -866,7 +903,7 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
             gaps,
             name=alias_grid(grid),
             color=_QUAL_PALETTE[i % len(_QUAL_PALETTE)],
-            hovertemplate="grid: %{x}<br>gap: %{y:.4f}<extra></extra>",
+            hovertemplate="grid: %{x}<br>gap (single run pair): %{y:.4f}<extra></extra>",
         )
     fig.add_hline(y=0, line=dict(color="#BBBBBB", dash="dash", width=1))
     fig.update_yaxes(
@@ -885,8 +922,12 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
 # Ablation impact (Pillar 4)
 
 
-def ablation_impact_bar(df: pd.DataFrame, out_path: Path) -> Path:
-    title = "Ablation impact (scare variant, compliant runs)"
+def ablation_impact_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Ablation impact (scare variant, compliant runs)",
+) -> Path:
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
@@ -894,12 +935,10 @@ def ablation_impact_bar(df: pd.DataFrame, out_path: Path) -> Path:
     # and flag ablations that break budget compliance.
     full_counts = df.groupby("ablation").size()
     df_c = df[_compliant_mask(df)]
-    grouped = df_c.groupby("ablation")[metric].agg(
-        mean="mean", count="count", std="std"
-    )
+    grouped = df_c.groupby("ablation")[metric].agg(mean="mean", count="count")
     if grouped.empty:
         return _save(_empty_fig("no compliant ablation rows", title), out_path)
-    grouped["ci"] = grouped["std"].fillna(0) / np.sqrt(grouped["count"]) * 1.96
+    grouped["ci"] = df_c.groupby("ablation")[metric].apply(lambda s: _mean_ci(s)[1])
     grouped = grouped.sort_values("mean", ascending=True)
 
     baseline_mean = (
@@ -917,7 +956,7 @@ def ablation_impact_bar(df: pd.DataFrame, out_path: Path) -> Path:
         rate_str = f" ({n / n_total * 100:.0f}%)" if n_total else ""
         base = (
             f"<b>{k}</b><br>mean PWSF (compliant): {m:.4f}<br>"
-            f"95% CI: ±{c:.4f}<br>compliant: {n}/{n_total}{rate_str}"
+            f"95% CI: {_ci_label(c)}<br>compliant: {n}/{n_total}{rate_str}"
         )
         if baseline_mean is not None:
             base += f"<br>Δ vs default: {(m - baseline_mean):+.4f}"
@@ -999,16 +1038,18 @@ def robustness_curve(
     # compliance rate even when its mean PWSF is empty.
     full_counts = parsed.groupby("x").size()
     parsed_c = parsed[_compliant_mask(parsed)]
-    grouped = parsed_c.groupby("x")[metric].agg(["mean", "std", "count"])
-    grouped["ci"] = grouped["std"].fillna(0) / np.sqrt(grouped["count"]) * 1.96
+    grouped = parsed_c.groupby("x")[metric].agg(["mean", "count"])
+    grouped["ci"] = parsed_c.groupby("x")[metric].apply(lambda s: _mean_ci(s)[1])
     grouped = grouped.sort_index()
     if grouped.empty:
         return _save(_empty_fig(f"no compliant {sweep_param} rows", title), out_path)
 
     x = grouped.index.tolist()
     y = grouped["mean"].tolist()
-    upper = (grouped["mean"] + grouped["ci"]).tolist()
-    lower = (grouped["mean"] - grouped["ci"]).tolist()
+    # NaN CI (n=1) collapses the ribbon to the line at that point.
+    band = grouped["ci"].fillna(0)
+    upper = (grouped["mean"] + band).tolist()
+    lower = (grouped["mean"] - band).tolist()
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     # CI ribbon.
@@ -1034,7 +1075,7 @@ def robustness_curve(
                 size=8, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
             ),
             customdata=[
-                f"x={xv}<br>mean PWSF (compliant): {m:.4f}<br>95% CI: ±{c:.4f}<br>"
+                f"x={xv}<br>mean PWSF (compliant): {m:.4f}<br>95% CI: {_ci_label(c)}<br>"
                 f"compliant: {int(n)}/{int(full_counts.get(xv, n))}"
                 for xv, m, c, n in zip(
                     x, grouped["mean"], grouped["ci"], grouped["count"]
@@ -1097,9 +1138,23 @@ def robustness_curve(
     return _save(_apply_theme(fig, title=title), out_path)
 
 
+# RestorationConfiguration defaults (src/scare/base/config.py) — the
+# ``default`` sweep arm must resolve to the parameter's actual default
+# (ttl_hops=3, holon_max_size=4), not a blanket 0 that merges it into an
+# explicit 0-valued arm. Unknown parameters resolve to None (row dropped).
+_SWEEP_PARAM_DEFAULTS: dict[str, float] = {
+    "cooldown_s": 0.0,
+    "ttl_hops": 3.0,
+    "cp_bridge_cost": 2.0,
+    "holon_max_size": 4.0,
+    "comms_packet_loss_pct": 0.0,
+    "comms_latency_jitter_ms": 0.0,
+}
+
+
 def _extract_sweep_value(sweep_key: str, param: str) -> float | None:
     if not sweep_key or sweep_key == "default":
-        return 0.0
+        return _SWEEP_PARAM_DEFAULTS.get(param)
     for tok in str(sweep_key).split(";"):
         if "=" not in tok:
             continue
@@ -1125,16 +1180,18 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
     # high n_failures reflects lost compliance, not slack overdraw.
     full_counts = df.groupby("n_failures").size()
     df_c = df[_compliant_mask(df)]
-    grouped = df_c.groupby("n_failures")[metric].agg(["mean", "std", "count"])
-    grouped["ci"] = grouped["std"].fillna(0) / np.sqrt(grouped["count"]) * 1.96
+    grouped = df_c.groupby("n_failures")[metric].agg(["mean", "count"])
+    grouped["ci"] = df_c.groupby("n_failures")[metric].apply(lambda s: _mean_ci(s)[1])
     grouped = grouped.sort_index()
     if grouped.empty:
         return _save(_empty_fig("no compliant rows", title), out_path)
 
     x = grouped.index.tolist()
     y = grouped["mean"].tolist()
-    upper = (grouped["mean"] + grouped["ci"]).tolist()
-    lower = (grouped["mean"] - grouped["ci"]).tolist()
+    # NaN CI (n=1) collapses the ribbon to the line at that point.
+    band = grouped["ci"].fillna(0)
+    upper = (grouped["mean"] + band).tolist()
+    lower = (grouped["mean"] - band).tolist()
 
     fig = go.Figure()
     fig.add_trace(
@@ -1159,7 +1216,7 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
             ),
             customdata=[
                 f"failures: {xv}<br>mean PWSF (compliant): {m:.4f}<br>"
-                f"95% CI: ±{c:.4f}<br>compliant: {int(n)}/{int(full_counts.get(xv, n))}"
+                f"95% CI: {_ci_label(c)}<br>compliant: {int(n)}/{int(full_counts.get(xv, n))}"
                 for xv, m, c, n in zip(
                     x, grouped["mean"], grouped["ci"], grouped["count"]
                 )
@@ -1411,6 +1468,11 @@ def claims_pass_rate(df: pd.DataFrame, out_path: Path) -> Path:
     title = "Claims validation pass rate by variant"
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
+    # Oracle is a one-shot LP with no MAS dispatch trajectory, so it emits only
+    # a partial claim set (no priority/monotonic/diary invariants). Its blank
+    # cells read as "0% fail" rather than "not applicable"; drop it entirely.
+    if "variant" in df.columns:
+        df = df[df["variant"] != "oracle"]
     claim_cols = [
         c for c in df.columns if c.startswith("claims__") and c.endswith("__passed")
     ]
@@ -1507,20 +1569,19 @@ def restoration_vs_baseline_bar(
     if sub.empty:
         return _save(_empty_fig("no scare baseline rows", title), out_path)
 
-    grouped = (
-        sub.groupby("grid")
-        .agg(
-            baseline_mw=(base_col, "mean"),
-            post_mw=(post_col, "mean"),
-            raw_ratio=(raw_col, "mean")
-            if raw_col in sub.columns
-            else (post_col, "mean"),
-            pwsf_ratio=(pwsf_col, "mean")
-            if pwsf_col in sub.columns
-            else (post_col, "mean"),
-            n=(base_col, "count"),
-        )
-        .sort_values("baseline_mw", ascending=False)
+    # Ratio overlays only when their columns exist — substituting the raw
+    # post-MW mean would put megawatts on the ratio axis.
+    agg_spec: dict[str, tuple[str, str]] = {
+        "baseline_mw": (base_col, "mean"),
+        "post_mw": (post_col, "mean"),
+        "n": (base_col, "count"),
+    }
+    if raw_col in sub.columns:
+        agg_spec["raw_ratio"] = (raw_col, "mean")
+    if pwsf_col in sub.columns:
+        agg_spec["pwsf_ratio"] = (pwsf_col, "mean")
+    grouped = sub.groupby("grid").agg(**agg_spec).sort_values(
+        "baseline_mw", ascending=False
     )
     grids = grouped.index.tolist()
     grids_lbl = _grids_display(grids)
@@ -1620,27 +1681,38 @@ def restoration_by_tier_bar(
     df: pd.DataFrame,
     out_path: Path,
     *,
-    title: str = "Per-tier restoration ratio (post / baseline served, MW)",
+    title: str = "Per-tier served fraction (post / demand, MW)",
 ) -> Path:
-    """Grouped bars per grid × tier: fraction of each tier's pre-failure
-    served load that survived restoration. Tier 1 (most critical) sitting
-    below 1.0 means the protocol is failing the loads that matter most.
+    """Grouped bars per grid × tier: fraction of each tier's demand served
+    post-restoration. Tier 1 (most critical) sitting below the others means
+    the protocol is failing the loads that matter most.
+
+    Uses ``post_fraction`` (absolute, against demand). The legacy
+    baseline-relative ``ratio`` divides by a priority-aware, slack-budget-
+    bounded baseline that already sheds low tiers, saturating them at 1.0 and
+    fabricating an apparent tier inversion; it remains only as a fallback for
+    campaigns that predate ``post_fraction``.
     """
     if df.empty or "variant" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
     sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
 
+    prefix = "outcomes__restoration__by_tier__"
     tier_cols: dict[int, str] = {}
-    for col in sub.columns:
-        m = col
-        prefix = "outcomes__restoration__by_tier__"
-        suffix = "__ratio"
-        if m.startswith(prefix) and m.endswith(suffix):
-            try:
-                tier = int(m[len(prefix) : -len(suffix)])
-            except ValueError:
-                continue
-            tier_cols[tier] = m
+    y_title = "served fraction (post / demand)"
+    for suffix in ("__post_fraction", "__ratio"):
+        for col in sub.columns:
+            if col.startswith(prefix) and col.endswith(suffix):
+                try:
+                    tier = int(col[len(prefix) : -len(suffix)])
+                except ValueError:
+                    continue
+                tier_cols[tier] = col
+        if tier_cols:
+            if suffix == "__ratio":
+                title = "Per-tier restoration ratio (post / baseline served, MW)"
+                y_title = "restoration ratio (post / baseline served)"
+            break
     if not tier_cols:
         return _save(_empty_fig("no per-tier restoration data", title), out_path)
 
@@ -1664,13 +1736,13 @@ def restoration_by_tier_bar(
                 x=grids_lbl,
                 y=grouped[col].values,
                 marker=_bar_marker(_tier_ramp_color(tier, n_tiers)),
-                hovertemplate=f"<b>tier {tier}</b><br>grid: %{{x}}<br>ratio: %{{y:.3f}}<extra></extra>",
+                hovertemplate=f"<b>tier {tier}</b><br>grid: %{{x}}<br>served: %{{y:.3f}}<extra></extra>",
             )
         )
     fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
     fig.update_layout(barmode="group", bargap=0.28, bargroupgap=0.08)
     fig.update_yaxes(
-        title="restoration ratio (post / baseline served)",
+        title=y_title,
         range=[0, 1.05],
         tickformat=".2f",
     )
@@ -1693,12 +1765,15 @@ def restoration_loss_split_by_tier_bar(
 
     - ``disconnect_lost`` (priority-blind): demand whose node had no
       active path to a grid-forming source — physics, unsavable by agents.
+    - ``constraint_lost`` (priority-blind): served the agents dispatched but
+      the eval feasibility gates removed (heat t_k out of bounds, line
+      overload de-rate) — physics-throttled, no agent lever.
     - ``agent_shed`` (priority-aware): load the QP / ADMM layers chose to
       drop — the only contribution priority weighting controls.
 
     The "tier 1 protected, tier 10 sheds first" claim applies to
-    ``agent_shed`` only: a tier-1 bar dominated by ``disconnect_lost`` is
-    a topology limit, not a priority-machinery failure.
+    ``agent_shed`` only: a tier-1 bar dominated by the priority-blind
+    shares is a topology / physics limit, not a priority-machinery failure.
     """
     if df.empty or "variant" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
@@ -1707,6 +1782,7 @@ def restoration_loss_split_by_tier_bar(
     # Discover tiers from the per-tier disconnect columns.
     disc_pat = "outcomes__restoration__by_tier__"
     disc_suf = "__disconnect_lost_mw"
+    cap_suf = "__constraint_lost_mw"
     agt_suf = "__agent_shed_mw"
     tiers: list[int] = []
     for col in sub.columns:
@@ -1724,15 +1800,17 @@ def restoration_loss_split_by_tier_bar(
             out_path,
         )
 
-    disc_means: list[float] = []
-    agt_means: list[float] = []
-    for t in tiers:
-        d_col = f"{disc_pat}{t}{disc_suf}"
-        a_col = f"{disc_pat}{t}{agt_suf}"
-        d = sub[d_col].dropna() if d_col in sub.columns else pd.Series(dtype=float)
-        a = sub[a_col].dropna() if a_col in sub.columns else pd.Series(dtype=float)
-        disc_means.append(float(d.mean()) if len(d) else 0.0)
-        agt_means.append(float(a.mean()) if len(a) else 0.0)
+    def _tier_means(suffix: str) -> list[float]:
+        means: list[float] = []
+        for t in tiers:
+            col = f"{disc_pat}{t}{suffix}"
+            v = sub[col].dropna() if col in sub.columns else pd.Series(dtype=float)
+            means.append(float(v.mean()) if len(v) else 0.0)
+        return means
+
+    disc_means = _tier_means(disc_suf)
+    cap_means = _tier_means(cap_suf)
+    agt_means = _tier_means(agt_suf)
 
     tier_labels = [f"tier {t}" for t in tiers]
 
@@ -1743,7 +1821,7 @@ def restoration_loss_split_by_tier_bar(
             y=tier_labels,
             x=disc_means,
             orientation="h",
-            # Hatch the priority-blind loss so it reads apart from the
+            # Hatch the priority-blind losses so they read apart from the
             # agent-controlled share in greyscale too.
             marker=_bar_marker("#999999", pattern_shape="x"),
             hovertemplate=(
@@ -1752,6 +1830,20 @@ def restoration_loss_split_by_tier_bar(
             ),
         )
     )
+    if any(v > 0 for v in cap_means):
+        fig.add_trace(
+            go.Bar(
+                name="physics-throttled (feasibility gate)",
+                y=tier_labels,
+                x=cap_means,
+                orientation="h",
+                marker=_bar_marker("#C4A35A", pattern_shape="/"),
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "constraint lost (mean per task): %{x:.3f} MW<extra></extra>"
+                ),
+            )
+        )
     fig.add_trace(
         go.Bar(
             name="agent-shed (priority-aware)",
@@ -1785,12 +1877,16 @@ def agent_only_ratio_by_tier_bar(
     df: pd.DataFrame,
     out_path: Path,
     *,
-    title: str = "Per-tier restoration ratio (agent-shed only — disconnect excluded)",
+    title: str = (
+        "Per-tier restoration ratio (agent-shed only — disconnect + gate excluded)"
+    ),
 ) -> Path:
-    """Per-tier bars of ``agent_only_ratio`` — the share each tier kept
-    after removing physically-disconnected load from the denominator.
-    Isolates the priority signal from topology noise: if the claim holds,
-    tier 1 sits near 1.0 and the curve slopes down monotonically.
+    """Per-tier bars of ``agent_only_ratio`` — the share of controllable
+    baseline each tier kept after removing physically-disconnected and
+    feasibility-gate-throttled load from the denominator. Isolates the
+    priority signal from topology/physics noise: if the claim holds, tier 1
+    sits near 1.0 and the curve slopes down monotonically. Note: still
+    baseline-relative (see ``restoration_by_tier_bar`` for the absolute view).
     """
     if df.empty or "variant" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
@@ -1931,19 +2027,41 @@ def absolute_load_lost_bar(
     if sub.empty:
         return _save(_empty_fig("no scare rows", title), out_path)
 
-    grouped = (
-        sub.groupby("grid")
-        .agg(
-            dropped_mw=(col, "mean"),
-            baseline_mw=(base_col, "mean") if base_col in sub.columns else (col, "max"),
-            n=(col, "count"),
-        )
-        .sort_values("dropped_mw", ascending=False)
+    # The "% of baseline" labels need the real baseline column; faking it
+    # from max(dropped) put a wrong share on the figure.
+    has_base = base_col in sub.columns
+    agg_spec: dict[str, tuple[str, str]] = {
+        "dropped_mw": (col, "mean"),
+        "n": (col, "count"),
+    }
+    if has_base:
+        agg_spec["baseline_mw"] = (base_col, "mean")
+    grouped = sub.groupby("grid").agg(**agg_spec).sort_values(
+        "dropped_mw", ascending=False
     )
 
-    pct = (grouped["dropped_mw"] / grouped["baseline_mw"]).where(
-        grouped["baseline_mw"] > 0, 0.0
-    )
+    if has_base:
+        pct = (grouped["dropped_mw"] / grouped["baseline_mw"]).where(
+            grouped["baseline_mw"] > 0, 0.0
+        )
+        text = [f"{p * 100:.1f}%" for p in pct]
+        hover = [
+            f"<b>{alias_grid(g)}</b><br>dropped: {d:.3f} MW<br>baseline: {b:.3f} MW<br>"
+            f"share: {p * 100:.1f}%<br>n: {int(n)}"
+            for g, d, b, p, n in zip(
+                grouped.index,
+                grouped["dropped_mw"],
+                grouped["baseline_mw"],
+                pct,
+                grouped["n"],
+            )
+        ]
+    else:
+        text = None
+        hover = [
+            f"<b>{alias_grid(g)}</b><br>dropped: {d:.3f} MW<br>n: {int(n)}"
+            for g, d, n in zip(grouped.index, grouped["dropped_mw"], grouped["n"])
+        ]
 
     fig = go.Figure(
         go.Bar(
@@ -1951,21 +2069,11 @@ def absolute_load_lost_bar(
             x=grouped["dropped_mw"].values,
             orientation="h",
             marker=_bar_marker("#701E96"),
-            text=[f"{p * 100:.1f}%" for p in pct],
+            text=text,
             textposition="outside",
             textfont=dict(size=_ANNOTATION_FONT_SIZE),
             cliponaxis=False,
-            customdata=[
-                f"<b>{alias_grid(g)}</b><br>dropped: {d:.3f} MW<br>baseline: {b:.3f} MW<br>"
-                f"share: {p * 100:.1f}%<br>n: {int(n)}"
-                for g, d, b, p, n in zip(
-                    grouped.index,
-                    grouped["dropped_mw"],
-                    grouped["baseline_mw"],
-                    pct,
-                    grouped["n"],
-                )
-            ],
+            customdata=hover,
             hovertemplate="%{customdata}<extra></extra>",
         )
     )
@@ -2127,9 +2235,11 @@ def solver_health_bar(
     warn_col = "solver_warnings"
     if df.empty or inf_col not in df.columns:
         return _save(_empty_fig("no solver-health columns", title), out_path)
-    sub = df.dropna(subset=["variant"]).copy()
+    # Completed sims only: a crashed/timed-out task has no meaningful solver
+    # tally, and fillna(0) would count it as a clean zero-event run.
+    sub = _completed(df).dropna(subset=["variant"]).copy()
     if sub.empty:
-        return _save(_empty_fig("no rows with a variant", title), out_path)
+        return _save(_empty_fig("no completed rows with a variant", title), out_path)
 
     sub[inf_col] = sub[inf_col].fillna(0).astype(float)
     if warn_col in sub.columns:
@@ -2842,11 +2952,31 @@ def constraint_violation_integral_bar(
         return _save(
             _empty_fig("no constraint_violation_integral columns", title), out_path
         )
-    sub = df.dropna(subset=["variant"]).copy()
-    # Drop the oracle: its integral is a vacuous hardcoded 0 (no time series).
-    sub = sub[sub["variant"] != "oracle"]
+    # Completed sims only — a crashed task has no integral; fillna(0) would
+    # count it as a zero-violation run.
+    sub = _completed(df).dropna(subset=["variant"]).copy()
+    # Drop rows whose integral is vacuous. Preferred: an explicit validity
+    # flag (newer payloads); fallback: the oracle, whose integral is a
+    # hardcoded 0 (single static LP solve, no time series).
+    valid_col = next(
+        (
+            c
+            for c in (
+                "outcomes__constraint_violation_integral_valid",
+                "outcomes__constraint_violation_integral__valid",
+            )
+            if c in sub.columns
+        ),
+        None,
+    )
+    had_oracle = bool((sub["variant"] == "oracle").any())
+    if valid_col is not None:
+        sub = sub[sub[valid_col].fillna(False).astype(bool)]
+    else:
+        sub = sub[sub["variant"] != "oracle"]
+    oracle_dropped = had_oracle and not bool((sub["variant"] == "oracle").any())
     if sub.empty:
-        return _save(_empty_fig("no non-oracle rows with a variant", title), out_path)
+        return _save(_empty_fig("no rows with a valid integral", title), out_path)
     for s in present:
         sub[cols[s]] = sub[cols[s]].fillna(0).astype(float)
 
@@ -2881,6 +3011,24 @@ def constraint_violation_integral_bar(
         rangemode="tozero",
         tickformat=".3g",
     )
+    if oracle_dropped:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.99,
+            y=-0.28,
+            xanchor="right",
+            yanchor="top",
+            showarrow=False,
+            text=(
+                "oracle omitted: its integral is never computed "
+                "(static LP, no time series) — absence ≠ zero violations"
+            ),
+            font=dict(
+                family=_FONT_FAMILY, size=_ANNOTATION_FONT_SIZE - 2,
+                color=_MUTED_COLOR,
+            ),
+        )
     height = _hbar_height(len(variants), len(present))
     return _save(
         _apply_theme(
@@ -2936,9 +3084,11 @@ def constraint_violations_by_variable_bar(
     """
     if df.empty or "variant" not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
-    sub = df.dropna(subset=["variant"]).copy()
+    # Completed sims only — a crashed task never got graded; fillna(0) would
+    # count it as a zero-violation run.
+    sub = _completed(df).dropna(subset=["variant"]).copy()
     if sub.empty:
-        return _save(_empty_fig("no rows with a variant", title), out_path)
+        return _save(_empty_fig("no completed rows with a variant", title), out_path)
 
     # Resolve each variable type to its first present column; build a per-type
     # numeric series (absent -> 0).

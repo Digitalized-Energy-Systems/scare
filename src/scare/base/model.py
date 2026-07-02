@@ -163,6 +163,11 @@ class ResultService:
 class NegotiationFinishedEvent:
     new_setpoint: float
     sector: Sector
+    # Gossip nid this finish belongs to. Non-empty on the peer convergence
+    # broadcast so members (incl. the blocked originator) can release matching
+    # gossip state instead of waiting for the wallclock timeout. "" on local
+    # emits and legacy senders (no release).
+    negotiation_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -273,6 +278,9 @@ class L2RecycleEscalation:
 @dataclass
 class AskForAvailableFlex:
     include_connectors: bool = False
+    # Flex-collection round identity; answers echo it so the collector can
+    # ignore late replies from an earlier round. "" = legacy sender.
+    round_id: str = ""
 
 
 @dataclass
@@ -301,6 +309,8 @@ class AvailableFlexAnswer:
     # ``balance_by_sector``, whose setpoints collapse to 0 on disconnect and
     # hide the deficit; lets the CP ADMM help disconnected demand.
     unmet_by_sector: dict[str, float] = field(default_factory=dict)
+    # Echo of AskForAvailableFlex.round_id; "" = legacy responder.
+    round_id: str = ""
 
 
 @dataclass

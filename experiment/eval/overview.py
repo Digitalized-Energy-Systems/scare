@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from experiment.eval.aliases import alias_variant
+from experiment.eval.compliance import compliant_mask, mean_ci95
 from experiment.eval.loader import CampaignData
 
 logger = logging.getLogger(__name__)
@@ -158,25 +160,46 @@ def _status_table(campaign: CampaignData) -> str:
 
 
 def _variant_means_table(campaign: CampaignData) -> str:
+    """Compliant-subset PWSF over completed sims (ok + claims_failed) with a
+    95% CI — the same gate + population as the REPORT.md "Variant means"
+    table, so the landing page cannot reverse the report's variant ranking."""
     df = campaign.summary
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns or "variant" not in df.columns:
         return ""
-    by_v = (
-        df.groupby("variant")[metric]
-        .agg(["mean", "std", "count"])
-        .sort_values("mean", ascending=False)
-    )
-    if by_v.empty:
+    done = df
+    if "status" in done.columns:
+        done = done[done["status"].isin(("ok", "claims_failed"))]
+    done = done[done[metric].notna()]
+    if done.empty:
         return ""
-    head = "<tr><th>variant</th><th>PWSF (mean)</th><th>± std</th><th>n</th></tr>"
-    body = "".join(
-        f"<tr><td>{v}</td><td>{r['mean']:.4f}</td>"
-        f"<td>{(r['std'] if pd.notna(r['std']) else 0):.4f}</td>"
-        f"<td>{int(r['count'])}</td></tr>"
-        for v, r in by_v.iterrows()
+    rows: list[tuple[str, int, int, float, float]] = []
+    for variant, g in done.groupby("variant"):
+        n_total = len(g)
+        comp = g[compliant_mask(g)]
+        if len(comp):
+            mean, ci = mean_ci95(comp[metric])
+        else:
+            mean, ci = float("nan"), float("nan")
+        rows.append((str(variant), len(comp), n_total, mean, ci))
+    rows.sort(key=lambda r: (pd.isna(r[3]), -(r[3] if pd.notna(r[3]) else 0.0)))
+    head = (
+        "<tr><th>variant</th><th>PWSF (compliant mean)</th><th>95% CI</th>"
+        "<th>n_compliant/n_total</th></tr>"
     )
-    return "<table class='status-table'>" + head + body + "</table>"
+    body = "".join(
+        f"<tr><td>{alias_variant(v)}</td>"
+        f"<td>{'—' if pd.isna(mean) else f'{mean:.4f}'}</td>"
+        f"<td>{'—' if pd.isna(ci) else f'±{ci:.4f}'}</td>"
+        f"<td>{n_c}/{n_t}</td></tr>"
+        for v, n_c, n_t, mean, ci in rows
+    )
+    caption = (
+        "<tr><td colspan='4' style='color:#888'>compliant subset, "
+        "completed sims (ok + claims_failed), unpaired, pooled across "
+        "grids and experiments — see REPORT.md</td></tr>"
+    )
+    return "<table class='status-table'>" + head + body + caption + "</table>"
 
 
 def _plot_card(html_path: Path) -> str | None:

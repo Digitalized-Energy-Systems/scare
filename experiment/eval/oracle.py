@@ -12,17 +12,20 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
 from monee import run_energy_flow_optimization
 from monee.model.child import ExtHydrGrid, ExtPowerGrid
+from monee.model.core import Var
 from monee.model.formulation import make_heat_convex_milp_formulation, GAS_NONCONVEX_MIQCQP_FORMULATION
+from monee.model.node import Bus
 from monee.problem import (
     WEIGHT_DEMAND,
     create_min_load_shedding_problem,
 )
-from monee.solver.pyo import PyomoSolver
+from monee.solver.gurobipy import GurobipySolver
 
 from experiment.eval.claims import heat_priority_from_rows
 from experiment.eval.metrics import (
@@ -100,16 +103,116 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
 # measures solver quality, not a policy mismatch — NOT the PWSF metric's moderate
 # 8:4:2:1, which would make the oracle trade tier-1 away and inflate the gap.
 #
-# The ONLY constraint is solver RESOLUTION: monee's ``auto_priority_floor`` lifts
-# the shed weights off the max objective coefficient, so a tier whose weight sits
-# far below the max is swamped below the optimality tolerance. That is exactly why
-# the legacy ``1e12/1e8/1e4/1`` ladder behaved priority-BLIND — tiers 3/4 were
-# 1e8-1e12x below tier 1, the LP tied them, and the oracle shed serveable tier-1
-# load under forced shedding. A span of 1e6 (adjacent ratio 100) is steep enough
-# to be effectively strict yet keeps the objective coefficient ratio (span x the
-# <=~40x in-sector demand range) within tolerance. Validated by a forced-shedding
-# oracle solve (see tests/eval/test_oracle_priority.py).
+# Two solver-resolution constraints apply. (1) Aux floor: monee's
+# ``auto_priority_floor`` lifts the shed weights off the max objective
+# coefficient, so a tier whose weight sits far below the max is swamped below
+# the aux terms. That is exactly why the legacy ``1e12/1e8/1e4/1`` ladder
+# behaved priority-BLIND — tiers 3/4 were 1e8-1e12x below tier 1, the LP tied
+# them, and the oracle shed serveable tier-1 load under forced shedding. A span
+# of 1e6 (adjacent ratio 100) keeps every tier above the aux floor. (2) MIP
+# TERMINATION: the aux-floor analysis says nothing about the branch-and-bound
+# gap. With forced-shed objective terms at ~1e9·MW, a relative MIPGap of 1e-3
+# (monee's default) exceeds the entire tier-3/4 objective contribution, so
+# their dispatch inside the gap is arbitrary (~64k tier inversions measured;
+# reproducibly eliminated at MIPGap=1e-8). ``_ORACLE_GUROBI_PARAMS`` below
+# tightens the gap so no tier decision fits inside the termination tolerance.
+# Validated by a forced-shedding oracle solve
+# (see tests/eval/test_oracle_priority.py).
 _ORACLE_TIER_WEIGHT: dict[int, float] = {1: 1e6, 2: 1e4, 3: 1e2, 4: 1.0}
+
+# MIPGapAbs = half the objective cost of fully shedding a conservative
+# minimum-size (1e-3 MW) load at the cheapest tier
+# (0.5 · WEIGHT_DEMAND · tier-4 weight · 1e-3 MW = 0.5), so no tier decision
+# can hide inside the absolute termination gap; MIPGap covers the relative
+# criterion. TimeLimit matches monee's default.
+_ORACLE_MIN_LOAD_MW = 1e-3
+_ORACLE_GUROBI_PARAMS: dict[str, float] = {
+    "MIPGap": 1e-9,
+    "MIPGapAbs": 0.5 * WEIGHT_DEMAND * _ORACLE_TIER_WEIGHT[4] * _ORACLE_MIN_LOAD_MW,
+    "TimeLimit": 300,
+}
+
+
+class _OracleGurobiSolver(GurobipySolver):
+    """GurobipySolver with the oracle's tight termination params that records
+    per-solve termination metadata. monee's ``SolverResult`` carries no
+    Status/MIPGap and the gurobipy model handle is local to ``solve()``, so
+    ``_classify`` (called once per optimize) is the interception point.
+    """
+
+    def __init__(self, params: dict | None = None):
+        super().__init__(params={**_ORACLE_GUROBI_PARAMS, **(params or {})})
+        self.solve_stats: dict[str, Any] = {}
+
+    def _classify(self, gm, *, phase_label: str):
+        # super() may re-solve to disambiguate INF_OR_UNBD; read stats after.
+        result = super()._classify(gm, phase_label=phase_label)
+        self.solve_stats = self._termination_stats(gm)
+        return result
+
+    def _termination_stats(self, gm) -> dict[str, Any]:
+        def read(attr: str):
+            # Gurobi raises on attrs unavailable for the model class / status
+            # (e.g. MIPGap on a continuous model or without an incumbent).
+            try:
+                return getattr(gm, attr)
+            except Exception:  # noqa: BLE001
+                return None
+
+        status = read("Status")
+        sol_count = read("SolCount") or 0
+        obj_val = read("ObjVal") if sol_count else None
+        obj_bound = read("ObjBound")
+        mip_gap = read("MIPGap") if sol_count else None
+        gap_ok = True
+        if mip_gap is not None and math.isfinite(mip_gap):
+            abs_gap = float("inf")
+            if (
+                obj_val is not None
+                and obj_bound is not None
+                and math.isfinite(obj_val)
+                and math.isfinite(obj_bound)
+            ):
+                abs_gap = abs(obj_val - obj_bound)
+            gap_ok = mip_gap <= self._params.get(
+                "MIPGap", 0.0
+            ) or abs_gap <= self._params.get("MIPGapAbs", 0.0)
+        return {
+            "status": status,
+            "sol_count": sol_count,
+            "objective": obj_val,
+            "obj_bound": obj_bound,
+            "mip_gap": mip_gap,
+            "runtime_s": read("Runtime"),
+            "solve_optimal": bool(status == self._GRB.OPTIMAL and gap_ok),
+        }
+
+
+def _make_vm_bounds_hook(bounds_vm: tuple[float, float]):
+    """Bound the electricity voltage Var the solver actually optimises.
+
+    monee's ``bounds_vm`` boxes only the ``vm_pu`` attribute, which under the
+    MISOCP electricity formulation is a reporting Intermediate at solve time —
+    the real Var is ``vm_pu_squared`` (box (0, 2.25)) — so the voltage envelope
+    was a no-op there. Mirrors monee's ``_make_pressure_bounds_hook``
+    (``pressure_squared_pu``); ``vm_pu`` is still bounded when it IS a Var
+    (non-MISOCP formulations).
+    """
+    lo, hi = bounds_vm
+
+    def _apply_vm_bounds(network: Any) -> None:
+        for component in network.all_components():
+            model = component.model
+            if type(model) is not Bus or not component.independent:
+                continue
+            v = getattr(model, "vm_pu", None)
+            vsq = getattr(model, "vm_pu_squared", None)
+            if type(v) is Var:
+                v.min, v.max = lo, hi
+            if type(vsq) is Var:
+                vsq.min, vsq.max = lo * lo, hi * hi
+
+    return _apply_vm_bounds
 
 
 def _weight_for_load_factory(
@@ -335,6 +438,7 @@ def run_oracle(
     # ``bounds_*`` mirror SCARE's ``SECTOR_CONSTRAINTS`` so the LP solves on the
     # same voltage / pressure / temperature envelope. Heat converts SCARE's
     # t_k = (313.15, 403.15) via monee's water-grid t_ref = 356 K -> t_pu.
+    bounds_vm_pu = (0.95, 1.05)
     bounds_pressure_pu = (0.85, 1.25)
     # Give the oracle the SAME regulator-setpoint lever the MAS now has: let each
     # gas slack outlet pressure be an optimizable decision var within the band,
@@ -359,12 +463,15 @@ def run_oracle(
         bounds_ext_el=ext_grid_el_bounds,
         bounds_ext_gas=ext_grid_gas_bounds,
         bounds_ext_heat=ext_grid_heat_bounds,
-        bounds_vm=(0.95, 1.05),
+        bounds_vm=bounds_vm_pu,
         bounds_pressure=bounds_pressure_pu,
         bounds_t=(0.8796, 1.1325),
         check_lp=True,
         max_line_loading=1.0,
     )
+    # Wired like monee's own pressure hook (``_controllable_appliables`` run
+    # against the solve copy) so ``vm_pu_squared`` is actually boxed.
+    prob._controllable_appliables.append(_make_vm_bounds_hook(bounds_vm_pu))
     if weight_for_load is not None:
         logger.info(
             "oracle: priority-aware mode — %d loads have per-tier weights",
@@ -381,14 +488,66 @@ def run_oracle(
         len(monee_net.childs),
         len(monee_net.branches),
     )
+    if solver is None:
+        solver = _OracleGurobiSolver()
     result = run_energy_flow_optimization(
         monee_net,
         prob,
-        solver="gurobi",
+        solver=solver,
         exclude_unconnected_nodes=True,
     )
     lp_success = bool(getattr(result, "success", True))
-    logger.info("oracle: solve done (success=%s).", lp_success)
+    solver_stats = dict(getattr(solver, "solve_stats", None) or {})
+    if not solver_stats:
+        # Caller-supplied non-oracle solver: record what SolverResult exposes.
+        solver_stats = {
+            "solver_status": getattr(result, "solver_status", None),
+            "termination_condition": getattr(result, "termination_condition", None),
+            "objective": getattr(result, "objective", None),
+        }
+    logger.info(
+        "oracle: solve done (success=%s, solver_stats=%s).", lp_success, solver_stats
+    )
+
+    if not lp_success:
+        # No usable incumbent: do NOT fabricate zero-served results — a zeroed
+        # network reads downstream as "oracle served nothing" and PWSF=0.0.
+        # NaN metrics are the excluded-task convention.
+        report = getattr(result, "infeasibility_report", None)
+        reason = (
+            "oracle LP returned no usable solution "
+            f"(status={solver_stats.get('status')})"
+        )
+        if report is not None:
+            reason = f"{reason}; {report!r}"
+        logger.error("oracle: %s", reason)
+        nan = float("nan")
+        return {
+            "served": {
+                "by_tier_sector": {},
+                "by_sector": {},
+                "by_tier": {},
+                "priority_weighted_fraction_by_sector": {},
+                "priority_weighted_served": nan,
+                "priority_weighted_demand": nan,
+                "priority_weighted_fraction": nan,
+                "n_loads": nan,
+                "n_loads_served_zero": nan,
+            },
+            "constraint_violation_integral": {
+                "electricity": nan,
+                "gas": nan,
+                "heat": nan,
+            },
+            "constraint_violations_final": {},
+            "regulations": {},
+            "lp_success": False,
+            "failure_reason": reason,
+            "solver_stats": solver_stats,
+            "slack_budget_summary": {},
+            "solved_net": None,
+            "behavior": None,
+        }
 
     solved_net = getattr(result, "network", monee_net)
     behavior = _adapter_observe(solved_net)
@@ -411,6 +570,7 @@ def run_oracle(
         "constraint_violations_final": constraints_final,
         "regulations": regulations,
         "lp_success": lp_success,
+        "solver_stats": solver_stats,
         "slack_budget_summary": slack_summary,
         "solved_net": solved_net,
         "behavior": behavior,
@@ -512,6 +672,13 @@ def compute_baseline_served(
             if hasattr(branch.model, "on_off"):
                 branch.model.on_off = 0
     out = run_oracle(fresh, [], solver=solver, priorities=priorities)
+    if not out.get("lp_success", True):
+        # Raise (uncached) so the runner's baseline-failure path handles it;
+        # a cached NaN baseline would poison every task sharing the key.
+        raise RuntimeError(
+            f"baseline LP failed for grid {grid_name!r}: "
+            f"{out.get('failure_reason')}"
+        )
     served = out["served"]
     _BASELINE_CACHE[cache_key] = copy.deepcopy(served)
     return served
@@ -523,7 +690,7 @@ def compose_oracle_result(
     failures: list[Any],
     task_meta: dict[str, Any],
     wallclock_s: float,
-    solver: str | None = None,
+    solver: Any = None,
     priorities: dict[str, int] | None = None,
     baseline_served: dict[str, Any] | None = None,
     out_dir: Path | None = None,
@@ -539,6 +706,57 @@ def compose_oracle_result(
     out = run_oracle(monee_net, failures, solver=solver, priorities=priorities)
     served = out["served"]
     integral = out["constraint_violation_integral"]
+    solver_stats = out.get("solver_stats", {})
+
+    if not out.get("lp_success", True):
+        # Failed solve: NaN served/PWSF (excluded-task convention), completed
+        # False, no per-load CSVs (there is no solved net — the old zeroed
+        # artefacts fabricated "oracle served nothing" rows).
+        failure_detail = {
+            "reason": out.get("failure_reason"),
+            "solver_stats": solver_stats,
+            "enforced_at_lp": True,
+        }
+        failed_claim = {"passed": False, "detail": failure_detail}
+        return {
+            "task": task_meta,
+            "wallclock_s": wallclock_s,
+            "completed": False,
+            "sim_time_final": 0.0,
+            "outcomes": {
+                "priority_weighted_demand": served["priority_weighted_demand"],
+                "priority_weighted_served": served["priority_weighted_served"],
+                "priority_weighted_fraction": served["priority_weighted_fraction"],
+                "priority_weighted_fraction_by_sector": served.get(
+                    "priority_weighted_fraction_by_sector", {}
+                ),
+                "served_by_sector": served["by_sector"],
+                "served_by_tier": served["by_tier"],
+                "served_by_tier_sector": served["by_tier_sector"],
+                "n_loads": served["n_loads"],
+                "n_loads_served_zero": served["n_loads_served_zero"],
+                "constraint_violation_integral": integral,
+                "constraint_violations_final": {},
+                "time_to_stabilise_s": 0.0,
+                "regulates_total": 0,
+                "regulates_by_reason": {},
+                "restoration": {"baseline_available": False},
+                "oracle_lp_success": False,
+                "oracle_failure_reason": out.get("failure_reason"),
+                "oracle_solver_stats": solver_stats,
+                "oracle_solve_optimal": False,
+                "slack_budget_summary": {},
+            },
+            "claims": {
+                "slack_budget_compliance": failed_claim,
+                "constraint_compliance": failed_claim,
+            },
+            "diary": {"invariant_holds": True},
+            "events": {},
+            "messages": {},
+            "oracle_regulations": {},
+        }
+
     restoration = restoration_breakdown(served, baseline_served)
 
     # Per-load detail off the SAME solved network the served breakdown used (the
@@ -631,6 +849,8 @@ def compose_oracle_result(
             "regulates_by_reason": {},
             "restoration": restoration,
             "oracle_lp_success": out.get("lp_success", True),
+            "oracle_solver_stats": solver_stats,
+            "oracle_solve_optimal": solver_stats.get("solve_optimal"),
             "slack_budget_summary": slack_summary,
         },
         "claims": {

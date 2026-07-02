@@ -16,7 +16,7 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.runtime.diagnostics import record_event, record_switch
-from scare.base.util import obs_constraint_values
+from scare.base.util import _get_behavior_store, obs_constraint_values
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -70,6 +70,16 @@ class GridReconfigurator(Role):
         self.context.subscribe_event(self, LineFailure, self._on_line_failure)
 
     def _on_line_failure(self, event: LineFailure, _src: Any) -> None:
+        # Both endpoints detect the failure independently; the env "switch"
+        # action is a TOGGLE, so two successful searches over the same open tie
+        # would close it and then re-open it. Only one endpoint initiates.
+        if not is_initiating_endpoint(event.source_node_id, event.target_node_id):
+            logger.debug(
+                "[%s] branch failure %s – peer endpoint initiates the path search",
+                self.context.aid,
+                event.branch_id,
+            )
+            return
         logger.info(
             "[%s] branch failure %s – starting path search",
             self.context.aid,
@@ -165,8 +175,13 @@ class GridReconfigurator(Role):
         for addr in grid_neighbours:
             if addr in already_asked:
                 continue
+            switch_state = self._branch_switch_state(addr)
+            if switch_state is None and self._branch_has_switch(addr):
+                # Unknown switch state: neither traversable-as-closed nor
+                # safely closable later (the toggle could open it).
+                continue
             new_uncertain = list(message.uncertain_connections)
-            if self._is_uncertain_connection(addr):
+            if switch_state == 0:
                 new_uncertain.append((my_addr, addr))
 
             # Carry running max_loading across the traversed line; an unreadable
@@ -326,25 +341,87 @@ class GridReconfigurator(Role):
             result.append(addr)
         return result
 
-    def _is_uncertain_connection(self, neighbour_addr: Any) -> bool:
-        """Return True if the branch to neighbour_addr has an unknown switch state."""
+    def _branch_switch_state(self, neighbour_addr: Any) -> int | None:
+        """Observed ``on_off`` of the branch to ``neighbour_addr``; None when
+        the state is unknown (no obs / no ``on_off`` reading)."""
         branch_aid = _branch_aid_from_addrs(self.context.addr, neighbour_addr)
-        obs = self.behavior.observe(branch_aid)
-        if obs:
-            return obs.get("on_off", 1) == 0
-        return False
+        return switch_state_from_obs(self.behavior.observe(branch_aid))
+
+    def _branch_has_switch(self, neighbour_addr: Any) -> bool:
+        branch_aid = _branch_aid_from_addrs(self.context.addr, neighbour_addr)
+        return self.behavior.has_action(branch_aid, "switch")
 
     async def _close_tie_switches(self, uncertain: list[tuple[Any, Any]]) -> None:
+        # Shared in-flight ledger across all reconfigurator roles: switch acts
+        # don't trigger a re-solve, so the observed ``on_off`` can hold the
+        # pre-close snapshot indefinitely and the act-time re-check alone
+        # would double-toggle (re-open) a tie closed by a concurrent search.
+        inflight: set[str] = _get_behavior_store(
+            self.behavior, "_scare_ties_closed_inflight", set
+        )
         for from_addr, to_addr in uncertain:
             branch_aid = _branch_aid_from_addrs(from_addr, to_addr)
-            if self.behavior.has_action(branch_aid, "switch"):
-                self.behavior.act(branch_aid, "switch")
-                record_switch(
-                    t=self.context.current_timestamp,
-                    aid=branch_aid,
-                    reason="reconfig_close",
+            if not self.behavior.has_action(branch_aid, "switch"):
+                continue
+            # The env "switch" action is a TOGGLE: re-check state at act time
+            # so a branch already closed (e.g. by an earlier search) isn't
+            # re-opened, and never toggle a branch whose state is unknown.
+            state = switch_state_from_obs(self.behavior.observe(branch_aid))
+            if state == 1:
+                # Fresh observation confirms the close landed.
+                inflight.discard(branch_aid)
+            if branch_aid in inflight:
+                logger.info(
+                    "[%s] skip tie switch %s (close in flight)",
+                    self.context.aid,
+                    branch_aid,
                 )
-                logger.info("[%s] closed tie switch %s", self.context.aid, branch_aid)
+                continue
+            if not should_close_tie(state):
+                logger.info(
+                    "[%s] skip tie switch %s (state=%s: %s)",
+                    self.context.aid,
+                    branch_aid,
+                    state,
+                    "already closed" if state == 1 else "unknown",
+                )
+                continue
+            self.behavior.act(branch_aid, "switch")
+            inflight.add(branch_aid)
+            record_switch(
+                t=self.context.current_timestamp,
+                aid=branch_aid,
+                reason="reconfig_close",
+            )
+            logger.info("[%s] closed tie switch %s", self.context.aid, branch_aid)
+
+
+def is_initiating_endpoint(source_node_id: Any, target_node_id: Any) -> bool:
+    """True when the endpoint at ``source_node_id`` owns the path search for a
+    failed branch. Deterministic and symmetric (smaller node id wins) so
+    exactly one of the two detecting endpoints initiates."""
+    if type(source_node_id) is type(target_node_id):
+        try:
+            return source_node_id < target_node_id
+        except TypeError:
+            pass
+    return str(source_node_id) < str(target_node_id)
+
+
+def switch_state_from_obs(obs: dict | None) -> int | None:
+    """``on_off`` from a branch observation; None when unknown."""
+    if not obs or "on_off" not in obs:
+        return None
+    try:
+        return int(obs["on_off"])
+    except (TypeError, ValueError):
+        return None
+
+
+def should_close_tie(switch_state: int | None) -> bool:
+    """Close only a branch KNOWN to be open. The env action is a toggle, so
+    acting on a closed (1) or unknown (None) branch could open it."""
+    return switch_state == 0
 
 
 def _addr_aid(addr: Any) -> str:

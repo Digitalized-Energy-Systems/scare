@@ -10,8 +10,10 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 from mango import sender_addr as mango_sender_addr
 from mango.express.topology import topology_neighbors
+from monee.model.child import ExtPowerGrid
 
 from scare.base.model import (
+    DEENERGISED_PRESSURE_HIGH_PU,
     DEENERGISED_PRESSURE_PU,
     DEENERGISED_VM_PU,
     PROACTIVE_WARNING_FRACTION,
@@ -43,6 +45,7 @@ from scare.base.util import (
     publish_node_voltage,
     qv_relief_avail,
     refresh_line_curtail_lock,
+    sector_from_grid,
 )
 from scare.service.balance.trust import TrustLedger, TrustParams
 from scare.service.control.curtailment import (
@@ -84,7 +87,7 @@ _SENSITIVITY_MIN_DP: dict[Sector, float] = {
 _SENSITIVITY_DEFAULT: dict[Sector, float] = {
     Sector.ELECTRICITY: 0.01,  # p.u. voltage per MW
     Sector.GAS: 0.5,  # p.u. pressure per kg/s
-    Sector.HEAT: 1e-5,  # K per W
+    Sector.HEAT: 10.0,  # K per MW (samples are dT/dP_MW; ≡ 1e-5 K/W)
 }
 
 # Bounds on the auction willingness sensitivity multiplier; a within-tier
@@ -116,11 +119,11 @@ _CURTAIL_PROGRESS_TOL: float = 0.01
 _QV_MAX_CONSECUTIVE_DEFERS: int = 6
 _QV_DEFER_PROGRESS_TOL: float = 1e-3
 
-# Variables the gated auction must NOT fire on: its node-blind bidding can't
-# relieve them. ``t_k`` is owned by the frontier controller; ``loading_percent``
-# (branch) by the line-relief path. The auction still fires on ``vm_pu`` /
-# ``pressure_pu`` where local load is the lever.
-_CURTAIL_AUCTION_SKIP_VARS: frozenset[str] = frozenset({"t_k", "loading_percent"})
+# The auction never fires on ``loading_percent``: its node-blind bidding can't
+# relieve a branch (the line-relief path owns it; downstream relief re-enables
+# it with a targeted bidder set). ``t_k`` is skipped only while the heat
+# frontier controller is enabled to own it — see ``_auction_skips_var``. The
+# auction still fires on ``vm_pu`` / ``pressure_pu`` where local load is the lever.
 
 # Targeting (``enable_curtail_auction_targeting``): proximity to the violated
 # origin scales willingness within these bounds (within-tier tiebreaker, from
@@ -131,6 +134,16 @@ _CURTAIL_PROX_MAX: float = 4.0
 # Min sim-seconds between line-relief re-assertions per branch
 # (``enable_line_relief_reassert``); never out-paces the gossip round it triggers.
 _LINE_RELIEF_COOLDOWN_S: float = 2.0
+
+# Consecutive polls classifying an overload as export (reverse flow) before
+# load-shed relief is suppressed and generators are curtailed; a single
+# transient reverse-flow sample must not trigger a non-reverting curtail.
+_EXPORT_DEBOUNCE_POLLS: int = 2
+
+# Sim-seconds a resolved downstream topology stays valid. No topology event
+# (branch failure, tie close) reaches branch monitors, so re-resolve on a TTL
+# when consulted.
+_DOWNSTREAM_TOPOLOGY_TTL_S: float = 10.0
 
 # Aggressive per-round gain for branch-downstream line relief (vs 0.3 default),
 # walking a 10-20% overload down to ≤100% over rounds; priority orders WHO.
@@ -265,6 +278,15 @@ class GridConstraintMonitor(Role):
         self._qv_last_value: dict[str, float] = {}
         # Per-variable cooldown for iterative line-relief re-assert.
         self._relief_inflight: dict[str, float] = {}
+        # Branch flow-direction context, resolved lazily from the live net and
+        # refreshed on a TTL: which endpoint is upstream (slack side) and which
+        # generators sit downstream — the export-overload relief targets.
+        self._downstream_resolved: bool = False
+        self._downstream_resolved_t: float = float("-inf")
+        self._upstream_is_from: bool | None = None
+        self._downstream_gen_aids: list[str] = []
+        # Per-variable consecutive export-classified polls (debounce).
+        self._export_streak: dict[str, int] = {}
         # Per-variable flag: waterfall has only tier-1 reducible bidders left
         # (can't relieve further without breaking the hard-lock).
         self._line_relief_tier1_residual: dict[str, bool] = {}
@@ -354,6 +376,15 @@ class GridConstraintMonitor(Role):
         except KeyError:
             pass
 
+    def _auction_skips_var(self, var: str) -> bool:
+        """Variables the node-blind auction never fires on: ``loading_percent``
+        always (the line-relief path owns branches); ``t_k`` only while the
+        heat frontier controller is enabled to own it — with the frontier
+        ablated the auction is the only heat lever left."""
+        if var == "loading_percent":
+            return True
+        return var == "t_k" and self.enable_heat_frontier
+
     async def _handle_violation(
         self, obs: dict, var: str, val: float, lo: float, hi: float
     ) -> None:
@@ -370,6 +401,27 @@ class GridConstraintMonitor(Role):
             and self.branch_id is not None
             and var == "loading_percent"
             and bool(self._downstream_load_addrs)
+        )
+        # Export-driven (reverse-flow) overload: shedding downstream load
+        # INCREASES net export and worsens it, so every load-shed relief path
+        # is suppressed and downstream generation is curtailed instead.
+        # Debounced over consecutive polls, and owned only while curtailable
+        # downstream generators exist — otherwise the ordinary relief chain
+        # stays in charge rather than suppressing everything.
+        is_export = (
+            self.branch_id is not None
+            and var == "loading_percent"
+            and val > hi
+            and self._flow_is_export(obs) is True
+        )
+        if is_export:
+            self._export_streak[var] = self._export_streak.get(var, 0) + 1
+        else:
+            self._export_streak.pop(var, None)
+        export_overload = (
+            is_export
+            and self._export_streak[var] >= _EXPORT_DEBOUNCE_POLLS
+            and bool(self._downstream_generator_aids())
         )
 
         if var not in self._violation_emitted:
@@ -412,6 +464,7 @@ class GridConstraintMonitor(Role):
                 and var == "loading_percent"
                 and self.home_leader_addr is not None
                 and not downstream_active
+                and not export_overload
                 and not self.enable_line_relief_reassert
             ):
                 await self._send_line_overload_relief(obs, val, lo, hi)
@@ -420,20 +473,23 @@ class GridConstraintMonitor(Role):
         if (
             self.enable_line_relief_reassert
             and not downstream_active
+            and not export_overload
             and self.branch_id is not None
             and var == "loading_percent"
             and self.home_leader_addr is not None
         ):
             await self._reassert_line_relief(obs, var, val, lo, hi)
-        # Curtailment auction; skipped for gated skip-vars unless downstream
-        # relief re-enables ``loading_percent`` with a targeted bidder set.
-        if self.enable_curtailment_auction and (
-            downstream_active
-            or not (
-                self.enable_curtail_auction_gating and var in _CURTAIL_AUCTION_SKIP_VARS
-            )
+        # Curtailment auction; skip-vars are scoped out (the node-blind
+        # auction can't relieve them) unless downstream relief re-enables
+        # ``loading_percent`` with a targeted bidder set.
+        if (
+            self.enable_curtailment_auction
+            and not export_overload
+            and (downstream_active or not self._auction_skips_var(var))
         ):
             await self._request_curtailment(var, val, lo, hi)
+        if export_overload:
+            await self._relieve_export_overload(obs, var, val, hi)
 
     def _handle_warning(
         self, var: str, val: float, lo: float, hi: float, util: float
@@ -501,15 +557,21 @@ class GridConstraintMonitor(Role):
             # Skip readings the solver hasn't populated or that signal a
             # de-energised junction: isolated heat nodes report t_k=0 / NaN
             # post-failure, a gas region cut off from its source collapses to
-            # pressure_pu~0, and an electricity node cut off from its slack
-            # collapses to vm_pu~0 (see DEENERGISED_*). None is an actionable
-            # breach (no curtailment lever re-energises a source-isolated
-            # region); genuine under-bound readings are well above the floor, so
-            # they still fire.
+            # pressure_pu~0 (or saturates the relaxed-Weymouth box at ~sqrt(3)),
+            # and an electricity node cut off from its slack collapses to
+            # vm_pu~0 (see DEENERGISED_*). None is an actionable breach (no
+            # curtailment lever re-energises a source-isolated region); genuine
+            # out-of-bound readings sit well inside the gap, so they still fire.
             if (
                 not math.isfinite(val)
                 or (var == "t_k" and val <= 0.0)
-                or (var == "pressure_pu" and val <= DEENERGISED_PRESSURE_PU)
+                or (
+                    var == "pressure_pu"
+                    and (
+                        val <= DEENERGISED_PRESSURE_PU
+                        or val >= DEENERGISED_PRESSURE_HIGH_PU
+                    )
+                )
                 or (var == "vm_pu" and val <= DEENERGISED_VM_PU)
             ):
                 continue
@@ -536,6 +598,7 @@ class GridConstraintMonitor(Role):
                 self._curtail_progress.pop(var, None)
                 self._relief_inflight.pop(var, None)
                 self._line_relief_tier1_residual.pop(var, None)
+                self._export_streak.pop(var, None)
 
             if (
                 util >= PROACTIVE_WARNING_FRACTION
@@ -747,6 +810,177 @@ class GridConstraintMonitor(Role):
                 refresh_line_curtail_lock(self.behavior, aid, now)
 
     # ------------------------------------------------------------------
+    # Flow direction / export-overload relief
+    # ------------------------------------------------------------------
+
+    def _flow_is_export(self, obs: dict) -> bool | None:
+        """True when the branch carries reverse (downstream→slack, export)
+        flow, False for forward flow, None when undeterminable. Sign
+        convention: ``p_from_mw > 0`` (equivalently ``p_to_mw < 0``) is
+        from→to flow."""
+        self._ensure_downstream_topology()
+        if self._upstream_is_from is None:
+            return None
+        try:
+            p_from = float(obs.get("p_from_mw", 0.0) or 0.0)
+            p_to = float(obs.get("p_to_mw", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if abs(p_from) <= 1e-9 and abs(p_to) <= 1e-9:
+            return None
+        flow_from_to = p_from > 0.0 if abs(p_from) >= abs(p_to) else p_to < 0.0
+        return flow_from_to is not self._upstream_is_from
+
+    def _ensure_downstream_topology(self) -> None:
+        """Resolve the downstream topology on first use and re-resolve after
+        ``_DOWNSTREAM_TOPOLOGY_TTL_S``: failures and tie closes reshape the
+        graph but no topology event reaches branch monitors, so a TTL is the
+        cheapest correct invalidation."""
+        now = self.context.current_timestamp
+        if (
+            self._downstream_resolved
+            and (now - self._downstream_resolved_t) < _DOWNSTREAM_TOPOLOGY_TTL_S
+        ):
+            return
+        self._downstream_resolved_t = now
+        self._resolve_downstream_topology()
+
+    def _resolve_downstream_topology(self) -> None:
+        """Cut this branch and BFS the electricity graph from the slacks to
+        find which endpoint is upstream and which generators sit downstream
+        (the export-relief targets). Open ties and failed branches are
+        non-conductive. Leaves ``_upstream_is_from`` None on a meshed /
+        unclean cut."""
+        self._downstream_resolved = True
+        self._upstream_is_from = None
+        self._downstream_gen_aids = []
+        net = getattr(self.behavior, "_net", None)
+        if net is None or self.branch_id is None:
+            return
+        try:
+            branches = list(net.branches)
+            childs = list(net.childs)
+        except Exception:  # noqa: BLE001
+            return
+
+        adj: dict[Any, list[Any]] = {}
+        for branch in branches:
+            try:
+                if branch.id == self.branch_id or branch.model.is_cp():
+                    continue
+                if (
+                    not getattr(branch, "active", True)
+                    or not getattr(branch.model, "active", True)
+                    or not int(getattr(branch.model, "on_off", 1) or 0)
+                ):
+                    continue
+                node = net.node_by_id(branch.id[0])
+            except Exception:  # noqa: BLE001
+                continue
+            if sector_from_grid(getattr(node, "grid", None)) is not Sector.ELECTRICITY:
+                continue
+            a, b = branch.id[0], branch.id[1]
+            adj.setdefault(a, []).append(b)
+            adj.setdefault(b, []).append(a)
+
+        slack_nodes = {
+            child.node_id for child in childs if isinstance(child.model, ExtPowerGrid)
+        }
+        if not slack_nodes:
+            return
+
+        def _reach(start: set[Any]) -> set[Any]:
+            seen = set(start)
+            frontier = list(start)
+            while frontier:
+                nxt: list[Any] = []
+                for n in frontier:
+                    for nb in adj.get(n, ()):
+                        if nb not in seen:
+                            seen.add(nb)
+                            nxt.append(nb)
+                frontier = nxt
+            return seen
+
+        fed = _reach(slack_nodes)
+        a, b = self.branch_id[0], self.branch_id[1]
+        a_up, b_up = a in fed, b in fed
+        if a_up == b_up:
+            return  # no clean cut: direction stays undeterminable
+        self._upstream_is_from = a_up
+
+        down = _reach({b if a_up else a})
+        gens: list[str] = []
+        for child in childs:
+            if child.node_id not in down or isinstance(child.model, ExtPowerGrid):
+                continue
+            try:
+                cap = obs_capacity(dict(child.model.values))
+            except Exception:  # noqa: BLE001
+                continue
+            if cap >= 0:
+                continue
+            aid = f"child-{child.id}"
+            if self.behavior.has_action(aid, "regulate"):
+                gens.append(aid)
+        self._downstream_gen_aids = gens
+
+    def _downstream_generator_aids(self) -> list[str]:
+        self._ensure_downstream_topology()
+        return self._downstream_gen_aids
+
+    async def _relieve_export_overload(
+        self, obs: dict, var: str, val: float, hi: float
+    ) -> None:
+        """Curtail downstream generation for an export (reverse-flow) overload.
+        Load-shed paths are suppressed for these — shedding raises net export.
+        Cooldown-guarded and re-armed each poll until the line clears."""
+        now = self.context.current_timestamp
+        deadline = self._relief_inflight.get(var)
+        if deadline is not None and now < deadline:
+            return
+        gens = self._downstream_generator_aids()
+        if not gens:
+            # No lever here; leave the shared cooldown unburnt so the
+            # ordinary relief chain isn't starved.
+            record_event(
+                t=now,
+                kind="line_export_relief_no_generators",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=f"{var}={val:.1f} hi={hi:.1f}",
+            )
+            return
+        self._relief_inflight[var] = now + _LINE_RELIEF_COOLDOWN_S
+        amount = min(1.0, max(0.25, _LINE_RELIEF_GAIN * (val - hi) / 100.0))
+        curtailed = 0
+        for aid in gens:
+            gen_obs = self.behavior.observe(aid) or {}
+            current = float(gen_obs.get("regulation", 1.0))
+            new_factor = max(0.0, current * (1.0 - amount))
+            applied = apply_regulate(
+                self.behavior,
+                aid,
+                new_factor,
+                sector=self.sector.value,
+                reason="curtail",
+                timestamp=now,
+                priority_tier=lookup_priority(self.behavior, aid),
+            )
+            if applied:
+                curtailed += 1
+        record_event(
+            t=now,
+            kind="line_export_relief",
+            aid=self.context.aid,
+            sector=self.sector.value,
+            detail=(
+                f"{var}={val:.1f} hi={hi:.1f} amount={amount:.2f} "
+                f"gens={len(gens)} curtailed={curtailed}"
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # Curtailment
     # ------------------------------------------------------------------
 
@@ -790,6 +1024,12 @@ class GridConstraintMonitor(Role):
     ) -> None:
         span = hi - lo
         if span <= 0:
+            return
+
+        # Gas OVER-pressure: shedding load shrinks the Weymouth drops and
+        # RAISES pressure — positive feedback. The slack pressure regulator
+        # owns that side; never arm a load-shed for it.
+        if self.sector is Sector.GAS and variable == "pressure_pu" and value > hi:
             return
 
         # In-flight guard: skip while an auction for this variable is open so

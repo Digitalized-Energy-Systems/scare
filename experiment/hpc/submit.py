@@ -5,10 +5,15 @@ Usage:
 
 ``--only`` lets you re-submit just a subset:
     all          (default) every task in manifest
-    failed       only tasks whose status.json shows error
+    failed       tasks whose status.json shows error/killed
     timeout      only tasks that timed out
     missing      only tasks that never started / never wrote status.json
+                 (covers OOM-killed tasks, which never write status.json)
     incomplete   anything that isn't ok (covers failed + timeout + missing)
+
+``missing`` / ``incomplete`` must only be used after the array has drained:
+a still-queued task also reads as missing, and resubmitting it double-runs
+the task (the two runs scrub each other's artifacts).
 """
 
 from __future__ import annotations
@@ -82,6 +87,17 @@ def _array_command(
     ]
 
 
+def _campaign_eval_slurm(campaign_dir: Path, fallback: SlurmConfig) -> SlurmConfig:
+    """Effective eval-job sizing from the campaign's config.json; falls back
+    to the given per-task SlurmConfig if the config can't be read (callers may
+    only hold the SlurmConfig, not the full CampaignConfig)."""
+    try:
+        cfg = CampaignConfig.from_json(campaign_dir / CAMPAIGN_LAYOUT["config"])
+        return cfg.effective_eval_slurm()
+    except (OSError, ValueError):
+        return fallback
+
+
 def _aggregator_command(
     campaign_dir: Path, slurm: SlurmConfig, after_job: str, log_dir: Path
 ) -> list[str]:
@@ -92,11 +108,16 @@ def _aggregator_command(
         f"exec {shlex.quote(py)} -m experiment.hpc.aggregate "
         f"--campaign-dir {shlex.quote(str(campaign_dir))}"
     )
-    # Aggregator is lightweight: bypass the heavy slurm flags but keep
-    # partition/account/nodelist so it lands on the user's cluster slice.
-    light_flags = ["--cpus-per-task=1", "--mem=2G", "--time=00:10:00"]
+    # Size from the config's slurm_eval overlay (like submit_plot) instead of
+    # hardcoding 2G/10min, which OOM'd/timed out on large campaigns.
+    eval_slurm = _campaign_eval_slurm(campaign_dir, slurm)
+    light_flags = [
+        f"--cpus-per-task={eval_slurm.cpus}",
+        f"--mem={eval_slurm.mem}",
+        f"--time={eval_slurm.time}",
+    ]
     for k in ("partition", "account", "qos", "nodelist", "exclude"):
-        v = getattr(slurm, k)
+        v = getattr(eval_slurm, k)
         if v:
             light_flags.append(f"--{k}={v}")
     return [
@@ -178,7 +199,9 @@ def _parse_args() -> argparse.Namespace:
         "--only",
         default="all",
         choices=["all", "failed", "timeout", "missing", "incomplete", "ok"],
-        help="Filter task subset to (re-)submit (default: all)",
+        help="Filter task subset to (re-)submit (default: all); "
+        "'failed' covers error/killed; use 'missing'/'incomplete' only after "
+        "the array has drained (a queued task also reads as missing)",
     )
     p.add_argument(
         "--dry-run",

@@ -105,14 +105,27 @@ def test_allocation_proportional_to_willingness():
     assert not plan.tier1_exhausted
 
 
-def test_allocation_even_split_when_all_zero():
+def test_allocation_empty_plan_when_all_zero():
+    # All-zero willingness = every bidder is a tier-1 hard-locked load.
     bids = {"a": 0.0, "b": 0.0}
     bidders = {"a": "addr_a", "b": "addr_b"}
     plan = plan_auction_allocation(
         bids, bidders, {}, 1.0, waterfall=False, min_reducible=5e-4
     )
+    assert plan == AllocationPlan([], False)
+
+
+def test_allocation_zero_willingness_bidders_excluded():
+    # Zero-willingness (tier-1) bidders get no share; positive bidders split.
+    bids = {"crit": 0.0, "a": 1.0, "b": 1.0}
+    bidders = {"crit": "addr_c", "a": "addr_a", "b": "addr_b"}
+    plan = plan_auction_allocation(
+        bids, bidders, {}, 1.0, waterfall=False, min_reducible=5e-4
+    )
     shares = {k: s for k, _addr, s in plan.dispatches}
-    assert shares == {"a": 0.5, "b": 0.5}
+    assert "crit" not in shares
+    assert abs(shares["a"] - 0.5) < 1e-12
+    assert abs(shares["b"] - 0.5) < 1e-12
 
 
 def test_waterfall_sheds_lowest_priority_tier_first_full_amount():

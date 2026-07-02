@@ -40,6 +40,7 @@ from scare.base.channel import (
 from scare.base.model import NegotiationFinishedEvent, Sector, StartBalanceNegotiation
 from scare.base.runtime.diagnostics import record_event
 from scare.base.util import (
+    clamp_tier_monotonic,
     lookup_slack,
     lookup_slack_eff_budget,
     obs_capacity,
@@ -1379,9 +1380,15 @@ class HolonSummaryRole(Role):
     async def _dispatch_active_coalition(self, active: _ActiveCoalition) -> None:
         """Send the constraint as a StartBalanceNegotiation to every
         accepting member, plus self.
+
+        Tier-monotonic clamp mirrors the component-allocation path: a coalition
+        fraction map dispatched directly must not serve a lower-priority tier
+        above a higher one.
         """
         service_fraction_by_sector_priority = {
-            active.sector.value: dict(active.service_fraction_by_tier),
+            active.sector.value: clamp_tier_monotonic(
+                dict(active.service_fraction_by_tier)
+            ),
         }
         payload = StartBalanceNegotiation(
             service_fraction_by_sector_priority=service_fraction_by_sector_priority,

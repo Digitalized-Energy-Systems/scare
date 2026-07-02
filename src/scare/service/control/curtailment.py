@@ -83,12 +83,13 @@ def plan_auction_allocation(
     waterfall: bool,
     min_reducible: float,
 ) -> AllocationPlan:
-    """Compute the per-bidder curtailment shares. Three modes:
+    """Compute the per-bidder curtailment shares. Two modes:
 
     - **waterfall** (line relief): shed the lowest-priority tier with reducible
       draw first; tier 1 is never shed (``tier1_exhausted=True`` when only it remains).
-    - **even split** when all willingness is zero.
-    - **willingness-proportional** otherwise.
+    - **willingness-proportional** otherwise; zero-willingness bidders (tier-1
+      hard-locked loads bid exactly 0.0) are excluded, and an all-zero field
+      yields an empty plan rather than an even split that would shed them.
     """
     if not bids:
         return AllocationPlan([], False)
@@ -109,14 +110,11 @@ def plan_auction_allocation(
         ]
         return AllocationPlan(dispatches, False)
 
-    sum_w = sum(bids.values())
-    if sum_w <= 0.0:
-        share = total / len(bids)
-        return AllocationPlan(
-            [(k, bidders.get(k), share) for k in bidders],
-            False,
-        )
+    positive = {k: w for k, w in bids.items() if w > 0.0}
+    if not positive:
+        return AllocationPlan([], False)
+    sum_w = sum(positive.values())
     return AllocationPlan(
-        [(k, bidders.get(k), total * (w / sum_w)) for k, w in bids.items()],
+        [(k, bidders.get(k), total * (w / sum_w)) for k, w in positive.items()],
         False,
     )

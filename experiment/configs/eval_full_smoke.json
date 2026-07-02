@@ -270,7 +270,7 @@
       ]
     },
     {
-      "$comment_block": "Thermal stress.  cold_day scenario on cp_heavy grid forces heat-sector deficit (supply_t_k=343, heat_load_scale=1.5) so heat_recovery and clpu_ramp have signal â€” both are heat-sector / ramp-rate gated and never fire on pure electricity failures.",
+      "$comment_block": "Thermal stress.  cold_day scenario on cp_heavy grid forces heat-sector deficit (supply_t_k=343, heat_load_scale=1.5) so heat_frontier (replaces the retired enable_heat_recovery flag) and clpu_ramp have signal â€” both are heat-sector / ramp-rate gated and never fire on pure electricity failures.",
       "name": "ablation_thermal",
       "grids": [
         "simbench_lv_cp_heavy"
@@ -282,7 +282,7 @@
       "ablations": [
         {},
         {
-          "enable_heat_recovery": false
+          "enable_heat_frontier": false
         },
         {
           "enable_clpu_ramp": false

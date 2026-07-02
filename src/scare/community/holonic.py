@@ -60,6 +60,7 @@ from scare.base.runtime.diagnostics import record_event
 from scare.base.runtime.trace import optimization
 from scare.base.topology.topology_mirror import LivePeerFilter
 from scare.base.util import (
+    clamp_tier_monotonic,
     compute_priority_weighted_shares,
 )
 from scare.community.deliverability import per_actor_deliverable_caps
@@ -83,6 +84,28 @@ _FLEX_TIMEOUT_PER_MEMBER_S = 0.5  # per expected member group
 
 
 DEFAULT_MAX_HOLON_SIZE: int = 4
+
+# Two fraction maps within this per-tier tolerance count as the same
+# allocation (matches the actuator dedup tolerance, so a skipped re-dispatch
+# would have been all no-ops anyway).
+_FRACTION_EQUAL_TOL: float = 1e-3
+
+
+def _fraction_maps_equal(
+    a: dict[str, dict[int, float]],
+    b: dict[str, dict[int, float]],
+    *,
+    tol: float = _FRACTION_EQUAL_TOL,
+) -> bool:
+    if set(a) != set(b):
+        return False
+    for sec in a:
+        ta, tb = a[sec], b[sec]
+        if set(ta) != set(tb):
+            return False
+        if any(abs(ta[t] - tb[t]) > tol for t in ta):
+            return False
+    return True
 
 
 class HolonicCommunityRole(Role):
@@ -177,6 +200,12 @@ class HolonicCommunityRole(Role):
         self._flex_answers: list[AvailableFlexAnswer] = []
         self._flex_answer_senders: list[Any] = []
         self._flex_expected: int = 0
+        # Round tag for ``_flex_collection_timeout``: a stale timeout from a
+        # completed round must not release/fire a later round.
+        self._flex_round_token: int = 0
+        # Stamped on AskForAvailableFlex and echoed by responders; a straggler
+        # from round N must not count into round N+1.
+        self._flex_round_id: str = ""
         self._rebalance_active: bool = False
         # Reactive triggers within ``rebalance_min_gap_s`` of this are dropped.
         self._last_rebalance_t: float = float("-inf")
@@ -210,9 +239,6 @@ class HolonicCommunityRole(Role):
         self._component_round_counter: int = 0
         self._component_report_buffer: dict[str, tuple[str, Any]] = {}
         self._component_dispatch_pending: bool = False
-        # Coordinator dispatch throttle (like ``rebalance_min_gap_s``, separate
-        # since reports may arrive between this community's own rebalances).
-        self._last_component_dispatch_t: float = float("-inf")
         # Latest dispatched fraction; new reports merge against it.
         self._last_component_fraction: dict[str, dict[int, float]] | None = None
 
@@ -222,8 +248,12 @@ class HolonicCommunityRole(Role):
         self._allocation_version_counter: int = 0
         # Latest dispatched allocation, re-sent to stale leaders. None until first.
         self._last_dispatched_allocation: Any = None  # ComponentAllocation
-        # Latest version applied as an L2 leaf, echoed in each report. -1 = none.
+        # Latest (coordinator aid, version) applied as an L2 leaf. Versions are
+        # per-publisher, so a re-elected coordinator's fresh low versions must
+        # not be judged against the old coordinator's high counter. Echoed in
+        # each report only when the publisher matches the current coordinator.
         self._last_applied_allocation_version: int = -1
+        self._last_applied_allocation_publisher: str | None = None
 
     def setup(self) -> None:
         # Formation is event-driven; this slow watchdog covers a leader that
@@ -669,15 +699,20 @@ class HolonicCommunityRole(Role):
             self._flex_answer_senders = []
             # Single self-ask aggregates the whole community's flex.
             self._flex_expected = 1
+            self._flex_round_token += 1
+            round_token = self._flex_round_token
+            self._flex_round_id = f"{self.context.aid}/{round_token}"
             await self.context.send_message(
-                AskForAvailableFlex(include_connectors=False),
+                AskForAvailableFlex(
+                    include_connectors=False, round_id=self._flex_round_id
+                ),
                 receiver_addr=self.context.addr,
             )
             base = _FLEX_TIMEOUT_BASE_S.get(self.sector, _FLEX_TIMEOUT_DEFAULT_S)
             timeout = base + _FLEX_TIMEOUT_PER_MEMBER_S
             deadline = now + timeout
             self.context.schedule_timestamp_task(
-                self._flex_collection_timeout(), timestamp=deadline
+                self._flex_collection_timeout(round_token), timestamp=deadline
             )
             return
 
@@ -712,13 +747,18 @@ class HolonicCommunityRole(Role):
         self._flex_answer_senders = []
         # Leader contributes its own flex, else ADMM is single-actor and bails.
         self._flex_expected = len(members) + 1
+        self._flex_round_token += 1
+        round_token = self._flex_round_token
+        self._flex_round_id = f"{self.context.aid}/{round_token}"
 
         logger.debug(
             "[%s] holon rebalance: asking %d members (+self) for flex",
             self.context.aid,
             len(members),
         )
-        msg = AskForAvailableFlex(include_connectors=False)
+        msg = AskForAvailableFlex(
+            include_connectors=False, round_id=self._flex_round_id
+        )
         await self.context.send_message(msg, receiver_addr=self.context.addr)
         for addr in members:
             await self.context.send_message(msg, receiver_addr=addr)
@@ -729,10 +769,14 @@ class HolonicCommunityRole(Role):
         timeout = base + len(members) * _FLEX_TIMEOUT_PER_MEMBER_S
         deadline = self.context.current_timestamp + timeout
         self.context.schedule_timestamp_task(
-            self._flex_collection_timeout(), timestamp=deadline
+            self._flex_collection_timeout(round_token), timestamp=deadline
         )
 
-    async def _flex_collection_timeout(self) -> None:
+    async def _flex_collection_timeout(self, round_token: int) -> None:
+        # Round-tagged: a timeout scheduled for an earlier, already-resolved
+        # round must not release the lock or fire the ADMM for a later one.
+        if round_token != self._flex_round_token:
+            return
         if not self._rebalance_active:
             return
         received = len(self._flex_answers)
@@ -909,6 +953,11 @@ class HolonicCommunityRole(Role):
         self, message: AvailableFlexAnswer, meta: dict
     ) -> None:
         if not self._rebalance_active:
+            return
+        # Strict round identity: asks stamp a fresh id per round and the sole
+        # responder (balance._handle_ask_flex) always echoes it, so a round-N
+        # straggler can't double-count a member into round N+1.
+        if getattr(message, "round_id", "") != self._flex_round_id:
             return
         # Ignore non-member answers: a stray reply would inflate the count.
         if self._holon_member_keys:
@@ -1344,6 +1393,11 @@ class HolonicCommunityRole(Role):
                 self.sector,
                 now,
             )
+            # Post-merge tier-monotonic clamp: same rationale as the
+            # component-allocation path — a per-tier coalition override must
+            # not lift a lower tier above a higher one.
+            for tier_map in service_fraction.values():
+                clamp_tier_monotonic(tier_map)
 
         # Send the holon-global fraction map to every member leader (L1 honour).
         triggers = self._resolve_holon_members()
@@ -1463,6 +1517,7 @@ class HolonicCommunityRole(Role):
         if not self._rebalance_active:
             return
         answers = self._flex_answers[:]
+        senders = self._flex_answer_senders[:]
         # Drain.
         self._flex_answers = []
         self._flex_answer_senders = []
@@ -1482,8 +1537,11 @@ class HolonicCommunityRole(Role):
 
         coord_aid = self._component_coordinator_aid()
         if coord_aid is None:
-            # No peer topology; degenerate to the per-holon path.
-            self._flex_answers = answers  # restore for fallback
+            # No peer topology; degenerate to the per-holon path. Restore both
+            # buffers: the fallback zips senders with answers for the
+            # deliverability caps, so answers alone leave it inert.
+            self._flex_answers = answers
+            self._flex_answer_senders = senders
             self._rebalance_active = True
             await self._run_supply_priority_admm()
             return
@@ -1493,6 +1551,16 @@ class HolonicCommunityRole(Role):
         now = float(self.context.current_timestamp)
         leader_aid = self.context.aid
 
+        # Implicit ACK: echo the latest applied version so the coordinator can
+        # detect a missed dispatch — but only when it was published by the
+        # CURRENT coordinator. After re-election the old coordinator's high
+        # version would otherwise wedge the new one's ``_resend_allocation_
+        # if_stale`` (its counter restarts low).
+        echo_version = (
+            self._last_applied_allocation_version
+            if self._last_applied_allocation_publisher == coord_aid
+            else -1
+        )
         report = ComponentAdmmReport(
             publisher=leader_aid,
             version=self._version.next(),
@@ -1503,9 +1571,7 @@ class HolonicCommunityRole(Role):
             supply_by_sector=supply,
             demand_by_sector_priority=demand,
             served_by_sector_priority=served,
-            # Implicit ACK: echo the latest applied version so the coordinator
-            # can detect a missed dispatch.
-            last_applied_allocation_version=self._last_applied_allocation_version,
+            last_applied_allocation_version=echo_version,
         )
 
         if coord_aid == leader_aid:
@@ -1521,6 +1587,7 @@ class HolonicCommunityRole(Role):
         if coord_addr is None:
             # Aid known but address unresolved — fall back to the per-holon path.
             self._flex_answers = answers
+            self._flex_answer_senders = senders
             self._rebalance_active = True
             await self._run_supply_priority_admm()
             return
@@ -1545,6 +1612,14 @@ class HolonicCommunityRole(Role):
         # Only buffer reports from leaders still in our active component.
         component_peers = self._resolve_component_peer_addrs()
         if message.leader_aid not in component_peers:
+            return
+        # Per-publisher staleness guard (mirrors ``_on_summary``): under
+        # latency/loss a reordered older report must not overwrite a fresher
+        # one (the buffer is last-arrival-wins otherwise).
+        prior = self._component_report_buffer.get(message.leader_aid)
+        if prior is not None and int(
+            getattr(message, "version", 0)
+        ) <= int(getattr(prior[1], "version", -1)):
             return
         self._component_report_buffer[message.leader_aid] = (message.round_id, message)
         # Packet-loss recovery: if the sender's echoed version trails our latest
@@ -1612,7 +1687,6 @@ class HolonicCommunityRole(Role):
             await self._run_component_admm_now_inner(reason=reason)
         finally:
             self._component_dispatch_pending = False
-            self._last_component_dispatch_t = float(self.context.current_timestamp)
 
     async def _run_component_admm_now_inner(self, *, reason: str) -> None:
         if not self._component_report_buffer:
@@ -1671,16 +1745,30 @@ class HolonicCommunityRole(Role):
         # Bounded to this coordinator's solve+history (not all P tiers): forcing
         # unknown tiers down over-sheds; handoff inversion needs L2.5 instead.
         sec_val = self.sector.value
-        prev_own = (self._last_component_fraction or {}).get(sec_val, {})
+        prev_fraction = self._last_component_fraction
+        prev_own = (prev_fraction or {}).get(sec_val, {})
         merged_own = dict(prev_own)
         merged_own.update(service_fraction.get(sec_val, {}))
-        cap = 1.0
-        for tier in sorted(t for t in merged_own if t >= 1):
-            merged_own[tier] = min(merged_own[tier], cap)
-            cap = merged_own[tier]
+        clamp_tier_monotonic(merged_own)
         service_fraction = {**service_fraction, sec_val: merged_own}
 
-        self._last_component_fraction = service_fraction
+        # Allocation-unchanged gate: when the merged solve equals the last
+        # dispatched fractions (within the actuator dedup tolerance), skip the
+        # re-dispatch entirely. This (with the leaf-side "anything actually
+        # changed" nudge gate) bounds the dispatch→rebalance→report→solve loop
+        # under enable_change_only_dispatch, where no time throttle applies.
+        # Leaders that missed the previous dispatch still recover via
+        # ``_resend_allocation_if_stale`` (version echo), so skipping is safe.
+        if (
+            self._allocation_version_counter > 0
+            and prev_fraction is not None
+            and _fraction_maps_equal(prev_fraction, service_fraction)
+        ):
+            logger.debug(
+                "[%s] component-scope ADMM: allocation unchanged — dispatch skipped",
+                self.context.aid,
+            )
+            return
         logger.info(
             "[%s] component-scope ADMM result (reason=%s): sectors=%s "
             "tiers=%s n_communities=%d fractions=%s",
@@ -1719,6 +1807,10 @@ class HolonicCommunityRole(Role):
             sector=self.sector,
             service_fraction_by_tier=service_fraction.get(self.sector.value, {}),
         )
+        # Rebase only on actual dispatch: both the skip gate's prev_fraction
+        # and the monotonic-merge anchor must reference the last DISPATCHED
+        # map, or skipped rounds accumulate unbounded drift.
+        self._last_component_fraction = service_fraction
         self._last_dispatched_allocation = allocation
         for addr in component_peers.values():
             await self.context.send_message(allocation, receiver_addr=addr)
@@ -1736,6 +1828,21 @@ class HolonicCommunityRole(Role):
         # Cheap drift guard: act only as a current group leader.
         if topology_characteristic(self, tid="groups") != "leader":
             return
+        # Version gate BEFORE applying: a delayed/duplicated older allocation
+        # from the same coordinator must not overwrite a fresher one. Versions
+        # are per-publisher; a different publisher (coordinator re-election)
+        # always passes and resets the counter below.
+        try:
+            msg_version = int(message.version)
+        except (TypeError, ValueError):
+            msg_version = None  # legacy allocation: apply, ack stays -1
+        msg_publisher = str(getattr(message, "publisher", "") or "")
+        if (
+            msg_version is not None
+            and msg_publisher == self._last_applied_allocation_publisher
+            and msg_version <= self._last_applied_allocation_version
+        ):
+            return
         # Rebuild a {sector: {tier: frac}} envelope for the L1 honour path.
         service_fraction: dict[str, dict[int, float]] = {
             self.sector.value: dict(message.service_fraction_by_tier),
@@ -1750,17 +1857,12 @@ class HolonicCommunityRole(Role):
             # Re-assert non-increasing-in-tier monotonicity AFTER the coalition
             # merge. ``merge_into`` lets a per-tier store fraction win, which can
             # lift a lower-priority tier above a higher one and reintroduce the
-            # exact inversion the coordinator's clamp removed (see the
-            # component-scope clamp above, ~L1677). Without this, a competing
-            # coalition override silently breaks component priority order (the
-            # observed gas tier-1-victim inversions). Clamp is priority-safe: it
-            # only ever lowers a lower tier to its higher tier's level.
+            # exact inversion the coordinator's clamp removed. Without this, a
+            # competing coalition override silently breaks component priority
+            # order (the observed gas tier-1-victim inversions).
             merged = service_fraction.get(self.sector.value)
             if merged:
-                cap = 1.0
-                for tier in sorted(t for t in merged if t >= 1):
-                    merged[tier] = min(merged[tier], cap)
-                    cap = merged[tier]
+                clamp_tier_monotonic(merged)
         # Send to SELF: the negotiator applies the fraction to every community
         # member, covering loads outside any holon. This authoritative dispatch
         # also refreshes the per-load L2 priority floor (in ``apply_regulate``);
@@ -1772,14 +1874,12 @@ class HolonicCommunityRole(Role):
             ),
             receiver_addr=self.context.addr,
         )
-        # ACK: record the applied version so the next report echoes it (the
-        # coordinator detects drops via the echo). Stale retransmits ignored.
-        try:
-            if int(message.version) > self._last_applied_allocation_version:
-                self._last_applied_allocation_version = int(message.version)
-        except (TypeError, ValueError):
-            # Legacy allocation (no version): ack stays -1.
-            pass
+        # ACK: record (publisher, version) so the next report echoes it (the
+        # coordinator detects drops via the echo). A new publisher resets the
+        # counter — versions are not comparable across coordinators.
+        if msg_version is not None:
+            self._last_applied_allocation_publisher = msg_publisher
+            self._last_applied_allocation_version = msg_version
         self._record_event(
             "holon_priority_allocation",
             f"component_scope round={message.round_id} "

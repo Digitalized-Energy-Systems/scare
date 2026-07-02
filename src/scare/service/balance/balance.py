@@ -721,6 +721,47 @@ class EnergyBalanceNegotiator(Role):
         for addr in neighbours:
             await self.context.send_message(msg, receiver_addr=addr)
 
+        # Deadline mirroring the gossip timeout: one dropped reply must not
+        # wedge the leader ``_active=True`` forever. On expiry proceed with the
+        # responses that did arrive (missing members contribute sp=0).
+        base = _GOSSIP_TIMEOUT_BASE_S.get(self.sector, _GOSSIP_TIMEOUT_DEFAULT_S)
+        timeout = base + len(neighbours) * _GOSSIP_TIMEOUT_PER_AGENT_S
+        self.context.schedule_timestamp_task(
+            self._trigger_timeout(nid),
+            timestamp=self.context.current_timestamp + timeout,
+        )
+
+    async def _trigger_timeout(self, nid: str) -> None:
+        if self._trigger_nid != nid:
+            return
+        logger.warning(
+            "[%s] trigger phase timed out (%d/%d responses) — proceeding",
+            self.context.aid,
+            len(self._trigger_responses),
+            self._trigger_expected,
+        )
+        await self._complete_trigger_phase()
+
+    async def _complete_trigger_phase(self) -> None:
+        own_obs = self.behavior.observe(self.context.aid) or {}
+        total_sp = self._reported_setpoint(own_obs) + sum(
+            self._trigger_responses.values()
+        )
+        responders = set(self._trigger_responses)
+        self._trigger_nid = None
+        self._trigger_responses = {}
+
+        # Tier-1 hard pre-step: lift tier-1 to regulation=1 if the pool
+        # covers it, else pro-rata distribute and shed tiers 2/3/4.
+        residual_target, skip_gossip = self._pre_apply_tier1_hard(
+            total_sp, responders
+        )
+        if skip_gossip:
+            # Residual below threshold.
+            self._active = False
+            return
+        await self._start_gossip(residual_target)
+
     async def _handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
         obs = self.behavior.observe(self.context.aid) or {}
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
@@ -770,46 +811,39 @@ class EnergyBalanceNegotiator(Role):
         self._trigger_responses[sender_key] = message.setpoint
 
         if len(self._trigger_responses) >= self._trigger_expected:
-            own_obs = self.behavior.observe(self.context.aid) or {}
-            total_sp = self._reported_setpoint(own_obs) + sum(
-                self._trigger_responses.values()
-            )
-            self._trigger_nid = None
-            self._trigger_responses = {}
+            await self._complete_trigger_phase()
 
-            # Tier-1 hard pre-step: lift tier-1 to regulation=1 if the pool
-            # covers it, else pro-rata distribute and shed tiers 2/3/4.
-            residual_target, skip_gossip = self._pre_apply_tier1_hard(total_sp)
-            if skip_gossip:
-                # Tier-1 infeasible, or residual below threshold.
-                self._active = False
-                return
-            await self._start_gossip(residual_target)
-
-    def _pre_apply_tier1_hard(self, total_sp: float) -> tuple[float, bool]:
+    def _pre_apply_tier1_hard(
+        self, total_sp: float, responders: set[str]
+    ) -> tuple[float, bool]:
         """Tier-1 hard-constraint pre-step over the leader's group.
 
         Feasible (``pool >= tier1_unmet``): lift tier-1 to ``regulation = 1``,
         return residual ``(-total_sp) - tier1_unmet`` (tier-1 has ``a_i = 0``).
         Infeasible: pro-rata the pool by per-load unmet, shed tiers 2/3/4 to 0,
-        return ``(0.0, True)``.
+        return the post-apply group imbalance so gossip can still ramp
+        generator headroom the pool estimate missed.
 
-        Returns (residual target, skip flag — True iff infeasible OR residual ≤
-        threshold).
+        ``responders``: sender keys (``str(addr)``) that answered this trigger
+        round's AskEnergyMessage.
+
+        Returns (residual target, skip flag — True iff residual ≤ threshold).
         """
         original_target = -float(total_sp)
         threshold = self._per_group_threshold()
 
-        members = [self.context.aid]
+        members = [(self.context.aid, True)]
         for neigh in self._live_neighbours():
-            members.append(neigh.aid)
+            members.append((neigh.aid, str(neigh) in responders))
 
         tier1_records: list[
             tuple[str, float, float, str]
         ] = []  # (aid, cap, sp, sector)
-        non_tier1_loads: list[tuple[str, float, str]] = []  # (aid, cap, sec)
+        non_tier1_loads: list[
+            tuple[str, float, float, str, int]
+        ] = []  # (aid, cap, sp, sec, tier)
         pool = 0.0
-        for aid in members:
+        for aid, responded in members:
             obs = self.behavior.observe(aid) or {}
             cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
             sec_enum = obs_sector(obs, behavior=self.behavior, aid=aid)
@@ -818,13 +852,30 @@ class EnergyBalanceNegotiator(Role):
             sec = sec_enum.value
             if cap > 0:
                 prio = obs_priority(obs, behavior=self.behavior, aid=aid)
+                sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
                 if int(prio) == 1:
-                    sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
                     tier1_records.append((aid, float(cap), float(sp), sec))
                 else:
-                    non_tier1_loads.append((aid, float(cap), sec))
+                    non_tier1_loads.append(
+                        (aid, float(cap), float(sp), sec, int(prio))
+                    )
             elif cap < 0:
-                pool += abs(float(cap))
+                # Generators that answered this trigger round are proven live:
+                # credit delivered |sp| plus rampable headroom, else a cold
+                # start (sp≈0) freezes the pool at slack-only and zeroes tiers
+                # 2-4 forever. Non-responders keep delivered-only |sp| so
+                # unreachable capacity can't declare tier-1 "feasible". Slacks
+                # keep the budgeted rating.
+                if lookup_slack(self.behavior, aid) is not None:
+                    pool += abs(float(cap))
+                else:
+                    sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
+                    if responded:
+                        pool += abs(float(sp)) + max(
+                            0.0, abs(float(cap)) - abs(float(sp))
+                        )
+                    else:
+                        pool += abs(float(sp))
 
         tier1_unmet_per_load = [
             max(0.0, cap - sp) for (_aid, cap, sp, _sec) in tier1_records
@@ -882,9 +933,13 @@ class EnergyBalanceNegotiator(Role):
                 priority_tier=1,
             )
             applied_tier1 += 1
-        for aid, cap, sec in non_tier1_loads:
+        shed_recovered = 0.0
+        for aid, cap, sp, sec, prio in non_tier1_loads:
             if cap <= 0.0:
                 continue
+            # Real tier passed so the L2 floor clamps this reactive shed up to
+            # the component allocation (``tier1_starvation`` is in
+            # ``L1_REACTIVE_SHED_REASONS``) — no cross-leader tier inversion.
             apply_regulate(
                 self.behavior,
                 aid,
@@ -892,19 +947,27 @@ class EnergyBalanceNegotiator(Role):
                 sector=sec,
                 reason="tier1_starvation",
                 timestamp=now,
-                priority_tier=None,
+                priority_tier=prio,
             )
+            shed_recovered += sp
             applied_shed += 1
+        # Post-apply imbalance: tier-1 lifted by ``pool``, tiers 2-4 shed
+        # their ``sp``. Gossip it rather than bailing — the pool is only an
+        # estimate and the gossip QP can still engage generator dmin/dmax
+        # headroom it missed.
+        residual = original_target - pool + shed_recovered
         logger.info(
             "[%s] tier-1 hard pre-step (INFEASIBLE): pool=%.4f "
-            "tier1_unmet=%.4f tier1_loads=%d non_tier1_shed=%d",
+            "tier1_unmet=%.4f tier1_loads=%d non_tier1_shed=%d "
+            "residual_target=%.4f",
             self.context.aid,
             pool,
             tier1_unmet,
             applied_tier1,
             applied_shed,
+            residual,
         )
-        return 0.0, True
+        return residual, abs(residual) <= threshold
 
     # ------------------------------------------------------------------
     # Gossip phase
@@ -1118,6 +1181,13 @@ class EnergyBalanceNegotiator(Role):
             init_dmin, init_dmax = obs_min_max(
                 obs, behavior=self.behavior, aid=self.context.aid
             )
+            # Adopt via ledger_merge so the incoming ledger gets the same
+            # Byzantine clip as the merge path below.
+            cap_byz = _BYZANTINE_DELTA_CAP_MULTIPLE * max(
+                abs(message.negotiation_target), 1.0
+            )
+            adopted_memory: dict[str, tuple[float, int, int, bool]] = {}
+            ledger_merge(adopted_memory, message.memory, byzantine_cap=cap_byz)
             self._gossip = _GossipState(
                 negotiation_id=nid,
                 target=message.negotiation_target,
@@ -1128,7 +1198,7 @@ class EnergyBalanceNegotiator(Role):
                 ),
                 dmin_starting=init_dmin,
                 dmax_starting=init_dmax,
-                memory=dict(message.memory),
+                memory=adopted_memory,
                 dual_lambda=getattr(message, "dual_lambda", 0.0),
             )
         else:
@@ -1395,9 +1465,14 @@ class EnergyBalanceNegotiator(Role):
         # Broadcast convergence to gossip-capable neighbours so each emits its
         # own local event. ``new_setpoint`` carries the leader's converged sp so
         # the CP fixed-point gate can detect movement (a hard zero would suppress
-        # CP re-triggers); neighbours re-derive their own sp.
+        # CP re-triggers); neighbours re-derive their own sp. ``negotiation_id``
+        # lets members with matching gossip state (incl. a blocked originator)
+        # release it instead of timing out.
+        finished_nid = self._gossip.negotiation_id if self._gossip else ""
         neighbours = self._gossip_neighbours()
-        finished_msg = NegotiationFinishedEvent(new_setpoint=new_sp, sector=self.sector)
+        finished_msg = NegotiationFinishedEvent(
+            new_setpoint=new_sp, sector=self.sector, negotiation_id=finished_nid
+        )
         for addr in neighbours:
             await self.context.send_message(finished_msg, receiver_addr=addr)
 
@@ -1427,7 +1502,13 @@ class EnergyBalanceNegotiator(Role):
                     await self.context.send_message(finished_msg, receiver_addr=addr)
 
         self._gossip = None
-        self._active = False
+        # ``_active`` is owned by the trigger phase while ``_trigger_nid`` is
+        # set (gossip adoption never sets it); a finishing adopted gossip must
+        # not release the trigger's re-entry guard. The trigger's own gossip
+        # always runs with ``_trigger_nid is None`` (cleared in
+        # ``_complete_trigger_phase``), so clearing is correct then.
+        if self._trigger_nid is None:
+            self._active = False
 
     def flush_pending(self) -> None:
         """Record still-active gossip as ``stalled`` (progress) or ``abandoned``.
@@ -1463,13 +1544,39 @@ class EnergyBalanceNegotiator(Role):
     async def _handle_negotiation_finished_msg(
         self, message: NegotiationFinishedEvent, meta: dict
     ) -> None:
-        """Convergence broadcast from a peer; emit own local NFE."""
+        """Convergence broadcast from a peer; release matching gossip state
+        and emit own local NFE.
+
+        A token-holder that detects convergence finishes only its own state;
+        without the nid-matched release here every other member (incl. the
+        originator) stayed blocked until the wallclock timeout and the
+        originator logged a spurious ``timed_out`` terminal.
+        """
         starting_sp = (
             self._gossip.starting_setpoint
             if self._gossip
             else obs_setpoint(self.behavior.observe(self.context.aid) or {})
         )
         delta = self._gossip.current_delta if self._gossip else 0.0
+        nid = getattr(message, "negotiation_id", "")
+        if nid and self._gossip is not None and self._gossip.negotiation_id == nid:
+            if self._gossip.is_originator:
+                total_delta = self._gossip_total_delta()
+                record_negotiation(
+                    t=self.context.current_timestamp,
+                    aid=self.context.aid,
+                    sector=self.sector.value,
+                    nid=nid,
+                    event="finished",
+                    target=self._gossip.target,
+                    residual=self._gossip.target - total_delta,
+                    group_size=len(self._gossip.memory),
+                )
+            self._gossip = None
+            # Same ownership rule as ``_finish_negotiation``: only the trigger
+            # phase may hold ``_active`` while ``_trigger_nid`` is set.
+            if self._trigger_nid is None:
+                self._active = False
         self.context.emit_event(
             NegotiationFinishedEvent(
                 new_setpoint=starting_sp + delta, sector=self.sector
@@ -1599,6 +1706,7 @@ class EnergyBalanceNegotiator(Role):
             demand_by_sector_priority=demand_by_sector_priority,
             served_by_sector_priority=served_by_sector_priority,
             supply_by_sector=supply_by_sector,
+            round_id=message.round_id,
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
@@ -1766,7 +1874,10 @@ class EnergyBalanceNegotiator(Role):
                 served_by_sector[sec.value] = (
                     served_by_sector.get(sec.value, 0.0) + factor * cap
                 )
-                apply_regulate(
+                # Count only writes ``apply_regulate`` actually landed (it
+                # returns False on dedup/defer): ``applied`` gates the cascade
+                # nudge below, and an all-no-op dispatch must not re-fire it.
+                if apply_regulate(
                     self.behavior,
                     aid,
                     factor,
@@ -1774,8 +1885,8 @@ class EnergyBalanceNegotiator(Role):
                     reason="holon_supply_priority",
                     timestamp=self.context.current_timestamp,
                     priority_tier=int(prio),
-                )
-                applied += 1
+                ):
+                    applied += 1
 
             # R3: ramp dispatchable DGs toward their sector's served demand so
             # enforcement realizes the holon-assumed supply rather than shedding
@@ -1799,18 +1910,19 @@ class EnergyBalanceNegotiator(Role):
                 # S1: close the L2->L1->L2 cascade. ``apply_regulate`` emits
                 # nothing, so nudge the local HolonicCommunityRole to rebalance.
                 # Do NOT emit NFE here: its placeholder sp would mis-trigger
-                # stability and reset the leader's factor to 0.
-                for role in getattr(self.context, "roles", []):
-                    if isinstance(role, HolonicCommunityRole):
-                        try:
-                            role._maybe_schedule_rebalance()
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug(
-                                "[%s] dispatch L2 re-fire skipped: %s",
-                                self.context.aid,
-                                exc,
-                            )
-                        break
+                # stability and reset the leader's factor to 0. Only reached
+                # when at least one setpoint actually changed (``applied`` gate)
+                # so a no-op re-dispatch can't spin the cascade.
+                holon_role = self.context.get_role(HolonicCommunityRole)
+                if holon_role is not None:
+                    try:
+                        holon_role._maybe_schedule_rebalance()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "[%s] dispatch L2 re-fire skipped: %s",
+                            self.context.aid,
+                            exc,
+                        )
         finally:
             self._active = False
 
@@ -1823,8 +1935,11 @@ class EnergyBalanceNegotiator(Role):
         demand, distributing the deficit (served demand minus current local
         generation) across DGs in proportion to headroom. Reuses the
         ``_try_self_dispatch`` ramp arithmetic; slacks are excluded by the
-        caller. The curtail/ramp interlock and actuator dedup are enforced
-        inside ``apply_regulate``. Returns the number of generators actuated.
+        caller. Uses the dedicated ``l2_gen_ramp`` reason (in
+        ``GEN_RESTORE_REASONS``) so the gen curtail-ramp interlock defers it
+        while the auction holds a generator down; actuator dedup applies via
+        ``apply_regulate``. ``priority_tier`` stays None so no L2 floor is
+        written for generators. Returns the number of generators actuated.
         """
         by_sector: dict[str, list[tuple[str, float, float]]] = {}
         for aid, sec, cap, sp in gen_members:
@@ -1859,7 +1974,7 @@ class EnergyBalanceNegotiator(Role):
                     aid,
                     new_factor,
                     sector=sec_val,
-                    reason="holon_supply_priority",
+                    reason="l2_gen_ramp",
                     timestamp=self.context.current_timestamp,
                 ):
                     ramped += 1

@@ -143,6 +143,11 @@ class CampaignConfig:
     # high-task-count campaigns where the few MB/task is material.
     write_trajectories: bool = True
     timestamp_dir: bool = True
+    # Claims that flip task status to ``claims_failed`` when they fail;
+    # round-tripped into the resolved config.json for RuntimePlan.
+    fatal_claims: list[str] = field(
+        default_factory=lambda: ["priority_invariant", "monotonic_progress"]
+    )
     notes: str = ""
     defaults: GridDefaults = field(default_factory=GridDefaults)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
@@ -154,7 +159,7 @@ class CampaignConfig:
 
     @classmethod
     def from_json(cls, path: Path) -> CampaignConfig:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls.from_dict(data)
 
     @classmethod
@@ -194,7 +199,9 @@ class CampaignConfig:
         return cfg
 
     def to_json(self, path: Path) -> None:
-        Path(path).write_text(json.dumps(asdict(self), indent=2, sort_keys=True))
+        Path(path).write_text(
+            json.dumps(asdict(self), indent=2, sort_keys=True), encoding="utf-8"
+        )
 
     # Derived
 
@@ -245,7 +252,7 @@ class RuntimePlan:
 
     @classmethod
     def from_config_json(cls, path: Path) -> RuntimePlan:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
         fatal = data.get("fatal_claims")
         return cls(
             simulation_duration_s=float(data.get("simulation_duration_s", 30.0)),

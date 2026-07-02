@@ -47,6 +47,7 @@ from scare.base.config import RestorationConfiguration
 from scare.base.model import (
     DEENERGISED_PRESSURE_HIGH_PU,
     DEENERGISED_PRESSURE_PU,
+    DEENERGISED_VM_PU,
     ConstraintViolation,
     ReconfigurationCompletedEvent,
     Sector,
@@ -467,8 +468,10 @@ async def _settle_end_of_sim(world: SimulationWorld) -> None:
         return
     for _ in range(rounds):
         flush()  # reveal the true converged state to observers
-        horizon = world.clock.time + chunk_s
-        await discrete_step_until(world, max_advance_time_s=horizon)
+        # max_advance_time_s is a relative duration in mango, not an absolute
+        # horizon — passing clock.time+chunk_s free-runs the sim for ~its whole
+        # elapsed length again per round.
+        await discrete_step_until(world, max_advance_time_s=chunk_s)
         # A clean env after the chunk means controllers issued no new setpoint
         # changes — already converged, no point iterating further.
         if not getattr(behavior, "_dirty", False):
@@ -1105,6 +1108,10 @@ def _branch_downstream_load_addrs(monee_net: Any, world: Any) -> dict[str, list[
             continue
         if _branch_sector_str(branch, monee_net) != "electricity":
             continue
+        # Open backup ties are non-conductive; including them closes cycles
+        # so no branch yields a clean cut (empty bidder sets everywhere).
+        if not int(getattr(branch.model, "on_off", 1) or 0):
+            continue
         a, b = branch.id[0], branch.id[1]
         b_aid = create_branch_aid(branch.id)
         adj[a].add((b, b_aid))
@@ -1622,7 +1629,12 @@ def _build_topologies(
 
     # L2.5 holon-summary mesh: per-sector full clique of leaders broadcasting
     # ``HolonSummary`` (surfaces cross-holon inversions for cross-chunk ADMM).
-    if config.enable_holonic and config.enable_holon_summary:
+    # Built whenever holonic dispatch is on — NOT gated on enable_holon_summary:
+    # the mesh doubles as the election substrate for the per-component L2 ADMM
+    # coordinator (holonic._resolve_sector_peer_addrs) and the LeaderEmerged
+    # re-registration broadcast (repartition.py). The summary/coalition ROLES
+    # stay gated on enable_holon_summary above.
+    if config.enable_holonic:
         # CP agents bridging each sector join too under the L3 priority-ADMM
         # cutover (CPPriorityAdmmRole reads supply/demand from HolonSummary).
         cp_agents_by_sector: dict[Sector, list[Any]] = {sec: [] for sec in _SECTORS}
@@ -2075,10 +2087,16 @@ def _register_recordings(
 
     # Per-(sector, tier) regulation sum (loads only, to exclude generator/
     # slack noise) so a higher-tier drop with a lower tier still served flags.
+    # Gas consumers are Sink models (heat-side return Sinks are a topology
+    # artifact, excluded), so gas gets its tier series too.
     load_aids = {
         _child_aid(c.id)
         for c in monee_net.childs
         if isinstance(c.model, (PowerLoad, HeatLoad))
+        or (
+            isinstance(c.model, Sink)
+            and not _is_heat_side_mass_flow_sink(c, monee_net)
+        )
     }
     sector_aids = {
         Sector.ELECTRICITY.value: el_child_aids,
@@ -2128,6 +2146,8 @@ def _register_recordings(
             ):
                 continue
             if key == "t_k" and v <= 0.0:
+                continue
+            if key == "vm_pu" and v <= DEENERGISED_VM_PU:
                 continue
             vals.append(v)
         return vals

@@ -89,6 +89,10 @@ _CP_DEFAULT_TOLERANCE = 0.01
 _PREDICATE_DEAD_BAND_MW: float = 1e-4
 _PREDICATE_MIN_GAP_S: float = 1.0
 
+# Flex-collection deadline (mirrors the curtailment auction's _close_auction):
+# a dropped/late AvailableFlexAnswer must not wedge the CP for the episode.
+_FLEX_ROUND_TIMEOUT_S: float = 2.0
+
 
 class EnergyConverterRole(Role):
     def __init__(
@@ -119,6 +123,10 @@ class EnergyConverterRole(Role):
         self._active: bool = False
         self._flex_answers: list[AvailableFlexAnswer] = []
         self._flex_expected: int = 0
+        # Current flex-collection round identity: stamped on the ask, matched
+        # against echoing answers, and keyed by the deadline task.
+        self._flex_round_id: str = ""
+        self._flex_round_counter: int = 0
 
         # Last-observed group setpoint per sector; feeds the fixed-point gate.
         self._last_sector_setpoint: dict[Sector, float] = {}
@@ -459,17 +467,62 @@ class EnergyConverterRole(Role):
             self._active = False
             return
 
-        self._flex_answers = []
-        self._flex_expected = len(group_leaders)
+        round_id = self._open_flex_round(len(group_leaders))
 
         logger.info(
             "[%s] CP triggered: asking %d group leaders for flex",
             self.context.aid,
             len(group_leaders),
         )
-        msg = AskForAvailableFlex(include_connectors=False)
+        msg = AskForAvailableFlex(include_connectors=False, round_id=round_id)
         for addr in group_leaders:
             await self.context.send_message(msg, receiver_addr=addr)
+
+    def _open_flex_round(self, n_expected: int) -> str:
+        """Arm a flex-collection round: reset the answer buffer, stamp a fresh
+        round id, and schedule the deadline that closes it on partial answers
+        so one dropped reply can't wedge the CP."""
+        self._flex_round_counter += 1
+        round_id = f"{self.context.aid}-flex-{self._flex_round_counter}"
+        self._flex_round_id = round_id
+        self._flex_answers = []
+        self._flex_expected = n_expected
+        deadline = float(self.context.current_timestamp) + _FLEX_ROUND_TIMEOUT_S
+        self.context.schedule_timestamp_task(
+            self._close_flex_round(round_id), timestamp=deadline
+        )
+        return round_id
+
+    async def _close_flex_round(self, round_id: str) -> None:
+        """Deadline task: close a still-open round on whatever answers arrived
+        and clear the active flag (nothing arrived => plain unwedge)."""
+        if round_id != self._flex_round_id:
+            return
+        if not (self._active or self._l3_active):
+            return
+        if self._flex_expected <= 0:
+            return  # complete set already dispatched to the ADMM driver
+        if len(self._flex_answers) >= self._flex_expected:
+            return
+        record_event(
+            t=float(self.context.current_timestamp),
+            kind="cp_flex_round_timeout",
+            aid=str(self.context.aid),
+            sector="cp",
+            detail=(
+                f"round={round_id} answers={len(self._flex_answers)}"
+                f"/{self._flex_expected}"
+            ),
+        )
+        if not self._flex_answers:
+            self._flex_expected = 0
+            self._active = False
+            self._l3_active = False
+            return
+        if self._l3_active:
+            await self._run_multi_sector_admm()
+        else:
+            await self._run_admm()
 
     async def _handle_flex_answer(
         self, message: AvailableFlexAnswer, meta: dict
@@ -479,6 +532,16 @@ class EnergyConverterRole(Role):
         # ``_active`` is set by the legacy ``trigger_cp_negotiation``.
         # Mutually exclusive by design — both guards reject re-entry.
         if not self._l3_active and not self._active:
+            return
+        # Complete set already dispatched: a late same-round answer arriving
+        # during the ADMM await must not seed a second concurrent run on a
+        # 1-answer aggregate.
+        if self._flex_expected <= 0:
+            return
+        # Strict round identity: both ask paths stamp a non-empty round_id and
+        # the sole responder (balance._handle_ask_flex) always echoes it.
+        answer_round = getattr(message, "round_id", "") or ""
+        if answer_round != self._flex_round_id:
             return
         self._flex_answers.append(message)
         if len(self._flex_answers) < self._flex_expected:
@@ -492,6 +555,7 @@ class EnergyConverterRole(Role):
         answers = self._flex_answers[:]
         self._flex_answers = []
         self._flex_expected = 0
+        self._flex_round_id = ""
 
         agg = aggregate_flex_answers(answers)
         imbalance_by_sector = agg.imbalance_by_sector
@@ -646,15 +710,14 @@ class EnergyConverterRole(Role):
             return
 
         self._l3_active = True
-        self._flex_answers = []
-        self._flex_expected = len(all_addrs)
+        round_id = self._open_flex_round(len(all_addrs))
 
         logger.info(
             "[%s] L3 coord triggered: asking %d leaders in MS component for flex",
             self.context.aid,
             len(all_addrs),
         )
-        msg = AskForAvailableFlex(include_connectors=False)
+        msg = AskForAvailableFlex(include_connectors=False, round_id=round_id)
         for addr in all_addrs:
             await self.context.send_message(msg, receiver_addr=addr)
 
@@ -671,6 +734,7 @@ class EnergyConverterRole(Role):
         answers = self._flex_answers[:]
         self._flex_answers = []
         self._flex_expected = 0
+        self._flex_round_id = ""
         if not answers:
             return
 

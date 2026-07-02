@@ -64,6 +64,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Distinguishes "caller didn't resolve reachability" from a resolved None
+# (mirror unwired => admit everything).
+_UNRESOLVED: Any = object()
+
 
 class CPPriorityAdmmRole(Role):
     """Replicated-kernel L3 role on a single CP."""
@@ -77,6 +81,7 @@ class CPPriorityAdmmRole(Role):
         bridged_sectors: list[Sector],
         home_node_id: Any = None,
         watchdog_s: float = 30.0,
+        summary_ttl_s: float | None = None,
         rebalance_min_gap_s: float = 0.5,
         horizon: int = 1,
         rho: float = 1.0,
@@ -96,6 +101,11 @@ class CPPriorityAdmmRole(Role):
         self.heat_supply_from_deficit = bool(heat_supply_from_deficit)
         self.home_node_id = home_node_id
         self.watchdog_s = watchdog_s
+        # Freshness bound on cached HolonSummary entries; the leader watchdog
+        # force-republishes every watchdog_s, so 2x covers one missed beat.
+        self.summary_ttl_s = (
+            float(summary_ttl_s) if summary_ttl_s is not None else 2.0 * watchdog_s
+        )
         self.rebalance_min_gap_s = rebalance_min_gap_s
         self.horizon = int(horizon)
         self.rho = float(rho)
@@ -296,20 +306,15 @@ class CPPriorityAdmmRole(Role):
             capacity_by_sector=dict(self.capacity_by_sector),
         )
 
-    def _reachable_peer_cp_ids(self) -> set[str]:
+    def _reachable_peer_cp_ids(self, reachable: Any = _UNRESOLVED) -> set[str]:
         """CPs reachable through the live cross-sector subgraph. Without the
         mirror, all announced peers are assumed reachable; with it, BFS from our
-        node and admit only peers whose host node is reachable.
+        node and admit only peers whose host node is reachable. Pass a
+        pre-computed ``_reachable_node_set()`` result to reuse one BFS.
         """
-        if self._topology_mirror is None or self.home_node_id is None:
-            return set(self._peer_cps.keys())
-        try:
-            reachable = self._topology_mirror.reachable_from(
-                self.home_node_id,
-                sector=None,
-                allow_cp_bridges=True,
-            )
-        except Exception:
+        if reachable is _UNRESOLVED:
+            reachable = self._reachable_node_set()
+        if reachable is None:
             return set(self._peer_cps.keys())
         out: set[str] = set()
         for aid in self._peer_cps:
@@ -318,12 +323,45 @@ class CPPriorityAdmmRole(Role):
                 out.add(aid)
         return out
 
-    def _build_demands(self) -> list[SectorDemand]:
+    def _reachable_node_set(self) -> set[Any] | None:
+        """Live cross-sector reachable node set from this CP, or None when the
+        mirror is unwired (admit everything, mirroring peer-CP behaviour)."""
+        if self._topology_mirror is None or self.home_node_id is None:
+            return None
+        try:
+            return self._topology_mirror.reachable_from(
+                self.home_node_id,
+                sector=None,
+                allow_cp_bridges=True,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _summary_admitted(
+        self, summary: HolonSummary, now: float, reachable: set[Any] | None
+    ) -> bool:
+        """Freshness + reachability gate for a cached leader summary; leaders
+        without a timestamp/home_node_id are admitted (additive, like unknown
+        peers)."""
+        ts = getattr(summary, "timestamp_s", None)
+        if ts is not None and (now - float(ts)) > self.summary_ttl_s:
+            return False
+        node = getattr(summary, "home_node_id", None)
+        if reachable is not None and node is not None and node not in reachable:
+            return False
+        return True
+
+    def _build_demands(self, reachable: Any = _UNRESOLVED) -> list[SectorDemand]:
         """Aggregate the latest HolonSummary per leader into one
         :class:`SectorDemand` per bridged sector; sectors with no summaries are
-        skipped (CP holds its current factor).
+        skipped (CP holds its current factor). Summaries from unreachable
+        (islanded) or stale leaders are dropped, matching the peer-CP filter.
+        Pass a pre-computed ``_reachable_node_set()`` result to reuse one BFS.
         """
         H = self.horizon
+        now = float(self.context.current_timestamp)
+        if reachable is _UNRESOLVED:
+            reachable = self._reachable_node_set()
         demands: list[SectorDemand] = []
         for sector in self.bridged_sectors:
             sec_v = sector.value
@@ -341,6 +379,8 @@ class CPPriorityAdmmRole(Role):
                 Sector.GAS.value,
             )
             for summary in bucket.values():
+                if not self._summary_admitted(summary, now, reachable):
+                    continue
                 if heat_deficit_mode:
                     # Heat is temperature-limited, not MW-limited; unbounded heat
                     # slack reads as infinite so L3 never ramps a heat CP. Use
@@ -388,14 +428,14 @@ class CPPriorityAdmmRole(Role):
     # Gossip mode — initiator gate, message routing, commit callback
     # ------------------------------------------------------------------
 
-    def _am_gossip_initiator(self) -> bool:
+    def _am_gossip_initiator(self, reachable_nodes: Any = _UNRESOLVED) -> bool:
         """Lowest cp_id among self + reachable peers wins the initiator slot.
         Re-evaluated per tick, so initiator death hands the slot to the next CP
         with no handover protocol; the participant's per-(cp_id, round_id) dedup
         ensures one negotiation at a time.
         """
-        reachable = self._reachable_peer_cp_ids() | {self.cp_id}
-        return self.cp_id == min(reachable)
+        peers = self._reachable_peer_cp_ids(reachable_nodes) | {self.cp_id}
+        return self.cp_id == min(peers)
 
     async def _on_gossip_message(
         self, message: GossipCascadeInit | GossipIter, meta: dict
@@ -447,7 +487,10 @@ class CPPriorityAdmmRole(Role):
         """
         if self._gossip_participant is None or self._gossip_carrier is None:
             return
-        if not self._am_gossip_initiator():
+        # One BFS per round, shared by the initiator gate, demand build and
+        # participant list.
+        reachable_nodes = self._reachable_node_set()
+        if not self._am_gossip_initiator(reachable_nodes):
             return
         # Don't supersede our own in-flight cascade: starting a new round here
         # calls _begin_round, which cancels the running cascade before it can
@@ -458,10 +501,12 @@ class CPPriorityAdmmRole(Role):
         # opens a fresh round on the updated state.
         if self._gossip_participant.is_round_active():
             return
-        demands = self._build_demands()
+        demands = self._build_demands(reachable_nodes)
         if not demands:
             return
-        participants = sorted(self._reachable_peer_cp_ids() | {self.cp_id})
+        participants = sorted(
+            self._reachable_peer_cp_ids(reachable_nodes) | {self.cp_id}
+        )
         self._gossip_round_id += 1
         # Timeouts in SIM-seconds (carrier clock). They MUST be small relative
         # to the task sim duration (~10s) and the rebalance cadence: the cascade
@@ -501,10 +546,11 @@ class CPPriorityAdmmRole(Role):
         if self.algorithm == "gossip":
             await self._run_gossip_round()
             return
-        demands = self._build_demands()
+        reachable_nodes = self._reachable_node_set()
+        demands = self._build_demands(reachable_nodes)
         if not demands:
             return
-        reachable = self._reachable_peer_cp_ids()
+        reachable = self._reachable_peer_cp_ids(reachable_nodes)
         cps: list[CPSpec] = [self._own_spec()]
         for aid in sorted(reachable):
             s = self._peer_cps.get(aid)

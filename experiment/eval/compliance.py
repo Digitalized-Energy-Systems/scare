@@ -79,7 +79,9 @@ def mean_ci95(values: Iterable[float]) -> tuple[float, float]:
     """Sample mean and 95% CI half-width via a Student-t table (no scipy
     dependency, robust to small n). Accepts any iterable / Series; ``None`` and
     NaN entries are dropped. Returns ``(mean, half_width)`` — display as
-    ``mean ± half_width``; ``(nan, 0.0)`` for empty input.
+    ``mean ± half_width``. For ``n < 2`` the half-width is NaN (a single sample
+    carries no spread information; 0.0 would render as "±0.0000", i.e. false
+    certainty) — formatters should show it as missing.
     """
     arr = np.asarray(
         [
@@ -91,9 +93,9 @@ def mean_ci95(values: Iterable[float]) -> tuple[float, float]:
     )
     n = arr.size
     if n == 0:
-        return float("nan"), 0.0
+        return float("nan"), float("nan")
     if n == 1:
-        return float(arr[0]), 0.0
+        return float(arr[0]), float("nan")
     mean = float(arr.mean())
     sd = float(arr.std(ddof=1))
     se = sd / math.sqrt(n)

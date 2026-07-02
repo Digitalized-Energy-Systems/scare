@@ -147,7 +147,9 @@ def _inject_holon_summary(
         publisher=leader_aid,
         version=version,
         caused_by={},
-        timestamp_s=0.0,
+        # Fresh relative to _FakeContext's t=100.0 so the role's summary
+        # freshness TTL admits it.
+        timestamp_s=100.0,
         sector=sector,
         per_tier_served_mw=dict(served_by_tier),
         per_tier_demand_mw=dict(demand_by_tier),
@@ -479,8 +481,8 @@ def test_build_demands_converts_gas_dimension_to_mw() -> None:
     gas = demands[Sector.GAS.value]
     assert float(gas.base_supply[0]) == pytest.approx(kgps_to_mw(1.0))
     assert float(gas.demand_by_tier[1][0]) == pytest.approx(kgps_to_mw(2.0))
-    # Sanity: the conversion is the ~55× HHV factor, not a no-op.
-    assert float(gas.base_supply[0]) > 50.0
+    # Sanity: the conversion is the ~42× lgas-HHV factor, not a no-op.
+    assert float(gas.base_supply[0]) > 30.0
 
     el = demands[Sector.ELECTRICITY.value]
     assert float(el.base_supply[0]) == pytest.approx(10.0)

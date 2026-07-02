@@ -61,9 +61,9 @@ class DynamicConnectorRole(Role):
 
     # --- Role lifecycle ---
 
-    def setup(self) -> None:
-        # Global ``BranchFailureEvent`` dispatches to ``on_branch_failure``.
-        pass
+    # Purely event-driven: the global ``BranchFailureEvent`` dispatches to
+    # ``on_branch_failure``. The mirror is monotone-shrinking (nothing marks
+    # edges restored), so a periodic reassess could never re-admit a leader.
 
     def on_branch_failure(self, branch_id: tuple) -> None:
         """Schedule a debounced reassess pass; the mirror is updated by the
@@ -87,22 +87,24 @@ class DynamicConnectorRole(Role):
         if topology_characteristic(self, tid="cps") != "leader":
             return
 
-        # Cross-sector reachability, including via other CP bridges.
+        # Cross-sector reachability, including via other CP bridges. Recompute
+        # the FULL unreachable set so a leader that becomes reachable again
+        # (restored path) is re-admitted rather than dropped forever.
         reachable_nodes = self._mirror.reachable_from(
             self._my_node_id, sector=None, allow_cp_bridges=True
         )
+        unreachable_now = {
+            aid
+            for aid, node_id in self._leader_aid_to_node.items()
+            if node_id not in reachable_nodes
+        }
 
-        newly_unreachable: list[str] = []
-        for aid, node_id in self._leader_aid_to_node.items():
-            if aid in self._unreachable_aids:
-                continue
-            if node_id not in reachable_nodes:
-                newly_unreachable.append(aid)
-
-        if not newly_unreachable:
+        newly_unreachable = unreachable_now - self._unreachable_aids
+        readmitted = self._unreachable_aids - unreachable_now
+        if not newly_unreachable and not readmitted:
             return
 
-        self._unreachable_aids.update(newly_unreachable)
+        self._unreachable_aids = unreachable_now
 
         record_event(
             t=self.context.current_timestamp,
@@ -110,13 +112,16 @@ class DynamicConnectorRole(Role):
             aid=self.context.aid,
             sector="cp",
             detail=(
-                f"new={len(newly_unreachable)} total_dropped={len(self._unreachable_aids)} "
+                f"new={len(newly_unreachable)} readmitted={len(readmitted)} "
+                f"total_dropped={len(self._unreachable_aids)} "
                 f"sample={sorted(newly_unreachable)[:3]}"
             ),
         )
         logger.info(
-            "[%s] CP dropped %d unreachable group leaders (total_dropped=%d)",
+            "[%s] CP connector reassess: dropped %d, readmitted %d "
+            "(total_dropped=%d)",
             self.context.aid,
             len(newly_unreachable),
+            len(readmitted),
             len(self._unreachable_aids),
         )

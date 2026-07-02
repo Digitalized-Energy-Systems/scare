@@ -7,6 +7,8 @@ from mango import Role
 
 from scare.base.model import SECTOR_TIMESCALE, NegotiationFinishedEvent, Sector
 from scare.base.util import (
+    _last_regulate_store,
+    _last_regulate_t_store,
     apply_regulate,
     constraint_allowed_fraction,
     has_gen_curtail_lock,
@@ -74,6 +76,11 @@ class GenerationController(Role):
         # Ramp-to-full lever (opt-in): periodically drive this generator toward
         # rated output so idle local supply is used (see enable_gen_ramp_to_full).
         self.ramp_to_full = bool(ramp_to_full)
+        # Change-point mirror of the shared regulate store (read-only): the
+        # ramp's respect window must also see balance-layer gen writes, which
+        # bypass this role's ``_last_factor``/``_last_t``.
+        self._ext_factor_seen: float | None = None
+        self._ext_change_t: float = -1e9
 
     def setup(self) -> None:
         self.context.subscribe_event(
@@ -136,6 +143,8 @@ class GenerationController(Role):
             and self._last_factor < target - self._RAMP_TOL
         ):
             return
+        if self._recent_external_hold(now, target):
+            return
         applied = apply_regulate(
             self.behavior,
             self.context.aid,
@@ -145,12 +154,42 @@ class GenerationController(Role):
             timestamp=now,
         )
         if applied:
+            # Sync the change-point mirror so the ramp's own write isn't
+            # counted as an external hold next tick.
+            self._ext_factor_seen = _last_regulate_store(self.behavior).get(
+                str(self.context.aid), self._ext_factor_seen
+            )
             logger.debug(
                 "[%s] gen ramp-to-full: %.2f -> %.2f",
                 self.context.aid,
                 cur_factor,
                 target,
             )
+
+    def _recent_external_hold(self, now: float, target: float) -> bool:
+        """True when the shared regulate store shows a recent write (any path:
+        balance gossip, L2 allocation, curtailment) holding this generator
+        below ``target``. Writes are detected as store change-points at poll
+        granularity; the cooldown timestamp store refines them when populated.
+        """
+        aid = str(self.context.aid)
+        store_factor = _last_regulate_store(self.behavior).get(aid)
+        if store_factor is None:
+            return False
+        if (
+            self._ext_factor_seen is None
+            or abs(store_factor - self._ext_factor_seen) > self._RAMP_TOL
+        ):
+            self._ext_factor_seen = store_factor
+            self._ext_change_t = now
+        store_t = _last_regulate_t_store(self.behavior).get(aid)
+        last_write_t = max(
+            self._ext_change_t, store_t if store_t is not None else -1e9
+        )
+        return (
+            (now - last_write_t) < self._RAMP_RESPECT_DISPATCH_S
+            and store_factor < target - self._RAMP_TOL
+        )
 
     def _on_negotiation_finished(
         self, event: NegotiationFinishedEvent, _src: Any

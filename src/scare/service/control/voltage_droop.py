@@ -14,7 +14,7 @@ from mango import Role
 
 from scare.base.model import SECTOR_TIMESCALE, Sector
 from scare.base.runtime.diagnostics import record_event
-from scare.base.util import publish_qv_relief
+from scare.base.util import _QV_RELIEF_TTL_S, publish_qv_relief
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -139,6 +139,12 @@ class ReactivePowerDroopRole(Role):
         self._last_obs_v: float | None = None
         self._last_obs_p: float | None = None
         self._last_obs_reg: float | None = None
+        # Last published reactive relief; re-stamped on cache-gated ticks (at
+        # half the ledger TTL) so the relief stays fresh through static plateaus.
+        self._last_relief: float | None = None
+        self._last_relief_stamp_t: float = float("-inf")
+        # Config flags are static per run; resolve once.
+        self._qv_coordination: bool = _qv_coordination_enabled(behavior)
         # |dV/dQ| EMA (p.u. voltage per MVar) for the published reactive relief,
         # seeded from the ``qv_dvdq_prior`` config.
         cfg = getattr(behavior, "_scare_config", None)
@@ -191,6 +197,20 @@ class ReactivePowerDroopRole(Role):
             and abs(p_mag - self._last_obs_p) < _OBS_DELTA_TOL
             and abs(regulation - self._last_obs_reg) < _OBS_DELTA_TOL
         ):
+            # Unchanged inputs => unchanged relief; still re-stamp the ledger
+            # so the auction hand-off doesn't lose it during static plateaus.
+            # Half-TTL pacing keeps it fresh without a write every poll.
+            if self._qv_coordination and self._last_relief is not None:
+                now = self.context.current_timestamp
+                if now - self._last_relief_stamp_t >= _QV_RELIEF_TTL_S / 2.0:
+                    publish_qv_relief(
+                        self.behavior,
+                        self.context.aid,
+                        self._last_relief,
+                        now,
+                        v_pu=v_f,
+                    )
+                    self._last_relief_stamp_t = now
             return
         self._last_obs_v = v_f
         self._last_obs_p = p_mag
@@ -228,7 +248,7 @@ class ReactivePowerDroopRole(Role):
         # auction sheds active only for the residual. ``headroom = q_max-|q_cmd|``
         # is the unused circle (~0 at saturation ⇒ no discount). Published before
         # the idempotency skip so it stays fresh on a no-op tick.
-        if _qv_coordination_enabled(self.behavior):
+        if self._qv_coordination:
             if self._sens_prev_v is not None and self._sens_prev_q is not None:
                 dq = q_cmd - self._sens_prev_q
                 dv = v_f - self._sens_prev_v
@@ -249,6 +269,8 @@ class ReactivePowerDroopRole(Role):
                 relief = headroom * self._dvdq * _DVDQ_SAFETY
             else:
                 relief = 0.0
+            self._last_relief = relief
+            self._last_relief_stamp_t = self.context.current_timestamp
             publish_qv_relief(
                 self.behavior,
                 self.context.aid,

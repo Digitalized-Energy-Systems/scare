@@ -282,11 +282,14 @@ class RepartitionHandlerRole(Role):
             pass
 
         # Repoint co-located ``SlackBudgetMonitor.home_leader_addr``: its cached
-        # original leader goes stale on reassignment. Duck-typed on class name
-        # to avoid a community→service import dependency.
-        for role in getattr(self.context, "roles", []):
-            if type(role).__name__ == "SlackBudgetMonitor":
-                role.home_leader_addr = message.new_leader_addr
+        # original leader goes stale on reassignment. ``get_role`` (RoleContext
+        # has no ``.roles`` attribute); import kept local to avoid a module-level
+        # community→service dependency.
+        from scare.service.control.slack_budget import SlackBudgetMonitor
+
+        monitor = self.context.get_role(SlackBudgetMonitor)
+        if monitor is not None:
+            monitor.home_leader_addr = message.new_leader_addr
 
 
 # ---------------------------------------------------------------------------

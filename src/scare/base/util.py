@@ -12,7 +12,9 @@ from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.runtime.diagnostics import record_event, record_regulate
 
 # Natural gas HHV. MW/(kg/s) factor is 3.6*HHV, not HHV itself.
-HHV: float = 15.3  # kWh/kg
+# Must match the fluid of the simulated grids: all benchmark nets are built
+# with gas_type="lgas" (monee model/grid.py), not hgas (15.3).
+HHV: float = 11.79011  # kWh/kg (lgas)
 
 _CAPACITY_KEYS = (
     "p_mw",
@@ -299,7 +301,11 @@ _REGULATE_DEDUP_TOL: float = 1e-3
 L2_ALLOCATION_REASONS: frozenset[str] = frozenset(
     {"holon_supply_priority", "holon_tier_alloc"}
 )
-L1_REACTIVE_SHED_REASONS: frozenset[str] = frozenset({"balance", "stability"})
+# ``tier1_starvation`` is the tier-1 hard pre-step zeroing non-tier-1 loads —
+# an L1 reactive shed like the others, so the L2 floor clamps it too.
+L1_REACTIVE_SHED_REASONS: frozenset[str] = frozenset(
+    {"balance", "stability", "tier1_starvation"}
+)
 
 # Community curtailment auction reason; heat-only L2 defer signal (see
 # ``apply_regulate``).
@@ -308,11 +314,12 @@ CURTAIL_AUCTION_REASON: str = "curtail"
 # recovered load back toward full service.
 HEAT_RECOVERY_REASON: str = "heat_recovery"
 
-# Local-generation RESTORE reasons (inline self-dispatch + fallback role).
-# Both ramp a generator UP; while the auction holds it down for a local
-# violation they must DEFER — see the gen curtail-lock in ``apply_regulate``.
+# Generator RESTORE reasons (inline self-dispatch, fallback role, gen-ramp
+# controller, and the R3 L2 service-fraction gen ramp). All ramp a generator
+# UP; while the auction holds it down for a local violation they must DEFER —
+# see the gen curtail-lock in ``apply_regulate``.
 GEN_RESTORE_REASONS: frozenset[str] = frozenset(
-    {"self_local_gen", "local_gen_fallback", "gen_ramp_to_full"}
+    {"self_local_gen", "local_gen_fallback", "gen_ramp_to_full", "l2_gen_ramp"}
 )
 
 
@@ -339,6 +346,19 @@ def set_l2_priority_floor(behavior: Any, aid: str, factor: float) -> None:
     still honours the holon's priority decision) without re-dispatching and
     abandoning an in-flight gossip."""
     _l2_floor_store(behavior)[aid] = float(factor)
+
+
+def clamp_tier_monotonic(fraction_by_tier: dict[int, float]) -> dict[int, float]:
+    """Clamp per-tier service fractions non-increasing in tier number (tier 1
+    = highest priority). Priority-safe: only ever lowers a lower-priority tier
+    to its higher tier's level. Mutates and returns ``fraction_by_tier``.
+    Shared by the component-allocation and coalition dispatch paths so a
+    coalition merge can't reintroduce a tier inversion."""
+    cap = 1.0
+    for tier in sorted(t for t in fraction_by_tier if t >= 1):
+        fraction_by_tier[tier] = min(fraction_by_tier[tier], cap)
+        cap = fraction_by_tier[tier]
+    return fraction_by_tier
 
 
 def _heat_curtail_lock_store(behavior: Any) -> dict[str, float]:
@@ -885,8 +905,7 @@ def apply_regulate(
 
     behavior.act(aid, "regulate", factor)
     _last_regulate_store(behavior)[aid] = factor
-    if cooldown_s > 0:
-        _last_regulate_t_store(behavior)[aid] = timestamp
+    _last_regulate_t_store(behavior)[aid] = timestamp
 
     record_regulate(
         t=timestamp,
@@ -996,14 +1015,15 @@ def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
             lf = obs.get("loading_from_pu")
             lt = obs.get("loading_to_pu")
             if lf is not None or lt is not None:
-                raw = max(
+                # loading_*_pu are per-unit fractions in every monee
+                # formulation — convert unconditionally, matching the eval
+                # grader's rule (a direct loading_percent key is already %).
+                raw = 100.0 * max(
                     abs(float(lf)) if lf is not None else 0.0,
                     abs(float(lt)) if lt is not None else 0.0,
                 )
         if raw is None:
             continue
-        if var == "loading_percent" and abs(raw) <= 5.0:
-            raw = raw * 100.0
         result[var] = raw
     return result
 
@@ -1167,8 +1187,9 @@ def tier_priority_weight(
 
     ``regime > 0`` restoration: tier 2→1e8, 3→1e4, 4→1. ``regime < 0``
     curtailment: 4→1e8 (sheds first), 3→1e4, 2→1. ``regime == 0``: 1.0.
-    Tier 1 returns 1.0 (hard-locked off-QP). ``priority_tiers`` kept for API
-    compatibility; schedule is fixed at 4 tiers, inputs clamped to ``[1, 4]``.
+    Tier 1 returns 0.0 (hard-locked off-QP; must not enter the QP or the dual
+    normaliser). ``priority_tiers`` kept for API compatibility; schedule is
+    fixed at 4 tiers, inputs clamped to ``[1, 4]``.
     """
     p = max(0, int(tier))
     if regime == 0 or p <= 0:

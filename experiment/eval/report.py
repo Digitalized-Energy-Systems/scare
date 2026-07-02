@@ -22,12 +22,22 @@ from pathlib import Path
 import pandas as pd
 
 from experiment.eval import plots
-from experiment.eval.aliases import alias_experiment, alias_variant
+from experiment.eval.aliases import alias_experiment, alias_grid, alias_variant
 from experiment.eval.compliance import compliant_mask, mean_ci95
 from experiment.eval.loader import CampaignData, load_campaign
 from experiment.eval.overview import write_overview
 
 logger = logging.getLogger(__name__)
+
+
+def _completed_sims(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows whose sim completed with valid metrics. ``claims_failed`` = a
+    fatal claim failed, not a missing measurement — figures must include it
+    like the tables do, else the population is variant-asymmetric (oracle ~0%
+    claims_failed vs single_level ~78%) and weak baselines look inflated."""
+    if "status" not in df.columns:
+        return df
+    return df[df["status"].isin(("ok", "claims_failed"))]
 
 
 # Per-experiment dispatchers
@@ -36,7 +46,7 @@ logger = logging.getLogger(__name__)
 def _functional_baseline(campaign: CampaignData, out_dir: Path) -> list[str]:
     """Restoration-quality baselines: variant comparison + a representative
     trajectory + a per-tier served bar chart for the representative task."""
-    sub = campaign.by_experiment("functional_baseline")
+    sub = _completed_sims(campaign.by_experiment("functional_baseline"))
     figs: list[str] = []
     if sub.empty:
         return figs
@@ -91,10 +101,9 @@ def _functional_baseline(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 
 def _optimality_gap(campaign: CampaignData, out_dir: Path) -> list[str]:
-    sub = campaign.by_experiment("optimality_gap")
+    sub = _completed_sims(campaign.by_experiment("optimality_gap"))
     if sub.empty:
         return []
-    sub = sub[sub["status"] == "ok"]
     return [
         str(plots.optimality_gap_scatter(sub, out_dir / "scatter.png")),
         str(plots.optimality_gap_box(sub, out_dir / "box.png")),
@@ -102,10 +111,9 @@ def _optimality_gap(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 
 def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
-    sub = campaign.by_experiment("variant_comparison")
+    sub = _completed_sims(campaign.by_experiment("variant_comparison"))
     if sub.empty:
         return []
-    sub = sub[sub["status"] == "ok"]
     return [
         str(
             plots.variant_comparison_bar(
@@ -137,20 +145,17 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
 def _restoration_time(campaign: CampaignData, out_dir: Path) -> list[str]:
     """Campaign-wide time-to-stabilise box plot.
 
-    Pools every OK task across all experiments so the per-variant box has
-    enough samples to be meaningful (the ``variant_comparison`` slice alone
-    collapses to n=1 per variant in small campaigns).
+    Pools every completed task across all experiments so the per-variant box
+    has enough samples to be meaningful (the ``variant_comparison`` slice
+    alone collapses to n=1 per variant in small campaigns).
     """
-    df = campaign.summary
-    if df.empty:
-        return []
-    ok = df[df["status"] == "ok"]
-    if ok.empty:
+    done = _completed_sims(campaign.summary)
+    if done.empty:
         return []
     return [
         str(
             plots.time_to_stabilise_box(
-                ok,
+                done,
                 out_dir / "time_to_stabilise.png",
             )
         )
@@ -171,25 +176,47 @@ def _ablation(
     """One ablation-impact bar per ablation experiment, each in its own
     ``plots/<experiment>/`` folder. Compares the per-flag PWSF against the
     in-block ``default`` baseline — the actual ablation matrix, not the
-    one-bar served-by-variant fallback."""
+    one-bar served-by-variant fallback.
+
+    Scare rows only (the title claims "scare variant"; pooling variants
+    diffed arms against a mixed population), and one figure per grid on
+    multi-grid experiments so each arm is baselined against its own
+    (experiment, grid) default — matching ``hpc.aggregate``'s methodology.
+    """
     out: list[tuple[str, list[str]]] = []
     for exp_name in _ablation_experiments(campaign):
-        sub = campaign.by_experiment(exp_name)
-        sub = sub[sub["status"] == "ok"]
+        sub = _completed_sims(campaign.by_experiment(exp_name))
+        if "variant" in sub.columns:
+            sub = sub[sub["variant"] == "scare"]
         if sub.empty:
             continue
-        out.append(
-            (
-                f"Ablation impact — {alias_experiment(exp_name)}",
-                [
+        grids = (
+            sorted(sub["grid"].dropna().unique()) if "grid" in sub.columns else []
+        )
+        figs: list[str] = []
+        if len(grids) > 1:
+            for grid in grids:
+                figs.append(
                     str(
                         plots.ablation_impact_bar(
-                            sub, plots_root / exp_name / "ablation_impact.png"
+                            sub[sub["grid"] == grid],
+                            plots_root / exp_name / f"ablation_impact_{grid}.png",
+                            title=(
+                                f"Ablation impact — {alias_grid(grid)} "
+                                "(scare variant, compliant runs)"
+                            ),
                         )
                     )
-                ],
+                )
+        else:
+            figs.append(
+                str(
+                    plots.ablation_impact_bar(
+                        sub, plots_root / exp_name / "ablation_impact.png"
+                    )
+                )
             )
-        )
+        out.append((f"Ablation impact — {alias_experiment(exp_name)}", figs))
     return out
 
 
@@ -200,7 +227,7 @@ def _robustness(campaign: CampaignData, out_dir: Path) -> list[str]:
         figs.append(
             str(
                 plots.robustness_curve(
-                    pl[pl["status"] == "ok"],
+                    _completed_sims(pl),
                     out_dir / "packet_loss.png",
                     sweep_param="comms_packet_loss_pct",
                     x_label="packet loss (%)",
@@ -213,7 +240,7 @@ def _robustness(campaign: CampaignData, out_dir: Path) -> list[str]:
         figs.append(
             str(
                 plots.robustness_curve(
-                    lat[lat["status"] == "ok"],
+                    _completed_sims(lat),
                     out_dir / "latency_jitter.png",
                     sweep_param="comms_latency_jitter_ms",
                     x_label="latency jitter (ms)",
@@ -231,7 +258,7 @@ def _cascading(campaign: CampaignData, out_dir: Path) -> list[str]:
     return [
         str(
             plots.cascading_curve(
-                sub[sub["status"] == "ok"], out_dir / "n_failures.png"
+                _completed_sims(sub), out_dir / "n_failures.png"
             )
         ),
     ]
@@ -265,7 +292,7 @@ def _sweeps(campaign: CampaignData, out_dir: Path) -> list[str]:
         figs.append(
             str(
                 plots.sweep_curve_dual(
-                    sub[sub["status"] == "ok"],
+                    _completed_sims(sub),
                     out_dir / f"{exp_name}.png",
                     sweep_param=param,
                     x_label=label,
@@ -284,7 +311,7 @@ def _claims(campaign: CampaignData, out_dir: Path) -> list[str]:
     return [
         str(
             plots.claims_pass_rate(
-                df[df["status"] == "ok"], out_dir / "claims_overall.png"
+                _completed_sims(df), out_dir / "claims_overall.png"
             )
         )
     ]
@@ -469,6 +496,8 @@ def _per_experiment_trajectories(
     df = campaign.summary
     if df.empty or "experiment" not in df.columns or "variant" not in df.columns:
         return []
+    # ok-only on purpose: this picks one representative per-task artefact and
+    # ``CampaignData.representative_task`` only returns OK tasks.
     ok = df[df["status"] == "ok"]
     if ok.empty:
         return []
@@ -539,7 +568,9 @@ def _per_task_overviews(
     campaign: CampaignData,
     out_dir: Path,
 ) -> list[tuple[str, list[str]]]:
-    """Render :func:`plots.system_state_overview` for every OK task.
+    """Render :func:`plots.system_state_overview` for every completed task
+    (ok + claims_failed — the failed-claim tasks are the ones worth
+    inspecting).
 
     One stacked-subplots figure per task at
     ``plots/per_task_overview/<task_id>.html`` — slack injection,
@@ -551,12 +582,12 @@ def _per_task_overviews(
     df = campaign.summary
     if df.empty or "task_id" not in df.columns:
         return []
-    ok = df[df["status"] == "ok"]
-    if ok.empty:
+    done = _completed_sims(df)
+    if done.empty:
         return []
 
     grouped: dict[tuple[str, str], list[str]] = {}
-    for _, row in ok.iterrows():
+    for _, row in done.iterrows():
         try:
             tid = int(row["task_id"])
         except (TypeError, ValueError):
@@ -603,38 +634,38 @@ def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
     df = campaign.summary
     if df.empty:
         return []
-    ok = df[df["status"] == "ok"]
-    if ok.empty:
+    done = _completed_sims(df)
+    if done.empty:
         return []
     figs = [
         str(
             plots.restoration_vs_baseline_bar(
-                ok,
+                done,
                 out_dir / "absolute_vs_baseline.png",
             )
         ),
         str(
             plots.restoration_ratio_by_variant_bar(
-                ok,
+                done,
                 out_dir / "ratio_by_variant.png",
             )
         ),
         str(
             plots.absolute_load_lost_bar(
-                ok,
+                done,
                 out_dir / "absolute_load_lost.png",
             )
         ),
         str(
             plots.restoration_by_tier_bar(
-                ok,
+                done,
                 out_dir / "by_tier.png",
             )
         ),
         # Per-sector mirror of the per-tier ratio bar.
         str(
             plots.restoration_by_sector_bar(
-                ok,
+                done,
                 out_dir / "by_sector.png",
             )
         ),
@@ -642,13 +673,13 @@ def _restoration(campaign: CampaignData, out_dir: Path) -> list[str]:
         # priority-aware (agent-shed); the tier-waterfall claim covers the latter.
         str(
             plots.restoration_loss_split_by_tier_bar(
-                ok,
+                done,
                 out_dir / "loss_split_by_tier.png",
             )
         ),
         str(
             plots.agent_only_ratio_by_tier_bar(
-                ok,
+                done,
                 out_dir / "agent_only_ratio_by_tier.png",
             )
         ),
@@ -679,14 +710,14 @@ def _missing_experiment_sections(
         "holon_size_sweep",
     }
     ablation_exps = set(_ablation_experiments(campaign))
-    ok = df[df["status"] == "ok"]
-    if ok.empty:
+    done = _completed_sims(df)
+    if done.empty:
         return []
     out: list[tuple[str, list[str]]] = []
-    for exp_name in sorted(ok["experiment"].dropna().unique()):
+    for exp_name in sorted(done["experiment"].dropna().unique()):
         if exp_name in handled or exp_name in ablation_exps or not exp_name:
             continue
-        sub = ok[ok["experiment"] == exp_name]
+        sub = done[done["experiment"] == exp_name]
         if sub.empty:
             continue
         out_dir = plots_root / exp_name
@@ -745,8 +776,9 @@ def _table_variant_means(campaign: CampaignData) -> str:
         return "_(no successful runs)_"
     lines = [
         "_Compliant-subset PWSF (slack + grid feasibility), unpaired, pooled "
-        "across grids; electricity+heat only. Paired comparison: see "
-        "`summary.md`._",
+        "across grids AND experiments (each variant is averaged over whatever "
+        "experiment mix it ran in); electricity+heat only. Paired comparison: "
+        "see `summary.md`._",
         "",
         "| variant | n_compliant/n_total | compliance | mean PWSF | 95% CI |",
         "|---|---|---|---|---|",
@@ -760,7 +792,8 @@ def _table_variant_means(campaign: CampaignData) -> str:
             mean_str, ci_str = "—", "—"
         else:
             mean, ci = mean_ci95(comp[metric])
-            mean_str, ci_str = f"{mean:.4f}", f"±{ci:.4f}"
+            mean_str = f"{mean:.4f}"
+            ci_str = "—" if pd.isna(ci) else f"±{ci:.4f}"
         lines.append(
             f"| {alias_variant(str(variant))} | {n_comp}/{n_total} | "
             f"{rate:.0f}% | {mean_str} | {ci_str} |"

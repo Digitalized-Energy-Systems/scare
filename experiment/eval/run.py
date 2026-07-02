@@ -145,15 +145,24 @@ def _report_command(
     """sbatch command for the plot+report generation step.  Light-weight
     single-task dependency on the aggregator's success.
     """
+    from experiment.hpc.submit import _campaign_eval_slurm
+
     job_name = (slurm.job_name or f"scare-restore-{campaign_dir.name}") + "-report"
     wrap = (
         f"cd {shlex.quote(str(_REPO_ROOT))} && "
         f"exec {shlex.quote(py)} -m experiment.eval.report "
         f"--campaign-dir {shlex.quote(str(campaign_dir))}"
     )
-    light_flags = ["--cpus-per-task=1", "--mem=2G", "--time=00:15:00"]
+    # Size from the config's slurm_eval overlay (like submit_plot) instead of
+    # hardcoding 2G/15min.
+    eval_slurm = _campaign_eval_slurm(campaign_dir, slurm)
+    light_flags = [
+        f"--cpus-per-task={eval_slurm.cpus}",
+        f"--mem={eval_slurm.mem}",
+        f"--time={eval_slurm.time}",
+    ]
     for k in ("partition", "account", "qos", "nodelist", "exclude"):
-        v = getattr(slurm, k)
+        v = getattr(eval_slurm, k)
         if v:
             light_flags.append(f"--{k}={v}")
     return [
@@ -217,6 +226,12 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from experiment.hpc.runner import ensure_deterministic_hashing
+
+    # Local mode forks a process pool from this process; without a pinned
+    # PYTHONHASHSEED every worker gets randomized set ordering over agent ids.
+    # SLURM mode is unaffected (each array task re-execs through runner.main).
+    ensure_deterministic_hashing()
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s"
     )

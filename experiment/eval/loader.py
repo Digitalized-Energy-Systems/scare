@@ -10,6 +10,7 @@ the analysis side and only reads.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -18,6 +19,8 @@ from typing import Any
 import pandas as pd
 
 from experiment.hpc.config import CAMPAIGN_LAYOUT
+
+logger = logging.getLogger(__name__)
 
 # Per-task wrapper
 
@@ -212,8 +215,9 @@ def _read_json(path: Path, *, default: Any = None) -> Any:
     if not Path(path).exists():
         return default
     try:
-        return json.loads(Path(path).read_text())
-    except json.JSONDecodeError:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        logger.warning("Unparseable JSON at %s — returning default", path)
         return default
 
 
@@ -222,5 +226,11 @@ def _read_csv(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         return pd.read_csv(path)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Unparseable CSV at %s (%s: %s) — returning empty DataFrame",
+            path,
+            type(exc).__name__,
+            exc,
+        )
         return pd.DataFrame()

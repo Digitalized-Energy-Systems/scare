@@ -86,7 +86,10 @@ def _parse_args() -> argparse.Namespace:
         "--only",
         default="all",
         choices=["all", "failed", "timeout", "missing", "incomplete", "ok"],
-        help="Filter task subset by on-disk status (default: all)",
+        help="Filter task subset by on-disk status (default: all); "
+        "'failed' covers error/killed; use 'missing'/'incomplete' only after "
+        "any pending submission has drained (a queued task also reads as "
+        "missing)",
     )
     p.add_argument(
         "--max-tasks-per-child",
@@ -109,7 +112,12 @@ def main() -> None:
     campaign_dir = args.campaign_dir.resolve()
     tasks = read_manifest(campaign_dir)
 
-    if args.task_ids:
+    if args.task_ids is not None:
+        if not args.task_ids:
+            raise SystemExit(
+                "--task-ids was given without any IDs; drop the flag to use "
+                "--only, or pass at least one task id"
+            )
         selected = list(args.task_ids)
     else:
         selected = filter_task_ids(campaign_dir, tasks, args.only)

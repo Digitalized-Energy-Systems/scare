@@ -82,17 +82,16 @@ def test_repartition_handler_rewrites_slack_budget_home_leader() -> None:
 
     from scare.base.model import RepartitionAssignment
     from scare.community.repartition import RepartitionHandlerRole
+    from scare.service.control.slack_budget import SlackBudgetMonitor
 
-    class _StubMonitor:
-        """Duck-typed SlackBudgetMonitor stand-in. The rewrite filters on
-        the class name (not isinstance), so only the name and
-        ``home_leader_addr`` matter.
+    class _StubMonitor(SlackBudgetMonitor):
+        """Real-class stand-in: the rewrite resolves it via
+        ``context.get_role(SlackBudgetMonitor)`` (mango RoleContext has no
+        ``.roles`` attribute), so isinstance must match.
         """
 
-        def __init__(self) -> None:
+        def __init__(self) -> None:  # noqa: super-init-not-called
             self.home_leader_addr = "original-leader"
-
-    _StubMonitor.__name__ = "SlackBudgetMonitor"
 
     class _OtherRole:
         """An unrelated role that must NOT be touched."""
@@ -107,9 +106,16 @@ def test_repartition_handler_rewrites_slack_budget_home_leader() -> None:
             self.current_timestamp = 1.1
             self.monitor = _StubMonitor()
             self.other = _OtherRole()
-            self.roles = [self.monitor, self.other]
+            self._roles = [self.other, self.monitor]
             self._models: dict = {}
             self._events: list = []
+
+        def get_role(self, cls):
+            # Mirrors mango RoleContext.get_role: first isinstance match.
+            for role in self._roles:
+                if isinstance(role, cls):
+                    return role
+            return None
 
         def get_or_create_model(self, _cls):
             return self._models.setdefault(

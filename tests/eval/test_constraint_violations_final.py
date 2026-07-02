@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import pytest
 
+import math
+
 from experiment.eval.metrics import (
     _bound_overshoot,
+    _branch_loading_percent,
     _violation_row,
     constraint_rows,
     constraint_violations_final,
@@ -170,3 +173,113 @@ class TestScanOnRealGrid:
         node.active = False
         rows = constraint_rows(net)
         assert all(r["id"] != node.id or r["kind"] != "node" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Line-loading re-judge on current-rated branches (max_s_mva=None)
+# ---------------------------------------------------------------------------
+
+
+class _StubModel:
+    def __init__(self, values, **attrs):
+        self.values = dict(values)
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+
+class _StubBranch:
+    def __init__(self, model, from_node_id=0, to_node_id=1):
+        self.model = model
+        self.from_node_id = from_node_id
+        self.to_node_id = to_node_id
+        self.id = (from_node_id, to_node_id, 0)
+
+
+class _StubNode:
+    def __init__(self, model):
+        self.model = model
+
+
+class _StubNet:
+    def __init__(self, nodes):
+        self._nodes = nodes
+
+    def node_by_id(self, node_id):
+        return self._nodes[node_id]
+
+
+def _current_rated_case(
+    *,
+    screen_pu,
+    p_from=0.1,
+    q_from=0.0,
+    p_to=-0.099,
+    q_to=0.0,
+    vm_from=1.0,
+    vm_to=0.98,
+    base_kv=0.4,
+    max_i_ka=0.4,
+    max_s_mva=None,
+):
+    model = _StubModel(
+        {
+            "loading_from_pu": screen_pu,
+            "loading_to_pu": screen_pu,
+            "p_from_mw": p_from,
+            "q_from_mvar": q_from,
+            "p_to_mw": p_to,
+            "q_to_mvar": q_to,
+        },
+        max_i_ka=max_i_ka,
+        max_s_mva=max_s_mva,
+    )
+    net = _StubNet(
+        {
+            0: _StubNode(_StubModel({"vm_pu": vm_from}, base_kv=base_kv)),
+            1: _StubNode(_StubModel({"vm_pu": vm_to}, base_kv=base_kv)),
+        }
+    )
+    return _StubBranch(model), net
+
+
+def _exact_pct(p, q, vm, base_kv, max_i_ka):
+    return 100.0 * math.hypot(p, q) / (math.sqrt(3.0) * vm * base_kv * max_i_ka)
+
+
+class TestCurrentBasisRejudge:
+    def test_phantom_overload_cleared_without_max_s_mva(self):
+        # SOC-relaxed screen says 110%, but the exact current implied by the
+        # solved flows and end voltages is well under rating — the re-judge
+        # must fire even though the benchmark branch carries no max_s_mva.
+        branch, net = _current_rated_case(screen_pu=1.10)
+        expected = max(
+            _exact_pct(0.1, 0.0, 1.0, 0.4, 0.4),
+            _exact_pct(0.099, 0.0, 0.98, 0.4, 0.4),
+        )
+        pct = _branch_loading_percent(branch, net)
+        assert pct == pytest.approx(expected)
+        assert pct < 101.0
+
+    def test_genuine_overload_survives_rejudge(self):
+        branch, net = _current_rated_case(screen_pu=1.80, p_from=0.5, p_to=-0.49)
+        pct = _branch_loading_percent(branch, net)
+        expected = _exact_pct(0.5, 0.0, 1.0, 0.4, 0.4)
+        assert pct == pytest.approx(expected)
+        assert pct > 101.0
+
+    def test_screen_below_threshold_is_not_rejudged(self):
+        branch, net = _current_rated_case(screen_pu=0.90)
+        assert _branch_loading_percent(branch, net) == pytest.approx(90.0)
+
+    def test_mva_rating_takes_precedence(self):
+        branch, net = _current_rated_case(screen_pu=1.10, max_s_mva=1.0)
+        # |S| = 0.1 MVA against a 1 MVA rating -> 10%.
+        assert _branch_loading_percent(branch, net) == pytest.approx(10.0)
+
+    def test_unbound_max_i_ka_keeps_screen_value(self):
+        branch, net = _current_rated_case(screen_pu=1.10, max_i_ka=999.0)
+        assert _branch_loading_percent(branch, net) == pytest.approx(110.0)
+
+    def test_deenergised_ends_keep_screen_value(self):
+        branch, net = _current_rated_case(screen_pu=1.10, vm_from=0.0, vm_to=0.0)
+        assert _branch_loading_percent(branch, net) == pytest.approx(110.0)

@@ -211,7 +211,9 @@ def _format_md(
     metric_cols = _interesting_metric_columns(df) if n else []
     if metric_cols:
         parts.append("")
-        parts.append("## Per-grid metrics (mean over OK runs)")
+        parts.append(
+            "## Per-grid metrics (mean over completed runs: ok + claims_failed)"
+        )
         # Include ``claims_failed``: the sim completed and the metrics are
         # real — a claim failure flags an invariant violation, not a
         # missing measurement.
@@ -353,6 +355,26 @@ def _paired_delta(
     rs = r[keys + [col]].copy()
     bs[col] = pd.to_numeric(bs[col], errors="coerce").astype(float)
     rs[col] = pd.to_numeric(rs[col], errors="coerce").astype(float)
+
+    # The merge fans out if a side has several rows per pair key (an
+    # experiment varying both ablation AND sweep would); collapse to the
+    # per-key mean so pairing stays 1:1.
+    def _dedupe(side: pd.DataFrame, label: str) -> pd.DataFrame:
+        n_dup = int(side.duplicated(keys).sum())
+        if not n_dup:
+            return side
+        logger.warning(
+            "_paired_delta: %d duplicate %s rows on %s for %r — averaging "
+            "within key to keep the pairing 1:1",
+            n_dup,
+            label,
+            keys,
+            col,
+        )
+        return side.groupby(keys, as_index=False)[col].mean()
+
+    bs = _dedupe(bs, "baseline")
+    rs = _dedupe(rs, "candidate")
     j = bs.merge(rs, on=keys, suffixes=("_b", "_r")).dropna(
         subset=[f"{col}_b", f"{col}_r"]
     )
@@ -641,7 +663,8 @@ def _format_eval_sections(
             mean_str, ci_str = "—", "—"
         else:
             mean, ci = mean_ci95(pwsf_c)
-            mean_str, ci_str = f"{mean:.4f}", f"±{ci:.4f}"
+            mean_str = f"{mean:.4f}"
+            ci_str = "—" if pd.isna(ci) else f"±{ci:.4f}"
         rate_str = "—" if pd.isna(rate) else f"{rate * 100:.0f}%"
         rows.append(
             [

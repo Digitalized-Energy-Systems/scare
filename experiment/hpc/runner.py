@@ -15,10 +15,12 @@ import asyncio
 import gc
 import json
 import logging
+import math
 import os
 import platform
 import random
 import signal
+import subprocess
 import sys
 import time
 import time as _time
@@ -143,7 +145,7 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
     # LOG_FORMAT's t=... field is always populated, including third-party logs.
     sim_time_filter = SimTimeLogFilter()
 
-    handler = logging.FileHandler(log_path, mode="w")
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(logging.Formatter(LOG_FORMAT))
     handler.addFilter(sim_time_filter)
@@ -182,7 +184,7 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
 
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
-    np.random.seed(seed % (2**32 - 1))
+    np.random.seed(seed % (2**32))
 
 
 def ensure_deterministic_hashing(seed: str = "0") -> None:
@@ -198,6 +200,11 @@ def ensure_deterministic_hashing(seed: str = "0") -> None:
         return
     os.environ["PYTHONHASHSEED"] = seed
     # sys.orig_argv (3.10+) preserves the exact invocation for -m imports.
+    if sys.platform == "win32":
+        # os.exec* on Windows joins argv without quoting, splitting paths
+        # containing spaces; run a properly-quoted child instead.
+        proc = subprocess.run([sys.executable, *sys.orig_argv[1:]])
+        sys.exit(proc.returncode)
     os.execv(sys.executable, sys.orig_argv)
 
 
@@ -284,7 +291,7 @@ def _write_timeseries(world: Any, path: Path) -> None:
 
 
 def _dump_diagnostics(path: Path) -> None:
-    path.write_text(diagnostics.dump_recent() + "\n")
+    path.write_text(diagnostics.dump_recent() + "\n", encoding="utf-8")
 
 
 async def _run_simulation(
@@ -608,24 +615,42 @@ def _compute_baseline(task: TaskSpec, logger: logging.Logger) -> dict[str, Any] 
         return None
 
 
+def _json_sanitize(obj: Any) -> Any:
+    """NaN/inf floats -> None so result.json is standard JSON (json.dumps
+    otherwise emits bare ``NaN`` tokens strict parsers reject)."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(v) for v in obj]
+    return obj
+
+
 def _write_oracle_outputs(
     out_dir: Path,
     plan: RuntimePlan,
     task: TaskSpec,
     logger: logging.Logger,
     baseline_served: dict[str, Any] | None,
-) -> None:
-    """Run the centralized oracle LP and write its result/slack/failures."""
+) -> dict[str, Any]:
+    """Run the centralized oracle LP, write its result/slack/failures, and
+    return the result payload so the caller can grade the solve outcome."""
     net, failures, oracle_metrics = _run_oracle(
         plan, task, logger, baseline_served=baseline_served, out_dir=out_dir
     )
+    oracle_metrics = _json_sanitize(oracle_metrics)
     (out_dir / "failures.json").write_text(
-        json.dumps(_serialize_failures(failures), indent=2)
+        json.dumps(_serialize_failures(failures), indent=2), encoding="utf-8"
     )
     (out_dir / "result.json").write_text(
-        json.dumps(oracle_metrics, indent=2, sort_keys=True, default=str)
+        json.dumps(
+            oracle_metrics, indent=2, sort_keys=True, default=str, allow_nan=False
+        ),
+        encoding="utf-8",
     )
     write_slack_meta(out_dir / "slack_meta.json", net)
+    return oracle_metrics
 
 
 def _exact_gas_solved_net(net: Any, logger: logging.Logger) -> Any:
@@ -668,15 +693,15 @@ def _write_simulation_outputs(
     logger: logging.Logger,
     started: float,
     baseline_served: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """Run the MAS simulation, write every per-task artefact, and return the
-    claims-validation payload (or ``None`` if validation itself failed).
+    claims-validation payload.
     """
     world, failures, net = asyncio.run(
         _run_simulation(plan, task, logger, out_dir=out_dir)
     )
     (out_dir / "failures.json").write_text(
-        json.dumps(_serialize_failures(failures), indent=2)
+        json.dumps(_serialize_failures(failures), indent=2), encoding="utf-8"
     )
     behavior = world.environment.behavior
     # Force a fresh energy flow so observers report post-action state, not the
@@ -697,6 +722,7 @@ def _write_simulation_outputs(
         priorities=priorities,
         baseline_served=baseline_served,
     )
+    payload = _json_sanitize(payload)
     write_result_json(out_dir / "result.json", payload)
     write_served_csv(out_dir / "served.csv", net, behavior, priorities=priorities)
     write_served_by_load_csv(
@@ -727,14 +753,12 @@ def _write_simulation_outputs(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to write trajectories.csv: %s", exc)
     # Claims validation: fold pass/fail into result.json for the aggregator.
-    try:
-        claims = evaluate_task(out_dir)
-        payload["claims"] = claims
-        write_result_json(out_dir / "result.json", payload)
-        return claims
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Claims validation failed: %s", exc)
-        return None
+    # An exception here propagates so the task is graded "error" — a run
+    # without claims columns must not land as an ungated "ok".
+    claims = evaluate_task(out_dir)
+    payload["claims"] = _json_sanitize(claims)
+    write_result_json(out_dir / "result.json", payload)
+    return claims
 
 
 def _failing_fatal_claims(
@@ -755,6 +779,36 @@ def _failing_fatal_claims(
     ]
 
 
+# Every artifact run_task / the oracle / the metrics writers can produce.
+# Scrubbed at task start so a re-run that fails early can't leave stale
+# outputs from a previous run for the aggregator to join.
+_TASK_ARTIFACTS = (
+    "status.json",
+    "exception.json",
+    "result.json",
+    "failures.json",
+    "diagnostics.txt",
+    "infeasibility_snapshot.json",
+    "slack_meta.json",
+    "served.csv",
+    "served_by_load.csv",
+    "constraints_final.csv",
+    "diary.csv",
+    "events.csv",
+    "messages.csv",
+    "timeseries.csv",
+    "trajectories.csv",
+)
+
+
+def _scrub_stale_artifacts(out_dir: Path) -> None:
+    for name in _TASK_ARTIFACTS:
+        try:
+            (out_dir / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     plan = RuntimePlan.from_config_json(campaign_dir / CAMPAIGN_LAYOUT["config"])
     tasks = read_manifest(campaign_dir)
@@ -764,8 +818,9 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
 
     out_dir = task_dir(campaign_dir, task.task_id)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _scrub_stale_artifacts(out_dir)
     (out_dir / "config.json").write_text(
-        json.dumps(task.to_dict(), indent=2, sort_keys=True)
+        json.dumps(task.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
     )
 
     handler, solver_counter = _setup_logging(out_dir / "run.log")
@@ -790,13 +845,6 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     _diag.arm()
     # Per-aid trajectory logging (off by default; the log can grow large).
     _diag.set_trajectory_logging(getattr(plan, "write_trajectories", False))
-    # Drop stale exception.json from a prior failed run on this worker.
-    stale_exc = out_dir / "exception.json"
-    if stale_exc.exists():
-        try:
-            stale_exc.unlink()
-        except OSError:
-            pass
     started = time.monotonic()
     status: dict[str, Any] = {
         "task_id": task.task_id,
@@ -825,11 +873,24 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         # Not main thread or otherwise restricted — best-effort only.
         _prev_term = None
 
-    baseline_served = _compute_baseline(task, logger)
-
     try:
+        # Inside the try so SIGTERM during the (up to 300s) Gurobi solve still
+        # lands in the handlers below: status.json written, log handler closed.
+        baseline_served = _compute_baseline(task, logger)
         if task.variant == "oracle":
-            _write_oracle_outputs(out_dir, plan, task, logger, baseline_served)
+            payload = _write_oracle_outputs(
+                out_dir, plan, task, logger, baseline_served
+            )
+            lp_success = bool(
+                payload.get("outcomes", {}).get("oracle_lp_success", True)
+            )
+            completed = bool(payload.get("completed", True))
+            if not (lp_success and completed):
+                raise RuntimeError(
+                    "oracle LP solve failed "
+                    f"(lp_success={lp_success}, completed={completed}) — "
+                    "refusing to grade a fictitious zero-PWSF result as ok"
+                )
         else:
             claims = _write_simulation_outputs(
                 out_dir, plan, task, logger, started, baseline_served
@@ -854,7 +915,8 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                     "message": f"Exceeded plan.task_timeout_s={plan.task_timeout_s}",
                 },
                 indent=2,
-            )
+            ),
+            encoding="utf-8",
         )
         exit_code = EXIT_TIMEOUT
 
@@ -869,7 +931,8 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                     "message": str(exc),
                 },
                 indent=2,
-            )
+            ),
+            encoding="utf-8",
         )
         exit_code = EXIT_TIMEOUT
 
@@ -883,7 +946,8 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                     "traceback": traceback.format_exc(),
                 },
                 indent=2,
-            )
+            ),
+            encoding="utf-8",
         )
         if reraise:
             raise
@@ -899,8 +963,24 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         status["solver_failures"] = solver_counter.count
         status["solver_infeasibilities"] = solver_counter.infeasible_count
         status["solver_warnings"] = solver_counter.warning_count
+        # Sampling can undershoot the requested count (small grids, clamps);
+        # record what was actually injected so analysis can stratify on it.
+        try:
+            failures_path = out_dir / "failures.json"
+            if failures_path.exists():
+                n_actual = len(json.loads(failures_path.read_text(encoding="utf-8")))
+                status["n_failures_actual"] = n_actual
+                if n_actual < task.n_failures:
+                    logger.warning(
+                        "Injected %d failure(s) but %d were requested "
+                        "(sampling undershoot)",
+                        n_actual,
+                        task.n_failures,
+                    )
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
         (out_dir / "status.json").write_text(
-            json.dumps(status, indent=2, sort_keys=True)
+            json.dumps(status, indent=2, sort_keys=True), encoding="utf-8"
         )
         try:
             _dump_diagnostics(out_dir / "diagnostics.txt")
