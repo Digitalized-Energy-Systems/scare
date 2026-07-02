@@ -1,5 +1,7 @@
 """Unit tests for scare.base.util — pure functions with no framework deps."""
 
+import math
+
 import pytest
 
 from scare.base.model import Sector
@@ -209,6 +211,63 @@ class TestObsConstraintValues:
     def test_heat(self):
         result = obs_constraint_values({"t_k": 370.0}, Sector.HEAT)
         assert result == {"t_k": 370.0}
+
+    def test_loading_direct_key_is_percent(self):
+        result = obs_constraint_values(
+            {"loading_percent": 87.5}, Sector.ELECTRICITY
+        )
+        assert result == {"loading_percent": 87.5}
+
+    def test_loading_line_from_side_fraction(self):
+        # PowerLine: no MVA rating, sane per-unit fraction -> x100.
+        result = obs_constraint_values(
+            {
+                "loading_from_pu": 0.9421,
+                "loading_to_pu": 0.9421,
+                "max_i_ka": 0.276,
+                "max_s_mva": None,
+                "p_from_mw": 0.06,
+                "q_from_mvar": 0.01,
+            },
+            Sector.ELECTRICITY,
+        )
+        assert result["loading_percent"] == pytest.approx(94.21)
+
+    def test_loading_trafo_mva_basis_ignores_inflated_to_side(self):
+        # 20/0.4 kV trafo: loading_to_pu is inflated by the voltage ratio
+        # (50x) because max_i_ka is from-side based; the MVA basis from the
+        # solved flows is the graded truth (~80%), not 4009%.
+        result = obs_constraint_values(
+            {
+                "loading_from_pu": 0.8019,
+                "loading_to_pu": 40.0966,
+                "max_i_ka": 0.011547,
+                "max_s_mva": 0.4,
+                "p_from_mw": 0.3186,
+                "q_from_mvar": 0.032,
+                "p_to_mw": -0.317,
+                "q_to_mvar": -0.03,
+            },
+            Sector.ELECTRICITY,
+        )
+        assert result["loading_percent"] == pytest.approx(
+            100.0 * math.hypot(0.3186, 0.032) / 0.4
+        )
+        assert result["loading_percent"] < 100.0
+
+    def test_loading_unbounded_rating_sentinel_skipped(self):
+        result = obs_constraint_values(
+            {"loading_from_pu": 0.001, "loading_to_pu": 0.001, "max_i_ka": 999.0},
+            Sector.ELECTRICITY,
+        )
+        assert "loading_percent" not in result
+
+    def test_loading_nan_fraction_skipped(self):
+        result = obs_constraint_values(
+            {"loading_from_pu": float("nan"), "max_i_ka": 0.2},
+            Sector.ELECTRICITY,
+        )
+        assert "loading_percent" not in result
 
 
 # ===================================================================

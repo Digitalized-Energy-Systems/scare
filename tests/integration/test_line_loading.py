@@ -71,8 +71,8 @@ def _make_branch_obs(
     """Synthetic PowerLine observation dict.
 
     ``loading_percent`` is in percent (matching the SECTOR_CONSTRAINTS
-    bound at +/-100); ``obs_constraint_values`` keeps the raw value when
-    |val| > 5 so it maps straight through.
+    bound at +/-100); a direct ``loading_percent`` key maps straight
+    through ``obs_constraint_values``.
     """
     return {
         "loading_percent": loading_percent,

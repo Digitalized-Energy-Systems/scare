@@ -997,13 +997,60 @@ _CONSTRAINT_OBS_KEYS: dict[Sector, dict[str, str]] = {
 }
 
 
+# Mirrors monee problem/utils.py and the eval grader: max_i_ka at/above this
+# sentinel means the branch carries no current rating to grade against.
+_UNBOUND_MAX_I_KA: float = 999.0
+
+
+def _obs_branch_loading_percent(obs: dict) -> float | None:
+    """Branch loading percent from a branch observation, in the exact basis
+    the oracle's ``line_loading_limit`` enforces and the eval grader re-judges
+    in (``metrics._branch_loading_percent``): apparent power against
+    ``max_s_mva`` when the branch is MVA-rated, else the from-side current
+    fraction ``loading_from_pu``. The to-side current is never divided by
+    ``max_i_ka``: that rating is expressed in the from-side voltage basis
+    (monee ``io/matpower.py``), so a transformer's ``loading_to_pu`` is
+    inflated by the voltage ratio — 50x on a 20/0.4 kV trafo, the phantom
+    ~4000% overloads that mass-shed tiers 2-4 in eval_full_20260702-133421.
+    """
+    try:
+        mva = float(obs["max_s_mva"])
+    except (KeyError, TypeError, ValueError):
+        mva = math.nan
+    if math.isfinite(mva) and mva > 0.0:
+        s_sides: list[float] = []
+        for side in ("from", "to"):
+            try:
+                p = float(obs[f"p_{side}_mw"])
+                q = float(obs[f"q_{side}_mvar"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(p) and math.isfinite(q):
+                s_sides.append(math.hypot(p, q))
+        if s_sides:
+            return 100.0 * max(s_sides) / mva
+    try:
+        lf = float(obs["loading_from_pu"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(lf):
+        return None
+    try:
+        max_i = float(obs["max_i_ka"])
+    except (KeyError, TypeError, ValueError):
+        max_i = math.nan
+    if math.isfinite(max_i) and not (0.0 < max_i < _UNBOUND_MAX_I_KA):
+        return None
+    return 100.0 * abs(lf)
+
+
 def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
     """Extract grid-constraint measurements from an observation dict.
 
-    ``loading_percent`` comes as a fraction ([0,1]) or actual percent;
-    ``SECTOR_CONSTRAINTS`` wants percent, so values ≤ 5 (only the fraction
-    form) are scaled ×100. When the bare key is missing (it's a property,
-    not in ``model.values``) fall back to max of ``loading_from/to_pu``.
+    ``loading_percent``: a direct key is already percent; otherwise it is
+    derived from the branch flow/loading vars via
+    ``_obs_branch_loading_percent`` (MVA basis when rated, else the from-side
+    current fraction x100).
     """
     keys = _CONSTRAINT_OBS_KEYS.get(sector, {})
     result: dict[str, float] = {}
@@ -1012,16 +1059,7 @@ def obs_constraint_values(obs: dict, sector: Sector) -> dict[str, float]:
         if obs_key in obs:
             raw = float(obs[obs_key])
         elif var == "loading_percent":
-            lf = obs.get("loading_from_pu")
-            lt = obs.get("loading_to_pu")
-            if lf is not None or lt is not None:
-                # loading_*_pu are per-unit fractions in every monee
-                # formulation — convert unconditionally, matching the eval
-                # grader's rule (a direct loading_percent key is already %).
-                raw = 100.0 * max(
-                    abs(float(lf)) if lf is not None else 0.0,
-                    abs(float(lt)) if lt is not None else 0.0,
-                )
+            raw = _obs_branch_loading_percent(obs)
         if raw is None:
             continue
         result[var] = raw
