@@ -142,6 +142,24 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
     ]
 
 
+def _cp_influence(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Coupling-point optimization influence, pooled over EVERY completed
+    task (all experiments) so each (grid, variant) cell has real sample
+    mass — the basic-result view of how much the L3 cross-sector ADMM
+    actually steers each grid."""
+    done = _completed_sims(campaign.summary)
+    if done.empty:
+        return []
+    return [
+        str(
+            plots.cp_influence_bar(
+                done,
+                out_dir / "cp_influence.png",
+            )
+        )
+    ]
+
+
 def _restoration_time(campaign: CampaignData, out_dir: Path) -> list[str]:
     """Campaign-wide time-to-stabilise box plot.
 
@@ -874,6 +892,7 @@ def generate_report(
         ("Functional baseline", _functional_baseline, "functional_baseline"),
         ("Optimality gap", _optimality_gap, "optimality_gap"),
         ("Variant comparison", _variant_comparison, "variant_comparison"),
+        ("Coupling-point influence", _cp_influence, "cp_influence"),
         ("Time to stabilise", _restoration_time, "restoration_time"),
         ("Robustness", _robustness, "robustness"),
         ("Cascading", _cascading, "cascading"),

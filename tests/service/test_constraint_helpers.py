@@ -227,7 +227,11 @@ def test_decide_waterfall_defers_to_lower_priority_peer():
         has_lock=False,
         waterfall_enabled=True,
     )
-    assert out is None  # deferred while lower-priority reducible remains
+    # Deferred while lower-priority reducible remains — surfaced as an
+    # explicit decision so the monitor can send the peer curtail request.
+    assert isinstance(out, FrontierDecision)
+    assert out.reason == "defer_waterfall"
+    assert out.new_reg == 1.0  # own regulation untouched
 
 
 def test_decide_restore_requires_lock():

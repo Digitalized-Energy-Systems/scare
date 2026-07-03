@@ -30,6 +30,7 @@ from monee.solver.gurobipy import GurobipySolver
 from experiment.eval.claims import heat_priority_from_rows
 from experiment.eval.metrics import (
     constraint_violations_final,
+    cp_generation_breakdown,
     restoration_breakdown,
     served_breakdown,
     served_by_load,
@@ -848,6 +849,9 @@ def compose_oracle_result(
             "regulates_total": 0,
             "regulates_by_reason": {},
             "restoration": restoration,
+            # Same measure as the MAS variants, off the oracle's solved net —
+            # the ceiling for "how much do the coupling points contribute?".
+            "cp_generation": cp_generation_breakdown(solved_net),
             "oracle_lp_success": out.get("lp_success", True),
             "oracle_solver_stats": solver_stats,
             "oracle_solve_optimal": solver_stats.get("solve_optimal"),

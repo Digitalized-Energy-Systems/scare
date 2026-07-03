@@ -15,6 +15,8 @@ attribute and silently returned ``None``.
 
 from __future__ import annotations
 
+import pytest
+
 from scare.base.config import RestorationConfiguration
 from scare.base.model import Sector
 from scare.base.util import apply_regulate, has_gen_curtail_lock
@@ -121,3 +123,58 @@ def test_find_constraint_monitor_sector_guard():
     role = EnergyBalanceNegotiator(MockBehavior(), Sector.ELECTRICITY)
     role._context = _FakeCtxWithGetRole(monitor)  # type: ignore[attr-defined]
     assert role._find_constraint_monitor() is None
+
+
+# --------------------------------------------------------------------------- #
+# Gossip _apply_setpoint clamps a curtail-locked generator to its held level.
+# The gossip path writes via behavior.act directly (bypassing apply_regulate),
+# so it must honour the lock itself — as a CLAMP, not a deferral: the clamped
+# applied_sp feeds the actuated-ledger writeback, which marks the gen
+# saturated so the dual reallocates. (A deferral skips the writeback and
+# leaves phantom gen supply on the ledger — A/B-validated worse.)
+# --------------------------------------------------------------------------- #
+
+
+class _FakeGossipCtx:
+    def __init__(self, aid: str, now: float) -> None:
+        self.aid = aid
+        self.current_timestamp = now
+
+
+def _gossip_role(b: MockBehavior, now: float) -> EnergyBalanceNegotiator:
+    role = EnergyBalanceNegotiator(
+        b,
+        Sector.ELECTRICITY,
+        constraint_aware=False,
+        enable_l2_priority_floor=False,
+    )
+    role._context = _FakeGossipCtx("pv", now)  # type: ignore[attr-defined]
+    return role
+
+
+def test_gossip_apply_setpoint_clamps_restore_to_curtail_lock():
+    b = _gen_behavior(interlock=True)
+    apply_regulate(b, "pv", 0.5, sector="electricity", reason="curtail", timestamp=0.0)
+    role = _gossip_role(b, now=0.5)
+    applied = role._apply_setpoint(-10.0)  # gossip asks for full output
+    assert applied == pytest.approx(-5.0)  # held at 0.5 * cap, not deferred
+    assert 1.0 not in _regulate_values(b)
+    assert _regulate_values(b)[-1] == pytest.approx(0.5)
+
+
+def test_gossip_apply_setpoint_shed_passes_under_gen_lock():
+    b = _gen_behavior(interlock=True)
+    apply_regulate(b, "pv", 0.5, sector="electricity", reason="curtail", timestamp=0.0)
+    role = _gossip_role(b, now=0.5)
+    applied = role._apply_setpoint(-2.0)  # deeper shed is allowed
+    assert applied == pytest.approx(-2.0)
+    assert _regulate_values(b)[-1] == pytest.approx(0.2)
+
+
+def test_gossip_apply_setpoint_restores_after_lock_expiry():
+    b = _gen_behavior(interlock=True)
+    apply_regulate(b, "pv", 0.5, sector="electricity", reason="curtail", timestamp=0.0)
+    role = _gossip_role(b, now=10.0)  # past the 3 s lock TTL
+    applied = role._apply_setpoint(-10.0)
+    assert applied == pytest.approx(-10.0)
+    assert _regulate_values(b)[-1] == pytest.approx(1.0)

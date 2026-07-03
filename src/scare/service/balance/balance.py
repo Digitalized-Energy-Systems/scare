@@ -44,7 +44,9 @@ from scare.base.util import (
     clamp_to_constraints,
     constraint_allowed_fraction,
     constraint_utilization,
+    has_gen_curtail_lock,
     l2_effective_floor,
+    last_actuated_factor,
     set_l2_priority_floor,
     lookup_slack,
     lookup_slack_cp_reserve,
@@ -2172,6 +2174,29 @@ class EnergyBalanceNegotiator(Role):
             )
 
         factor = max(0.0, min(1.0, abs(new_setpoint / cap)))
+
+        # A generator the auction holds down for a live over-voltage (fresh
+        # curtail-lock) must not be re-ramped by this direct-act path — it
+        # bypasses ``apply_regulate``'s interlock and the gossip anchor
+        # predates the curtail. CLAMP to the held level rather than defer:
+        # the actuated-ledger writeback below then records the true (held)
+        # contribution and marks this member saturated, so the dual
+        # reallocates the shortfall. A deferral (returning None) skips the
+        # writeback and leaves the requested delta on the books as phantom
+        # gen supply — A/B-validated worse (loads shed against paper supply).
+        if cap < 0 and has_gen_curtail_lock(
+            self.behavior, self.context.aid, self.context.current_timestamp
+        ):
+            held = last_actuated_factor(self.behavior, self.context.aid)
+            if held is not None and factor > held + 1e-6:
+                record_event(
+                    t=self.context.current_timestamp,
+                    kind="gossip_gen_clamped_to_curtail_lock",
+                    aid=self.context.aid,
+                    sector=self.sector.value,
+                    detail=f"requested_factor={factor:.4f} held={held:.4f}",
+                )
+                factor = held
 
         # No-regret floor applies only during restoration (target > 0); shedding
         # (target < 0) legitimately reduces factor.

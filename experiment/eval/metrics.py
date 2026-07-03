@@ -841,6 +841,92 @@ def _model_value(model: Any, key: str) -> float | None:
         return None
 
 
+def cp_generation_breakdown(monee_net: Any) -> dict[str, Any]:
+    """Delivered coupling-point converter output (MW) at end of sim, summed
+    over every CP unit — the direct "are the CPs contributing?" measure.
+
+    Sources, all read off the SOLVED net:
+
+    - Compound CPs (CHP / CHPHG / P2H / G2H) surface as multi-grid control
+      NODES (``model.is_cp()``); their delivered outputs are the
+      generation-convention (≤ 0) ``el_mw`` / ``heat_mw`` Vars. The P2H
+      control node's positive ``el_mw`` is its electricity CONSUMPTION and
+      is skipped by the sign test.
+    - Branch CPs (``branch.model.is_cp()``): GasToPower delivers
+      ``p_to_mw`` (≤ 0, electricity); PowerToHeatHG delivers ``q_mw_heat``
+      (≤ 0, heat); PowerToGas delivers gas, counted as energy content
+      ``efficiency * p_from_mw`` (identified by its ``to_mass_flow_kgs``
+      Var) so the total stays in MW.
+
+    A failed/deactivated CP solves to ~0 output and naturally contributes
+    nothing; ``n_active`` counts units above a 1 kW floor.
+    """
+    el = heat = gas = 0.0
+    n_cp = 0
+    n_active = 0
+
+    def _is_cp_model(model: Any) -> bool:
+        fn = getattr(model, "is_cp", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _note(out_mw: float) -> None:
+        nonlocal n_cp, n_active
+        n_cp += 1
+        if out_mw > 1e-3:
+            n_active += 1
+
+    for node in monee_net.nodes:
+        model = getattr(node, "model", None)
+        if not _is_cp_model(model):
+            continue
+        out = 0.0
+        v_el = _model_value(model, "el_mw")
+        if v_el is not None and v_el < 0:
+            el += -v_el
+            out += -v_el
+        v_heat = _model_value(model, "heat_mw")
+        if v_heat is not None and v_heat < 0:
+            heat += -v_heat
+            out += -v_heat
+        _note(out)
+
+    for branch in monee_net.branches:
+        model = getattr(branch, "model", None)
+        if not _is_cp_model(model):
+            continue
+        out = 0.0
+        v_el = _model_value(model, "p_to_mw")
+        if v_el is not None and v_el < 0:
+            el += -v_el
+            out += -v_el
+        v_heat = _model_value(model, "q_mw_heat")
+        if v_heat is not None and v_heat < 0:
+            heat += -v_heat
+            out += -v_heat
+        if _model_value(model, "to_mass_flow_kgs") is not None:
+            eff = _model_value(model, "efficiency")
+            p_from = _model_value(model, "p_from_mw")
+            if eff is not None and p_from is not None and p_from > 0:
+                gas_mw = eff * p_from
+                gas += gas_mw
+                out += gas_mw
+        _note(out)
+
+    return {
+        "total_mw": el + heat + gas,
+        "el_mw": el,
+        "heat_mw": heat,
+        "gas_mw": gas,
+        "n_cp": n_cp,
+        "n_active": n_active,
+    }
+
+
 def _branch_loading_mva_percent(model: Any) -> float | None:
     """Worst-side loading in the MVA basis: ``100 * sqrt(p^2 + q^2) /
     max_s_mva``. None when the rating or the solved p/q flows are

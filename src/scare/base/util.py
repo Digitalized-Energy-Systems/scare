@@ -335,6 +335,13 @@ def note_actuated_factor(behavior: Any, aid: str, factor: float) -> None:
     _last_regulate_store(behavior)[str(aid)] = float(factor)
 
 
+def last_actuated_factor(behavior: Any, aid: str) -> float | None:
+    """Last regulate factor actuated for *aid* (via :func:`apply_regulate` or
+    synced with :func:`note_actuated_factor`); ``None`` before any write."""
+    value = _last_regulate_store(behavior).get(str(aid))
+    return None if value is None else float(value)
+
+
 def _l2_floor_store(behavior: Any) -> dict[str, float]:
     """Per-aid served fraction the component-scope holon ADMM last assigned."""
     return _get_behavior_store(behavior, "_scare_l2_floor")

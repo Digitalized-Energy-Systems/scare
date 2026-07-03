@@ -253,9 +253,12 @@ class RestorationConfiguration:
     # gating with partial-frontier serving. All tiers; heat-scoped.
     enable_heat_frontier: bool = True
 
-    # Priority-waterfall gate for the heat frontier controller. True: a cold heat
+    # Priority waterfall for the heat frontier controller. True: a cold heat
     # load defers its own (otherwise tier-blind) shed while a strictly lower-
-    # priority load in its hydraulic region still has reducible draw. Heat-scoped.
+    # priority load in range still has reducible draw, AND actively sends that
+    # peer a bounded CurtailmentRequest each poll (one target per poll,
+    # per-peer cooldown) — the shed authority that makes the deferral a real
+    # waterfall instead of a wait-until-peers-freeze no-op. Heat-scoped.
     enable_heat_priority_waterfall: bool = True
 
     # Local Q-V droop at every inverter-coupled PV. VDE-AR-N 4105 Q(U): piecewise-

@@ -2395,6 +2395,288 @@ def regulates_by_reason_bar(
     )
 
 
+# Coupling-point optimization influence — how much the L3 cross-sector ADMM
+# actually steers each run, next to what that steering buys in restored load.
+
+
+def cp_influence_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = (
+        "Coupling-point optimization — activity and restored load "
+        "(all runs, by grid)"
+    ),
+) -> Path:
+    """Two panels, shared grid axis, pooled over every completed run.
+
+    LEFT — CP contribution: mean delivered coupling-point converter output
+    per task in MW, from ``outcomes.cp_generation.total_mw`` (end-of-sim
+    solved net; el + heat + gas-as-energy across every CHP / P2H / G2P /
+    P2G / G2H unit). Hover breaks the total down by output carrier and
+    reports how many CP units were actively producing. The oracle records
+    the same measure off its solved LP, so its bar is the CP-usage ceiling.
+    On campaigns recorded before ``cp_generation`` existed the panel falls
+    back to the CP-ADMM regulate-action count from
+    ``outcomes.regulates_by_reason`` (``cp*`` reasons; oracle dropped there
+    — it never fires the regulate path).
+
+    RIGHT — restored load: compliant-mean PWSF for the same (grid, variant)
+    cells, so a grid steered heavily through its coupling points can be read
+    against what that steering buys. The scare hover carries the Δ vs each
+    L3-less baseline; NOTE both baselines (``component_level``,
+    ``single_level``) disable the holonic layer TOO, so the gap is the joint
+    L2+L3 coordination lift — an upper bound on, not an isolation of, the CP
+    contribution (no variant toggles CP alone; see the
+    ``enable_cp_admm=False`` ablation for the scare-internal toggle).
+    """
+    prefix = "outcomes__regulates_by_reason__"
+    cp_cols = [
+        c
+        for c in df.columns
+        if c.startswith(prefix) and c[len(prefix) :].startswith("cp")
+    ]
+    mw_col = "outcomes__cp_generation__total_mw"
+    use_mw = mw_col in df.columns and (
+        pd.to_numeric(df[mw_col], errors="coerce").notna().any()
+    )
+    pwsf_col = "outcomes__priority_weighted_fraction"
+    if df.empty or (not cp_cols and not use_mw) or "grid" not in df.columns:
+        return _save(_empty_fig("no CP generation / regulate data", title), out_path)
+
+    sub = df.dropna(subset=["variant"]).copy()
+    if not use_mw:
+        # Action-count fallback: the oracle never fires the regulate path, so
+        # its bar would be an empty artefact. With MW recorded it stays in as
+        # the CP-usage ceiling.
+        sub = sub[sub["variant"] != "oracle"]
+    if sub.empty:
+        return _save(_empty_fig("no rows with a variant", title), out_path)
+
+    if use_mw:
+        sub["_cp_actions"] = pd.to_numeric(sub[mw_col], errors="coerce")
+    else:
+        sub["_cp_actions"] = sub[cp_cols].fillna(0).astype(float).sum(axis=1)
+    total_col = "outcomes__regulates_total"
+    if total_col in sub.columns:
+        sub["_reg_total"] = sub[total_col].fillna(0).astype(float)
+    else:
+        sub["_reg_total"] = float("nan")
+
+    grouped = sub.groupby(["grid", "variant"])
+    cp_vals = grouped["_cp_actions"].apply(lambda s: list(s.dropna()))
+    tot_sum = grouped["_reg_total"].sum()
+    # Per-carrier breakdown + active-unit counts for the MW-mode hover.
+    bd_means: dict[str, Any] = {}
+    if use_mw:
+        for key in ("el_mw", "heat_mw", "gas_mw", "n_active", "n_cp"):
+            col = f"outcomes__cp_generation__{key}"
+            if col in sub.columns:
+                bd_means[key] = grouped[col].apply(
+                    lambda s: pd.to_numeric(s, errors="coerce").mean()
+                )
+    # Restored load on the compliant subset — same gate as the variant tables.
+    have_pwsf = pwsf_col in sub.columns
+    if have_pwsf:
+        comp = sub[_compliant_mask(sub)]
+        pwsf_vals = comp.groupby(["grid", "variant"])[pwsf_col].apply(
+            lambda s: list(s.dropna())
+        )
+    grids = sorted({k[0] for k in cp_vals.index})
+    variants = sorted({k[1] for k in cp_vals.index})
+    grids_lbl = _grids_display(grids)
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        shared_yaxes=True,
+        horizontal_spacing=0.06,
+        subplot_titles=(
+            (
+                "CP generation delivered (MW) / task"
+                if use_mw
+                else "CP-ADMM converter actions / task"
+            ),
+            "restored load — PWSF (compliant mean)",
+        ),
+    )
+
+    # Pre-compute compliant PWSF means so the scare hover can quote deltas.
+    pwsf_mean: dict[tuple[str, str], float] = {}
+    if have_pwsf:
+        for (grid, variant), vals in pwsf_vals.items():
+            if vals:
+                pwsf_mean[(grid, variant)] = float(pd.Series(vals).mean())
+
+    for variant in variants:
+        cp_means: list[float] = []
+        cp_cis: list[float] = []
+        shares: list[float] = []
+        ns: list[int] = []
+        hover_cp: list[str] = []
+        for grid, g_lbl in zip(grids, grids_lbl):
+            vals = cp_vals.get((grid, variant), [])
+            mean, ci = _mean_ci(vals)
+            cp_means.append(mean)
+            cp_cis.append(ci)
+            total = float(tot_sum.get((grid, variant), 0.0))
+            cp_total = float(sum(vals))
+            shares.append(cp_total / total if total > 0 else float("nan"))
+            ns.append(len(vals))
+            if use_mw:
+
+                def _nz(v: Any) -> float:
+                    return 0.0 if v is None or v != v else float(v)
+
+                detail = ""
+                el = _nz(bd_means.get("el_mw", {}).get((grid, variant)))
+                ht = _nz(bd_means.get("heat_mw", {}).get((grid, variant)))
+                gs = _nz(bd_means.get("gas_mw", {}).get((grid, variant)))
+                if el or ht or gs:
+                    detail += (
+                        f"el: {el:.3f} · heat: {ht:.3f} · gas: {gs:.3f} MW<br>"
+                    )
+                n_act = _nz(bd_means.get("n_active", {}).get((grid, variant)))
+                n_cp = _nz(bd_means.get("n_cp", {}).get((grid, variant)))
+                if n_cp:
+                    detail += f"active CP units: {n_act:.1f} of {n_cp:.0f}<br>"
+                hover_cp.append(
+                    f"<b>{alias_variant(variant)}</b><br>grid: {g_lbl}<br>"
+                    f"mean CP generation: {mean:.3f} MW/task<br>"
+                    f"95% CI: {_ci_label(ci)}<br>" + detail + f"n = {len(vals)}"
+                )
+            else:
+                share = shares[-1]
+                hover_cp.append(
+                    f"<b>{alias_variant(variant)}</b><br>grid: {g_lbl}<br>"
+                    f"mean CP-ADMM actions/task: {mean:.1f}<br>"
+                    f"95% CI: {_ci_label(ci)}<br>"
+                    + (
+                        f"share of all regulate actions: {share * 100:.1f}%<br>"
+                        if share == share  # NaN-safe
+                        else ""
+                    )
+                    + f"n = {len(vals)}"
+                )
+        fig.add_trace(
+            go.Bar(
+                name=alias_variant(variant),
+                legendgroup=variant,
+                y=grids_lbl,
+                x=cp_means,
+                orientation="h",
+                error_x=dict(
+                    type="data",
+                    array=cp_cis,
+                    visible=True,
+                    thickness=1.2,
+                    width=4,
+                    color=_MUTED_COLOR,
+                ),
+                marker=_bar_marker(
+                    _variant_color(variant),
+                    pattern_shape=_VARIANT_PATTERN.get(variant, ""),
+                ),
+                hovertemplate="%{customdata}<extra></extra>",
+                customdata=hover_cp,
+            ),
+            row=1,
+            col=1,
+        )
+
+        if not have_pwsf:
+            continue
+        p_means: list[float] = []
+        p_cis: list[float] = []
+        p_ns: list[int] = []
+        hover_p: list[str] = []
+        for grid, g_lbl in zip(grids, grids_lbl):
+            vals = pwsf_vals.get((grid, variant), []) if have_pwsf else []
+            mean, ci = _mean_ci(vals)
+            p_means.append(mean)
+            p_cis.append(ci)
+            p_ns.append(len(vals))
+            deltas = ""
+            if variant == "scare":
+                for other in variants:
+                    if other == variant:
+                        continue
+                    o_mean = pwsf_mean.get((grid, other))
+                    s_mean = pwsf_mean.get((grid, variant))
+                    if o_mean is not None and s_mean is not None:
+                        deltas += (
+                            f"Δ vs {alias_variant(other)}: "
+                            f"{s_mean - o_mean:+.4f}<br>"
+                        )
+                if deltas:
+                    deltas = (
+                        "<i>joint L2+L3 lift (baselines also drop the "
+                        "holonic layer):</i><br>" + deltas
+                    )
+            hover_p.append(
+                f"<b>{alias_variant(variant)}</b><br>grid: {g_lbl}<br>"
+                f"mean PWSF (compliant): {mean:.4f}<br>"
+                f"95% CI: {_ci_label(ci)}<br>n = {len(vals)}<br>" + deltas
+            )
+        fig.add_trace(
+            go.Bar(
+                name=alias_variant(variant),
+                legendgroup=variant,
+                showlegend=False,
+                y=grids_lbl,
+                x=p_means,
+                orientation="h",
+                error_x=dict(
+                    type="data",
+                    array=p_cis,
+                    visible=True,
+                    thickness=1.2,
+                    width=4,
+                    color=_MUTED_COLOR,
+                ),
+                marker=_bar_marker(
+                    _variant_color(variant),
+                    pattern_shape=_VARIANT_PATTERN.get(variant, ""),
+                ),
+                hovertemplate="%{customdata}<extra></extra>",
+                customdata=hover_p,
+            ),
+            row=1,
+            col=2,
+        )
+
+    fig.update_layout(barmode="group", bargap=0.32, bargroupgap=0.12)
+    fig.update_xaxes(
+        title_text=(
+            "mean delivered MW per task" if use_mw else "mean actions per task"
+        ),
+        rangemode="tozero",
+        tickformat=".2f" if use_mw else ".0f",
+        row=1,
+        col=1,
+    )
+    fig.update_xaxes(
+        title_text="PWSF (compliant mean)",
+        range=[0, 1.05],
+        tickformat=".2f",
+        row=1,
+        col=2,
+    )
+    fig.update_yaxes(title_text="grid", row=1, col=1)
+    height = _hbar_height(len(grids), len(variants)) + 30
+    return _save(
+        _apply_theme(
+            fig,
+            title=title,
+            height=height,
+            width=int(_BAR_FIG_WIDTH * 1.55),
+            font_bump=2,
+            legend_top=True,
+        ),
+        out_path,
+    )
+
+
 # Per-sector restoration ratio (mirrors restoration_by_tier_bar)
 
 

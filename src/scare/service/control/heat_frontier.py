@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 class FrontierDecision(NamedTuple):
     new_reg: float
-    reason: str  # "curtail" (shed) | "heat_recovery" (restore)
+    # "curtail" (shed self) | "heat_recovery" (restore self) |
+    # "defer_waterfall" (hold: ask a lower-priority peer to shed instead;
+    # new_reg is the unchanged current regulation, nothing to actuate)
+    reason: str
 
 
 class HeatFrontierController:
@@ -66,6 +69,22 @@ class HeatFrontierController:
                 total += reducible
         return total
 
+    def waterfall_request_targets(
+        self, my_tier: int, now: float
+    ) -> list[tuple[str, int, float]]:
+        """Fresh strictly-lower-priority peers with reducible draw, ordered
+        lowest-priority (highest tier) then most-reducible first — the shed
+        order for the waterfall's peer curtail requests."""
+        peers = [
+            (origin, tier, reducible)
+            for origin, (t_rx, tier, reducible) in self._peer_state.items()
+            if now - t_rx <= self._peer_freshness_s
+            and tier > my_tier
+            and reducible > self.WATERFALL_REDUCIBLE_EPS
+        ]
+        peers.sort(key=lambda p: (-p[1], -p[2]))
+        return peers
+
     def decide(
         self,
         *,
@@ -93,8 +112,11 @@ class HeatFrontierController:
         if not (too_cold or can_restore):
             return None  # inside the hold band
 
-        # Waterfall gate (shed only): defer while a lower-priority same-region
-        # load still has reducible draw.
+        # Waterfall gate (shed only): while a lower-priority same-region load
+        # still has reducible draw, hold the own shed and surface the defer so
+        # the monitor can actively request that peer to shed (the actuator
+        # that makes the waterfall real — a silent hold just waits for peers
+        # to freeze at the same time and sheds anyway).
         if too_cold and waterfall_enabled:
             if self.region_has_lower_priority_reducible(my_tier, now) > 0.0:
                 logger.debug(
@@ -104,7 +126,7 @@ class HeatFrontierController:
                     t,
                     my_tier,
                 )
-                return None
+                return FrontierDecision(cur, "defer_waterfall")
 
         # |d(t_k)/d(reg)| = sensitivity * cap; floor away from 0 for a finite
         # step (clamp bounds it regardless).

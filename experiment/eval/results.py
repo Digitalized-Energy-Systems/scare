@@ -28,6 +28,7 @@ from experiment.eval.metrics import (
     constraint_rows,
     constraint_violation_integral,
     constraint_violations_final,
+    cp_generation_breakdown,
     restoration_breakdown,
     served_breakdown,
     served_by_load,
@@ -110,6 +111,9 @@ def compose_result(
             "regulates_total": sum(regulates_by_reason.values()),
             "regulates_by_reason": dict(regulates_by_reason),
             "restoration": restoration,
+            # Delivered CP converter output (MW) off the same solved net as
+            # the served breakdown — "are the coupling points contributing?".
+            "cp_generation": cp_generation_breakdown(monee_net),
         },
         "diary": {**diary_summary, "invariant_holds": diary_invariant},
         "events": event_summary,

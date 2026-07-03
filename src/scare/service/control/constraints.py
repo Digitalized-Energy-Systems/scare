@@ -290,6 +290,9 @@ class GridConstraintMonitor(Role):
         # Per-variable flag: waterfall has only tier-1 reducible bidders left
         # (can't relieve further without breaking the hard-lock).
         self._line_relief_tier1_residual: dict[str, bool] = {}
+        # Heat waterfall actuator: per-peer cooldown deadline for the curtail
+        # requests a deferring cold load sends to lower-priority peers.
+        self._waterfall_request_cooldown: dict[str, float] = {}
 
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
@@ -1434,6 +1437,10 @@ class GridConstraintMonitor(Role):
         )
         if decision is None:
             return
+        if decision.reason == "defer_waterfall":
+            # Own shed held — actively shed the lower-priority peer instead.
+            await self._request_waterfall_peer_shed(my_tier)
+            return
 
         applied = apply_regulate(
             self.behavior,
@@ -1453,6 +1460,52 @@ class GridConstraintMonitor(Role):
                 cur,
                 decision.new_reg,
             )
+
+    # Bounded multiplicative shed step per peer request; the receiver's
+    # ``_apply_curtail`` compounds repeated requests toward zero, so a single
+    # step can't overshoot, and the per-peer cooldown paces escalation while
+    # the requester's own poll re-fires each cycle the node stays cold.
+    _HEAT_WATERFALL_SHED_AMOUNT: float = 0.5
+    _HEAT_WATERFALL_REQUEST_COOLDOWN_S: float = 1.0
+
+    async def _request_waterfall_peer_shed(self, my_tier: int) -> None:
+        """Actuate the heat priority waterfall: while this cold load's own
+        shed is deferred, send a bounded ``CurtailmentRequest`` to the
+        lowest-priority reducible peer in range (one per poll). The receiver
+        curtails with ``reason="curtail"``, taking the heat curtail-lock, so
+        L2 defers and its own frontier restores it once the region warms.
+        """
+        now = self.context.current_timestamp
+        for origin, tier, reducible in self._heat_frontier.waterfall_request_targets(
+            my_tier, now
+        ):
+            deadline = self._waterfall_request_cooldown.get(origin)
+            if deadline is not None and now < deadline:
+                continue
+            state = self._neighbour_state.get((origin, "t_k"))
+            addr = getattr(state, "origin_addr", None) if state is not None else None
+            if addr is None:
+                continue
+            self._waterfall_request_cooldown[origin] = (
+                now + self._HEAT_WATERFALL_REQUEST_COOLDOWN_S
+            )
+            await self.context.send_message(
+                CurtailmentRequest(
+                    sector=self.sector, amount=self._HEAT_WATERFALL_SHED_AMOUNT
+                ),
+                receiver_addr=addr,
+            )
+            record_event(
+                t=now,
+                kind="heat_waterfall_peer_shed",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=(
+                    f"target={origin} tier={tier} reducible={reducible:.4f} "
+                    f"amount={self._HEAT_WATERFALL_SHED_AMOUNT}"
+                ),
+            )
+            return
 
     # ------------------------------------------------------------------
     # Public helpers

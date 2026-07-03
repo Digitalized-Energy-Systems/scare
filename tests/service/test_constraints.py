@@ -364,6 +364,179 @@ async def test_frontier_sheds_when_only_higher_priority_peers():
     assert regs and regs[-1][2][0] < 1.0
 
 
+def test_frontier_defer_decision_surfaces_waterfall():
+    """The deferral is an explicit decision (not a silent hold) so the
+    monitor can actuate the waterfall, and the request targets come back
+    lowest-priority-first."""
+    from scare.service.control.heat_frontier import HeatFrontierController
+
+    ctrl = HeatFrontierController(peer_freshness_s=10.0)
+    ctrl.note_peer_state("peer-3", 0.0, 3, 0.02)
+    ctrl.note_peer_state("peer-4", 0.0, 4, 0.05)
+    d = ctrl.decide(
+        t=300.0,
+        lo=313.15,
+        cap=0.05,
+        cur=1.0,
+        sensitivity=660.0,
+        now=0.0,
+        my_tier=1,
+        has_lock=False,
+        waterfall_enabled=True,
+    )
+    assert d is not None
+    assert d.reason == "defer_waterfall"
+    assert d.new_reg == 1.0
+    assert ctrl.waterfall_request_targets(1, 0.0) == [
+        ("peer-4", 4, 0.05),
+        ("peer-3", 3, 0.02),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_waterfall_peer_shed_request_curtails_peer():
+    """The deferring cold tier-1 load actively sheds its lowest-priority
+    reducible peer: a bounded CurtailmentRequest reaches the peer, which
+    curtails multiplicatively — while the tier-1 load itself stays served."""
+    from scare.base.model import ConstraintStateMessage
+
+    behavior = MockBehavior()
+    behavior.set_obs(
+        "agent-0",
+        {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 300.0, "priority": 1},
+    )
+    behavior.add_action("agent-0", "regulate")
+    behavior.set_obs(
+        "agent-1",
+        {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 330.0, "priority": 4},
+    )
+    behavior.add_action("agent-1", "regulate")
+
+    m0 = GridConstraintMonitor(
+        behavior,
+        Sector.HEAT,
+        node_id=0,
+        max_hops=1,
+        enable_curtailment_auction=False,
+        enable_multihop_constraint=False,
+        enable_heat_frontier=False,
+        enable_heat_priority_waterfall=True,
+    )
+    m1 = GridConstraintMonitor(
+        behavior,
+        Sector.HEAT,
+        node_id=1,
+        max_hops=1,
+        enable_curtailment_auction=False,
+        enable_multihop_constraint=False,
+        enable_heat_frontier=False,
+    )
+
+    world = create_world()
+    a0 = world.register(RoleAgent(), suggested_aid="agent-0")
+    a0.add_role(m0)
+    a1 = world.register(RoleAgent(), suggested_aid="agent-1")
+    a1.add_role(m1)
+
+    async with world:
+        m0._sensitivity = 660.0
+        now = m0.context.current_timestamp
+        origin = str(m1.context.addr)
+        m0._heat_frontier.note_peer_state(origin, now, 4, 0.05)
+        m0._neighbour_state[(origin, "t_k")] = ConstraintStateMessage(
+            sector=Sector.HEAT,
+            variable="t_k",
+            value=330.0,
+            utilization=0.1,
+            hops_remaining=1,
+            origin_addr=m1.context.addr,
+            priority_tier=4,
+            reducible=0.05,
+        )
+        await m0._heat_frontier_control()
+        await step_simulation(world, step_size_s=1.0)
+
+    peer_regs = [
+        a for a in behavior.action_log if a[0] == "agent-1" and a[1] == "regulate"
+    ]
+    assert peer_regs, "peer never received/applied the waterfall curtail request"
+    expected = 1.0 * (1.0 - GridConstraintMonitor._HEAT_WATERFALL_SHED_AMOUNT)
+    assert peer_regs[-1][2][0] == pytest.approx(expected)
+    own_regs = [
+        a for a in behavior.action_log if a[0] == "agent-0" and a[1] == "regulate"
+    ]
+    assert not own_regs, "the deferring tier-1 load must not shed itself"
+
+
+@pytest.mark.asyncio
+async def test_waterfall_peer_shed_request_cooldown():
+    """Repeated polls within the per-peer cooldown send only one request."""
+    from scare.base.model import ConstraintStateMessage
+
+    behavior = MockBehavior()
+    behavior.set_obs(
+        "agent-0",
+        {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 300.0, "priority": 1},
+    )
+    behavior.add_action("agent-0", "regulate")
+    behavior.set_obs(
+        "agent-1",
+        {"q_mw_heat": 0.05, "regulation": 1.0, "t_k": 330.0, "priority": 4},
+    )
+    behavior.add_action("agent-1", "regulate")
+
+    m0 = GridConstraintMonitor(
+        behavior,
+        Sector.HEAT,
+        node_id=0,
+        max_hops=1,
+        enable_curtailment_auction=False,
+        enable_multihop_constraint=False,
+        enable_heat_frontier=False,
+        enable_heat_priority_waterfall=True,
+    )
+    m1 = GridConstraintMonitor(
+        behavior,
+        Sector.HEAT,
+        node_id=1,
+        max_hops=1,
+        enable_curtailment_auction=False,
+        enable_multihop_constraint=False,
+        enable_heat_frontier=False,
+    )
+
+    world = create_world()
+    a0 = world.register(RoleAgent(), suggested_aid="agent-0")
+    a0.add_role(m0)
+    a1 = world.register(RoleAgent(), suggested_aid="agent-1")
+    a1.add_role(m1)
+
+    async with world:
+        m0._sensitivity = 660.0
+        now = m0.context.current_timestamp
+        origin = str(m1.context.addr)
+        m0._heat_frontier.note_peer_state(origin, now, 4, 0.05)
+        m0._neighbour_state[(origin, "t_k")] = ConstraintStateMessage(
+            sector=Sector.HEAT,
+            variable="t_k",
+            value=330.0,
+            utilization=0.1,
+            hops_remaining=1,
+            origin_addr=m1.context.addr,
+            priority_tier=4,
+            reducible=0.05,
+        )
+        # Two control polls back-to-back — inside the 2 s per-peer cooldown.
+        await m0._heat_frontier_control()
+        await m0._heat_frontier_control()
+        await step_simulation(world, step_size_s=1.0)
+
+    peer_regs = [
+        a for a in behavior.action_log if a[0] == "agent-1" and a[1] == "regulate"
+    ]
+    assert len(peer_regs) == 1  # a single 0.25 step, not two compounded
+
+
 @pytest.mark.asyncio
 async def test_frontier_sheds_when_lower_priority_exhausted():
     """Once the lower-priority peer has shed (reducible ≈ 0) the gate opens
