@@ -136,5 +136,23 @@
         }
       ]
     }
-  ]
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "02:00:00",
+    "mem": "16G",
+    "cpus": 1,
+    "max_concurrent": 64,
+    "aggregate": true,
+    "nodelist": "mpcb014,mpcb015"
+  },
+  "slurm_eval": {
+    "partition": "rosa_express.p",
+    "time": "2:00:00",
+    "mem": "32G",
+    "cpus": 1,
+    "max_concurrent": 64,
+    "aggregate": true,
+    "nodelist": "mpcb014,mpcb015"
+  }
 }
