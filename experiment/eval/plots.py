@@ -108,13 +108,22 @@ _TITLE_FONT_FAMILY = "Charter, Georgia, 'Times New Roman', serif"
 _FIG_WIDTH = 1000
 _FIG_HEIGHT = 440
 
-# Font sizes tuned to read at full-width PDF without further scaling.
-_BASE_FONT_SIZE = 17
-_TITLE_FONT_SIZE = 22
-_AXIS_TITLE_FONT_SIZE = 18
-_TICK_FONT_SIZE = 16
-_LEGEND_FONT_SIZE = 16
-_ANNOTATION_FONT_SIZE = 14
+# Font sizes tuned to read when the figure is scaled down to a two-column
+# (half-text-width) slot: bumped ~4pt over the full-width baseline so labels
+# stay legible after LaTeX shrinks the canvas.
+_BASE_FONT_SIZE = 21
+_TITLE_FONT_SIZE = 26
+_AXIS_TITLE_FONT_SIZE = 22
+_TICK_FONT_SIZE = 20
+_LEGEND_FONT_SIZE = 20
+_ANNOTATION_FONT_SIZE = 18
+
+# Data-series line thickness and marker size for the line/scatter figures
+# (sweeps, cascading, robustness, optimality). Kept well above plotly's
+# defaults so a single series reads clearly at two-column scale. Reference
+# lines (parity, bounds, gridlines) keep their own thin widths.
+_DATA_LINE_WIDTH = 5.0
+_MARKER_SIZE = 15
 
 _GRID_COLOR = "#ECECEC"
 _AXIS_COLOR = "#1A1A1A"
@@ -749,7 +758,7 @@ def pwsf_by_sector_bar(
     )
     return _save(
         _apply_theme(
-            fig, title=title, height=380, width=_BAR_FIG_WIDTH, legend_top=True
+            fig, title=title, height=560, width=_BAR_FIG_WIDTH, legend_top=True
         ),
         out_path,
     )
@@ -759,13 +768,20 @@ def pwsf_by_sector_bar(
 
 
 def _gap_pair_pivot(df: pd.DataFrame, metric: str) -> pd.DataFrame:
-    """One row per single run pair: pivot on (grid, seed, scenario) — not
-    (grid, seed), which silently MEANS over the scenarios sharing a seed and,
-    with the compliance filter applied per row first, mixes asymmetric
-    scenario subsets between the two sides. Cells where either side is
+    """One row per single run pair: pivot on (experiment, grid, seed,
+    scenario) — not (grid, seed), which silently MEANS over the scenarios
+    sharing a seed and, with the compliance filter applied per row first,
+    mixes asymmetric scenario subsets between the two sides. ``experiment`` is
+    included so pooling several experiments (all grids) keeps each scare/oracle
+    pair matched within its own experiment rather than averaging the same
+    (grid, seed, scenario) across experiments. Cells where either side is
     missing or non-compliant are dropped."""
     df = df[_compliant_mask(df)]
-    idx = ["grid", "seed"] + (["scenario"] if "scenario" in df.columns else [])
+    idx = (
+        (["experiment"] if "experiment" in df.columns else [])
+        + ["grid", "seed"]
+        + (["scenario"] if "scenario" in df.columns else [])
+    )
     return df.pivot_table(index=idx, columns="variant", values=metric)
 
 
@@ -814,7 +830,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
                 mode="markers",
                 name=alias_grid(grid),
                 marker=dict(
-                    size=9,
+                    size=_MARKER_SIZE,
                     color=_QUAL_PALETTE[i % len(_QUAL_PALETTE)],
                     line=dict(width=1, color="white"),
                     opacity=0.9,
@@ -1070,9 +1086,9 @@ def robustness_curve(
             x=x,
             y=y,
             mode="lines+markers",
-            line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
+            line=dict(color=_VARIANT_COLOR["scare"], width=_DATA_LINE_WIDTH),
             marker=dict(
-                size=8, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
+                size=_MARKER_SIZE, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
             ),
             customdata=[
                 f"x={xv}<br>mean PWSF (compliant): {m:.4f}<br>95% CI: {_ci_label(c)}<br>"
@@ -1098,9 +1114,9 @@ def robustness_curve(
                 y=(share.values * 100).tolist(),
                 mode="lines+markers",
                 name="compliant runs",
-                line=dict(color=_VARIANT_COLOR["oracle"], width=2.0, dash="dot"),
+                line=dict(color=_VARIANT_COLOR["oracle"], width=_DATA_LINE_WIDTH, dash="dot"),
                 marker=dict(
-                    size=8,
+                    size=_MARKER_SIZE,
                     color=_VARIANT_COLOR["oracle"],
                     symbol="square",
                     line=dict(color="white", width=1),
@@ -1210,9 +1226,9 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
             x=x,
             y=y,
             mode="lines+markers",
-            line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
+            line=dict(color=_VARIANT_COLOR["scare"], width=_DATA_LINE_WIDTH),
             marker=dict(
-                size=9, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
+                size=_MARKER_SIZE, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
             ),
             customdata=[
                 f"failures: {xv}<br>mean PWSF (compliant): {m:.4f}<br>"
@@ -1273,9 +1289,9 @@ def sweep_curve_dual(
             y=served.values,
             mode="lines+markers",
             name="served (compliant)",
-            line=dict(color=_VARIANT_COLOR["scare"], width=2.0),
+            line=dict(color=_VARIANT_COLOR["scare"], width=_DATA_LINE_WIDTH),
             marker=dict(
-                size=8, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
+                size=_MARKER_SIZE, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
             ),
             hovertemplate=f"{sweep_param}: %{{x}}<br>served (compliant): %{{y:.4f}}<extra></extra>",
         ),
@@ -1293,9 +1309,9 @@ def sweep_curve_dual(
                 y=share.values.tolist(),
                 mode="lines+markers",
                 name="compliant share",
-                line=dict(color=_VARIANT_COLOR["oracle"], width=2.0, dash="dot"),
+                line=dict(color=_VARIANT_COLOR["oracle"], width=_DATA_LINE_WIDTH, dash="dot"),
                 marker=dict(
-                    size=8,
+                    size=_MARKER_SIZE,
                     color=_VARIANT_COLOR["oracle"],
                     symbol="diamond",
                     line=dict(color="white", width=1),
@@ -1313,9 +1329,9 @@ def sweep_curve_dual(
                 y=wall.values,
                 mode="lines+markers",
                 name="wallclock (s)",
-                line=dict(color=_VARIANT_COLOR["single_level"], width=2.0, dash="dot"),
+                line=dict(color=_VARIANT_COLOR["single_level"], width=_DATA_LINE_WIDTH, dash="dot"),
                 marker=dict(
-                    size=8,
+                    size=_MARKER_SIZE,
                     color=_VARIANT_COLOR["single_level"],
                     symbol="square",
                     line=dict(color="white", width=1),
@@ -1386,7 +1402,7 @@ def served_by_tier(
     fig.update_yaxes(title="served fraction", range=[0, 1.05], tickformat=".2f")
     return _save(
         _apply_theme(
-            fig, title=title, height=360, width=_BAR_FIG_WIDTH, legend_top=True
+            fig, title=title, height=700, width=_BAR_FIG_WIDTH, legend_top=True
         ),
         out_path,
     )
@@ -1749,7 +1765,7 @@ def restoration_by_tier_bar(
     fig.update_xaxes(title="grid")
     return _save(
         _apply_theme(
-            fig, title=title, height=360, width=_BAR_FIG_WIDTH, legend_top=True
+            fig, title=title, height=700, width=_BAR_FIG_WIDTH, legend_top=True
         ),
         out_path,
     )
@@ -1938,7 +1954,7 @@ def agent_only_ratio_by_tier_bar(
     fig.update_xaxes(title="grid")
     return _save(
         _apply_theme(
-            fig, title=title, height=360, width=_BAR_FIG_WIDTH, legend_top=True
+            fig, title=title, height=700, width=_BAR_FIG_WIDTH, legend_top=True
         ),
         out_path,
     )
@@ -4224,3 +4240,373 @@ def system_state_overview(
         ),
         out_path,
     )
+
+
+# Extension experiments — islanding MILP + temporal physics (linepack / LTC)
+
+
+def _scenario_value(scenario_key: str, field: str) -> str | None:
+    """Value of ``field`` in an aggregated ``k=v;k=v`` scenario key (the
+    format of ``hpc.aggregate._key_of``); ``None`` when absent."""
+    for tok in str(scenario_key).split(";"):
+        if "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        if k.strip() == field:
+            return v.strip()
+    return None
+
+
+def _extension_ab_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    arm_of,
+    label_a: str,
+    label_b: str,
+    title: str,
+    oracle_b_col: str | None = None,
+) -> Path:
+    """Paired A/B PWSF bars (scare variant), one bar pair per (grid, seed),
+    with oracle reference markers. ``arm_of`` maps a scenario key to
+    "A"/"B"/None; pairs missing either arm are dropped. ``oracle_b_col``
+    substitutes a dedicated oracle outcome column for the B arm when present
+    (e.g. the receding-horizon temporal oracle's mean PWSF)."""
+    metric = "outcomes__priority_weighted_fraction"
+    if df.empty or metric not in df.columns or "scenario" not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+
+    d = _completed(df).copy()
+    d["arm"] = d["scenario"].map(arm_of)
+    d = d[d["arm"].notna()]
+    scare = d[d["variant"] == "scare"]
+    if scare.empty:
+        return _save(_empty_fig("no scare rows", title), out_path)
+    pivot = scare.pivot_table(index=["grid", "seed"], columns="arm", values=metric)
+    if pivot.empty or {"A", "B"} - set(pivot.columns):
+        return _save(_empty_fig("need both A and B arms (scare)", title), out_path)
+    pivot = pivot.dropna(subset=["A", "B"]).sort_index()
+    if pivot.empty:
+        return _save(_empty_fig("no complete scare A/B pairs", title), out_path)
+
+    multi_grid = pivot.index.get_level_values("grid").nunique() > 1
+    x = [
+        f"{alias_grid(g)} · s{s}" if multi_grid else f"seed {s}"
+        for g, s in pivot.index
+    ]
+    delta = pivot["B"] - pivot["A"]
+
+    fig = go.Figure()
+    for arm, name, color in (
+        ("A", label_a, "#7F7F7F"),
+        ("B", label_b, _VARIANT_COLOR["scare"]),
+    ):
+        hover = [
+            f"<b>{name}</b><br>{lbl}<br>PWSF: {v:.4f}<br>Δ (B−A): {dl:+.4f}"
+            for lbl, v, dl in zip(x, pivot[arm], delta)
+        ]
+        fig.add_trace(
+            go.Bar(
+                name=name,
+                x=x,
+                y=pivot[arm].values,
+                marker=_bar_marker(color),
+                customdata=hover,
+                hovertemplate="%{customdata}<extra></extra>",
+            )
+        )
+
+    orc = d[d["variant"] == "oracle"].copy()
+    if not orc.empty:
+        orc["_ref"] = orc[metric]
+        if oracle_b_col and oracle_b_col in orc.columns:
+            b_rows = orc["arm"] == "B"
+            orc.loc[b_rows, "_ref"] = orc.loc[b_rows, oracle_b_col].fillna(
+                orc.loc[b_rows, metric]
+            )
+        opivot = orc.pivot_table(
+            index=["grid", "seed"], columns="arm", values="_ref"
+        ).reindex(pivot.index)
+        for arm, name, symbol in (
+            ("A", f"oracle · {label_a}", "circle"),
+            ("B", f"oracle · {label_b}", "diamond"),
+        ):
+            if arm not in opivot.columns or opivot[arm].dropna().empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=opivot[arm].values,
+                    mode="markers",
+                    name=name,
+                    marker=dict(
+                        size=_MARKER_SIZE,
+                        symbol=symbol,
+                        color=_VARIANT_COLOR["oracle"],
+                        line=dict(width=1.2, color="white"),
+                    ),
+                    hovertemplate=(
+                        f"<b>{name}</b><br>%{{x}}<br>PWSF: %{{y:.4f}}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+    mean_delta = float(delta.mean())
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.97,
+        y=0.97,
+        xanchor="right",
+        yanchor="top",
+        showarrow=False,
+        align="right",
+        bgcolor="rgba(255,255,255,0.85)",
+        bordercolor="#CCCCCC",
+        borderwidth=0.6,
+        borderpad=5,
+        text=(
+            f"<b>mean Δ (B−A)</b> {mean_delta:+.4f}  ·  "
+            f"<b>n</b>={len(pivot)} pairs"
+        ),
+        font=dict(family=_FONT_FAMILY, size=_ANNOTATION_FONT_SIZE, color=_AXIS_COLOR),
+    )
+    fig.update_layout(barmode="group", bargap=0.3, bargroupgap=0.1)
+    fig.update_xaxes(title="paired run (same grid + seed)")
+    fig.update_yaxes(
+        title="priority-weighted served fraction", range=[0, 1.05], tickformat=".2f"
+    )
+    return _save(
+        _apply_theme(
+            fig, title=title, height=520, width=_BAR_FIG_WIDTH, legend_top=True
+        ),
+        out_path,
+    )
+
+
+def extension_islanding_ab(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Islanding extension — paired PWSF, clean vs microgrid (scare)",
+) -> Path:
+    def arm_of(scenario: str) -> str | None:
+        return {"clean": "A", "microgrid": "B"}.get(
+            _scenario_value(scenario, "kind") or ""
+        )
+
+    return _extension_ab_bar(
+        df,
+        out_path,
+        arm_of=arm_of,
+        label_a="clean",
+        label_b="microgrid",
+        title=title,
+    )
+
+
+def extension_temporal_ab(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "Temporal extensions — paired PWSF, off vs linepack+LTC (scare)",
+) -> Path:
+    def arm_of(scenario: str) -> str | None:
+        on = _scenario_value(scenario, "linepack") in ("True", "true", "1")
+        return "B" if on else "A"
+
+    return _extension_ab_bar(
+        df,
+        out_path,
+        arm_of=arm_of,
+        label_a="no extensions",
+        label_b="linepack+LTC",
+        title=title,
+        oracle_b_col="outcomes__oracle_temporal__priority_weighted_fraction_mean",
+    )
+
+
+def extension_islanding_events(
+    tasks: list[tuple[str, pd.DataFrame]],
+    out_path: Path,
+    *,
+    title: str = (
+        "Islanding evidence — de-energised nodes + islanding events "
+        "(microgrid arm, scare)"
+    ),
+) -> Path:
+    """One line per (label, timeseries) task: ``nodes_deenergised`` (top) and
+    ``islanded_events_cum`` (bottom) over simulation time."""
+    panels = (
+        (1, "nodes_deenergised", "de-energised nodes"),
+        (2, "islanded_events_cum", "cumulative islanding events"),
+    )
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=[p[2] for p in panels],
+    )
+    plotted = False
+    for i, (label, ts) in enumerate(tasks):
+        if ts.empty or "time_s" not in ts.columns:
+            continue
+        color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
+        for row_idx, col, panel_lbl in panels:
+            if col not in ts.columns:
+                continue
+            plotted = True
+            fig.add_trace(
+                go.Scatter(
+                    x=ts["time_s"].astype(float).values,
+                    y=ts[col].astype(float).values,
+                    mode="lines",
+                    # Counts change stepwise at solve boundaries.
+                    line=dict(color=color, width=2, shape="hv"),
+                    name=label,
+                    legendgroup=label,
+                    showlegend=(row_idx == 1),
+                    hovertemplate=(
+                        f"<b>{label}</b><br>{panel_lbl}: %{{y:.0f}}<br>"
+                        "t: %{x:.2f}s<extra></extra>"
+                    ),
+                ),
+                row=row_idx,
+                col=1,
+            )
+    if not plotted:
+        return _save(_empty_fig("no islanding timeseries columns", title), out_path)
+
+    fig.update_yaxes(title="nodes", rangemode="tozero", row=1, col=1)
+    fig.update_yaxes(title="events", rangemode="tozero", row=2, col=1)
+    fig.update_xaxes(title="simulation time (s)", row=2, col=1)
+    return _save(_apply_theme(fig, title=title, height=620, legend_top=True), out_path)
+
+
+def extension_temporal_trajectories(
+    tasks: list[tuple[str, pd.DataFrame, str]],
+    out_path: Path,
+    *,
+    oracle_series: list[tuple[str, list[dict[str, Any]]]] | None = None,
+    title: str = (
+        "Temporal extensions — linepack + LTC temperature over physical time "
+        "(scare, B arm)"
+    ),
+) -> Path:
+    """Per-task ``linepack_total_kg`` (top) and LTC junction temperature
+    mean/min (bottom) against PHYSICAL hours: x = time_s ·
+    physics_time_scale / 3600, with the scale read from each task's scenario
+    key. ``oracle_series`` overlays the receding-horizon oracle's per-step
+    linepack (already in hours) as dashed reference lines."""
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=["gas linepack", "LTC junction temperature"],
+    )
+    plotted = False
+    for i, (label, ts, scenario) in enumerate(tasks):
+        if ts.empty or "time_s" not in ts.columns:
+            continue
+        try:
+            scale = float(_scenario_value(scenario, "physics_time_scale") or 1.0)
+        except ValueError:
+            scale = 1.0
+        x = (ts["time_s"].astype(float) * scale / 3600.0).values
+        color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
+        if "linepack_total_kg" in ts.columns:
+            plotted = True
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=ts["linepack_total_kg"].astype(float).values,
+                    mode="lines",
+                    line=dict(color=color, width=2),
+                    name=label,
+                    legendgroup=label,
+                    hovertemplate=(
+                        f"<b>{label}</b><br>linepack: %{{y:.2f}} kg<br>"
+                        "t: %{x:.2f}h<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=1,
+            )
+        for col, dash, sub_lbl in (
+            ("ltc_junction_t_mean_k", "solid", "mean"),
+            ("ltc_junction_t_min_k", "dot", "min"),
+        ):
+            if col not in ts.columns:
+                continue
+            plotted = True
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=ts[col].astype(float).values,
+                    mode="lines",
+                    line=dict(color=color, width=2, dash=dash),
+                    name=label,
+                    legendgroup=label,
+                    showlegend=False,
+                    hovertemplate=(
+                        f"<b>{label}</b><br>T {sub_lbl}: %{{y:.2f}} K<br>"
+                        "t: %{x:.2f}h<extra></extra>"
+                    ),
+                ),
+                row=2,
+                col=1,
+            )
+    if not plotted:
+        return _save(_empty_fig("no temporal timeseries columns", title), out_path)
+
+    for j, (label, series) in enumerate(oracle_series or []):
+        pts = [
+            (p.get("t_h"), p.get("linepack_total_kg"))
+            for p in series
+            if isinstance(p, dict)
+        ]
+        pts = [(t, v) for t, v in pts if t is not None and v is not None]
+        if not pts:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=[t for t, _ in pts],
+                y=[v for _, v in pts],
+                mode="lines",
+                line=dict(color=_VARIANT_COLOR["oracle"], width=1.6, dash="dash"),
+                opacity=0.8,
+                name="oracle linepack",
+                legendgroup="oracle",
+                showlegend=(j == 0),
+                hovertemplate=(
+                    f"<b>oracle {label}</b><br>linepack: %{{y:.2f}} kg<br>"
+                    "t: %{x:.2f}h<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+
+    # Sentinel entries so the mean/min dash coding is legible from the legend.
+    for dash, name in (("solid", "T mean"), ("dot", "T min")):
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="lines",
+                line=dict(color="#666666", width=2, dash=dash),
+                name=name,
+                legendgroup="linestyle",
+                showlegend=True,
+            ),
+            row=2,
+            col=1,
+        )
+
+    fig.update_yaxes(title="linepack (kg)", row=1, col=1)
+    fig.update_yaxes(title="temperature (K)", row=2, col=1)
+    fig.update_xaxes(title="physical time (h)", row=2, col=1)
+    return _save(_apply_theme(fig, title=title, height=620, legend_top=True), out_path)

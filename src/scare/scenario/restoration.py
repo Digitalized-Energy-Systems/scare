@@ -349,6 +349,9 @@ def create_restoration_scenario_world(
     strategy: SystemStrategy = SystemStrategy.GROUP_TO_CP,
     simulation_duration_s: float = 30.0,
     config: RestorationConfiguration | None = None,
+    physics_time_scale: float | None = None,
+    physics_interval_s: float | None = None,
+    physics_solve_time_limit_s: float | None = None,
 ) -> SimulationWorld:
     priorities = priorities or {}
     config = config or RestorationConfiguration()
@@ -389,6 +392,17 @@ def create_restoration_scenario_world(
     _max_acts = getattr(config, "energy_flow_max_acts", None)
     if _max_acts is not None and hasattr(behavior, "_energy_flow_max_acts"):
         behavior._energy_flow_max_acts = int(_max_acts)
+    # Physics-stepper knobs (scenario-level, not agent-config): map sim seconds
+    # to physical time and force periodic re-solves so temporal extensions
+    # (linepack, LTC) integrate even while agents are quiet.
+    if physics_time_scale is not None and hasattr(behavior, "_physics_time_scale"):
+        behavior._physics_time_scale = float(physics_time_scale)
+    if physics_interval_s is not None and hasattr(behavior, "_physics_interval_s"):
+        behavior._physics_interval_s = float(physics_interval_s)
+    if physics_solve_time_limit_s is not None and hasattr(
+        behavior, "_physics_solve_time_limit_s"
+    ):
+        behavior._physics_solve_time_limit_s = float(physics_solve_time_limit_s)
 
     # Install perturbations before agents register so every send is covered.
     install_perturbation(
@@ -2300,6 +2314,90 @@ def _register_recordings(
         return _freshness_state["t"]
 
     record_world(world, "last_feasible_solve_t", _last_feasible_solve_t)
+
+    # --- Physics-extension trajectories ---
+    # Gated on the scenario actually attaching the extension so standard
+    # campaigns keep their timeseries schema unchanged.
+    ext_names = {type(e).__name__ for e in getattr(monee_net, "extensions", ())}
+
+    def _result_net() -> Any:
+        nr = getattr(behavior, "_net_results", None)
+        return getattr(nr, "network", None)
+
+    if "GasLinepack" in ext_names:
+
+        def _linepack_total_kg() -> float:
+            net = _result_net()
+            if net is None:
+                return 0.0
+            total = 0.0
+            for branch in net.branches:
+                lp = dict(getattr(branch.model, "values", {}) or {}).get(
+                    "linepack_kg"
+                )
+                try:
+                    total += float(lp)
+                except (TypeError, ValueError):
+                    continue
+            return total
+
+        record_world(world, "linepack_total_kg", _linepack_total_kg)
+
+    if "LumpedThermalCapacitance" in ext_names:
+        _water_node_ids = [
+            n.id
+            for n in monee_net.nodes
+            if "water" in str(getattr(n.grid, "name", "") or "").lower()
+        ]
+
+        def _junction_temps() -> list[float]:
+            net = _result_net()
+            if net is None:
+                return []
+            vals: list[float] = []
+            for nid in _water_node_ids:
+                try:
+                    node = net.node_by_id(nid)
+                except Exception:  # noqa: BLE001 — node may be pruned
+                    continue
+                v = dict(getattr(node.model, "values", {}) or {}).get("t_k")
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if v > 0.0:  # de-energised junctions read ~0
+                    vals.append(v)
+            return vals
+
+        def _junction_t_mean_k() -> float:
+            v = _junction_temps()
+            return sum(v) / len(v) if v else 0.0
+
+        def _junction_t_min_k() -> float:
+            v = _junction_temps()
+            return min(v) if v else 0.0
+
+        record_world(world, "ltc_junction_t_mean_k", _junction_t_mean_k)
+        record_world(world, "ltc_junction_t_min_k", _junction_t_min_k)
+
+    if getattr(monee_net, "islanding_config", None) is not None:
+
+        def _nodes_deenergised() -> float:
+            net = _result_net()
+            if net is None:
+                return 0.0
+            return float(
+                sum(1 for n in net.nodes if getattr(n, "ignored", False))
+            )
+
+        def _islanded_events() -> float:
+            st = getattr(behavior, "stepper", None)
+            if st is None:
+                return 0.0
+            return float(sum(1 for c in st.changes if c.kind == "islanded"))
+
+        record_world(world, "nodes_deenergised", _nodes_deenergised)
+        record_world(world, "islanded_events_cum", _islanded_events)
 
     # --- Emergent metrics ---
     # Per-sector event counts read directly from the diagnostics ledger

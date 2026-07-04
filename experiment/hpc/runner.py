@@ -341,11 +341,15 @@ async def _run_simulation(
     # Stash on the net so post-sim metric writers can pick it up.
     net._scare_priorities = priorities
 
+    scenario = task.scenario or {}
     world = create_restoration_scenario_world(
         net,
         priorities=priorities,
         simulation_duration_s=plan.simulation_duration_s,
         config=cfg,
+        physics_time_scale=scenario.get("physics_time_scale"),
+        physics_interval_s=scenario.get("physics_interval_s"),
+        physics_solve_time_limit_s=per_solve_cap,
     )
     # One-shot capture: first failed solve drops a snapshot; disarmed
     # after the task so the next one on this worker gets a fresh window.
@@ -413,6 +417,7 @@ def _run_oracle(
         priorities=priorities,
         baseline_served=baseline_served,
         out_dir=out_dir,
+        simulation_duration_s=plan.simulation_duration_s,
     )
     payload["wallclock_s"] = round(_time.monotonic() - started, 3)
     return net, failures, payload
@@ -493,8 +498,20 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
             promote_all_generators=promote_all,
             grid_former_aids=former_aids,
         )
+        # Islanding solves on the native gurobipy backend, which cannot ingest
+        # the live path's fully nonlinear DHS heat balance — linearise it like
+        # the oracle does. Accepted trade-off: McCormick envelopes can be
+        # tighter than the exact physics, but islanding is unsolvable without.
+        from monee.model.formulation import make_heat_convex_milp_formulation
+
+        net.apply_formulation(
+            make_heat_convex_milp_formulation(
+                num_partitions=16, include_heat_exchangers=False
+            )
+        )
         logger.info(
-            "Applied microgrid scenario: carriers=%s promote_all=%s promoted=%s",
+            "Applied microgrid scenario: carriers=%s promote_all=%s promoted=%s "
+            "(heat McCormick-linearised for the MILP islanding solve)",
             list(carriers),
             promote_all,
             counts,
@@ -710,6 +727,14 @@ def _write_simulation_outputs(
         behavior.flush_energy_flow()
     except AttributeError:
         logger.debug("Behavior has no flush_energy_flow() — skipping")
+    # Stepper change log: topology mutations + solver-decided islanding events
+    # ('islanded'/'rejoined'), the primary islanding-extension evidence.
+    try:
+        changes_df = behavior.network_changes_df()
+        if changes_df is not None and len(changes_df):
+            changes_df.to_csv(out_dir / "network_changes.csv", index=False)
+    except Exception as exc:  # noqa: BLE001 — diagnostics only, never fatal
+        logger.warning("network_changes.csv not written: %s", exc)
     priorities = getattr(net, "_scare_priorities", None)
     payload = compose_result(
         world=world,

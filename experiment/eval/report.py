@@ -101,7 +101,12 @@ def _functional_baseline(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 
 def _optimality_gap(campaign: CampaignData, out_dir: Path) -> list[str]:
-    sub = _completed_sims(campaign.by_experiment("optimality_gap"))
+    # Pool EVERY completed run, not just the dedicated ``optimality_gap``
+    # experiment: the scatter/box pair scare vs oracle on task identity
+    # (experiment, grid, seed, scenario) and drop unpaired rows, so pooling
+    # all experiments that ran both variants integrates every grid family into
+    # one figure instead of the single S1 optimality-gap sweep.
+    sub = _completed_sims(campaign.summary)
     if sub.empty:
         return []
     return [
@@ -315,6 +320,67 @@ def _sweeps(campaign: CampaignData, out_dir: Path) -> list[str]:
                     sweep_param=param,
                     x_label=label,
                     title=title,
+                )
+            )
+        )
+    return figs
+
+
+def _extensions(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Extension campaign: paired A/B PWSF per (grid, seed) for the islanding
+    MILP (clean vs microgrid) and the temporal physics extensions (off vs
+    linepack+LTC), plus the per-task evidence trajectories (de-energised
+    nodes / islanding events; linepack + LTC temperature over physical
+    hours with the oracle's per-step linepack as reference)."""
+    if not any(e.startswith("extension_") for e in campaign.experiments()):
+        return []
+    figs: list[str] = []
+
+    isl = _completed_sims(campaign.by_experiment("extension_islanding"))
+    if not isl.empty:
+        figs.append(
+            str(plots.extension_islanding_ab(isl, out_dir / "islanding_ab.png"))
+        )
+        micro = isl[
+            (isl["variant"] == "scare")
+            & isl["scenario"].str.contains("kind=microgrid", na=False)
+        ]
+        tasks = []
+        for _, row in micro.sort_values("seed").iterrows():
+            task = campaign.task(int(row["task_id"]))
+            tasks.append((f"seed {task.seed}", task.timeseries))
+        figs.append(
+            str(
+                plots.extension_islanding_events(
+                    tasks, out_dir / "islanding_events.png"
+                )
+            )
+        )
+
+    tmp = _completed_sims(campaign.by_experiment("extension_temporal"))
+    if not tmp.empty:
+        figs.append(
+            str(plots.extension_temporal_ab(tmp, out_dir / "temporal_ab.png"))
+        )
+        b_arm = tmp[tmp["scenario"].str.contains("linepack=True", na=False)]
+        tasks = []
+        for _, row in b_arm[b_arm["variant"] == "scare"].sort_values("seed").iterrows():
+            task = campaign.task(int(row["task_id"]))
+            tasks.append((f"seed {task.seed}", task.timeseries, task.scenario))
+        oracle_series = []
+        for _, row in b_arm[b_arm["variant"] == "oracle"].sort_values("seed").iterrows():
+            task = campaign.task(int(row["task_id"]))
+            series = (
+                (task.result.get("outcomes") or {}).get("oracle_temporal") or {}
+            ).get("series") or []
+            if series:
+                oracle_series.append((f"seed {task.seed}", series))
+        figs.append(
+            str(
+                plots.extension_temporal_trajectories(
+                    tasks,
+                    out_dir / "temporal_trajectories.png",
+                    oracle_series=oracle_series,
                 )
             )
         )
@@ -726,6 +792,8 @@ def _missing_experiment_sections(
         "cooldown_sweep",
         "ttl_sweep",
         "holon_size_sweep",
+        "extension_islanding",
+        "extension_temporal",
     }
     ablation_exps = set(_ablation_experiments(campaign))
     done = _completed_sims(df)
@@ -898,6 +966,11 @@ def generate_report(
         ("Cascading", _cascading, "cascading"),
         ("Sensitivity sweeps", _sweeps, "sweeps"),
         ("Restoration vs baseline", _restoration, "restoration"),
+        (
+            "Extensions — islanding + temporal physics (paired A/B)",
+            _extensions,
+            "extensions",
+        ),
         ("Claims (overall)", _claims, "claims"),
         ("Solver health", _solver_health, "solver_health"),
         ("Constraints", _constraints, "constraints"),

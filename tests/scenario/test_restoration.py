@@ -25,13 +25,34 @@ class _FakeEnergyFlowResult:
         self.network = net
 
 
+class _FakeStepResult:
+    def __init__(self, net):
+        self.failed = False
+        self.error = None
+        self.result = _FakeEnergyFlowResult(net)
+
+
+class _FakeStepper:
+    """Pass-through stepper: every step 'solves' to the live net unchanged."""
+
+    def __init__(self, net):
+        self._net = net
+        self.changes = []
+
+    def step(self, dt_h, **kwargs):
+        return _FakeStepResult(self._net)
+
+    def changes_df(self):
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _stub_energyflow(monkeypatch):
-    """Replace energyflow with a pass-through stub to avoid GEKKO dependency."""
+    """Replace the physics stepper with a pass-through stub — no solver needed."""
     monkeypatch.setattr(
         _restoration_mod,
-        "energyflow",
-        lambda net: _FakeEnergyFlowResult(net),
+        "create_physics_stepper",
+        lambda net, **kwargs: _FakeStepper(net),
     )
 
 

@@ -69,6 +69,15 @@ def _summarize_net(net: Any) -> dict[str, Any]:
 
 
 def _summarize_result(result: Any) -> dict[str, Any]:
+    if getattr(result, "failed", False):
+        # monee StepResult from a skipped step: the solver raised (or reported
+        # unsuccessful) and only the exception survives.
+        return {
+            "success": False,
+            "objective": None,
+            "termination_condition": "step_failed",
+            "report": _stringify(getattr(result, "error", None))[:2000],
+        }
     return {
         "success": bool(getattr(result, "success", False)),
         "objective": _to_float(getattr(result, "objective", None)),
@@ -118,12 +127,26 @@ def _capture(behavior: Any, candidate: Any, sim_time: float) -> None:
         logger.warning("infeasibility snapshot failed: %s", exc)
 
 
+def _current_sim_time(behavior: Any) -> float:
+    clock_ref = _CaptureCtx.get("clock_ref")
+    if clock_ref is not None and hasattr(clock_ref, "time"):
+        return float(clock_ref.time)
+    if behavior is not None and hasattr(behavior, "_last_energy_flow_t"):
+        return float(behavior._last_energy_flow_t)
+    return 0.0
+
+
 def arm_infeasibility_capture(
     behavior: Any,
     out_path: Path | str,
     clock: Any = None,
 ) -> None:
-    """Install the wrapped ``energyflow`` for the next run.
+    """Install the capture wrapper for the next run.
+
+    Stepper-based behaviors expose ``_solve_physics`` — that per-instance
+    seam is wrapped directly (a fresh behavior per task makes unpatching
+    unnecessary). Older behaviors fall back to the module-level
+    ``energyflow`` monkey-patch.
 
     ``behavior`` supplies the ``_net`` to sample; ``out_path``'s parent
     must exist. ``clock`` (if given) is preferred for ``sim_time_s``: the
@@ -133,6 +156,39 @@ def arm_infeasibility_capture(
     _CaptureCtx["captured"] = False
     _CaptureCtx["out_path"] = str(out_path)
     _CaptureCtx["clock_ref"] = clock
+    _CaptureCtx["behavior_ref"] = behavior
+
+    solve = getattr(behavior, "_solve_physics", None)
+    if solve is not None:
+
+        def _wrapped_step(dt_h, _orig=solve):
+            try:
+                n_childs = len(behavior._net.childs)
+            except Exception:  # noqa: BLE001
+                n_childs = "?"
+            with optimization("energyflow", solver="gurobi", n_childs=n_childs):
+                step_result = _orig(dt_h)
+            try:
+                result = getattr(step_result, "result", None)
+                failed = (
+                    step_result is None
+                    or getattr(step_result, "failed", False)
+                    or not bool(getattr(result, "success", True))
+                )
+                if _CaptureCtx["armed"] and not _CaptureCtx["captured"] and failed:
+                    _capture(
+                        behavior,
+                        result if result is not None else step_result,
+                        _current_sim_time(behavior),
+                    )
+                    _CaptureCtx["captured"] = True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("infeasibility wrapper post-hook failed: %s", exc)
+            return step_result
+
+        behavior._solve_physics = _wrapped_step
+        return
+
     if _CaptureCtx.get("original") is None:
         _CaptureCtx["original"] = _host.energyflow
 

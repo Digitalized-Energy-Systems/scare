@@ -25,6 +25,7 @@ from monee.problem import (
     WEIGHT_DEMAND,
     create_min_load_shedding_problem,
 )
+from monee.simulation import Stepper
 from monee.solver.gurobipy import GurobipySolver
 
 from experiment.eval.claims import heat_priority_from_rows
@@ -363,22 +364,47 @@ def _adapter_observe(monee_net: Any) -> Any:
     return _OracleBehavior()
 
 
-def run_oracle(
-    monee_net: Any,
-    failures: list[Any],
-    *,
-    solver: Any = None,
-    priorities: dict[str, int] | None = None,
+def _oracle_failure_payload(
+    reason: str, solver_stats: dict[str, Any]
 ) -> dict[str, Any]:
-    """Solve minimal load shedding on the post-failure network.
+    """NaN-metric payload for a solve with no usable incumbent (the
+    excluded-task convention downstream)."""
+    nan = float("nan")
+    return {
+        "served": {
+            "by_tier_sector": {},
+            "by_sector": {},
+            "by_tier": {},
+            "priority_weighted_fraction_by_sector": {},
+            "priority_weighted_served": nan,
+            "priority_weighted_demand": nan,
+            "priority_weighted_fraction": nan,
+            "n_loads": nan,
+            "n_loads_served_zero": nan,
+        },
+        "constraint_violation_integral": {
+            "electricity": nan,
+            "gas": nan,
+            "heat": nan,
+        },
+        "constraint_violations_final": {},
+        "regulations": {},
+        "lp_success": False,
+        "failure_reason": reason,
+        "solver_stats": solver_stats,
+        "slack_budget_summary": {},
+        "solved_net": None,
+        "behavior": None,
+    }
 
-    Returns a dict with the optimal regulation per child + the served
-    breakdown, in the same shape the scare result composer uses.
+
+def _build_min_shed_problem(
+    monee_net: Any,
+    priorities: dict[str, int] | None,
+) -> Any:
+    """Apply the oracle formulations to *monee_net* (in place) and build the
+    min-load-shedding problem both the one-shot and the temporal oracle solve.
     """
-    # ``create_min_load_shedding_problem`` is exposed only via the submodule
-    # ``monee.problem`` (filtered out of the top-level ``monee`` namespace).
-    _apply_failures(monee_net, failures)
-
     # Linearise the district-heating temperature physics for the oracle solve
     # only. The factory leaves DHS in its full nonlinear form; with the binary
     # ``on_off`` decision var on reconfiguration-grid backup branches, the
@@ -484,6 +510,25 @@ def run_oracle(
                 }
             ),
         )
+    return prob
+
+
+def run_oracle(
+    monee_net: Any,
+    failures: list[Any],
+    *,
+    solver: Any = None,
+    priorities: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Solve minimal load shedding on the post-failure network.
+
+    Returns a dict with the optimal regulation per child + the served
+    breakdown, in the same shape the scare result composer uses.
+    """
+    # ``create_min_load_shedding_problem`` is exposed only via the submodule
+    # ``monee.problem`` (filtered out of the top-level ``monee`` namespace).
+    _apply_failures(monee_net, failures)
+    prob = _build_min_shed_problem(monee_net, priorities)
     logger.info(
         "oracle: solving min-load-shedding LP on net (%d childs, %d branches)",
         len(monee_net.childs),
@@ -522,33 +567,7 @@ def run_oracle(
         if report is not None:
             reason = f"{reason}; {report!r}"
         logger.error("oracle: %s", reason)
-        nan = float("nan")
-        return {
-            "served": {
-                "by_tier_sector": {},
-                "by_sector": {},
-                "by_tier": {},
-                "priority_weighted_fraction_by_sector": {},
-                "priority_weighted_served": nan,
-                "priority_weighted_demand": nan,
-                "priority_weighted_fraction": nan,
-                "n_loads": nan,
-                "n_loads_served_zero": nan,
-            },
-            "constraint_violation_integral": {
-                "electricity": nan,
-                "gas": nan,
-                "heat": nan,
-            },
-            "constraint_violations_final": {},
-            "regulations": {},
-            "lp_success": False,
-            "failure_reason": reason,
-            "solver_stats": solver_stats,
-            "slack_budget_summary": {},
-            "solved_net": None,
-            "behavior": None,
-        }
+        return _oracle_failure_payload(reason, solver_stats)
 
     solved_net = getattr(result, "network", monee_net)
     behavior = _adapter_observe(solved_net)
@@ -575,6 +594,146 @@ def run_oracle(
         "slack_budget_summary": slack_summary,
         "solved_net": solved_net,
         "behavior": behavior,
+    }
+
+
+def run_temporal_oracle(
+    monee_net: Any,
+    failures: list[Any],
+    *,
+    n_steps: int,
+    dt_h: float,
+    solver: Any = None,
+    priorities: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Receding min-load-shedding oracle over the physical horizon the
+    Stepper-based environment integrates.
+
+    Solves the same problem as :func:`run_oracle`, but as ``n_steps`` monee
+    Stepper steps of ``dt_h`` hours with inter-step state (gas linepack, LTC
+    thermal mass) carried between solves, so the oracle can exploit the
+    temporal flexibility the extensions add. Receding = non-anticipative:
+    each step optimises the current state only, matching the information the
+    MAS has (a full-horizon plan would be a clairvoyant, unfairly tight
+    bound).
+
+    Result shape matches :func:`run_oracle` — structural breakdowns are read
+    from the final step — plus a ``temporal`` sub-dict with per-step series
+    (priority-weighted served fraction, total linepack).
+    """
+    _apply_failures(monee_net, failures)
+    prob = _build_min_shed_problem(monee_net, priorities)
+    if solver is None:
+        # Tighter per-step cap than the one-shot oracle's 300 s: the horizon
+        # multiplies it by n_steps, and the temporal experiments run on the
+        # small LV grid where each step solves in seconds.
+        solver = _OracleGurobiSolver(params={"TimeLimit": 60})
+    logger.info(
+        "temporal oracle: %d steps x %.3f h on net (%d childs, %d branches)",
+        n_steps,
+        dt_h,
+        len(monee_net.childs),
+        len(monee_net.branches),
+    )
+    stepper = Stepper(
+        monee_net,
+        solver=solver,
+        optimization_problem=prob,
+        on_step_error="skip",
+        max_history=2,
+        exclude_unconnected_nodes=True,
+    )
+    series: list[dict[str, Any]] = []
+    pwsf_values: list[float] = []
+    last: tuple[Any, Any] | None = None
+    last_stats: dict[str, Any] = {}
+    for i in range(int(n_steps)):
+        step_result = stepper.step(float(dt_h))
+        result = getattr(step_result, "result", None)
+        ok = not getattr(step_result, "failed", False) and bool(
+            getattr(result, "success", True)
+        )
+        if not ok:
+            series.append(
+                {
+                    "step": i,
+                    "t_h": (i + 1) * float(dt_h),
+                    "success": False,
+                    "error": str(getattr(step_result, "error", ""))[:500],
+                }
+            )
+            continue
+        solved = result.network
+        behavior = _adapter_observe(solved)
+        step_served = served_breakdown(solved, behavior, priorities=priorities)
+        linepack_total = 0.0
+        for branch in solved.branches:
+            lp = dict(getattr(branch.model, "values", {}) or {}).get("linepack_kg")
+            try:
+                linepack_total += float(lp)
+            except (TypeError, ValueError):
+                continue
+        pwsf = float(step_served["priority_weighted_fraction"])
+        pwsf_values.append(pwsf)
+        series.append(
+            {
+                "step": i,
+                "t_h": (i + 1) * float(dt_h),
+                "success": True,
+                "priority_weighted_fraction": pwsf,
+                "linepack_total_kg": linepack_total,
+            }
+        )
+        last = (solved, behavior)
+        last_stats = dict(getattr(solver, "solve_stats", None) or {})
+
+    n_failed = sum(1 for s in series if not s["success"])
+    temporal = {
+        "n_steps": int(n_steps),
+        "dt_h": float(dt_h),
+        "horizon_h": int(n_steps) * float(dt_h),
+        "n_failed_steps": n_failed,
+        "priority_weighted_fraction_mean": (
+            sum(pwsf_values) / len(pwsf_values) if pwsf_values else float("nan")
+        ),
+        "priority_weighted_fraction_min": (
+            min(pwsf_values) if pwsf_values else float("nan")
+        ),
+        "series": series,
+    }
+
+    if last is None:
+        reason = f"temporal oracle: all {n_steps} steps failed"
+        logger.error(reason)
+        out = _oracle_failure_payload(reason, last_stats)
+        out["temporal"] = temporal
+        return out
+
+    solved_net, behavior = last
+    served = served_breakdown(solved_net, behavior, priorities=priorities)
+    regulations = {
+        f"child-{c.id}": float(
+            (c.model.values if hasattr(c.model, "values") else {}).get(
+                "regulation", 1.0
+            )
+        )
+        for c in solved_net.childs
+    }
+    return {
+        "served": served,
+        "constraint_violation_integral": {
+            "electricity": 0.0,
+            "gas": 0.0,
+            "heat": 0.0,
+        },
+        "constraint_violations_final": constraint_violations_final(solved_net),
+        "regulations": regulations,
+        "lp_success": True,
+        "solver_stats": last_stats,
+        "slack_budget_summary": _slack_budget_summary(solved_net),
+        "solved_net": solved_net,
+        "behavior": behavior,
+        "temporal": temporal,
     }
 
 
@@ -695,6 +854,7 @@ def compose_oracle_result(
     priorities: dict[str, int] | None = None,
     baseline_served: dict[str, Any] | None = None,
     out_dir: Path | None = None,
+    simulation_duration_s: float | None = None,
 ) -> dict[str, Any]:
     """Build a result.json payload identical in shape to the scare
     composer so the aggregator can read both off the same schema.
@@ -703,8 +863,29 @@ def compose_oracle_result(
     ``served_by_load.csv`` (the per-load detail the MAS variants emit) so the
     report can compare SCARE against the oracle per (sector, tier, load) and the
     oracle-relative ``heat_priority`` diagnostic can be calibrated.
+
+    Scenarios carrying temporal extensions (``linepack``/``ltc``) plus the
+    physics-stepping keys (``physics_time_scale``, ``physics_interval_s``)
+    route to :func:`run_temporal_oracle` on the same step grid the MAS
+    environment integrates, so both sides face the same temporal physics.
     """
-    out = run_oracle(monee_net, failures, solver=solver, priorities=priorities)
+    scenario = (task_meta or {}).get("scenario") or {}
+    temporal_requested = bool(scenario.get("linepack") or scenario.get("ltc"))
+    physics_interval_s = scenario.get("physics_interval_s")
+    if temporal_requested and physics_interval_s and simulation_duration_s:
+        time_scale = float(scenario.get("physics_time_scale", 1.0))
+        dt_h = float(physics_interval_s) * time_scale / 3600.0
+        n_steps = max(1, round(float(simulation_duration_s) / float(physics_interval_s)))
+        out = run_temporal_oracle(
+            monee_net,
+            failures,
+            n_steps=n_steps,
+            dt_h=dt_h,
+            solver=solver,
+            priorities=priorities,
+        )
+    else:
+        out = run_oracle(monee_net, failures, solver=solver, priorities=priorities)
     served = out["served"]
     integral = out["constraint_violation_integral"]
     solver_stats = out.get("solver_stats", {})
@@ -747,6 +928,11 @@ def compose_oracle_result(
                 "oracle_solver_stats": solver_stats,
                 "oracle_solve_optimal": False,
                 "slack_budget_summary": {},
+                **(
+                    {"oracle_temporal": out["temporal"]}
+                    if "temporal" in out
+                    else {}
+                ),
             },
             "claims": {
                 "slack_budget_compliance": failed_claim,
@@ -826,12 +1012,24 @@ def compose_oracle_result(
         },
     }
 
+    extension_outcomes: dict[str, Any] = {}
+    if "temporal" in out:
+        extension_outcomes["oracle_temporal"] = out["temporal"]
+    if getattr(monee_net, "islanding_config", None) is not None:
+        extension_outcomes["oracle_islanding"] = {
+            "enabled": True,
+            "nodes_deenergised": sum(
+                1 for n in solved_net.nodes if getattr(n, "ignored", False)
+            ),
+        }
+
     return {
         "task": task_meta,
         "wallclock_s": wallclock_s,
         "completed": True,
         "sim_time_final": 0.0,  # one-shot — no sim trajectory
         "outcomes": {
+            **extension_outcomes,
             "priority_weighted_demand": served["priority_weighted_demand"],
             "priority_weighted_served": served["priority_weighted_served"],
             "priority_weighted_fraction": served["priority_weighted_fraction"],

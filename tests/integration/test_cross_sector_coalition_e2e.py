@@ -40,12 +40,31 @@ class _FakeEnergyFlowResult:
         self.network = net
 
 
+class _FakeStepResult:
+    def __init__(self, net):
+        self.failed = False
+        self.error = None
+        self.result = _FakeEnergyFlowResult(net)
+
+
+class _FakeStepper:
+    def __init__(self, net):
+        self._net = net
+        self.changes = []
+
+    def step(self, dt_h, **kwargs):
+        return _FakeStepResult(self._net)
+
+    def changes_df(self):
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _stub_energyflow(monkeypatch):
     monkeypatch.setattr(
         _restoration_mod,
-        "energyflow",
-        lambda net: _FakeEnergyFlowResult(net),
+        "create_physics_stepper",
+        lambda net, **kwargs: _FakeStepper(net),
     )
 
 
