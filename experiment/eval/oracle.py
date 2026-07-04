@@ -30,6 +30,7 @@ from monee.solver.gurobipy import GurobipySolver
 
 from experiment.eval.claims import heat_priority_from_rows
 from experiment.eval.metrics import (
+    _is_deenergised,
     constraint_violations_final,
     cp_generation_breakdown,
     restoration_breakdown,
@@ -364,6 +365,21 @@ def _adapter_observe(monee_net: Any) -> Any:
     return _OracleBehavior()
 
 
+def apply_oracle_heat_linearisation(net: Any) -> None:
+    """Apply the McCormick-DHS heat MILP with the oracle's exact settings.
+
+    Shared with the runner's live-net linearisation (islanding scenarios and
+    ``heat_mccormick`` arms) so the live physics can never drift from the
+    oracle physics it is A/B-compared against.
+    """
+    net.apply_formulation(
+        make_heat_convex_milp_formulation(
+            num_partitions=_ORACLE_MCCORMICK_PARTITIONS,
+            include_heat_exchangers=False,
+        )
+    )
+
+
 def _oracle_failure_payload(
     reason: str, solver_stats: dict[str, Any]
 ) -> dict[str, Any]:
@@ -414,12 +430,7 @@ def _build_min_shed_problem(
     # solve with backup lines intact, comparable to SCARE. Applied here, not in
     # the factory, so only the oracle LP is affected; the net is oracle-dedicated
     # so the in-place swap is safe.
-    monee_net.apply_formulation(
-        make_heat_convex_milp_formulation(
-            num_partitions=_ORACLE_MCCORMICK_PARTITIONS,
-            include_heat_exchangers=False,
-        )
-    )
+    apply_oracle_heat_linearisation(monee_net)
     monee_net.apply_formulation(
         GAS_NONCONVEX_MIQCQP_FORMULATION
     )
@@ -572,26 +583,34 @@ def run_oracle(
     solved_net = getattr(result, "network", monee_net)
     behavior = _adapter_observe(solved_net)
     served = served_breakdown(solved_net, behavior, priorities=priorities)
+    return _oracle_success_payload(solved_net, behavior, served, solver_stats)
 
-    integral = {"electricity": 0.0, "gas": 0.0, "heat": 0.0}
 
+def _oracle_success_payload(
+    solved_net: Any,
+    behavior: Any,
+    served: dict[str, Any],
+    solver_stats: dict[str, Any],
+) -> dict[str, Any]:
+    """Shared success-result shape for the one-shot and temporal oracles —
+    one place so the two row schemas cannot drift."""
     regulations: dict[str, float] = {}
     for child in solved_net.childs:
         vals = child.model.values if hasattr(child.model, "values") else {}
         regulations[f"child-{child.id}"] = float(vals.get("regulation", 1.0))
 
-    slack_summary = _slack_budget_summary(solved_net)
-
-    constraints_final = constraint_violations_final(solved_net)
-
     return {
         "served": served,
-        "constraint_violation_integral": integral,
-        "constraint_violations_final": constraints_final,
+        "constraint_violation_integral": {
+            "electricity": 0.0,
+            "gas": 0.0,
+            "heat": 0.0,
+        },
+        "constraint_violations_final": constraint_violations_final(solved_net),
         "regulations": regulations,
-        "lp_success": lp_success,
+        "lp_success": True,
         "solver_stats": solver_stats,
-        "slack_budget_summary": slack_summary,
+        "slack_budget_summary": _slack_budget_summary(solved_net),
         "solved_net": solved_net,
         "behavior": behavior,
     }
@@ -645,14 +664,16 @@ def run_temporal_oracle(
     )
     series: list[dict[str, Any]] = []
     pwsf_values: list[float] = []
-    last: tuple[Any, Any] | None = None
+    last: tuple[Any, Any, dict[str, Any]] | None = None
     last_stats: dict[str, Any] = {}
+    final_ok = False
     for i in range(int(n_steps)):
         step_result = stepper.step(float(dt_h))
         result = getattr(step_result, "result", None)
         ok = not getattr(step_result, "failed", False) and bool(
             getattr(result, "success", True)
         )
+        final_ok = ok
         if not ok:
             series.append(
                 {
@@ -684,7 +705,7 @@ def run_temporal_oracle(
                 "linepack_total_kg": linepack_total,
             }
         )
-        last = (solved, behavior)
+        last = (solved, behavior, step_served)
         last_stats = dict(getattr(solver, "solve_stats", None) or {})
 
     n_failed = sum(1 for s in series if not s["success"])
@@ -702,37 +723,26 @@ def run_temporal_oracle(
         "series": series,
     }
 
-    if last is None:
-        reason = f"temporal oracle: all {n_steps} steps failed"
+    if last is None or not final_ok:
+        # No end-of-horizon state: grading the last mid-horizon success as the
+        # final result would report an easier (e.g. pre-linepack-depletion)
+        # state as the oracle bound. NaN metrics = excluded-task convention.
+        reason = (
+            f"temporal oracle: all {n_steps} steps failed"
+            if last is None
+            else (
+                f"temporal oracle: final step failed ({n_failed}/{n_steps} "
+                "steps failed) — end-of-horizon state unknown"
+            )
+        )
         logger.error(reason)
         out = _oracle_failure_payload(reason, last_stats)
         out["temporal"] = temporal
         return out
 
-    solved_net, behavior = last
-    served = served_breakdown(solved_net, behavior, priorities=priorities)
-    regulations = {
-        f"child-{c.id}": float(
-            (c.model.values if hasattr(c.model, "values") else {}).get(
-                "regulation", 1.0
-            )
-        )
-        for c in solved_net.childs
-    }
+    solved_net, behavior, served = last
     return {
-        "served": served,
-        "constraint_violation_integral": {
-            "electricity": 0.0,
-            "gas": 0.0,
-            "heat": 0.0,
-        },
-        "constraint_violations_final": constraint_violations_final(solved_net),
-        "regulations": regulations,
-        "lp_success": True,
-        "solver_stats": last_stats,
-        "slack_budget_summary": _slack_budget_summary(solved_net),
-        "solved_net": solved_net,
-        "behavior": behavior,
+        **_oracle_success_payload(solved_net, behavior, served, last_stats),
         "temporal": temporal,
     }
 
@@ -817,7 +827,12 @@ def compute_baseline_served(
             )
         slack_budget_pct = scenario.get("slack_budget_pct")
         if slack_budget_pct is not None:
-            apply_slack_budget(fresh, float(slack_budget_pct))
+            hard_cap = scenario.get("slack_hard_cap_carriers")
+            apply_slack_budget(
+                fresh,
+                float(slack_budget_pct),
+                hard_cap_carriers=tuple(hard_cap) if hard_cap else None,
+            )
     # No-failure baseline: the backup tie-lines are normally-open and there is
     # nothing to reroute around, so fix them open for THIS solve and clear the
     # ``backup`` flag so ``controllable_backup_lines`` does not promote ``on_off``
@@ -872,7 +887,8 @@ def compose_oracle_result(
     scenario = (task_meta or {}).get("scenario") or {}
     temporal_requested = bool(scenario.get("linepack") or scenario.get("ltc"))
     physics_interval_s = scenario.get("physics_interval_s")
-    if temporal_requested and physics_interval_s and simulation_duration_s:
+    interval_ok = physics_interval_s is not None and float(physics_interval_s) > 0
+    if temporal_requested and interval_ok and simulation_duration_s:
         time_scale = float(scenario.get("physics_time_scale", 1.0))
         dt_h = float(physics_interval_s) * time_scale / 3600.0
         n_steps = max(1, round(float(simulation_duration_s) / float(physics_interval_s)))
@@ -885,6 +901,16 @@ def compose_oracle_result(
             priorities=priorities,
         )
     else:
+        if temporal_requested:
+            # The env still integrates temporal physics for these scenarios —
+            # a one-shot bound is not like-for-like, so make the fallback loud.
+            logger.warning(
+                "temporal extensions requested (linepack/ltc) but "
+                "physics_interval_s=%r / simulation_duration_s=%r do not "
+                "define a step grid — falling back to the ONE-SHOT oracle.",
+                physics_interval_s,
+                simulation_duration_s,
+            )
         out = run_oracle(monee_net, failures, solver=solver, priorities=priorities)
     served = out["served"]
     integral = out["constraint_violation_integral"]
@@ -1016,10 +1042,14 @@ def compose_oracle_result(
     if "temporal" in out:
         extension_outcomes["oracle_temporal"] = out["temporal"]
     if getattr(monee_net, "islanding_config", None) is not None:
+        # Count both static pruning (.ignored) and MILP e=0 decisions — the
+        # latter never sets .ignored (see metrics._is_deenergised).
         extension_outcomes["oracle_islanding"] = {
             "enabled": True,
             "nodes_deenergised": sum(
-                1 for n in solved_net.nodes if getattr(n, "ignored", False)
+                1
+                for n in solved_net.nodes
+                if getattr(n, "ignored", False) or _is_deenergised({}, n)
             ),
         }
 

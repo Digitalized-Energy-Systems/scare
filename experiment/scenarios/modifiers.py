@@ -130,16 +130,26 @@ def apply_temporal_extensions(
     linepack: bool = False,
     ltc: bool = False,
     ltc_default_t_init: float | None = None,
+    ltc_first_step_steady_state: bool = False,
 ) -> dict[str, int]:
     """Attach monee's temporal-storage extensions to *mes*.
 
     ``GasLinepack`` (per-pipe ``linepack_kg`` / ``net_pack_kgs`` vars) and
     ``LumpedThermalCapacitance`` (per-water-junction ρ·V thermal mass)
-    only activate their dynamics in monee's timeseries solver; the
-    single-step ``energyflow`` used here pins ``net_pack_kgs = 0`` and
-    emits no LTC inertia term. Attaching them is thus an agent-side
-    compatibility check (agents must tolerate the augmented obs schema),
-    not a flexibility benchmark.
+    activate their inter-step dynamics under monee's ``Stepper`` (the
+    persistent physics stepper this campaign drives). The single-step
+    ``energyflow`` path pins ``net_pack_kgs = 0`` and emits no LTC inertia
+    term, so under it attaching them is only an obs-schema compatibility
+    check.
+
+    ``ltc_first_step_steady_state`` drops the LTC inertia equation on the
+    FIRST step (emits ``net_heat == 0`` instead), so the first solve settles
+    the junctions onto the network's steady-state thermal field before
+    inertia kicks in on step 2. Without it, every LTC junction cold-starts at
+    the ``t_pu`` per-unit default (≈ reference temperature) regardless of the
+    real supply temperature, which then reads as an instantaneous temperature
+    collapse rather than thermal inertia. MIP-backend only (the campaign's
+    stepper resolves to gurobipy, which satisfies this).
 
     Returns ``{"linepack_pipes": n, "ltc_junctions": n}`` so the caller
     can confirm the extension found something to attach to.
@@ -156,7 +166,7 @@ def apply_temporal_extensions(
             pass
         counters["linepack_pipes"] = len(getattr(ext, "_active_branches", ()))
     if ltc:
-        kwargs: dict = {}
+        kwargs: dict = {"first_step_steady_state": bool(ltc_first_step_steady_state)}
         if ltc_default_t_init is not None:
             kwargs["default_t_init"] = float(ltc_default_t_init)
         ext = LumpedThermalCapacitance(**kwargs)
@@ -169,12 +179,27 @@ def apply_temporal_extensions(
     return counters
 
 
-def apply_slack_budget(mes, fraction: float) -> None:
+def apply_slack_budget(
+    mes,
+    fraction: float,
+    *,
+    hard_cap_carriers: "tuple[str, ...] | list[str] | set[str] | None" = None,
+) -> None:
     """Register the operator's slack budget on the slack agents.
 
     The slack budget is a soft target the MAS enforces, not a hard LP
     bound (which could make the energy-flow LP infeasible after a failure
-    shifts the imbalance). Steps:
+    shifts the imbalance).
+
+    ``hard_cap_carriers`` (subset of ``{"electricity", "gas"}``) makes the
+    budget a HARD LP import cap for those carriers instead of the wide
+    feasibility envelope: the slack can supply at most ``budget`` and any
+    deficit above it must come from stored energy (gas linepack) or be shed.
+    This is what turns the temporal experiment's gas linepack into a
+    load-bearing lever — with the soft budget the physics just backfills from
+    the unbounded slack and the pack never moves. Use only where a storage
+    extension can cover the transient; too tight a cap starves the pack and
+    the gas LP goes infeasible. Steps:
 
     1. Compute the operator budget per sector from nominal load (plus
        injection) magnitudes.
@@ -253,6 +278,7 @@ def apply_slack_budget(mes, fraction: float) -> None:
         total_gas_mass_kgs + total_gas_source_kgs + total_gas_conv_kgs,
     )
 
+    hard = frozenset(hard_cap_carriers or ())
     for child in mes.childs:
         m = child.model
         if (
@@ -260,10 +286,12 @@ def apply_slack_budget(mes, fraction: float) -> None:
             and hasattr(m, "p_mw")
             and hasattr(m.p_mw, "min")
         ):
-            # Wide LP envelope keeps the solve feasible under any
-            # failure-induced imbalance; the MAS owns the soft target.
+            # Hard-cap carriers pin the import bound at the budget so a deficit
+            # must draw storage or shed; others keep the wide feasibility
+            # envelope and let the MAS own the soft target.
+            p_import_cap = cap_p_mw if "electricity" in hard else lp_p_mw
             m.p_mw.min = -lp_p_mw
-            m.p_mw.max = lp_p_mw
+            m.p_mw.max = p_import_cap
             # Soft target the MAS drives toward.
             m._scare_slack_budget_mw = cap_p_mw
         elif (
@@ -278,7 +306,13 @@ def apply_slack_budget(mes, fraction: float) -> None:
             except Exception:
                 grid_name = ""
             if "gas" in grid_name:
-                m.mass_flow_kgs.min = -lp_gas_mass_kgs
+                # The gas ExtHydrGrid SUPPLIES at negative mass_flow (import is
+                # the -min direction; positive is withdrawal-from-network), the
+                # opposite of the power slack. Hard-cap the supply magnitude on
+                # the min side; leave the positive side wide so a surplus can
+                # always be dumped without infeasibility.
+                gas_supply_cap = cap_gas_mass_kgs if "gas" in hard else lp_gas_mass_kgs
+                m.mass_flow_kgs.min = -gas_supply_cap
                 m.mass_flow_kgs.max = lp_gas_mass_kgs
                 m._scare_slack_budget_kgs = cap_gas_mass_kgs
             # heat-side ExtHydrGrid left unbounded

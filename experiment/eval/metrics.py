@@ -60,16 +60,48 @@ def _tier_weight(tier: int) -> float:
 
 
 def _disconnected_node_ids(monee_net: Any) -> set[int]:
-    """Node IDs with no path to any grid-forming component (ExtPowerGrid /
-    ExtHydrGrid) through the active branch topology. Their loads are
-    physically un-servable and must count as zero served, regardless of what
-    the LP or agents report (a disconnected load can otherwise keep a default
-    regulation of 1.0 and report ``served = cap``).
+    """Node IDs with no path to any grid-forming component through the active
+    branch topology. Their loads are physically un-servable and must count as
+    zero served, regardless of what the LP or agents report (a disconnected
+    load can otherwise keep a default regulation of 1.0 and report
+    ``served = cap``).
+
+    The islanding config MUST be forwarded when present: the solve path
+    passes it (a GridForming-anchored island is servable there), so grading
+    without it would zero exactly the load the islanding extension restores.
     """
     try:
-        return set(find_ignored_nodes(monee_net))
+        return set(
+            find_ignored_nodes(
+                monee_net, getattr(monee_net, "islanding_config", None)
+            )
+        )
     except Exception:
         return set()
+
+
+_ENERGISATION_KEYS = ("e_el", "e_gas", "e_water")
+
+
+def _is_deenergised(obs: dict, node: Any) -> bool:
+    """Whether the islanding MILP de-energised this node (energisation binary
+    solved to 0). The binaries live on the solved node model; MAS observers
+    merge node values into ``obs``, the oracle adapter does not — fall back to
+    the node model for the latter (where the net IS the solved net)."""
+    node_vals = None
+    for key in _ENERGISATION_KEYS:
+        v = obs.get(key)
+        if v is None:
+            if node_vals is None:
+                node_vals = dict(getattr(node.model, "values", {}) or {})
+            v = node_vals.get(key)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v) and v < 0.5:
+            return True
+    return False
 
 
 def _branch_carries_sector(branch: Any, monee_net: Any, sector: str | None) -> bool:
@@ -284,16 +316,24 @@ def served_by_load(
             continue
         aid = f"child-{child.id}"
         obs = behavior.observe(aid) or {}
+        node = monee_net.node_by_id(child.node_id)
+        deenergised = _is_deenergised(obs, node)
         cap = obs_capacity(obs)
         if not (cap > 0):
-            continue
+            # Injection-gated de-energised load: nominal demand stays counted
+            # (mirrors served_breakdown).
+            if deenergised:
+                cap = obs_capacity(dict(getattr(child.model, "values", {}) or {}))
+            if not (cap > 0):
+                continue
         is_disconnected = (
-            not getattr(child, "active", True) or child.node_id in disconnected
+            not getattr(child, "active", True)
+            or child.node_id in disconnected
+            or deenergised
         )
         sp = 0.0 if is_disconnected else obs_setpoint(obs)
         # min(cap, nan) returns cap — a NaN setpoint must not credit full served.
         served = max(0.0, min(cap, sp)) if math.isfinite(sp) else 0.0
-        node = monee_net.node_by_id(child.node_id)
         sec = sector_from_grid(node.grid)
         if sec is None:
             continue
@@ -391,19 +431,30 @@ def served_breakdown(
             continue
         aid = f"child-{child.id}"
         obs = behavior.observe(aid) or {}
+        node = monee_net.node_by_id(child.node_id)
+        deenergised = _is_deenergised(obs, node)
         cap = obs_capacity(obs)
         # Skip generators (cap < 0), zero-capacity placeholders, and
         # NaN-capacity entries (NaN propagates into compound port-childs on
         # disconnected nodes and carries no consumer demand).
         if not (cap > 0):
-            continue
+            # Injection gating zeroes a de-energised load's setpoint on the
+            # solved net — its demand is real and must stay counted as
+            # unserved, so recover the nominal rating from the child model.
+            if deenergised:
+                cap = obs_capacity(dict(getattr(child.model, "values", {}) or {}))
+            if not (cap > 0):
+                continue
         n_loads += 1
         # ``is_disconnected`` distinguishes the physical loss path
-        # (priority-blind: no path to a grid-forming source) from the
-        # agent-driven path (QP / ADMM priority weighting decides who sheds).
-        # restoration_breakdown uses this to split per-tier losses.
+        # (priority-blind: no path to a grid-forming source, or islanding
+        # de-energisation) from the agent-driven path (QP / ADMM priority
+        # weighting decides who sheds). restoration_breakdown uses this to
+        # split per-tier losses.
         is_disconnected = (
-            not getattr(child, "active", True) or child.node_id in disconnected
+            not getattr(child, "active", True)
+            or child.node_id in disconnected
+            or deenergised
         )
         if is_disconnected:
             sp = 0.0
@@ -419,7 +470,6 @@ def served_breakdown(
         # per-tier loss; restoration_breakdown uses it to attribute losses.
         demand_disc = demand if is_disconnected else 0.0
 
-        node = monee_net.node_by_id(child.node_id)
         sec = sector_from_grid(node.grid)
         if sec is None:
             continue
@@ -1104,6 +1154,10 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
 
     for node in monee_net.nodes:
         if not getattr(node, "active", True) or node.id in disconnected:
+            continue
+        # Islanding-de-energised nodes read ~0 like disconnected ones — their
+        # excursions are de-energisation artifacts, not operating violations.
+        if _is_deenergised({}, node):
             continue
         sec = sector_from_grid(getattr(node, "grid", None))
         if sec is None:

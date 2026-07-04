@@ -8,8 +8,13 @@
     "",
     "  Experiment 1  extension_islanding — A/B via the two scenario rows",
     "                (kind=clean vs kind=microgrid) on the typical",
-    "                simbench_lv grid with identical seeds + concentrated-5",
-    "                branch failures.  kind=microgrid enables monee's",
+    "                simbench_lv grid with identical seeds + failure_type=island",
+    "                (each cut isolates a GENERATION-bearing subtree from the",
+    "                slack, so the microgrid arm's promoted grid-former can",
+    "                self-anchor the island while the clean arm de-energises it",
+    "                — concentrated cuts strand load-only pockets that collapse",
+    "                identically in both arms and never exercise islanding).",
+    "                kind=microgrid enables monee's",
     "                islanding MILP and promotes every generator to",
     "                GridForming so sub-islands can self-anchor.  The",
     "                environment auto-selects monee's native gurobipy",
@@ -24,12 +29,31 @@
     "                outcomes.oracle_islanding.",
     "",
     "  Experiment 2  extension_temporal — gas linepack + thermal LTC",
-    "                (LumpedThermalCapacitance) on simbench_lv_small (LV-S,",
-    "                1-LV-rural1) to keep the per-step solve cheap.  Both",
-    "                scenario rows run the same multi-hour physical horizon:",
-    "                physics_time_scale=720 maps the 30 s agent clock onto",
-    "                6 h of physical time, physics_interval_s=2 re-solves",
-    "                every 2 sim-seconds => dt=24 min, 15 steps.  The only",
+    "                (LumpedThermalCapacitance) on simbench_lv_small_tuned",
+    "                (LV-S, 1-LV-rural1 at CP density 0.5, slack-fed heat +",
+    "                flow-sized pipes + 0.4x CPs so the born heat field stays",
+    "                inside [313,403] K instead of saturating at the ~620 K",
+    "                t_pu ceiling, while carrying the CHP / P2H / PowerToGas",
+    "                CPs the deficit has to bite) to keep the per-step solve",
+    "                cheap.  LTC runs with the first-step steady-state anchor so",
+    "                junctions settle onto the physical field before inertia",
+    "                engages, rather than cold-starting at the t_pu reference.",
+    "                failure_type=generator with generator_carriers=[heat,gas]",
+    "                (stratified so the lone PowerToGas AND a heat producer are",
+    "                both failed) puts the deficit on the storage carriers — a",
+    "                mix of electrical-generator failures leaves gas/heat intact",
+    "                and never draws linepack or thermal mass.  Both",
+    "                scenario rows run the same multi-hour physical horizon at",
+    "                physics_time_scale=1 (sim clock = physical time, so agent",
+    "                message/poll delays and the physics dt share one unit).",
+    "                physics_interval_s=10 => dt 10 s; simulation_duration_s=",
+    "                21600 => 6 h, 2160 steps.  sector_timescale sets physical",
+    "                control cadences (elec 30s, gas 120s, heat 600s poll).",
+    "                Periodic-only physics solving (ablation cooldown/max_acts)",
+    "                settles the physics at CONVERGED agent states each step",
+    "                rather than re-solving mid-negotiation on every setpoint",
+    "                write (which gave ~27% infeasible-then-stale solves at the",
+    "                slow real-time cadence).  The",
     "                delta between the rows is the temporal extensions, so",
     "                the comparison isolates the storage-flexibility uplift",
     "                (linepack draw-down + thermal inertia riding through",
@@ -45,7 +69,7 @@
   "name": "extension_campaign",
   "out_root": "experiment/_runs/eval",
   "simulation_duration_s": 30.0,
-  "task_timeout_s": 2400.0,
+  "task_timeout_s": 5400.0,
   "failure_delay_s_max": 2.0,
   "write_timeseries": true,
   "write_trajectories": true,
@@ -57,7 +81,7 @@
   },
   "experiments": [
     {
-      "$comment": "Scenario row 1 = baseline (no islanding: sub-islands without a slack lose their load); row 2 = islanding extension + GridForming promotion. Same seeds and failure draws across rows.",
+      "$comment": "Scenario row 1 = baseline (no islanding: sub-islands without a slack lose their load); row 2 = islanding extension + GridForming promotion. Same seeds and failure draws across rows. heat_mccormick on row 1 puts the clean arm on the SAME relaxed heat physics the microgrid arm needs for its MILP solve, so the paired delta isolates the islanding extension instead of confounding it with the heat relaxation.",
       "name": "extension_islanding",
       "grids": [
         "simbench_lv"
@@ -76,14 +100,15 @@
       "scenarios": [
         {
           "kind": "clean",
-          "failure_type": "concentrated",
+          "heat_mccormick": true,
+          "failure_type": "island",
           "n_failures": 5,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.45
         },
         {
           "kind": "microgrid",
-          "failure_type": "concentrated",
+          "failure_type": "island",
           "n_failures": 5,
           "carriers": [
             "electricity",
@@ -97,18 +122,22 @@
       ]
     },
     {
-      "$comment": "Scenario row 1 = multi-hour horizon WITHOUT temporal extensions; row 2 = same horizon with gas linepack + thermal LTC. Generator failures + tight slack (0.15) so stored energy is a genuine lever. LV-S keeps the 15 per-task physics solves cheap.",
+      "$comment": "Scenario row 1 = multi-hour horizon WITHOUT temporal extensions; row 2 = same horizon with gas linepack + thermal LTC. Heat+gas generator failures + tight slack (0.15) put the deficit on the storage carriers. physics_time_scale=1 (sim clock = physical time), interval 10 => dt 10s, dur 21600 => 6h/2160 steps; sector_timescale sets physical control cadences (elec 30s, gas 120s, heat 600s poll). Periodic-only physics solving (ablation cooldown/max_acts) settles at converged agent states each step; stays feasible (0% solve fail) with PWSF flat vs coarser intervals — benchmarked ~7 min MAS / ~3 min oracle per task at 6h on the tiny LV-S (each MILP ~0.09s). Note interval < elec poll (30s) so physics updates faster than agents observe; finer than 30s only refines trajectory resolution. Tuned LV-S keeps the per-step solve cheap.",
       "name": "extension_temporal",
       "grids": [
-        "simbench_lv_small"
+        "simbench_lv_small_tuned"
       ],
       "n_seeds": 5,
       "variants": [
         "scare",
         "oracle"
       ],
+      "$ablation_comment": "physics_time_scale=1 makes the sim clock physical time; pair it with periodic-only physics solving (huge cooldown + max_acts=0) so the physics settles at CONVERGED agent states each 10-s step instead of re-solving mid-negotiation on every setpoint write — the latter caused ~27% infeasible-then-stale solves at the slow real-time cadence. Applies to both scenario rows and both variants, so no A/B confound.",
       "ablations": [
-        {}
+        {
+          "energy_flow_cooldown_s_override": 1000000.0,
+          "energy_flow_max_acts": 0
+        }
       ],
       "sweeps": [
         {}
@@ -117,22 +146,36 @@
         {
           "kind": "clean",
           "failure_type": "generator",
+          "generator_carriers": ["heat", "gas"],
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.15,
-          "physics_time_scale": 720.0,
-          "physics_interval_s": 2.0
+          "simulation_duration_s": 21600.0,
+          "physics_time_scale": 1.0,
+          "physics_interval_s": 10.0,
+          "sector_timescale": {
+            "electricity": {"poll_period_s": 30.0, "decision_delay_s": 5.0},
+            "gas": {"poll_period_s": 120.0, "decision_delay_s": 30.0},
+            "heat": {"poll_period_s": 600.0, "decision_delay_s": 120.0}
+          }
         },
         {
           "kind": "clean",
           "failure_type": "generator",
+          "generator_carriers": ["heat", "gas"],
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.15,
+          "simulation_duration_s": 21600.0,
+          "physics_time_scale": 1.0,
+          "physics_interval_s": 10.0,
+          "sector_timescale": {
+            "electricity": {"poll_period_s": 30.0, "decision_delay_s": 5.0},
+            "gas": {"poll_period_s": 120.0, "decision_delay_s": 30.0},
+            "heat": {"poll_period_s": 600.0, "decision_delay_s": 120.0}
+          },
           "linepack": true,
-          "ltc": true,
-          "physics_time_scale": 720.0,
-          "physics_interval_s": 2.0
+          "ltc": true
         }
       ]
     }

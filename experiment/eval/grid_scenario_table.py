@@ -42,6 +42,7 @@ _GRID_PRETTY: dict[str, str] = {
     "simbench_lv": "LV, large",
     "simbench_lv_high": "LV, high CP density",
     "simbench_lv_small": "LV, small",
+    "simbench_lv_small_tuned": "LV, small (in-bounds heat)",
     "simbench_lv_medium": "LV, medium",
     "simbench_lv_reconfig": "LV with backup branches",
     "simbench_lv_cp_heavy": "CP-heavy (2x, additive)",

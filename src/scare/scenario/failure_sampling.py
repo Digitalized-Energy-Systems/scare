@@ -9,8 +9,11 @@ from __future__ import annotations
 import random
 from typing import Any
 
+import networkx as nx
+
 from mango_energy_environments import Failure
-from monee.model.child import HeatGenerator, PowerGenerator, Source
+from monee.model.child import ExtPowerGrid, HeatGenerator, PowerGenerator, Source
+from monee.model.grid import PowerGrid
 from monee.model.multi import (
     CHP,
     CHPHG,
@@ -30,27 +33,137 @@ def create_failures(
     num_failures: int = 1,
     delay_s_max: float = 5.0,
     generator_share: float = 0.5,
+    generator_carriers: "tuple[str, ...] | list[str] | set[str] | None" = None,
 ) -> list[Failure]:
     """Sample ``num_failures`` failure events on the network.
 
     ``failure_type``: ``"branch"`` (non-CP branches), ``"generator"``
     (generator-class childs/compounds/branch-CPs), ``"mixed"``
     (``generator_share`` controls the gen fraction), ``"concentrated"``
-    (cluster cuts around a load-rich node).
+    (cluster cuts around a load-rich node), ``"island"`` (cuts the branch
+    above a generation-bearing subtree so it becomes a self-anchoring island
+    — the failure mode that actually exercises the microgrid/islanding
+    extension; concentrated/branch cuts strand load-only pockets no
+    grid-former can rescue).
+
+    ``generator_carriers`` (generator/mixed only) restricts the candidate
+    pool to producers of those carriers (``"electricity"``, ``"heat"``,
+    ``"gas"``, ``"water"``). Targeting ``("heat", "gas")`` bites the carriers
+    that carry temporal storage (LTC thermal mass, gas linepack) so the
+    deficit is one the storage extensions can actually buffer.
     """
+    carriers = frozenset(generator_carriers) if generator_carriers else None
     if failure_type == "branch":
         return _sample_branch_failures(monee_net, num_failures, delay_s_max)
     if failure_type == "generator":
-        return _sample_generator_failures(monee_net, num_failures, delay_s_max)
+        return _sample_generator_failures(
+            monee_net, num_failures, delay_s_max, carriers=carriers
+        )
     if failure_type == "mixed":
         n_gen = int(round(num_failures * max(0.0, min(1.0, generator_share))))
         n_branch = num_failures - n_gen
         out = _sample_branch_failures(monee_net, n_branch, delay_s_max)
-        out += _sample_generator_failures(monee_net, n_gen, delay_s_max)
+        out += _sample_generator_failures(
+            monee_net, n_gen, delay_s_max, carriers=carriers
+        )
         return out
     if failure_type == "concentrated":
         return _sample_concentrated_failures(monee_net, num_failures, delay_s_max)
+    if failure_type == "island":
+        return _sample_island_failures(monee_net, num_failures, delay_s_max)
     return []
+
+
+def _sample_island_failures(
+    monee_net: Any, num_failures: int, delay_s_max: float
+) -> list[Failure]:
+    """Cut power branches that each isolate a downstream subtree *containing a
+    generator* from the electricity slack, forming genuine self-anchoring
+    islands.
+
+    Rationale: with the microgrid extension every generator is promoted to a
+    ``GridForming`` reference, so a severed subtree that holds one stays
+    energised (the island self-anchors) whereas the clean arm de-energises it —
+    that is the paired contrast the islanding experiment is meant to show. The
+    ``concentrated`` sampler deliberately strands *load-rich* pockets, which
+    carry no generation and so cannot exercise islanding at all (every island
+    collapses identically in both arms).
+
+    Each cut is the branch nearest the slack on the path to a chosen generator,
+    so it maximises the islanded subtree; cuts are chosen to isolate *disjoint*
+    generator subtrees. Falls back to ``[]`` (caller may downgrade) when the
+    grid has no slack or no generator downstream of any single branch.
+    """
+    roots = {
+        c.node_id
+        for c in monee_net.childs
+        if c.active and isinstance(c.model, ExtPowerGrid)
+    }
+    gen_nodes = {
+        c.node_id
+        for c in monee_net.childs
+        if c.active and isinstance(c.model, PowerGenerator)
+    }
+    if not roots or not gen_nodes:
+        return []
+
+    graph = nx.Graph()
+    edge_branch: dict[tuple, Any] = {}
+    for b in monee_net.branches:
+        if b.model.is_cp():
+            continue
+        try:
+            node = monee_net.node_by_id(b.id[0])
+        except Exception:
+            continue
+        if not isinstance(getattr(node, "grid", None), PowerGrid):
+            continue
+        u, v = b.id[0], b.id[1]
+        graph.add_edge(u, v)
+        edge_branch[(u, v)] = b
+        edge_branch[(v, u)] = b
+    if graph.number_of_edges() == 0:
+        return []
+
+    # For each power branch, the component that does NOT hold a slack after the
+    # cut is the island; keep only branches whose island carries a generator.
+    candidates: list[tuple[int, frozenset, Any]] = []
+    for (u, v), b in list(edge_branch.items()):
+        if u >= v:  # dedupe the undirected pair
+            continue
+        graph.remove_edge(u, v)
+        comp_u = nx.node_connected_component(graph, u)
+        island = comp_u if not (comp_u & roots) else nx.node_connected_component(graph, v)
+        graph.add_edge(u, v)
+        if island & roots:  # cut did not disconnect from the slack (in a loop)
+            continue
+        n_gen = len(island & gen_nodes)
+        if n_gen == 0:
+            continue
+        candidates.append((n_gen, frozenset(island), b))
+
+    if not candidates:
+        return []
+
+    # Prefer generator-rich islands; sample among the top to seed variance.
+    candidates.sort(key=lambda t: (-t[0], -len(t[1])))
+    top_k = max(1, len(candidates) // 3)
+    pool = candidates[:top_k]
+    random.shuffle(pool)
+
+    selected: list[Any] = []
+    claimed: set = set()  # nodes already inside a selected island
+    for _n_gen, island, b in pool:
+        if len(selected) >= num_failures:
+            break
+        if island & claimed:  # keep islands disjoint (avoid nested cuts)
+            continue
+        selected.append(b)
+        claimed |= set(island)
+    return [
+        Failure(delay_s=random.uniform(0.0, delay_s_max), branch_ids=[b.id])
+        for b in selected
+    ]
 
 
 def _sample_concentrated_failures(
@@ -133,15 +246,44 @@ def _sample_branch_failures(
 
 
 def _sample_generator_failures(
-    monee_net: Any, num_failures: int, delay_s_max: float
+    monee_net: Any,
+    num_failures: int,
+    delay_s_max: float,
+    *,
+    carriers: "frozenset[str] | None" = None,
 ) -> list[Failure]:
     """Sample generator-class components; branch CPs via ``branch_ids``,
-    childs/compounds via ``Failure.custom``.
+    childs/compounds via ``Failure.custom``. ``carriers`` (if given) keeps only
+    producers of those carriers.
     """
     candidates = list(_iter_generator_candidates(monee_net))
-    if not candidates:
-        return []
-    selected = random.sample(candidates, min(num_failures, len(candidates)))
+    if carriers is not None:
+        by_carrier: dict[str, list] = {}
+        for kind, comp in candidates:
+            car = _generator_carrier(kind, comp, monee_net)
+            if car in carriers:
+                by_carrier.setdefault(car, []).append((kind, comp))
+        if not by_carrier:
+            return []
+        # Stratify: take one candidate from EACH requested carrier that exists
+        # (so a scarce producer — e.g. the lone PowerToGas — is reliably failed
+        # and its carrier's storage sees a genuine deficit), then fill the
+        # remaining slots at random across all matched candidates.
+        selected = [random.choice(group) for group in by_carrier.values()]
+        chosen_ids = {id(comp) for _k, comp in selected}
+        rest = [
+            (kind, comp)
+            for group in by_carrier.values()
+            for kind, comp in group
+            if id(comp) not in chosen_ids
+        ]
+        random.shuffle(rest)
+        selected += rest[: max(0, num_failures - len(selected))]
+        selected = selected[:num_failures]
+    else:
+        if not candidates:
+            return []
+        selected = random.sample(candidates, min(num_failures, len(candidates)))
     out: list[Failure] = []
     for kind, component in selected:
         if kind == "branch":
@@ -184,3 +326,32 @@ def _iter_generator_candidates(monee_net: Any):
     for branch in monee_net.branches:
         if isinstance(branch.model, branch_classes):
             yield ("branch", branch)
+
+
+def _generator_carrier(kind: str, component: Any, monee_net: Any) -> str:
+    """Carrier this generator-class component *supplies*: the one whose deficit
+    its failure creates. Gas-consuming converters (GasToPower) count as
+    electricity producers; gas/heat producers (Source, PowerToGas, CHP, P2H)
+    map to the carrier whose storage (linepack / thermal mass) must then cover
+    the gap.
+    """
+    m = getattr(component, "model", component)
+    if isinstance(m, PowerGenerator):
+        return "electricity"
+    if isinstance(m, HeatGenerator):
+        return "heat"
+    if isinstance(m, Source):
+        try:
+            gname = str(
+                getattr(monee_net.node_by_id(component.node_id).grid, "name", "")
+            ).lower()
+        except Exception:
+            gname = ""
+        return "water" if "water" in gname else "gas"
+    if isinstance(m, (CHP, CHPHG, PowerToHeat, PowerToHeatHG)):
+        return "heat"
+    if isinstance(m, PowerToGas):
+        return "gas"
+    if isinstance(m, GasToPower):
+        return "electricity"
+    return "electricity"

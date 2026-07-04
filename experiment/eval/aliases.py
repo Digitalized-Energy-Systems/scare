@@ -88,6 +88,8 @@ def alias_scenario(scenario: Any) -> str:
 
     if ft == "concentrated":
         parts.append(f"conc{n_fail or ''}")
+    elif ft == "island":
+        parts.append(f"isl{n_fail or ''}")
     elif ft == "generator":
         parts.append(f"gen{n_fail or ''}")
     elif ft == "mixed":

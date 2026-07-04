@@ -115,6 +115,22 @@ def _optimality_gap(campaign: CampaignData, out_dir: Path) -> list[str]:
     ]
 
 
+def _stress_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Single combined grouped bar: PWSF per variant across every hard stress
+    scenario class, replacing the one-panel-per-class figures."""
+    done = _completed_sims(campaign.summary)
+    if done.empty:
+        return []
+    return [
+        str(
+            plots.stress_class_variant_bar(
+                done,
+                out_dir / "stress_class_variants.png",
+            )
+        )
+    ]
+
+
 def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
     sub = _completed_sims(campaign.by_experiment("variant_comparison"))
     if sub.empty:
@@ -807,12 +823,20 @@ def _missing_experiment_sections(
         if sub.empty:
             continue
         out_dir = plots_root / exp_name
+        # These single-/few-grid served-by-variant panels (stress, voltage,
+        # reconfiguration, cp-*) otherwise hit the compact ``_hbar_height``
+        # floor and render as slivers. Size them by bar count (~125 px per
+        # bar + header) so the four-variant groups read at full thickness,
+        # capped so the two-row stress subfigure still fits the page.
+        n_bars = sub["grid"].nunique() * sub["variant"].nunique()
+        panel_h = min(920, max(760, n_bars * 125 + 300))
         figs = [
             str(
                 plots.variant_comparison_bar(
                     sub,
                     out_dir / "served_by_variant.png",
                     title=f"PWSF by variant — {alias_experiment(exp_name)}",
+                    height=panel_h,
                 )
             )
         ]
@@ -960,6 +984,7 @@ def generate_report(
         ("Functional baseline", _functional_baseline, "functional_baseline"),
         ("Optimality gap", _optimality_gap, "optimality_gap"),
         ("Variant comparison", _variant_comparison, "variant_comparison"),
+        ("Stress-class comparison", _stress_comparison, "stress_comparison"),
         ("Coupling-point influence", _cp_influence, "cp_influence"),
         ("Time to stabilise", _restoration_time, "restoration_time"),
         ("Robustness", _robustness, "robustness"),

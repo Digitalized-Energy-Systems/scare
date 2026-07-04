@@ -30,6 +30,7 @@ def create_large_lv_simbench(
     backup_seed: int | None = None,
     cp_size_multiplier: float = 1.0,
     replace_primary_generation: bool = False,
+    heat_kwargs: dict | None = None,
 ):
     """Build a simbench LV multi-energy network.
 
@@ -62,6 +63,14 @@ def create_large_lv_simbench(
         production invariant. Reframes CP-as-redundancy (additive
         default) into CP-as-cross-carrier-dependence: losing a CP then
         disables both the unit and the primary gen it displaced.
+    heat_kwargs:
+        Overrides merged onto the DHS builder's defaults
+        (``node_based_heat_loads=True``). Use to detune the born heat
+        field — e.g. ``node_heat_gen_share=0.0`` (slack-fed instead of
+        distributed HeatGenerators) + ``auto_diameter=True`` (pipes sized
+        to flow) keep supply temperatures inside the operating envelope on
+        the tiny LV grids, where distributed low-flow heat injection
+        otherwise saturates junctions at the t_pu ceiling.
     """
 
     def create():
@@ -78,7 +87,7 @@ def create_large_lv_simbench(
                 "cp_size_multiplier": cp_size_multiplier,
                 "replace_primary_generation": replace_primary_generation,
             },
-            heat_kwargs={"node_based_heat_loads": True},
+            heat_kwargs={"node_based_heat_loads": True, **(heat_kwargs or {})},
             gas_kwargs=_GAS_KWARGS,
         )
         mes.apply_formulation(EL_MISOCP_FORMULATION)
@@ -110,6 +119,23 @@ GRIDS: dict[str, Callable[[], "object"]] = {
     # Same coupling density; slack budget keeps operator policy orthogonal.
     "simbench_lv_small": create_large_lv_simbench(
         0.2, simbench_code="1-LV-rural1--1-no_sw"
+    ),
+    # Tuned LV-S for the temporal (linepack + LTC) experiment. Two goals:
+    # (1) keep the born heat field inside the envelope — the stock LV-S
+    # saturates supply junctions at the ~620 K t_pu ceiling (distributed
+    # HeatGenerators + oversized CPs injecting into low-flow DHS junctions), so
+    # the LTC steady-state start would settle onto an out-of-bounds field.
+    # Slack-fed heat (node_heat_gen_share=0.0), flow-sized pipes
+    # (auto_diameter) and smaller CPs (0.4) fix that. (2) Actually populate the
+    # coupling points the temporal deficit must bite: at density 0.5 rural1
+    # carries CHP + P2H + a PowerToGas injector (the gas producer whose failure
+    # a linepack draw-down needs — density 0.2 gave none), while the field
+    # lands 324-383 K (100% in-bounds) and voltage stays stressed near 1.1.
+    "simbench_lv_small_tuned": create_large_lv_simbench(
+        0.5,
+        simbench_code="1-LV-rural1--1-no_sw",
+        cp_size_multiplier=0.4,
+        heat_kwargs={"node_heat_gen_share": 0.0, "auto_diameter": True},
     ),
     "simbench_lv_medium": create_large_lv_simbench(
         0.2, simbench_code="1-LV-semiurb4--1-no_sw"

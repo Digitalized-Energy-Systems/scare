@@ -74,6 +74,12 @@ PROACTIVE_WARNING_FRACTION: float = 0.85
 
 
 # Per-sector time-scales: electricity near-instant, gas minutes, heat hours.
+# These sim-second periods are physical durations only after multiplying by the
+# environment's ``physics_time_scale`` (e.g. at scale=720 the heat 5 s poll maps
+# to ~1 physical hour). At ``physics_time_scale=1`` the sim clock IS physical
+# time, so they must be set to real physical periods (gas minutes, heat tens of
+# minutes) via ``set_sector_timescale`` — the defaults below are the compressed
+# small-clock values used by the 1:1 legacy campaigns.
 SECTOR_TIMESCALE: dict[Sector, dict[str, float]] = {
     Sector.ELECTRICITY: {
         "poll_period_s": 0.5,
@@ -91,6 +97,44 @@ SECTOR_TIMESCALE: dict[Sector, dict[str, float]] = {
         "decision_delay_s": 3.0,
     },
 }
+
+# Pristine baseline so ``set_sector_timescale`` can reset before applying a
+# per-run override — a worker process runs many tasks in sequence and must not
+# leak one task's slow time-scales into the next.
+_DEFAULT_SECTOR_TIMESCALE: dict[Sector, dict[str, float]] = {
+    sector: dict(vals) for sector, vals in SECTOR_TIMESCALE.items()
+}
+
+
+def set_sector_timescale(
+    overrides: "dict[str, dict[str, float]] | None" = None,
+) -> None:
+    """Reset the per-sector agent time-scales to their defaults, then apply
+    *overrides* IN PLACE (so services that imported ``SECTOR_TIMESCALE`` see the
+    change). Call once per task before the agents are built.
+
+    *overrides* keys are carrier names (``"electricity"``/``"gas"``/``"heat"``);
+    each value updates a subset of ``poll_period_s`` / ``decision_delay_s`` /
+    ``convergence_rate`` for that sector. Reset-then-apply is what keeps a
+    slow-time-scale task from bleeding into the next task on a reused worker
+    process. Intended for ``physics_time_scale=1`` runs, where the poll/decision
+    periods are real physical seconds and must be sized up (gas minutes, heat
+    tens of minutes) or the discrete-event count explodes over a multi-hour
+    horizon. Pair with periodic-only physics solving
+    (``energy_flow_cooldown_s_override`` >= ``physics_interval_s``,
+    ``energy_flow_max_acts=0``) so the physics settles at converged agent states
+    rather than re-solving mid-negotiation on every setpoint write.
+    """
+    for sector, vals in _DEFAULT_SECTOR_TIMESCALE.items():
+        SECTOR_TIMESCALE[sector] = dict(vals)
+    for name, vals in (overrides or {}).items():
+        try:
+            sector = Sector(name)
+        except ValueError:
+            continue
+        SECTOR_TIMESCALE.setdefault(sector, {}).update(
+            {k: float(v) for k, v in vals.items()}
+        )
 
 
 @dataclass

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from typing import Any
 from uuid import uuid4
 
@@ -381,6 +382,9 @@ def create_restoration_scenario_world(
         monee_net,
         with_communication=False,
         static_delay_s=base_delay_ms / 1000.0,
+        physics_time_scale=physics_time_scale,
+        physics_interval_s=physics_interval_s,
+        physics_solve_time_limit_s=physics_solve_time_limit_s,
     )
 
     behavior: RestorationEnvironmentBehavior = world.environment.behavior
@@ -392,17 +396,6 @@ def create_restoration_scenario_world(
     _max_acts = getattr(config, "energy_flow_max_acts", None)
     if _max_acts is not None and hasattr(behavior, "_energy_flow_max_acts"):
         behavior._energy_flow_max_acts = int(_max_acts)
-    # Physics-stepper knobs (scenario-level, not agent-config): map sim seconds
-    # to physical time and force periodic re-solves so temporal extensions
-    # (linepack, LTC) integrate even while agents are quiet.
-    if physics_time_scale is not None and hasattr(behavior, "_physics_time_scale"):
-        behavior._physics_time_scale = float(physics_time_scale)
-    if physics_interval_s is not None and hasattr(behavior, "_physics_interval_s"):
-        behavior._physics_interval_s = float(physics_interval_s)
-    if physics_solve_time_limit_s is not None and hasattr(
-        behavior, "_physics_solve_time_limit_s"
-    ):
-        behavior._physics_solve_time_limit_s = float(physics_solve_time_limit_s)
 
     # Install perturbations before agents register so every send is covered.
     install_perturbation(
@@ -2382,13 +2375,29 @@ def _register_recordings(
 
     if getattr(monee_net, "islanding_config", None) is not None:
 
+        def _node_deenergised(n: Any) -> bool:
+            # Two channels: static pre-solve pruning (.ignored) AND the
+            # islanding MILP's per-node energisation binaries solved to 0 —
+            # the latter is the extension's actual shedding decision and never
+            # sets .ignored.
+            if getattr(n, "ignored", False):
+                return True
+            vals = dict(getattr(n.model, "values", {}) or {})
+            for key in ("e_el", "e_gas", "e_water"):
+                v = vals.get(key)
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(v) and v < 0.5:
+                    return True
+            return False
+
         def _nodes_deenergised() -> float:
             net = _result_net()
             if net is None:
                 return 0.0
-            return float(
-                sum(1 for n in net.nodes if getattr(n, "ignored", False))
-            )
+            return float(sum(1 for n in net.nodes if _node_deenergised(n)))
 
         def _islanded_events() -> float:
             st = getattr(behavior, "stepper", None)

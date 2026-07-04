@@ -34,7 +34,11 @@ import pandas as pd
 from mango.simulation.world import WorldRecording
 
 from experiment.eval.claims import evaluate_task
-from experiment.eval.oracle import compose_oracle_result, compute_baseline_served
+from experiment.eval.oracle import (
+    apply_oracle_heat_linearisation,
+    compose_oracle_result,
+    compute_baseline_served,
+)
 from experiment.eval.results import (
     compose_result,
     write_constraints_final_csv,
@@ -65,6 +69,7 @@ from experiment.scenarios import (
     assign_load_priorities,
 )
 from scare.base.config import RestorationConfiguration
+from scare.base.model import set_sector_timescale
 from scare.base.runtime import diagnostics
 from scare.base.runtime import diagnostics as _diag
 from scare.base.runtime.infeasibility_capture import (
@@ -118,6 +123,13 @@ class _SolverFailureCounter(logging.Filter):
             "Loading a SolverResults object" in msg
             and "termination condition: infeasible" in msg
         ):
+            return True
+        # monee.solver.gurobipy (islanding backend) + monee.simulation.stepper
+        # skip-mode absorption — without these, stepper-path failures leave
+        # solver_failures at 0.
+        if "Gurobi solve failed without a usable solution" in msg:
+            return True
+        if "Stepper step" in msg and "failed" in msg:
             return True
         return False
 
@@ -176,8 +188,15 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     counter = _SolverFailureCounter()
-    # Listen on both infeasibility emitters; the counter dedupes the pair.
-    for logger_name in ("monee.solver.pyo", "pyomo.core"):
+    # Listen on every infeasibility emitter; the counter dedupes pairs (an
+    # absorbed stepper failure fires as gurobipy/pyo ERROR + stepper WARNING
+    # within the dedupe window).
+    for logger_name in (
+        "monee.solver.pyo",
+        "pyomo.core",
+        "monee.solver.gurobipy",
+        "monee.simulation.stepper",
+    ):
         logging.getLogger(logger_name).addFilter(counter)
     return handler, counter
 
@@ -217,6 +236,8 @@ def _resolve_failures(monee_net: Any, plan: RuntimePlan, task: TaskSpec) -> list
     kwargs = {}
     if "generator_share" in scenario:
         kwargs["generator_share"] = float(scenario["generator_share"])
+    if scenario.get("generator_carriers"):
+        kwargs["generator_carriers"] = tuple(scenario["generator_carriers"])
     return create_failures(
         monee_net,
         failure_type,
@@ -342,10 +363,18 @@ async def _run_simulation(
     net._scare_priorities = priorities
 
     scenario = task.scenario or {}
+    # Per-experiment horizon override (scenario key, alongside physics_time_scale
+    # / physics_interval_s): a longer sim accrues MORE receding-physics steps at
+    # the SAME 24-min dt and the SAME per-step agent budget. Stretching physical
+    # time via physics_time_scale instead would desync agent message delays
+    # (sim-clock) from the physics dt, so horizon length is a duration knob only.
+    sim_duration_s = float(
+        scenario.get("simulation_duration_s") or plan.simulation_duration_s
+    )
     world = create_restoration_scenario_world(
         net,
         priorities=priorities,
-        simulation_duration_s=plan.simulation_duration_s,
+        simulation_duration_s=sim_duration_s,
         config=cfg,
         physics_time_scale=scenario.get("physics_time_scale"),
         physics_interval_s=scenario.get("physics_interval_s"),
@@ -362,12 +391,12 @@ async def _run_simulation(
         )
     logger.info(
         "Running simulation for %.1f s (timeout=%.0f s)",
-        plan.simulation_duration_s,
+        sim_duration_s,
         plan.task_timeout_s,
     )
     try:
         await asyncio.wait_for(
-            start_restoration_simulation(world, failures, plan.simulation_duration_s),
+            start_restoration_simulation(world, failures, sim_duration_s),
             timeout=plan.task_timeout_s,
         )
     except asyncio.TimeoutError:
@@ -417,7 +446,10 @@ def _run_oracle(
         priorities=priorities,
         baseline_served=baseline_served,
         out_dir=out_dir,
-        simulation_duration_s=plan.simulation_duration_s,
+        simulation_duration_s=float(
+            (task.scenario or {}).get("simulation_duration_s")
+            or plan.simulation_duration_s
+        ),
     )
     payload["wallclock_s"] = round(_time.monotonic() - started, 3)
     return net, failures, payload
@@ -458,6 +490,11 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
     mutation (per-scenario operator policy, not a baked-in grid attribute).
     """
     scenario = task.scenario or {}
+    # Process-local per-task reset+apply of the MAS agent time-scales. Always
+    # called (None resets to defaults) so a slow-time-scale temporal task cannot
+    # leak into the next task on a reused worker process. Must run BEFORE the
+    # world/agents are built; the oracle path ignores it (no MAS).
+    set_sector_timescale(scenario.get("sector_timescale"))
     kind = scenario.get("kind", "clean")
     _KNOWN_KINDS = {"clean", "cold_day", "pv_peak", "line_stress", "microgrid"}
     if kind not in _KNOWN_KINDS:
@@ -498,33 +535,40 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
             promote_all_generators=promote_all,
             grid_former_aids=former_aids,
         )
-        # Islanding solves on the native gurobipy backend, which cannot ingest
-        # the live path's fully nonlinear DHS heat balance — linearise it like
-        # the oracle does. Accepted trade-off: McCormick envelopes can be
-        # tighter than the exact physics, but islanding is unsolvable without.
-        from monee.model.formulation import make_heat_convex_milp_formulation
-
-        net.apply_formulation(
-            make_heat_convex_milp_formulation(
-                num_partitions=16, include_heat_exchangers=False
-            )
-        )
         logger.info(
-            "Applied microgrid scenario: carriers=%s promote_all=%s promoted=%s "
-            "(heat McCormick-linearised for the MILP islanding solve)",
+            "Applied microgrid scenario: carriers=%s promote_all=%s promoted=%s",
             list(carriers),
             promote_all,
             counts,
         )
 
+    # Heat McCormick linearisation: mandatory for islanding (the gurobipy
+    # backend cannot ingest the fully nonlinear DHS balance), opt-in via
+    # ``heat_mccormick`` for other kinds so a paired A/B arm can run the
+    # identical heat physics — without it the clean-vs-microgrid delta
+    # confounds islanding with the relaxation. Shared helper keeps live and
+    # oracle physics identical.
+    if kind == "microgrid" or scenario.get("heat_mccormick"):
+        apply_oracle_heat_linearisation(net)
+        logger.info("Applied McCormick heat linearisation (oracle settings)")
+
     # Slack-budget policy: widens LP Var bounds to ±10·budget and stamps the
-    # budget as the slack agents' rating the MAS drives toward.
+    # budget as the slack agents' rating the MAS drives toward. Carriers named
+    # in slack_hard_cap_carriers instead get a HARD import cap at the budget
+    # (deficit must draw storage or shed) — a storage lever, feasible only where
+    # local generation + a stored buffer can cover the capped share.
     slack_budget_pct = scenario.get("slack_budget_pct")
     if slack_budget_pct is not None:
-        apply_slack_budget(net, float(slack_budget_pct))
+        hard_cap = scenario.get("slack_hard_cap_carriers")
+        apply_slack_budget(
+            net,
+            float(slack_budget_pct),
+            hard_cap_carriers=tuple(hard_cap) if hard_cap else None,
+        )
         logger.info(
-            "Applied slack_budget_pct=%s (per-scenario operator policy)",
+            "Applied slack_budget_pct=%s hard_cap=%s (per-scenario operator policy)",
             slack_budget_pct,
+            list(hard_cap) if hard_cap else [],
         )
 
     # Temporal-storage extensions (GasLinepack / LumpedThermalCapacitance).
@@ -533,16 +577,23 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
     ltc = bool(scenario.get("ltc", False))
     if linepack or ltc:
         ltc_t_init = scenario.get("ltc_default_t_init")
+        # Default the first-step steady-state anchor ON: without it every LTC
+        # junction cold-starts at the t_pu per-unit default instead of the real
+        # supply temperature, faking a temperature collapse. Scenarios can still
+        # force it off with ltc_first_step_steady_state=false.
+        ltc_steady_start = bool(scenario.get("ltc_first_step_steady_state", True))
         ext_counts = apply_temporal_extensions(
             net,
             linepack=linepack,
             ltc=ltc,
             ltc_default_t_init=ltc_t_init,
+            ltc_first_step_steady_state=ltc_steady_start,
         )
         logger.info(
-            "Applied temporal extensions: linepack=%s ltc=%s counts=%s",
+            "Applied temporal extensions: linepack=%s ltc=%s steady_start=%s counts=%s",
             linepack,
             ltc,
+            ltc_steady_start,
             ext_counts,
         )
 
@@ -735,6 +786,17 @@ def _write_simulation_outputs(
             changes_df.to_csv(out_dir / "network_changes.csv", index=False)
     except Exception as exc:  # noqa: BLE001 — diagnostics only, never fatal
         logger.warning("network_changes.csv not written: %s", exc)
+    # The stepper absorbs raising solvers (on_step_error="skip"), so a task
+    # whose every solve failed would otherwise grade a frozen pre-failure
+    # state as ok — mirror the oracle's refusing-to-grade guard.
+    solves_ok = getattr(behavior, "_physics_solves_ok", None)
+    solves_failed = int(getattr(behavior, "_physics_solves_failed", 0) or 0)
+    if solves_ok is not None and int(solves_ok) == 0:
+        raise RuntimeError(
+            f"no physics solve succeeded during the simulation "
+            f"({solves_failed} failed) — refusing to grade a frozen-state "
+            "result as ok"
+        )
     priorities = getattr(net, "_scare_priorities", None)
     payload = compose_result(
         world=world,
@@ -747,6 +809,11 @@ def _write_simulation_outputs(
         priorities=priorities,
         baseline_served=baseline_served,
     )
+    if solves_ok is not None:
+        payload.setdefault("outcomes", {})["physics_solves"] = {
+            "ok": int(solves_ok),
+            "failed": solves_failed,
+        }
     payload = _json_sanitize(payload)
     write_result_json(out_dir / "result.json", payload)
     write_served_csv(out_dir / "served.csv", net, behavior, priorities=priorities)

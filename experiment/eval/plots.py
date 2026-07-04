@@ -111,19 +111,26 @@ _FIG_HEIGHT = 440
 # Font sizes tuned to read when the figure is scaled down to a two-column
 # (half-text-width) slot: bumped ~4pt over the full-width baseline so labels
 # stay legible after LaTeX shrinks the canvas.
-_BASE_FONT_SIZE = 21
-_TITLE_FONT_SIZE = 26
-_AXIS_TITLE_FONT_SIZE = 22
-_TICK_FONT_SIZE = 20
-_LEGEND_FONT_SIZE = 20
-_ANNOTATION_FONT_SIZE = 18
+_BASE_FONT_SIZE = 25
+_TITLE_FONT_SIZE = 30
+_AXIS_TITLE_FONT_SIZE = 26
+_TICK_FONT_SIZE = 24
+_LEGEND_FONT_SIZE = 24
+_ANNOTATION_FONT_SIZE = 22
+
+# Multi-panel trajectory / constraint-envelope figures are shown small and
+# dense, so they take an extra font bump on top of the base sizes above.
+_TRAJ_FONT_BUMP = 4
 
 # Data-series line thickness and marker size for the line/scatter figures
 # (sweeps, cascading, robustness, optimality). Kept well above plotly's
 # defaults so a single series reads clearly at two-column scale. Reference
 # lines (parity, bounds, gridlines) keep their own thin widths.
-_DATA_LINE_WIDTH = 5.0
-_MARKER_SIZE = 15
+_DATA_LINE_WIDTH = 7.0
+_MARKER_SIZE = 17
+# Slightly thinner than ``_DATA_LINE_WIDTH`` because trajectory/envelope
+# panels carry several overlaid series; still well above the old width=2.
+_TRAJ_LINE_WIDTH = 3.6
 
 _GRID_COLOR = "#ECECEC"
 _AXIS_COLOR = "#1A1A1A"
@@ -357,7 +364,15 @@ def _apply_theme(
                 itemsizing="constant",
                 tracegroupgap=6,
             ),
-            margin=dict(l=84, r=40, t=top_margin, b=64),
+            # Bottom margin must clear the x-axis tick labels + axis title,
+            # both of which grow with the (bumped) font sizes; a fixed 64 px
+            # clipped the x-title once the fonts were enlarged.
+            margin=dict(
+                l=84,
+                r=40,
+                t=top_margin,
+                b=int(_TICK_FONT_SIZE + _AXIS_TITLE_FONT_SIZE + 2 * font_bump + 42),
+            ),
         )
     return fig
 
@@ -570,13 +585,16 @@ def _tier_ramp_color(tier: int, n_tiers: int) -> str:
 
 
 def _hbar_height(n_groups: int, n_series: int = 1) -> int:
-    """Compact height for a horizontal bar figure: enough per-category room
-    to keep bars slim, plus headroom for the title + top legend + x-axis."""
+    """Height for a horizontal bar figure: enough per-category room to keep
+    bars readable, plus headroom for the title + top legend + x-axis. The
+    per-category allowance (and the floor/cap) is doubled over the original
+    compact sizing so the bars read at twice the thickness at two-column
+    scale; the fixed header allowance is kept as-is."""
     if n_series <= 1:
-        per_row = 30
+        per_row = 60
     else:
-        per_row = 15 * n_series + 10
-    return int(min(640, max(230, per_row * n_groups + 150)))
+        per_row = 30 * n_series + 20
+    return int(min(1280, max(460, per_row * n_groups + 150)))
 
 
 # Display-only alias helpers: map canonical summary.csv names to the
@@ -604,6 +622,7 @@ def variant_comparison_bar(
     *,
     metric_col: str = "outcomes__priority_weighted_fraction",
     title: str = "Priority-weighted served fraction by variant (compliant runs)",
+    height: int | None = None,
 ) -> Path:
     if df.empty or metric_col not in df.columns:
         return _save(_empty_fig("no data", title), out_path)
@@ -663,10 +682,6 @@ def variant_comparison_bar(
             )
         )
 
-    rate = _compliance_rate(df)
-    if rate is not None:
-        n_c_total = int(_compliant_mask(df).sum())
-        title = f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(df))}"
 
     fig.update_layout(barmode="group", 
                       bargap=0.32, 
@@ -676,7 +691,8 @@ def variant_comparison_bar(
         range=[0, 1.05], title="priority-weighted served fraction", tickformat=".2f"
     )
     fig.update_yaxes(title="grid")
-    height = _hbar_height(len(grids), len(variants))
+    if height is None:
+        height = _hbar_height(len(grids), len(variants))
     return _save(
         _apply_theme(
             fig,
@@ -758,7 +774,121 @@ def pwsf_by_sector_bar(
     )
     return _save(
         _apply_theme(
-            fig, title=title, height=560, width=_BAR_FIG_WIDTH, legend_top=True
+            fig, title=title, height=380, width=_BAR_FIG_WIDTH, legend_top=True
+        ),
+        out_path,
+    )
+
+
+# Combined stress-class comparison (Pillar 5)
+
+
+# Canonical order + display labels for the hardest scenario classes, combined
+# into a single grouped bar instead of one panel per class.
+_STRESS_CLASS_ORDER: list[tuple[str, str]] = [
+    ("generator_failure", "generator outage"),
+    ("line_stress", "line stress"),
+    ("concentrated_imbalance", "concentrated"),
+    ("cold_day_stress", "cold-day"),
+    ("voltage_stress", "pv-peak"),
+    ("reconfiguration", "reconfiguration"),
+]
+
+
+def stress_class_variant_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    classes: list[tuple[str, str]] | None = None,
+    metric_col: str = "outcomes__priority_weighted_fraction",
+    title: str = "Priority-weighted served fraction by variant across stress classes",
+) -> Path:
+    """One grouped horizontal bar per stress scenario class, a bar per variant.
+
+    Combines the per-class served-by-variant panels into a single figure so the
+    hardest scenarios read side by side. Compliant-subset PWSF mean with a 95%
+    CI whisker; a class that ran only a subset of the variants simply omits the
+    missing bars (e.g. the pv-peak class runs \\textsc{Scare} only).
+    """
+    if classes is None:
+        classes = _STRESS_CLASS_ORDER
+    if df.empty or metric_col not in df.columns or "experiment" not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+    have = set(df["experiment"].dropna().unique())
+    present = [(e, lbl) for e, lbl in classes if e in have]
+    if not present:
+        return _save(_empty_fig("no stress-class experiments", title), out_path)
+
+    compliant = df[_compliant_mask(df)]
+    exps = [e for e, _ in present]
+    variants = sorted(
+        compliant[compliant["experiment"].isin(exps)]["variant"].dropna().unique()
+    )
+    labels = [lbl for _, lbl in present]
+
+    fig = go.Figure()
+    for variant in variants:
+        means: list[float] = []
+        cis: list[float] = []
+        hover: list[str] = []
+        for exp, label in present:
+            vals = (
+                compliant[
+                    (compliant["experiment"] == exp)
+                    & (compliant["variant"] == variant)
+                ][metric_col]
+                .dropna()
+                .tolist()
+            )
+            if vals:
+                m, ci = _mean_ci(vals)
+            else:
+                m, ci = float("nan"), 0.0
+            means.append(m)
+            cis.append(0.0 if ci != ci else ci)  # NaN CI -> 0 (single sample)
+            hover.append(
+                f"<b>{alias_variant(variant)}</b><br>class: {label}<br>"
+                f"mean PWSF (compliant): {m:.4f}<br>95% CI: {_ci_label(ci)}<br>"
+                f"n={len(vals)}"
+            )
+        fig.add_trace(
+            go.Bar(
+                name=alias_variant(variant),
+                y=labels,
+                x=means,
+                orientation="h",
+                error_x=dict(
+                    type="data",
+                    array=cis,
+                    visible=True,
+                    thickness=1.2,
+                    width=4,
+                    color=_MUTED_COLOR,
+                ),
+                marker=_bar_marker(
+                    _variant_color(variant),
+                    pattern_shape=_VARIANT_PATTERN.get(variant, ""),
+                ),
+                hovertemplate="%{customdata}<extra></extra>",
+                customdata=hover,
+            )
+        )
+    fig.update_layout(barmode="group", bargap=0.3, bargroupgap=0.08)
+    fig.update_xaxes(
+        range=[0, 1.05], title="priority-weighted served fraction", tickformat=".2f"
+    )
+    fig.update_yaxes(title="stress scenario class")
+    height = _hbar_height(len(labels), len(variants))
+    # 30% wider than the standard bar canvas so the four-variant legend fits a
+    # single horizontal row above the plot.
+    return _save(
+        _apply_theme(
+            fig,
+            title=title,
+            height=height,
+            width=int(_BAR_FIG_WIDTH * 1.3),
+            font_bump=2,
+            legend_top=True,
         ),
         out_path,
     )
@@ -774,13 +904,15 @@ def _gap_pair_pivot(df: pd.DataFrame, metric: str) -> pd.DataFrame:
     mixes asymmetric scenario subsets between the two sides. ``experiment`` is
     included so pooling several experiments (all grids) keeps each scare/oracle
     pair matched within its own experiment rather than averaging the same
-    (grid, seed, scenario) across experiments. Cells where either side is
+    (grid, seed, scenario) across experiments; ``ablation``/``sweep`` join the
+    identity for the same reason — multi-arm experiments would otherwise mean
+    deliberately-degraded arms into one scare cell. Cells where either side is
     missing or non-compliant are dropped."""
     df = df[_compliant_mask(df)]
     idx = (
         (["experiment"] if "experiment" in df.columns else [])
         + ["grid", "seed"]
-        + (["scenario"] if "scenario" in df.columns else [])
+        + [c for c in ("scenario", "ablation", "sweep") if c in df.columns]
     )
     return df.pivot_table(index=idx, columns="variant", values=metric)
 
@@ -929,7 +1061,12 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
     fig.update_layout(showlegend=False, boxgap=0.45, boxgroupgap=0.2)
     return _save(
         _apply_theme(
-            fig, title=title, height=380, width=_box_fig_width(len(grids)), no_legend=True
+            fig,
+            title=title,
+            height=440,
+            width=_box_fig_width(len(grids)),
+            no_legend=True,
+            font_bump=6,
         ),
         out_path,
     )
@@ -1129,7 +1266,7 @@ def robustness_curve(
             secondary_y=True,
         )
         fig.update_yaxes(
-            title="compliant runs (%)",
+            title="compliant (%)",
             range=[0, 105],
             color=_VARIANT_COLOR["oracle"],
             secondary_y=True,
@@ -1139,19 +1276,20 @@ def robustness_curve(
             title_font=dict(size=_AXIS_TITLE_FONT_SIZE),
         )
 
-    rate = _compliance_rate(parsed)
-    if rate is not None:
-        n_c_total = int(_compliant_mask(parsed).sum())
-        title = f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(parsed))}"
     fig.update_yaxes(
-        title="priority-weighted served fraction (compliant)",
+        title="PWSF (compliant)",
         range=[0, 1.05],
         color=_VARIANT_COLOR["scare"],
         secondary_y=False,
         tickformat=".2f",
     )
     fig.update_xaxes(title=x_label)
-    return _save(_apply_theme(fig, title=title), out_path)
+    themed = _apply_theme(fig, title=title, font_bump=6, legend_top=True)
+    # ``legend_top`` reclaims the right margin (the legend moved up top), but
+    # this figure keeps a right-hand secondary axis (compliant %), so give that
+    # axis its ticks + title back.
+    themed.update_layout(margin_r=150)
+    return _save(themed, out_path)
 
 
 # RestorationConfiguration defaults (src/scare/base/config.py) — the
@@ -1241,10 +1379,6 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
             name="scare",
         )
     )
-    rate = _compliance_rate(df)
-    if rate is not None:
-        n_c_total = int(_compliant_mask(df).sum())
-        title = f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(df))}"
     fig.update_yaxes(
         title="priority-weighted served fraction (compliant)",
         range=[0, 1.05],
@@ -1357,13 +1491,7 @@ def sweep_curve_dual(
         tickformat=".2f",
     )
     fig.update_xaxes(title=x_label)
-    rate = _compliance_rate(parsed)
-    if rate is not None:
-        n_c_total = int(_compliant_mask(parsed).sum())
-        title = f"{title}<br>{_compliance_subtitle(rate, n_c_total, len(parsed))}"
-        # Re-apply so the updated subtitle shows.
-        fig.update_layout(title=dict(text=title))
-    return _save(_apply_theme(fig, title=title), out_path)
+    return _save(_apply_theme(fig, title=title, font_bump=4), out_path)
 
 
 # Per-tier served (Pillars 1, 4)
@@ -1402,7 +1530,7 @@ def served_by_tier(
     fig.update_yaxes(title="served fraction", range=[0, 1.05], tickformat=".2f")
     return _save(
         _apply_theme(
-            fig, title=title, height=700, width=_BAR_FIG_WIDTH, legend_top=True
+            fig, title=title, height=240, width=_BAR_FIG_WIDTH, legend_top=True
         ),
         out_path,
     )
@@ -1436,7 +1564,7 @@ def restoration_trajectory(
                     y=timeseries[col],
                     mode="lines",
                     name=sec,
-                    line=dict(color=_SECTOR_COLOR[sec], width=2),
+                    line=dict(color=_SECTOR_COLOR[sec], width=_TRAJ_LINE_WIDTH),
                     hovertemplate=f"<b>{sec}</b><br>t: %{{x:.2f}}s<br>balance: %{{y:.4f}}<extra></extra>",
                 )
             )
@@ -1474,7 +1602,12 @@ def restoration_trajectory(
 
     fig.update_xaxes(title="simulation time (s)")
     fig.update_yaxes(title="Σ regulation per sector")
-    return _save(_apply_theme(fig, title=title, height=360, legend_top=True), out_path)
+    return _save(
+        _apply_theme(
+            fig, title=title, height=360, legend_top=True, font_bump=_TRAJ_FONT_BUMP
+        ),
+        out_path,
+    )
 
 
 # Claims pass-rate (Pillar 8)
@@ -1765,7 +1898,7 @@ def restoration_by_tier_bar(
     fig.update_xaxes(title="grid")
     return _save(
         _apply_theme(
-            fig, title=title, height=700, width=_BAR_FIG_WIDTH, legend_top=True
+            fig, title=title, height=480, width=_BAR_FIG_WIDTH, legend_top=True
         ),
         out_path,
     )
@@ -1880,7 +2013,7 @@ def restoration_loss_split_by_tier_bar(
     )
     # Tier 1 (most critical) on top.
     fig.update_yaxes(title="priority tier (1 = most critical)", autorange="reversed")
-    height = _hbar_height(len(tier_labels))
+    height = int(_hbar_height(len(tier_labels)) * 0.7)  # -30%: compact next to the taller vertical panels
     return _save(
         _apply_theme(
             fig, title=title, height=height, width=_BAR_FIG_WIDTH, legend_top=True
@@ -1954,7 +2087,7 @@ def agent_only_ratio_by_tier_bar(
     fig.update_xaxes(title="grid")
     return _save(
         _apply_theme(
-            fig, title=title, height=700, width=_BAR_FIG_WIDTH, legend_top=True
+            fig, title=title, height=480, width=_BAR_FIG_WIDTH, legend_top=True
         ),
         out_path,
     )
@@ -2756,7 +2889,7 @@ def restoration_by_sector_bar(
         tickformat=".2f",
     )
     fig.update_yaxes(title="grid")
-    height = _hbar_height(len(grids), len(sectors))
+    height = int(_hbar_height(len(grids), len(sectors)) * 0.7)  # -30%: compact next to the taller vertical panels
     return _save(
         _apply_theme(
             fig, title=title, height=height, width=_BAR_FIG_WIDTH, legend_top=True
@@ -3154,7 +3287,7 @@ def constraint_envelope_trajectory(
             _add_series(
                 min_vals,
                 dash=_MIN_DASH,
-                width=1.6,
+                width=2.4,
                 legend_group=LG_MIN,
                 legend_name="min (across nodes)",
                 hover_label="min",
@@ -3163,7 +3296,7 @@ def constraint_envelope_trajectory(
             _add_series(
                 max_vals,
                 dash=_MAX_DASH,
-                width=1.6,
+                width=2.4,
                 legend_group=LG_MAX,
                 legend_name="max (across nodes)",
                 hover_label="max",
@@ -3171,7 +3304,7 @@ def constraint_envelope_trajectory(
         _add_series(
             avg_vals,
             dash=_AVG_DASH,
-            width=2.4,
+            width=_TRAJ_LINE_WIDTH,
             legend_group=LG_AVG,
             legend_name="avg (across nodes)",
             hover_label="avg",
@@ -3221,7 +3354,12 @@ def constraint_envelope_trajectory(
 
     fig.update_xaxes(title="simulation time (s)", row=len(present), col=1)
     height = max(_FIG_HEIGHT, 200 * len(present) + 100)
-    return _save(_apply_theme(fig, title=title, height=height, legend_top=True), out_path)
+    return _save(
+        _apply_theme(
+            fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP
+        ),
+        out_path,
+    )
 
 
 # Constraint-violation integral by sector × variant
@@ -3525,7 +3663,7 @@ def _group_balance_lines(
                     x=x,
                     y=timeseries[col].astype(float).values,
                     mode="lines",
-                    line=dict(color=base, width=2),
+                    line=dict(color=base, width=_TRAJ_LINE_WIDTH),
                     opacity=opacity,
                     name=col.split("__")[-1],
                     legendgroup=sec,
@@ -3543,7 +3681,7 @@ def _group_balance_lines(
 
     fig.update_xaxes(title="simulation time (s)", row=len(sectors), col=1)
     height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
-    return _save(_apply_theme(fig, title=title, height=height, legend_top=True), out_path)
+    return _save(_apply_theme(fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path)
 
 
 def slack_trajectory(
@@ -3610,7 +3748,7 @@ def slack_trajectory(
                     x=x,
                     y=timeseries[col].astype(float).values,
                     mode="lines",
-                    line=dict(color=base, width=1.4),
+                    line=dict(color=base, width=_TRAJ_LINE_WIDTH),
                     opacity=opacity,
                     name=aid,
                     legendgroup=sec,
@@ -3682,7 +3820,7 @@ def slack_trajectory(
 
     fig.update_xaxes(title="simulation time (s)", row=len(sectors), col=1)
     height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
-    return _save(_apply_theme(fig, title=title, height=height, legend_top=True), out_path)
+    return _save(_apply_theme(fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path)
 
 
 def gas_slack_pressure_trajectory(
@@ -3748,7 +3886,7 @@ def gas_slack_pressure_trajectory(
                 x=x,
                 y=timeseries[col].astype(float).values,
                 mode="lines",
-                line=dict(color=base, width=1.4),
+                line=dict(color=base, width=_TRAJ_LINE_WIDTH),
                 opacity=opacity,
                 name=aid,
                 showlegend=(i < 10),
@@ -3872,7 +4010,7 @@ def regulation_per_child_lines(
     fig.update_xaxes(title="simulation time (s)")
     fig.update_yaxes(title="regulation factor", range=[-0.05, 1.5], tickformat=".2f")
     return _save(
-        _apply_theme(fig, title=title + subtitle, height=380, legend_top=True), out_path
+        _apply_theme(fig, title=title + subtitle, height=380, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path
     )
 
 
