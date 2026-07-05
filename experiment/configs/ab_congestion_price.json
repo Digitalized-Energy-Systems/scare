@@ -1,0 +1,39 @@
+{
+  "$comment": "A/B for the soft congestion-price line-relief (v1 export/gen radial). Arm A {} = legacy (hard export curtail-to-0 + gen lock + load-shed waterfall on debounce). Arm B {enable_line_congestion_price:true} = reversible gen ceiling, no lock, load-shed suppressed on export. Guard metrics vs the A/B-refuted gen-priority fix: Δserved>=0, Δagent_shed<=0. LV-S clean = dominant paired gap; pv_peak = direct export/over-voltage.",
+  "name": "ab_congestion_price",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1200.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 16, "failure_lambda": 1.0, "max_failures": 3 },
+  "experiments": [
+    {
+      "name": "lvs_clean_ab",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 16,
+      "variants": ["scare"],
+      "ablations": [ {}, { "enable_line_congestion_price": true } ],
+      "scenarios": [ { "kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45 } ]
+    },
+    {
+      "name": "lvs_clean_oracle",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 16,
+      "variants": ["oracle"],
+      "ablations": [ {} ],
+      "scenarios": [ { "kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45 } ]
+    },
+    {
+      "name": "lvs_pv_ab",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 16,
+      "variants": ["scare"],
+      "ablations": [ {}, { "enable_line_congestion_price": true } ],
+      "scenarios": [ { "kind": "pv_peak", "max_failures": 1, "priority_assignment": "skewed" } ]
+    }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "02:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 64 }
+}

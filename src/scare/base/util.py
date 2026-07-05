@@ -310,6 +310,12 @@ L1_REACTIVE_SHED_REASONS: frozenset[str] = frozenset(
 # Community curtailment auction reason; heat-only L2 defer signal (see
 # ``apply_regulate``).
 CURTAIL_AUCTION_REASON: str = "curtail"
+# Soft congestion-price curtailment for line loading. Deliberately NOT
+# ``CURTAIL_AUCTION_REASON``: it must NOT arm the gen over-voltage curtail-lock
+# (which clamps PV to ~0 and starves downstream load — the A/B-refuted
+# pathology). The congestion ceiling is a reversible cap enforced in the gossip
+# ``_apply_setpoint``; when the line clears, the price decays and the cap lifts.
+LINE_CONGESTION_REASON: str = "line_congestion"
 # Heat un-shed recovery reason; lifts the heat curtail lock as it ramps a
 # recovered load back toward full service.
 HEAT_RECOVERY_REASON: str = "heat_recovery"
@@ -410,6 +416,87 @@ def refresh_line_curtail_lock(behavior: Any, aid: str, now: float) -> None:
     if entry is not None:
         factor, _t_set = entry
         store[str(aid)] = (factor, float(now))
+
+
+def _line_relief_headroom_store(behavior: Any) -> dict[str, tuple]:
+    """Per-aid branch loading headroom for the line-relief hand-off:
+    ``aid -> (headroom_pct, t_set)``.
+
+    ``headroom_pct = hi - loading_percent`` for the branch whose downstream
+    subtree contains this load, published every poll by the line-relief branch
+    monitor. The hand-off in :func:`apply_regulate` reads it to decide whether
+    the line has room to accept a bounded restore step. Freshness-stamped."""
+    return _get_behavior_store(behavior, "_scare_line_relief_headroom")
+
+
+def publish_line_relief_headroom(
+    behavior: Any, aid: str, headroom_pct: float, now: float
+) -> None:
+    """Record the current branch loading headroom (%-points below the limit)
+    available to *aid* for the line-relief restore hand-off."""
+    _line_relief_headroom_store(behavior)[str(aid)] = (float(headroom_pct), float(now))
+
+
+def line_relief_headroom(behavior: Any, aid: str, now: float) -> float | None:
+    """Fresh branch loading headroom (%-points below limit) for *aid*, or None
+    when none is published / the reading is stale."""
+    entry = _line_relief_headroom_store(behavior).get(str(aid))
+    if entry is None:
+        return None
+    headroom, t_set = entry
+    if (now - float(t_set)) >= _LINE_CURTAIL_LOCK_TTL_S:
+        return None
+    return float(headroom)
+
+
+def _line_congestion_store(behavior: Any) -> dict[tuple[str, str], tuple]:
+    """Additive congestion price per ``(branch_key, aid)``: ``-> (price, t)``.
+
+    Each overloaded branch publishes a per-downstream-generator price
+    ``price = 1 - ceiling`` (0 = no curtail, 1 = full). Keyed by branch so a
+    generator downstream of several congested branches accumulates the SUM
+    (:func:`line_congestion_ceiling`), rather than a later branch overwriting an
+    earlier one. Freshness-stamped; a stale entry drops out of the sum."""
+    return _get_behavior_store(behavior, "_scare_line_congestion_price")
+
+
+def publish_line_congestion_price(
+    behavior: Any, branch_key: str, aid: str, price: float, now: float
+) -> None:
+    """Record *branch_key*'s congestion price (``1 - ceiling``) for generator
+    *aid*. ``price <= 0`` clears this branch's entry (the line has headroom)."""
+    store = _line_congestion_store(behavior)
+    key = (str(branch_key), str(aid))
+    if price <= 0.0:
+        store.pop(key, None)
+    else:
+        store[key] = (float(price), float(now))
+
+
+def line_congestion_ceiling(
+    behavior: Any, aid: str, now: float, ttl: float
+) -> float:
+    """Generation ceiling (max regulation factor) for *aid* = ``1 - Σ fresh
+    branch prices``, clamped to ``[0, 1]``. Returns 1.0 (no cap) when no fresh
+    price is published."""
+    store = _line_congestion_store(behavior)
+    total = 0.0
+    for (_branch, a), (price, t_set) in list(store.items()):
+        if a == str(aid) and (now - float(t_set)) < ttl:
+            total += float(price)
+    return max(0.0, min(1.0, 1.0 - total))
+
+
+# Min fresh loading headroom (%-points below the limit) at which the line lock
+# hands active back (analogue of ``_QV_LOCK_RELEASE_MARGIN_PU``). The restore
+# step raises loading, so this cushion keeps the closed loop settling just
+# under the limit rather than re-breaching it.
+_LINE_RELIEF_HANDOFF_HEADROOM_PCT: float = 8.0
+
+# Max regulation the line lock hands back per restore cycle (Mechanism B). The
+# hand-back is a headroom-gated ramp re-evaluated each cycle, so a speed knob
+# (any value in (0, 1] is stable), not load-bearing.
+_LINE_RELIEF_RESTORE_STEP: float = 0.1
 
 
 def _gen_curtail_lock_store(behavior: Any) -> dict[str, float]:
@@ -728,14 +815,47 @@ def apply_regulate(
         elif reason in L2_ALLOCATION_REASONS and has_line_curtail_lock(
             behavior, aid, float(timestamp)
         ):
-            record_event(
-                t=float(timestamp),
-                kind="regulate_deferred_to_line_lock",
-                aid=str(aid),
-                sector=str(sector),
-                detail=f"reason={reason} requested_factor={factor:.4f}",
-            )
-            return False
+            # A further shed always passes (it only helps the line); only a
+            # RESTORE is interlocked. Mechanism B: hand active back one bounded
+            # step per cycle when the branch has fresh loading headroom below the
+            # limit, re-gated each tick — else a one-shot release slams the load
+            # to full and the line re-overloads (relaxation limit cycle leaving
+            # loading oscillating 40–170%).
+            _current = _last_regulate_store(behavior).get(str(aid), 0.0)
+            if factor > float(_current) + tolerance:  # a restore, not a shed
+                _headroom = line_relief_headroom(behavior, aid, float(timestamp))
+                if (
+                    _headroom is not None
+                    and _headroom >= _LINE_RELIEF_HANDOFF_HEADROOM_PCT
+                ):
+                    factor = min(factor, float(_current) + _LINE_RELIEF_RESTORE_STEP)
+                    if factor >= 1.0 - tolerance:
+                        _lline.pop(str(aid), None)  # fully restored — drop the lock
+                    else:
+                        _prev = _lline.get(str(aid))
+                        _lline[str(aid)] = (
+                            _prev[0] if _prev else factor,
+                            float(timestamp),
+                        )  # keep fresh; ramp continues next tick
+                    record_event(
+                        t=float(timestamp),
+                        kind="line_curtail_lock_released_to_headroom",
+                        aid=str(aid),
+                        sector=str(sector),
+                        detail=f"reason={reason} stepped_factor={factor:.4f} "
+                        f"headroom={_headroom:.2f}",
+                    )
+                    # fall through: the bounded restore step applies.
+                else:
+                    record_event(
+                        t=float(timestamp),
+                        kind="regulate_deferred_to_line_lock",
+                        aid=str(aid),
+                        sector=str(sector),
+                        detail=f"reason={reason} requested_factor={factor:.4f}",
+                    )
+                    return False
+            # else: further shed — fall through to apply it.
 
     # --- Electricity generator over-voltage curtail-lock --------------
     # Curtail-vs-ramp interlock. When the auction sheds a generator for a live

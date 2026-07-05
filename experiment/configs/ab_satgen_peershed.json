@@ -1,0 +1,35 @@
+{
+  "$comment": "Round-3 paired code A/B for the redesigned fixes: (1) gossip clamps curtail-locked gens to held level and marks them saturated in the ledger (pv_peak LV-S exercises the PV over-voltage curtailment race); (2) heat frontier waterfall sends real peer CurtailmentRequests instead of a passive hold (LV-M clean exercises heat tier inversion). Arm A = HEAD, arm B = fixed tree; same config, deterministic seeds.",
+  "name": "ab_satgen_peershed",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1200.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 16, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "lvs_pv",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 16,
+      "variants": ["scare"],
+      "ablations": [ {} ],
+      "scenarios": [
+        { "kind": "pv_peak", "gen_scale": 1.5, "load_scale": 0.4, "slack_vm_pu": 1.04, "priority_assignment": "skewed" }
+      ]
+    },
+    {
+      "name": "heat",
+      "grids": ["simbench_lv_medium"],
+      "n_seeds": 16,
+      "variants": ["scare"],
+      "ablations": [ {} ],
+      "scenarios": [
+        { "kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45 }
+      ]
+    }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "02:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 64 }
+}

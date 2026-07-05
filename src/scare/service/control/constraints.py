@@ -33,6 +33,7 @@ from scare.base.model import (
 )
 from scare.base.runtime.diagnostics import record_event
 from scare.base.util import (
+    LINE_CONGESTION_REASON,
     apply_regulate,
     constraint_utilization,
     feeder_max_voltage,
@@ -42,6 +43,8 @@ from scare.base.util import (
     obs_constraint_values,
     obs_priority,
     obs_setpoint,
+    publish_line_congestion_price,
+    publish_line_relief_headroom,
     publish_node_voltage,
     qv_relief_avail,
     refresh_line_curtail_lock,
@@ -158,6 +161,23 @@ _LINE_RELIEF_MIN_REDUCIBLE: float = 5e-4
 # Released only on genuine headroom, not the relief's own settle point.
 _LINE_RELIEF_RELEASE_MARGIN: float = 15.0
 
+# Congestion-price controller (``enable_line_congestion_price``). Integral gain
+# on the normalized loading overshoot ((val-hi)/100) per poll: moderate so the
+# price climbs to the export-clearing level over a few polls instead of slamming
+# PV to 0 in one shot. Restore step decays the price each headroom poll so PV
+# ramps back to serve local load. Headroom margin (loading-% points below the
+# limit) gates the decay — inside the band the last ceiling is held (a stalled
+# monitor must not release curtailment and re-overload). Price is capped below 1
+# so a downstream generator is never pinned fully to 0 by a single branch.
+_LINE_CONGESTION_GAIN: float = 0.35
+_LINE_CONGESTION_RESTORE_STEP: float = 0.05
+_LINE_CONGESTION_HEADROOM_MARGIN: float = 8.0
+_LINE_CONGESTION_PRICE_MAX: float = 0.95
+# Freshness (sim-s) of a published congestion price; matches the line-curtail
+# lock TTL so a monitor that stops publishing releases the ceiling on the same
+# horizon the old hard lock aged out.
+_LINE_CONGESTION_TTL_S: float = 3.0
+
 # Heat frontier feedback period (s), faster than the heat SCADA poll so a
 # rate-limited deeply-cold node converges within the run. See HeatFrontierController.
 _HEAT_FRONTIER_PERIOD_S: float = 1.0
@@ -177,6 +197,8 @@ class GridConstraintMonitor(Role):
         *,
         max_hops: int = _DEFAULT_MAX_HOPS,
         enable_curtailment_auction: bool = True,
+        enable_generation_priority_curtailment: bool = False,
+        enable_line_congestion_price: bool = True,
         enable_curtail_auction_gating: bool = False,
         enable_curtail_auction_targeting: bool = False,
         enable_line_relief_reassert: bool = False,
@@ -197,6 +219,14 @@ class GridConstraintMonitor(Role):
         self.node_id = node_id
         self.max_hops = max_hops
         self.enable_curtailment_auction = enable_curtailment_auction
+        # Over-voltage relief curtails generation only (never sheds load).
+        self.enable_generation_priority_curtailment = (
+            enable_generation_priority_curtailment
+        )
+        # Soft congestion-price line relief (reversible gen ceiling, no lock).
+        self.enable_line_congestion_price = enable_line_congestion_price
+        # Per-branch congestion price (1 - gen ceiling); AIMD integrator state.
+        self._line_congestion_price: float = 0.0
         self.enable_curtail_auction_gating = enable_curtail_auction_gating
         self.enable_curtail_auction_targeting = enable_curtail_auction_targeting
         self.enable_line_relief_reassert = enable_line_relief_reassert
@@ -426,6 +456,18 @@ class GridConstraintMonitor(Role):
             and self._export_streak[var] >= _EXPORT_DEBOUNCE_POLLS
             and bool(self._downstream_generator_aids())
         )
+        # Load-shed suppression for an export overload. Legacy: only once the
+        # debounced ``export_overload`` is confirmed — but then the waterfall
+        # sheds downstream load on the first poll or two before generation
+        # curtail (the correct lever) engages, and that shed doesn't revert once
+        # the line clears. Under generation-priority curtailment, stop shedding
+        # the MOMENT an overload looks export-driven with curtailable downstream
+        # generation; the gen-curtail actuation below stays debounced so a single
+        # transient reverse sample can't latch a non-reverting curtail.
+        if self.enable_generation_priority_curtailment or self.enable_line_congestion_price:
+            suppress_load_shed = is_export and bool(self._downstream_generator_aids())
+        else:
+            suppress_load_shed = export_overload
 
         if var not in self._violation_emitted:
             self._violation_emitted.add(var)
@@ -467,7 +509,7 @@ class GridConstraintMonitor(Role):
                 and var == "loading_percent"
                 and self.home_leader_addr is not None
                 and not downstream_active
-                and not export_overload
+                and not suppress_load_shed
                 and not self.enable_line_relief_reassert
             ):
                 await self._send_line_overload_relief(obs, val, lo, hi)
@@ -476,7 +518,7 @@ class GridConstraintMonitor(Role):
         if (
             self.enable_line_relief_reassert
             and not downstream_active
-            and not export_overload
+            and not suppress_load_shed
             and self.branch_id is not None
             and var == "loading_percent"
             and self.home_leader_addr is not None
@@ -487,11 +529,14 @@ class GridConstraintMonitor(Role):
         # ``loading_percent`` with a targeted bidder set.
         if (
             self.enable_curtailment_auction
-            and not export_overload
+            and not suppress_load_shed
             and (downstream_active or not self._auction_skips_var(var))
         ):
             await self._request_curtailment(var, val, lo, hi)
-        if export_overload:
+        # Export gen relief: the soft congestion-price controller (driven every
+        # poll from ``_monitor``) owns it when enabled; else the legacy hard
+        # curtail-to-0 export relief.
+        if export_overload and not self.enable_line_congestion_price:
             await self._relieve_export_overload(obs, var, val, hi)
 
     def _handle_warning(
@@ -581,6 +626,14 @@ class GridConstraintMonitor(Role):
 
             lo, hi = bounds.get(var, (float("-inf"), float("inf")))
             util = constraint_utilization(val, lo, hi)
+
+            # Every poll: feed the line-relief hand-off its loading headroom and
+            # keep any live restore-ramp lock fresh, so the bounded hand-back can
+            # proceed once the line clears without the lock ageing out (which
+            # would let L2 slam the load to full and re-overload the line).
+            self._maintain_line_relief_handoff(var, val, hi)
+            if self.enable_line_congestion_price:
+                self._maintain_congestion_price(obs, var, val, hi)
 
             if val < lo or val > hi:
                 await self._handle_violation(obs, var, val, lo, hi)
@@ -812,6 +865,96 @@ class GridConstraintMonitor(Role):
             if aid is not None:
                 refresh_line_curtail_lock(self.behavior, aid, now)
 
+    def _maintain_line_relief_handoff(self, var: str, val: float, hi: float) -> None:
+        """Publish this branch's loading headroom (``hi - val``) to its
+        downstream loads every poll, and keep any live restore-ramp lock fresh
+        so ``apply_regulate``'s bounded hand-back can proceed in the cleared
+        region. ``refresh_line_curtail_lock`` only re-stamps EXISTING locks, so
+        a fully-restored (lock-dropped) load is left alone. No-op unless this is
+        the line-relief branch lever on ``loading_percent``."""
+        if var != "loading_percent" or not self._is_line_relief_branch():
+            return
+        now = self.context.current_timestamp
+        headroom = hi - val
+        for addr in self._downstream_load_addrs:
+            aid = getattr(addr, "aid", None)
+            if aid is None:
+                continue
+            publish_line_relief_headroom(self.behavior, aid, headroom, now)
+            refresh_line_curtail_lock(self.behavior, aid, now)
+
+    def _maintain_congestion_price(
+        self, obs: dict, var: str, val: float, hi: float
+    ) -> None:
+        """Soft congestion-price controller for an export (reverse-flow) branch
+        overload. Runs EVERY poll (not just on breach) so the price can decay and
+        the generation ceiling recover once the line clears.
+
+        AIMD-style: integrate the price up on overshoot while the flow is export
+        with curtailable downstream gens; decay it on genuine loading headroom;
+        hold it inside the hysteresis band (a stalled monitor must not release
+        the ceiling and re-overload). The price is published per downstream gen
+        (summed across branches by ``line_congestion_ceiling``) and the gens are
+        curtailed DOWN to the ceiling immediately; the gossip ``_apply_setpoint``
+        enforces the same ceiling softly, so PV can ramp back to serve local load
+        up to the export-clearing level without a curtail-lock pinning it at 0.
+        """
+        if var != "loading_percent" or self.branch_id is None:
+            return
+        gens = self._downstream_generator_aids()
+        if not gens:
+            # No lever here; let the price decay so any stale ceiling lifts.
+            self._line_congestion_price = max(
+                0.0, self._line_congestion_price - _LINE_CONGESTION_RESTORE_STEP
+            )
+        else:
+            overshoot = (val - hi) / 100.0 if val > hi else 0.0
+            is_export = overshoot > 0.0 and self._flow_is_export(obs) is True
+            if is_export:
+                self._line_congestion_price = min(
+                    _LINE_CONGESTION_PRICE_MAX,
+                    self._line_congestion_price
+                    + _LINE_CONGESTION_GAIN * overshoot,
+                )
+            elif val <= hi - _LINE_CONGESTION_HEADROOM_MARGIN:
+                self._line_congestion_price = max(
+                    0.0, self._line_congestion_price - _LINE_CONGESTION_RESTORE_STEP
+                )
+            # else: hysteresis band / non-export overload — hold last price.
+
+        now = self.context.current_timestamp
+        price = self._line_congestion_price
+        ceiling = max(0.0, 1.0 - price)
+        for aid in gens:
+            publish_line_congestion_price(
+                self.behavior, str(self.branch_id), aid, price, now
+            )
+            if price <= 0.0:
+                continue
+            gen_obs = self.behavior.observe(aid) or {}
+            current = float(gen_obs.get("regulation", 1.0))
+            if current > ceiling + 1e-6:
+                apply_regulate(
+                    self.behavior,
+                    aid,
+                    ceiling,
+                    sector=self.sector.value,
+                    reason=LINE_CONGESTION_REASON,
+                    timestamp=now,
+                    priority_tier=lookup_priority(self.behavior, aid),
+                )
+        if price > 0.0:
+            record_event(
+                t=now,
+                kind="line_congestion_price",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=(
+                    f"val={val:.1f} hi={hi:.1f} price={price:.3f} "
+                    f"ceiling={ceiling:.3f} gens={len(gens)}"
+                ),
+            )
+
     # ------------------------------------------------------------------
     # Flow direction / export-overload relief
     # ------------------------------------------------------------------
@@ -995,7 +1138,9 @@ class GridConstraintMonitor(Role):
     # cycle if the violation persists.
     _AUCTION_TIMEOUT_S: float = 2.0
 
-    def _own_curtail_willingness(self, obs: dict) -> float:
+    def _own_curtail_willingness(
+        self, obs: dict, *, injection_relief: bool = False
+    ) -> float:
         """Curtailment willingness for this agent's own load: priority tier
         weight (dominant, lexicographic) × bounded sensitivity multiplier ×
         reducible output.
@@ -1003,6 +1148,7 @@ class GridConstraintMonitor(Role):
         Tier-1 LOADS (cap > 0) return exactly 0.0, not the 1e-9 floor (which
         would let a tier-1 self-only auction shed itself, breaking the
         hard-lock); generators (cap < 0) keep the floor so PV stays shed-eligible.
+        ``injection_relief`` restricts an over-voltage auction to generators.
         """
         from scare.service.balance.balance import _PRIORITY_TIERS
 
@@ -1020,6 +1166,7 @@ class GridConstraintMonitor(Role):
             priority_tiers=_PRIORITY_TIERS,
             sens_mult_min=_SENS_MULT_MIN,
             sens_mult_max=_SENS_MULT_MAX,
+            injection_relief=injection_relief,
         )
 
     async def _request_curtailment(
@@ -1028,6 +1175,24 @@ class GridConstraintMonitor(Role):
         span = hi - lo
         if span <= 0:
             return
+
+        # Excess-injection violation: over-voltage is relieved ONLY by cutting
+        # generation. Bid generators, exclude loads — shedding load on a
+        # PV-surplus feeder raises voltage and needlessly drops served demand.
+        # The Q(U)/auction coordination substitutes reactive for the ACTIVE
+        # over-voltage shed it defers; that shed must target generation (its
+        # premise), so it implies generation-priority even if the standalone
+        # flag is off — otherwise the coordinated path sheds loads, which raises
+        # voltage on an export feeder (wrong direction).
+        injection_relief = (
+            (
+                self.enable_generation_priority_curtailment
+                or self.enable_qv_auction_coordination
+            )
+            and self.sector is Sector.ELECTRICITY
+            and variable == "vm_pu"
+            and value > hi
+        )
 
         # Gas OVER-pressure: shedding load shrinks the Weymouth drops and
         # RAISES pressure — positive feedback. The slack pressure regulator
@@ -1152,7 +1317,7 @@ class GridConstraintMonitor(Role):
         # junction); priority still decides absorption.
         self_obs = self.behavior.observe(self.context.aid) or {}
         self_w_raw = (
-            self._own_curtail_willingness(self_obs)
+            self._own_curtail_willingness(self_obs, injection_relief=injection_relief)
             if self.behavior.has_action(self.context.aid, "regulate")
             else None
         )
@@ -1192,6 +1357,7 @@ class GridConstraintMonitor(Role):
             "self_willingness": self_w,
             "self_addr": self.context.addr,
             "waterfall": _waterfall,
+            "injection_relief": injection_relief,
         }
         self._curtail_inflight[variable] = now + self._AUCTION_TIMEOUT_S
 
@@ -1206,6 +1372,7 @@ class GridConstraintMonitor(Role):
             auction_id=auction_id,
             origin_addr=self.context.addr,
             variable=variable,
+            injection_relief=injection_relief,
         )
         for addr in neighbors:
             await self.context.send_message(need_msg, receiver_addr=addr)
@@ -1224,7 +1391,9 @@ class GridConstraintMonitor(Role):
         if not obs:
             return
 
-        willingness = self._own_curtail_willingness(obs)
+        willingness = self._own_curtail_willingness(
+            obs, injection_relief=bool(getattr(message, "injection_relief", False))
+        )
         # Targeting: scale by proximity to the origin so the share concentrates
         # on relieving loads (bounded within-tier, priority stays dominant).
         if self.enable_curtail_auction_targeting:

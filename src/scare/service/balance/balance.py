@@ -47,6 +47,7 @@ from scare.base.util import (
     has_gen_curtail_lock,
     l2_effective_floor,
     last_actuated_factor,
+    line_congestion_ceiling,
     set_l2_priority_floor,
     lookup_slack,
     lookup_slack_cp_reserve,
@@ -89,6 +90,10 @@ _THRESHOLD_ABS_FLOOR: float = 1e-6
 _HEAT_CLEAR_FRACTION: float = 0.6
 
 _MAX_HOPS = 100
+
+# Freshness (sim-s) of a congestion-price ceiling read in ``_apply_setpoint``;
+# matches the branch monitor's publish TTL (see constraints.py).
+_LINE_CONGESTION_TTL_S: float = 3.0
 
 # Robbins-Monro step decay: gain = gamma_s / (1 + k / k0). k0 ≈ LV group size.
 _STEP_DECAY_K0_DEFAULT: int = 20
@@ -2248,6 +2253,26 @@ class EnergyBalanceNegotiator(Role):
             )
             if floor is not None and factor < floor:
                 factor = floor
+
+        # Soft congestion-price ceiling for a generator on an overloaded export
+        # branch (``enable_line_congestion_price``). Authoritative — placed AFTER
+        # the floors: caps this gen's ramp at ``1 - Σ branch prices`` so gossip
+        # can still serve LOCAL load up to the export-clearing level but not push
+        # the line back over. Reversible: as the line clears the price decays and
+        # the ceiling lifts. No lock, so nothing pins the gen at 0. Gens only.
+        if cap < 0 and getattr(
+            getattr(self.behavior, "_scare_config", None),
+            "enable_line_congestion_price",
+            False,
+        ):
+            ceiling = line_congestion_ceiling(
+                self.behavior,
+                self.context.aid,
+                self.context.current_timestamp,
+                _LINE_CONGESTION_TTL_S,
+            )
+            if ceiling < factor:
+                factor = ceiling
 
         # Gossip regulates bypass the ``apply_regulate`` dedup on purpose: the
         # ledger advances regardless, so dedupping micro-steps would diverge it

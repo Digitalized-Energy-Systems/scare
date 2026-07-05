@@ -1,0 +1,25 @@
+{
+  "$comment": "Smoke test for the outcomes.cp_generation recording: a few scare + oracle tasks on a CP-bearing grid.",
+  "name": "cp_gen_smoke",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1200.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 3, "failure_lambda": 0.5, "max_failures": 2 },
+  "experiments": [
+    {
+      "name": "cp_gen",
+      "grids": ["simbench_lv_medium"],
+      "n_seeds": 3,
+      "variants": ["scare", "oracle"],
+      "ablations": [ {} ],
+      "scenarios": [
+        { "kind": "clean", "max_failures": 2, "priority_assignment": "skewed", "slack_budget_pct": 0.45 }
+      ]
+    }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "01:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 8 }
+}

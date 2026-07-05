@@ -1,0 +1,40 @@
+{
+  "$comment": [
+    "Code-change A/B for the Q(U) droop regulation-delivery fix (finding #1):",
+    "monee scales a child's commanded q_mvar by regulation, so a curtailed PV",
+    "inverter delivered only q_cmd*regulation of the intended reactive. The fix",
+    "pre-divides the dispatched command by regulation so delivered Q == circle",
+    "target. Same binary is run twice (baseline code vs fixed code) on this",
+    "identical campaign; compare over-voltage residual and PV curtailment.",
+    "gen-priority curtailment is ON so PV generators are actually curtailed",
+    "(regulation<1) — otherwise the fix is a no-op. VVW on (default full circle)."
+  ],
+  "name": "qvfix_ab",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1200.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": false,
+  "timestamp_dir": false,
+  "defaults": { "runs_per_grid": 12, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "qvfix_pv_peak",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 12,
+      "variants": ["scare"],
+      "ablations": [ { "enable_generation_priority_curtailment": true } ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "gen_scale": 1.5,
+          "load_scale": 0.4,
+          "slack_vm_pu": 1.04,
+          "priority_assignment": "skewed"
+        }
+      ]
+    }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "02:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 64 }
+}

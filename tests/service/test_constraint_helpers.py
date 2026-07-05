@@ -20,7 +20,7 @@ _SENS_MIN, _SENS_MAX = 0.25, 4.0
 _PROX_MIN, _PROX_MAX = 0.25, 4.0
 
 
-def _willingness(tier, cap, reducible, *, sens=0.01, sens_ref=0.01):
+def _willingness(tier, cap, reducible, *, sens=0.01, sens_ref=0.01, injection_relief=False):
     return curtail_willingness(
         priority_tier=tier,
         capacity=cap,
@@ -30,6 +30,7 @@ def _willingness(tier, cap, reducible, *, sens=0.01, sens_ref=0.01):
         priority_tiers=4,
         sens_mult_min=_SENS_MIN,
         sens_mult_max=_SENS_MAX,
+        injection_relief=injection_relief,
     )
 
 
@@ -67,6 +68,32 @@ def test_sensitivity_multiplier_is_clamped():
     base = _willingness(2, cap=1.0, reducible=1.0, sens=0.01, sens_ref=0.01)
     huge = _willingness(2, cap=1.0, reducible=1.0, sens=1e6, sens_ref=0.01)
     assert abs(huge - base * _SENS_MAX) < 1e-9
+
+
+def test_injection_relief_excludes_loads():
+    # Over-voltage relief: shedding load worsens it, so any load (cap >= 0) is
+    # excluded regardless of tier — even a highly-sheddable tier-4 load.
+    assert _willingness(4, cap=1.0, reducible=1.0, injection_relief=True) == 0.0
+    assert _willingness(2, cap=1.0, reducible=1.0, injection_relief=True) == 0.0
+
+
+def test_injection_relief_bids_generators_by_reducible():
+    # Generators (cap < 0) bid their reducible output; a bigger reducible bids
+    # higher so the auction curtails the largest injectors first.
+    w_small = _willingness(1, cap=-1.0, reducible=0.5, injection_relief=True)
+    w_big = _willingness(1, cap=-1.0, reducible=2.0, injection_relief=True)
+    assert w_big > w_small > 0.0
+    # Priority tier is irrelevant for injection relief (generators aren't tiered
+    # loads): same reducible => same willingness across tiers.
+    assert _willingness(1, cap=-1.0, reducible=1.0, injection_relief=True) == (
+        _willingness(3, cap=-1.0, reducible=1.0, injection_relief=True)
+    )
+
+
+def test_injection_relief_exhausted_generator_drops_to_floor():
+    # A generator already at zero output has nothing to give: floor bid so it
+    # drops out of the proportional split once curtailed.
+    assert _willingness(1, cap=-1.0, reducible=0.0, injection_relief=True) == 1e-9
 
 
 # --------------------------------------------------------------------------- #

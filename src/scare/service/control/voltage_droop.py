@@ -65,14 +65,26 @@ def _qv_coordination_enabled(behavior) -> bool:
 #   * safety asymmetry — advertise only ``_DVDQ_SAFETY`` of the measured relief,
 #     so the estimate under-credits reactive (costs energy, never stability).
 _DVDQ_PRIOR: float = 0.03
-# Min |Δq| (MVar) before a (Δv, Δq) pair is trusted (below this ΔV is noise).
-_DVDQ_MIN_DQ: float = 1e-3
+# Min |Δq| before a (Δv, Δq) pair is trusted (below this the ΔV is noise),
+# as a FRACTION of the inverter's reactive range ``q_max``. An absolute MVar
+# threshold starves calibration on small LV inverters whose entire reactive
+# swing is a few mMVar, so the confidence gate never opens and relief stays 0.
+# ``_DVDQ_MIN_DQ_ABS`` floors it so a degenerate q_max≈0 can't admit pure noise.
+_DVDQ_MIN_DQ_FRAC: float = 0.02
+_DVDQ_MIN_DQ_ABS: float = 1e-6
 _DVDQ_EMA_ALPHA: float = 0.3
 # Real samples the EMA must accumulate before any relief is advertised.
 _DVDQ_MIN_SAMPLES: int = 3
 # Fraction of measured relief advertised (<1 ⇒ under-credit). Any value in
 # (0, 1] is stable; a speed/energy knob, not load-bearing.
 _DVDQ_SAFETY: float = 0.7
+
+# monee's nodal balance scales a child's commanded ``q_mvar`` by ``regulation``
+# (node.py), so to DELIVER the capability-circle target ``q_cmd`` the dispatched
+# command must be pre-divided by regulation. Floor the divisor so a deeply
+# curtailed inverter (regulation → 0) doesn't demand an unbounded raw command;
+# below the floor it simply loses reactive authority (delivered → 0).
+_REG_DELIVERY_FLOOR: float = 0.1
 
 
 def vde_cos_phi_min(s_nom_mva: float) -> float:
@@ -131,6 +143,11 @@ class ReactivePowerDroopRole(Role):
             if cos_phi_min is not None
             else vde_cos_phi_min(self.s_nom_mva)
         )
+        if voltage_ref_pu <= 0.0 or not math.isfinite(voltage_ref_pu):
+            raise ValueError(
+                "voltage_ref_pu must be positive and finite (it divides the "
+                f"measured voltage); got {voltage_ref_pu!r}"
+            )
         self.voltage_ref_pu = float(voltage_ref_pu)
         # Last commanded Q (monee convention); gates duplicate records.
         self._last_q: float | None = None
@@ -152,6 +169,10 @@ class ReactivePowerDroopRole(Role):
         self._dvdq_n: int = 0  # real (Δv, Δq) samples folded into the EMA
         self._sens_prev_v: float | None = None
         self._sens_prev_q: float | None = None
+        # Last committed Δq. The observed voltage lags one solve behind the
+        # command, so Δv(t) is the response to the PREVIOUS command delta, not
+        # the current one — pair Δv against this lagged Δq (see ``_step``).
+        self._sens_prev_dq: float | None = None
 
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(Sector.ELECTRICITY, {}).get("poll_period_s", 0.5)
@@ -249,17 +270,27 @@ class ReactivePowerDroopRole(Role):
         # is the unused circle (~0 at saturation ⇒ no discount). Published before
         # the idempotency skip so it stays fresh on a no-op tick.
         if self._qv_coordination:
-            if self._sens_prev_v is not None and self._sens_prev_q is not None:
-                dq = q_cmd - self._sens_prev_q
+            # Δv(t) reflects the command applied at the PREVIOUS solve, so divide
+            # it by the previous committed Δq — not the current one (the plant
+            # hasn't seen q_cmd yet). Gate on a fraction of q_max so small LV
+            # inverters calibrate instead of discarding every sub-mMVar step.
+            dq_gate = max(_DVDQ_MIN_DQ_ABS, _DVDQ_MIN_DQ_FRAC * q_max)
+            if (
+                self._sens_prev_v is not None
+                and self._sens_prev_dq is not None
+                and abs(self._sens_prev_dq) >= dq_gate
+            ):
                 dv = v_f - self._sens_prev_v
-                if abs(dq) >= _DVDQ_MIN_DQ and math.isfinite(dv):
-                    sample = abs(dv / dq)
+                if math.isfinite(dv):
+                    sample = abs(dv / self._sens_prev_dq)
                     # Clamp absurd jumps (post-failure snapshots) before the EMA.
                     sample = min(sample, 10.0 * self._dvdq + 1.0)
                     self._dvdq = (
                         1.0 - _DVDQ_EMA_ALPHA
                     ) * self._dvdq + _DVDQ_EMA_ALPHA * sample
                     self._dvdq_n += 1
+            if self._sens_prev_q is not None:
+                self._sens_prev_dq = q_cmd - self._sens_prev_q
             self._sens_prev_v = v_f
             self._sens_prev_q = q_cmd
             # Confidence gate + safety asymmetry: nothing until calibrated, then
@@ -278,16 +309,22 @@ class ReactivePowerDroopRole(Role):
                 self.context.current_timestamp,
                 v_pu=v_f,
             )
+        # Pre-compensate for monee's ×regulation on the commanded q_mvar so the
+        # DELIVERED reactive equals the circle target q_cmd; ``circle_q`` already
+        # bounds delivered Q, so the raw command stays within the rating for
+        # regulation ≥ floor. At regulation=1 (default) this is a no-op.
+        q_dispatch = q_cmd / max(regulation, _REG_DELIVERY_FLOOR)
         # Idempotency: skip the act() write when within tolerance of the last.
         tol = max(1e-6, 1e-4 * q_max)
-        if self._last_q is not None and abs(q_cmd - self._last_q) < tol:
+        if self._last_q is not None and abs(q_dispatch - self._last_q) < tol:
             return
-        self.behavior.act(self.context.aid, "set_q", q_cmd)
-        self._last_q = q_cmd
+        self.behavior.act(self.context.aid, "set_q", q_dispatch)
+        self._last_q = q_dispatch
         record_event(
             t=self.context.current_timestamp,
             kind="qv_droop",
             aid=self.context.aid,
             sector=Sector.ELECTRICITY.value,
-            detail=f"v={v_f:.4f} q={q_cmd:.6f} q_max={q_max:.6f} p={p_dispatched:.4f}",
+            detail=f"v={v_f:.4f} q={q_cmd:.6f} q_disp={q_dispatch:.6f} "
+            f"q_max={q_max:.6f} p={p_dispatched:.4f} reg={regulation:.3f}",
         )

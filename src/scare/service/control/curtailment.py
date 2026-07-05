@@ -23,15 +23,33 @@ def curtail_willingness(
     priority_tiers: int,
     sens_mult_min: float,
     sens_mult_max: float,
+    injection_relief: bool = False,
 ) -> float:
-    """Curtailment willingness for one load (bigger = more able to absorb).
+    """Curtailment willingness for one bidder (bigger = more able to absorb).
 
     Product of priority-tier weight (dominant), a bounded sensitivity
     multiplier (within-tier tiebreaker), and reducible output. Tier-1 LOADS
     (``capacity > 0``) return exactly 0.0 (not the 1e-9 floor) so they can't
     dispatch to self and break the hard lock; generators keep the floor so PV
     stays shed-eligible under overvoltage.
+
+    ``injection_relief`` flips the bidding for an excess-injection violation
+    (over-voltage): only cutting generation lowers the value, so GENERATORS
+    (``capacity < 0``) bid their reducible output and LOADS (``capacity >= 0``)
+    are excluded (shedding them worsens the violation). A generator already at
+    zero output bids the 1e-9 floor, so it drops out once exhausted.
     """
+    sens_mult = sensitivity / sensitivity_ref if sensitivity_ref > 0.0 else 1.0
+    if not math.isfinite(sens_mult) or sens_mult <= 0.0:
+        sens_mult = 1.0
+    sens_mult = max(sens_mult_min, min(sens_mult_max, sens_mult))
+
+    if injection_relief:
+        if capacity >= 0:
+            return 0.0
+        willingness = abs(reducible) * sens_mult
+        return willingness if math.isfinite(willingness) and willingness > 0.0 else 1e-9
+
     if priority_tier <= 1 and capacity > 0:
         return 0.0
     prio_weight = tier_priority_weight(
@@ -39,10 +57,6 @@ def curtail_willingness(
         regime=-1,
         priority_tiers=priority_tiers,
     )
-    sens_mult = sensitivity / sensitivity_ref if sensitivity_ref > 0.0 else 1.0
-    if not math.isfinite(sens_mult) or sens_mult <= 0.0:
-        sens_mult = 1.0
-    sens_mult = max(sens_mult_min, min(sens_mult_max, sens_mult))
     willingness = prio_weight * sens_mult * reducible
     if not math.isfinite(willingness) or willingness <= 0.0:
         willingness = 1e-9

@@ -494,6 +494,9 @@ class CurtailmentNeed:
     # electrical proximity. ``origin_addr`` keys cached multi-hop distance.
     origin_addr: Any = None
     variable: str = ""
+    # Excess-injection violation (over-voltage): bidders curtail generation
+    # only and exclude load-shed. See ``curtail_willingness``.
+    injection_relief: bool = False
 
 
 @dataclass

@@ -100,6 +100,26 @@ class RestorationConfiguration:
     # BalanceProblem; no proportional curtailment broadcast.
     enable_curtailment_auction: bool = True
 
+    # Generation-prioritised relief for excess-injection violations. True: an
+    # over-voltage (vm_pu > hi) auction bids GENERATORS only (by reducible
+    # output) and excludes loads, and an export line overload suppresses the
+    # load-shed waterfall the moment it is export-classified with curtailable
+    # downstream generation (instead of after the debounce). Cutting injection is
+    # the only lever that lowers voltage / reverse-flow line loading; shedding
+    # load on a PV-surplus feeder does not help.
+    #
+    # DEFAULT FALSE — the naive form is A/B-REFUTED on LV-S (paired Δpwsf
+    # -0.047 clean, -0.056 pv_peak; served DOWN, agent_shed UP, voltage no
+    # better). Root cause: relieving an export line by curtailing PV also removes
+    # the PV that serves LOCAL load, and the gen curtail-lock then holds it at 0
+    # (the balance layer's ramp-back requests are clamped), so the downstream
+    # region starves and balance sheds MORE than the waterfall did. A correct
+    # form must (a) bound the curtailment so PV keeps serving local load (cut
+    # only the export excess) and (b) add a line/voltage-clear gen handoff (cf.
+    # the line-relief lock's always-on bounded hand-off) so PV recovers to local service once the
+    # constraint clears. Kept as an opt-in flag + tested machinery for that work.
+    enable_generation_priority_curtailment: bool = False
+
     # Gate the curtailment auction where it can't help (no-op if auction off).
     # True adds two guards: (a) SCOPE — never fire on heat t_k or line
     # loading_percent (its blind willingness-bidding can't target those); still
@@ -112,6 +132,25 @@ class RestorationConfiguration:
     # (bounded within-tier multiplier, priority stays dominant), so shed lands on
     # loads nearest the violation. Pairs with ``enable_curtail_auction_gating``.
     enable_curtail_auction_targeting: bool = False
+
+    # Soft congestion-price line relief (v1: export/reverse-flow radial case).
+    # True: an overloaded branch with curtailable downstream generation drives a
+    # per-branch congestion price (AIMD integrator on the overshoot) instead of
+    # the hard curtail-to-0 + gen curtail-lock of ``_relieve_export_overload``.
+    # The price becomes a REVERSIBLE generation ceiling enforced softly in the
+    # gossip ``_apply_setpoint`` (min(requested, 1 - Σprice)) under
+    # ``reason='line_congestion'``, which does NOT arm the gen curtail-lock — so
+    # gossip can ramp PV back up to serve LOCAL load up to the export-clearing
+    # level, and the ceiling lifts as the line clears (price decays). Targets the
+    # A/B-refuted pathology where the lock pinned PV at 0 and starved downstream
+    # load. Load-shed on export lines stays suppressed. Electricity-only; leaves
+    # the forward-flow load waterfall, over-voltage interlock, and L2/L3 intact.
+    #
+    # DEFAULT TRUE. A/B-VALIDATED on LV-S (16 paired seeds): pv_peak Δpwsf +0.065
+    # (15/15 wins, served up, agent_shed down, voltage no worse), clean neutral
+    # (−0.0005) — the correct inversion of the refuted gen-priority fix. Broader
+    # no-regression validation (CP grids, line_stress, heat) still advisable.
+    enable_line_congestion_price: bool = True
 
     # Iterative line-overload relief. False (legacy): relief sent ONCE per
     # episode, line plateaus above 100%. True: RE-ASSERTED every poll while still

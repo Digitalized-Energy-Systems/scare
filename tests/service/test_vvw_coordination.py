@@ -93,3 +93,34 @@ async def test_vvw_and_cos_phi_coincide_at_full_power():
     await on._step()
     await off._step()
     assert _last_set_q(b_on) == pytest.approx(_last_set_q(b_off), abs=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_curtailed_inverter_precompensates_regulation_so_delivered_q_matches():
+    # monee's nodal balance delivers q_mvar * regulation, so a curtailed inverter
+    # must dispatch q_cmd / regulation to actually deliver the capability-circle
+    # target. p_mw is the unregulated nameplate; p_dispatched = |p| * regulation.
+    reg = 0.5
+    role, b = _make_droop(s_nom_mva=_S_NOM, vvw=True)
+    b.set_obs("pv", {"vm_pu": 1.07, "p_mw": -_P_CURTAILED, "regulation": reg})
+    await role._step()
+    p_dispatched = _P_CURTAILED * reg
+    circle_q = math.sqrt(_S_NOM**2 - p_dispatched**2)  # delivered target q_cmd
+    dispatched = _last_set_q(b)
+    # Raw command is pre-divided by regulation …
+    assert dispatched == pytest.approx(circle_q / reg, abs=1e-4)
+    # … so the DELIVERED reactive (command × regulation) equals the target.
+    assert dispatched * reg == pytest.approx(circle_q, abs=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_deeply_curtailed_inverter_bounds_the_raw_command_at_the_floor():
+    # Below the regulation floor the pre-compensation is capped so the raw q
+    # command can't blow up (delivered reactive tapers toward 0 instead).
+    reg = 0.02  # < _REG_DELIVERY_FLOOR (0.1)
+    role, b = _make_droop(s_nom_mva=_S_NOM, vvw=True)
+    b.set_obs("pv", {"vm_pu": 1.07, "p_mw": -_P_CURTAILED, "regulation": reg})
+    await role._step()
+    p_dispatched = _P_CURTAILED * reg
+    circle_q = math.sqrt(_S_NOM**2 - p_dispatched**2)
+    assert _last_set_q(b) == pytest.approx(circle_q / 0.1, abs=1e-4)
