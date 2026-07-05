@@ -14,6 +14,22 @@ from typing import Any
 import networkx as nx
 from mango.simulation.world import WorldRecording
 from monee.model.child import ExtPowerGrid, HeatLoad, PowerLoad, Sink
+from monee.model.core import value as _mvalue
+from monee.model.grid import (
+    DEFAULT_GAS_HHV_KWH_PER_KG,
+    KGPS_KWHPERKG_TO_MW,
+    GasGrid,
+)
+from monee.model.multi import (
+    CHPControlNode,
+    CHPHGControlNode,
+    GasToHeatControlNode,
+    GasToHeatHG,
+    GasToPower,
+    PowerToGas,
+    PowerToHeatControlNode,
+    PowerToHeatHG,
+)
 from monee.solver.core import find_ignored_nodes
 
 from scare.base.model import (
@@ -891,29 +907,87 @@ def _model_value(model: Any, key: str) -> float | None:
         return None
 
 
+def _cp_param(model: Any, key: str, default: float = 0.0) -> float:
+    """Numeric CP attribute (``Var`` or scalar), or *default* when absent."""
+    if not hasattr(model, key):
+        return default
+    try:
+        v = _mvalue(getattr(model, key))
+    except Exception:  # noqa: BLE001
+        return default
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _net_gas_hhv(monee_net: Any) -> float:
+    for grid in getattr(monee_net, "grids", []) or []:
+        if isinstance(grid, GasGrid):
+            hhv = getattr(grid, "higher_heating_value_kwh_per_kg", None)
+            if hhv:
+                return float(hhv)
+    return DEFAULT_GAS_HHV_KWH_PER_KG
+
+
+def _cp_output(model: Any, gas_hhv: float) -> tuple[float, float, float]:
+    """Delivered ``(el, heat, gas)`` MW for one CP model at its ACTUAL setpoint.
+
+    Computed as ``nameplate_capacity * regulation`` from the model's fixed
+    parameters — NOT from the solved ``el_mw`` / ``heat_mw`` Vars. The oracle
+    solves ``regulation`` to a free Var and folds it into those output Vars, but
+    the scare net only runs a power flow: it never re-derives the converter
+    setpoints, so their Vars sit at the unregulated nameplate and reading them
+    reports nameplate injection (e.g. 6 MW into a 1 MW grid). ``regulation`` is
+    the single lever both variants carry (a solved Var for the oracle, the
+    MAS-actuated scalar for scare), so scaling capacity by it reads the true
+    dispatched setpoint consistently. Gas output is energy content (MW).
+    """
+    reg = _cp_param(model, "regulation", 1.0)
+    k = KGPS_KWHPERKG_TO_MW
+    if isinstance(model, (CHPControlNode, CHPHGControlNode)):
+        hhv = _cp_param(model, "_hhv", gas_hhv)
+        base = abs(_cp_param(model, "gas_mass_flow_kgs")) * k * hhv * reg
+        return (
+            _cp_param(model, "efficiency_power") * base,
+            _cp_param(model, "efficiency_heat") * base,
+            0.0,
+        )
+    if isinstance(model, GasToHeatControlNode):
+        hhv = _cp_param(model, "_hhv", gas_hhv)
+        heat = _cp_param(model, "efficiency_heat") * (
+            abs(_cp_param(model, "gas_mass_flow_kgs")) * k * hhv * reg
+        )
+        return (0.0, heat, 0.0)
+    if isinstance(model, PowerToHeatControlNode):
+        # el_mw here is the electricity CONSUMPTION setpoint; only heat is output.
+        return (0.0, _cp_param(model, "efficiency") * abs(_cp_param(model, "el_mw")) * reg, 0.0)
+    if isinstance(model, (PowerToHeatHG, GasToHeatHG)):
+        return (0.0, abs(_cp_param(model, "heat_energy_mw")) * reg, 0.0)
+    if isinstance(model, GasToPower):
+        return (abs(_cp_param(model, "el_mw")) * reg, 0.0, 0.0)
+    if isinstance(model, PowerToGas):
+        return (0.0, 0.0, abs(_cp_param(model, "gas_mass_flow_kgs")) * k * gas_hhv * reg)
+    return (0.0, 0.0, 0.0)
+
+
 def cp_generation_breakdown(monee_net: Any) -> dict[str, Any]:
     """Delivered coupling-point converter output (MW) at end of sim, summed
     over every CP unit — the direct "are the CPs contributing?" measure.
 
-    Sources, all read off the SOLVED net:
-
-    - Compound CPs (CHP / CHPHG / P2H / G2H) surface as multi-grid control
-      NODES (``model.is_cp()``); their delivered outputs are the
-      generation-convention (≤ 0) ``el_mw`` / ``heat_mw`` Vars. The P2H
-      control node's positive ``el_mw`` is its electricity CONSUMPTION and
-      is skipped by the sign test.
-    - Branch CPs (``branch.model.is_cp()``): GasToPower delivers
-      ``p_to_mw`` (≤ 0, electricity); PowerToHeatHG delivers ``q_mw_heat``
-      (≤ 0, heat); PowerToGas delivers gas, counted as energy content
-      ``efficiency * p_from_mw`` (identified by its ``to_mass_flow_kgs``
-      Var) so the total stays in MW.
-
-    A failed/deactivated CP solves to ~0 output and naturally contributes
-    nothing; ``n_active`` counts units above a 1 kW floor.
+    Each CP's delivered output is its nameplate capacity scaled by its actual
+    ``regulation`` setpoint (see :func:`_cp_output` for why the solved Vars are
+    not read directly). CHP/CHPHG deliver el + heat off gas; P2H/G2H/`*HG`
+    deliver heat; G2P delivers el; P2G delivers gas (energy content, MW). A
+    failed/deactivated CP carries ``regulation ~ 0`` and contributes nothing;
+    ``n_active`` counts units above a 1 kW floor.
     """
     el = heat = gas = 0.0
     n_cp = 0
     n_active = 0
+    gas_hhv = _net_gas_hhv(monee_net)
 
     def _is_cp_model(model: Any) -> bool:
         fn = getattr(model, "is_cp", None)
@@ -924,48 +998,17 @@ def cp_generation_breakdown(monee_net: Any) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             return False
 
-    def _note(out_mw: float) -> None:
-        nonlocal n_cp, n_active
+    for component in list(monee_net.nodes) + list(monee_net.branches):
+        model = getattr(component, "model", None)
+        if not _is_cp_model(model):
+            continue
+        c_el, c_heat, c_gas = _cp_output(model, gas_hhv)
+        el += c_el
+        heat += c_heat
+        gas += c_gas
         n_cp += 1
-        if out_mw > 1e-3:
+        if c_el + c_heat + c_gas > 1e-3:
             n_active += 1
-
-    for node in monee_net.nodes:
-        model = getattr(node, "model", None)
-        if not _is_cp_model(model):
-            continue
-        out = 0.0
-        v_el = _model_value(model, "el_mw")
-        if v_el is not None and v_el < 0:
-            el += -v_el
-            out += -v_el
-        v_heat = _model_value(model, "heat_mw")
-        if v_heat is not None and v_heat < 0:
-            heat += -v_heat
-            out += -v_heat
-        _note(out)
-
-    for branch in monee_net.branches:
-        model = getattr(branch, "model", None)
-        if not _is_cp_model(model):
-            continue
-        out = 0.0
-        v_el = _model_value(model, "p_to_mw")
-        if v_el is not None and v_el < 0:
-            el += -v_el
-            out += -v_el
-        v_heat = _model_value(model, "q_mw_heat")
-        if v_heat is not None and v_heat < 0:
-            heat += -v_heat
-            out += -v_heat
-        if _model_value(model, "to_mass_flow_kgs") is not None:
-            eff = _model_value(model, "efficiency")
-            p_from = _model_value(model, "p_from_mw")
-            if eff is not None and p_from is not None and p_from > 0:
-                gas_mw = eff * p_from
-                gas += gas_mw
-                out += gas_mw
-        _note(out)
 
     return {
         "total_mw": el + heat + gas,

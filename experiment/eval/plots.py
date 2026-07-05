@@ -422,6 +422,21 @@ def _time_axis(t_seconds: Any) -> tuple[Any, str, float]:
     return t, "simulation time (s)", 1.0
 
 
+def _decimate(n: int, max_points: int = 4000) -> Any:
+    """Index selector that caps a trace at ``max_points`` via a uniform stride
+    (the last sample is always kept). Long temporal runs record ~50k ticks per
+    task; plotting them raw makes multi-MB HTML. A uniform stride preserves the
+    staircase shape of the mostly-flat inter-solve segments. Returns
+    ``slice(None)`` when no decimation is needed."""
+    if n <= max_points:
+        return slice(None)
+    step = int(np.ceil(n / max_points))
+    idx = np.arange(0, n, step)
+    if idx[-1] != n - 1:
+        idx = np.append(idx, n - 1)
+    return idx
+
+
 def _empty_fig(message: str, title: str) -> go.Figure:
     fig = go.Figure()
     fig.add_annotation(
@@ -1788,6 +1803,8 @@ def restoration_trajectory(
         return _save(_empty_fig("no timeseries", title), out_path)
 
     fig = go.Figure()
+    x_vals, x_title, x_scale = _time_axis(timeseries["time_s"].values)
+    x_hover = x_title.split("(")[-1].rstrip(")")
     sectors = [
         ("electrical_balance", "electricity"),
         ("gas_balance", "gas"),
@@ -1797,12 +1814,12 @@ def restoration_trajectory(
         if col in timeseries.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=timeseries["time_s"],
+                    x=x_vals,
                     y=timeseries[col],
                     mode="lines",
                     name=sec,
                     line=dict(color=_SECTOR_COLOR[sec], width=_TRAJ_LINE_WIDTH),
-                    hovertemplate=f"<b>{sec}</b><br>t: %{{x:.2f}}s<br>balance: %{{y:.4f}}<extra></extra>",
+                    hovertemplate=f"<b>{sec}</b><br>t: %{{x:.2f}}{x_hover}<br>balance: %{{y:.4f}}<extra></extra>",
                 )
             )
 
@@ -1819,7 +1836,7 @@ def restoration_trajectory(
                 continue
             for tx in sub["t"].astype(float).unique():
                 fig.add_vline(
-                    x=float(tx),
+                    x=float(tx) * x_scale,
                     line=dict(color=style["color"], dash=style["dash"], width=1),
                     opacity=0.7,
                 )
@@ -1835,9 +1852,11 @@ def restoration_trajectory(
                 )
             )
     elif failure_t is not None:
-        fig.add_vline(x=failure_t, line=dict(color="#1A1A1A", dash="dash", width=1))
+        fig.add_vline(
+            x=failure_t * x_scale, line=dict(color="#1A1A1A", dash="dash", width=1)
+        )
 
-    fig.update_xaxes(title="simulation time (s)")
+    fig.update_xaxes(title=x_title)
     fig.update_yaxes(title="Σ regulation per sector")
     return _save(
         _apply_theme(
@@ -3365,6 +3384,10 @@ def constraint_envelope_trajectory(
         col=1,
     )
 
+    # Decimate long runs (stale detection above already used the full trace).
+    _dec = _decimate(len(timeseries))
+    if not isinstance(_dec, slice):
+        timeseries = timeseries.iloc[_dec].reset_index(drop=True)
     x, x_title, x_scale = _time_axis(timeseries["time_s"].values)
     x_list = list(x)
     x_band = x_list + x_list[::-1]
@@ -3891,7 +3914,10 @@ def _group_balance_lines(
         vertical_spacing=0.08,
         subplot_titles=[s for s in sectors],
     )
-    x = timeseries["time_s"].values
+    x, x_title, _ = _time_axis(timeseries["time_s"].values)
+    x_hover = x_title.split("(")[-1].rstrip(")")
+    _dec = _decimate(len(x))
+    x = x[_dec]
     for row_idx, sec in enumerate(sectors, start=1):
         cols = sorted(by_sector[sec])
         base = _SECTOR_COLOR.get(sec, "#888888")
@@ -3901,7 +3927,7 @@ def _group_balance_lines(
             fig.add_trace(
                 go.Scatter(
                     x=x,
-                    y=timeseries[col].astype(float).values,
+                    y=timeseries[col].astype(float).values[_dec],
                     mode="lines",
                     line=dict(color=base, width=_TRAJ_LINE_WIDTH),
                     opacity=opacity,
@@ -3911,7 +3937,7 @@ def _group_balance_lines(
                     showlegend=(row_idx == 1 and i < 10),  # avoid legend explosion
                     hovertemplate=(
                         f"<b>{series_label} {sec}/{col.split('__')[-1]}</b><br>"
-                        "t: %{x:.2f}s<br>Σ regulation: %{y:.3f}<extra></extra>"
+                        f"t: %{{x:.2f}}{x_hover}<br>Σ regulation: %{{y:.3f}}<extra></extra>"
                     ),
                 ),
                 row=row_idx,
@@ -3919,7 +3945,7 @@ def _group_balance_lines(
             )
         fig.update_yaxes(title=f"Σ reg. ({sec})", row=row_idx, col=1)
 
-    fig.update_xaxes(title="simulation time (s)", row=len(sectors), col=1)
+    fig.update_xaxes(title=x_title, row=len(sectors), col=1)
     height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
     return _save(_apply_theme(fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path)
 
@@ -3969,7 +3995,10 @@ def slack_trajectory(
         vertical_spacing=0.08,
         subplot_titles=[s for s in sectors],
     )
-    x = timeseries["time_s"].values
+    x, x_title, x_scale = _time_axis(timeseries["time_s"].values)
+    x_hover = x_title.split("(")[-1].rstrip(")")
+    _dec = _decimate(len(x))
+    x = x[_dec]
     x_span = [float(x[0]), float(x[-1])] if len(x) else [0.0, 1.0]
     _y_unit = {
         "electricity": "p_mw",
@@ -3986,7 +4015,7 @@ def slack_trajectory(
             fig.add_trace(
                 go.Scatter(
                     x=x,
-                    y=timeseries[col].astype(float).values,
+                    y=timeseries[col].astype(float).values[_dec],
                     mode="lines",
                     line=dict(color=base, width=_TRAJ_LINE_WIDTH),
                     opacity=opacity,
@@ -3996,7 +4025,7 @@ def slack_trajectory(
                     showlegend=(row_idx == 1 and i < 10),
                     hovertemplate=(
                         f"<b>slack {sec}/{aid}</b><br>"
-                        "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                        f"t: %{{x:.2f}}{x_hover}<br>value: %{{y:.4f}}<extra></extra>"
                     ),
                 ),
                 row=row_idx,
@@ -4052,13 +4081,13 @@ def slack_trajectory(
         fig.update_yaxes(title=_y_unit.get(sec, "value"), row=row_idx, col=1)
         if failure_t is not None:
             fig.add_vline(
-                x=float(failure_t),
+                x=float(failure_t) * x_scale,
                 line=dict(color="#888888", dash="dash", width=1),
                 row=row_idx,
                 col=1,
             )
 
-    fig.update_xaxes(title="simulation time (s)", row=len(sectors), col=1)
+    fig.update_xaxes(title=x_title, row=len(sectors), col=1)
     height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
     return _save(_apply_theme(fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path)
 
@@ -4088,7 +4117,10 @@ def gas_slack_pressure_trajectory(
             _empty_fig("no slack_pressure__gas__* columns", title), out_path
         )
 
-    x = timeseries["time_s"].values
+    x, x_title, x_scale = _time_axis(timeseries["time_s"].values)
+    x_hover = x_title.split("(")[-1].rstrip(")")
+    _dec = _decimate(len(x))
+    x = x[_dec]
     x_span = [float(x[0]), float(x[-1])] if len(x) else [0.0, 1.0]
     lo, hi = _sector_envelope_bounds()["avg_pressure_pu"]
     base = _SECTOR_COLOR.get("gas", "#2CA02C")
@@ -4124,7 +4156,7 @@ def gas_slack_pressure_trajectory(
         fig.add_trace(
             go.Scatter(
                 x=x,
-                y=timeseries[col].astype(float).values,
+                y=timeseries[col].astype(float).values[_dec],
                 mode="lines",
                 line=dict(color=base, width=_TRAJ_LINE_WIDTH),
                 opacity=opacity,
@@ -4132,18 +4164,18 @@ def gas_slack_pressure_trajectory(
                 showlegend=(i < 10),
                 hovertemplate=(
                     f"<b>gas slack {aid}</b><br>"
-                    "t: %{x:.2f}s<br>setpoint: %{y:.4f} pu<extra></extra>"
+                    f"t: %{{x:.2f}}{x_hover}<br>setpoint: %{{y:.4f}} pu<extra></extra>"
                 ),
             )
         )
 
     if failure_t is not None:
         fig.add_vline(
-            x=float(failure_t),
+            x=float(failure_t) * x_scale,
             line=dict(color="#888888", dash="dash", width=1),
         )
     fig.update_yaxes(title="slack pressure setpoint (p.u.)")
-    fig.update_xaxes(title="simulation time (s)")
+    fig.update_xaxes(title=x_title)
     return _save(_apply_theme(fig, title=title, legend_top=True), out_path)
 
 
@@ -4222,13 +4254,16 @@ def regulation_per_child_lines(
     show_cols = list(active.index) if not active.empty else aid_cols[:max_lines]
 
     fig = go.Figure()
-    x = trajectories["time_s"].values
+    x, x_title, _ = _time_axis(trajectories["time_s"].values)
+    x_hover = x_title.split("(")[-1].rstrip(")")
+    _dec = _decimate(len(x))
+    x = x[_dec]
     for i, aid in enumerate(show_cols):
         color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
         fig.add_trace(
             go.Scatter(
                 x=x,
-                y=arr[aid].values,
+                y=arr[aid].values[_dec],
                 mode="lines",
                 line=dict(color=color, width=1.0),
                 opacity=0.55,
@@ -4236,7 +4271,7 @@ def regulation_per_child_lines(
                 showlegend=False,
                 hovertemplate=(
                     f"<b>{aid}</b><br>"
-                    "t: %{x:.2f}s<br>factor: %{y:.3f}<extra></extra>"
+                    f"t: %{{x:.2f}}{x_hover}<br>factor: %{{y:.3f}}<extra></extra>"
                 ),
             )
         )
@@ -4247,7 +4282,7 @@ def regulation_per_child_lines(
         )
     else:
         subtitle = ""
-    fig.update_xaxes(title="simulation time (s)")
+    fig.update_xaxes(title=x_title)
     fig.update_yaxes(title="regulation factor", range=[-0.05, 1.5], tickformat=".2f")
     return _save(
         _apply_theme(fig, title=title + subtitle, height=380, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path
@@ -4309,7 +4344,11 @@ def system_state_overview(
     if timeseries.empty or "time_s" not in timeseries.columns:
         return _save(_empty_fig("no timeseries", title), out_path)
 
-    x = timeseries["time_s"].astype(float).values
+    x_full, x_title, x_scale = _time_axis(timeseries["time_s"].astype(float).values)
+    _dec = _decimate(len(x_full))
+    x = x_full[_dec]
+    if not isinstance(_dec, slice):
+        timeseries = timeseries.iloc[_dec].reset_index(drop=True)
 
     # Panel inventory
     slack_cols_by_sector: dict[str, list[str]] = {}
@@ -4573,7 +4612,7 @@ def system_state_overview(
             for tx in sub["t"].astype(float).unique():
                 for r in range(1, rows + 1):
                     fig.add_vline(
-                        x=float(tx),
+                        x=float(tx) * x_scale,
                         line=dict(color=style["color"], dash=style["dash"], width=1),
                         opacity=0.55,
                         row=r,
@@ -4582,7 +4621,7 @@ def system_state_overview(
     elif failure_t is not None:
         for r in range(1, rows + 1):
             fig.add_vline(
-                x=float(failure_t),
+                x=float(failure_t) * x_scale,
                 line=dict(color="#1A1A1A", dash="dash", width=1),
                 opacity=0.55,
                 row=r,
@@ -4606,7 +4645,7 @@ def system_state_overview(
             col=1,
         )
 
-    fig.update_xaxes(title="simulation time (s)", row=rows, col=1)
+    fig.update_xaxes(title=x_title, row=rows, col=1)
     height = 180 * rows + 100
     return _save(
         _apply_theme(
@@ -4841,14 +4880,15 @@ def extension_islanding_events(
         if ts.empty or "time_s" not in ts.columns:
             continue
         color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
+        idx = _decimate(len(ts))
         for row_idx, col, panel_lbl in panels:
             if col not in ts.columns:
                 continue
             plotted = True
             fig.add_trace(
                 go.Scatter(
-                    x=ts["time_s"].astype(float).values * x_scale,
-                    y=ts[col].astype(float).values,
+                    x=ts["time_s"].astype(float).values[idx] * x_scale,
+                    y=ts[col].astype(float).values[idx],
                     mode="lines",
                     # Counts change stepwise at solve boundaries.
                     line=dict(color=color, width=2, shape="hv"),
@@ -4902,14 +4942,15 @@ def extension_temporal_trajectories(
             scale = float(_scenario_value(scenario, "physics_time_scale") or 1.0)
         except ValueError:
             scale = 1.0
-        x = (ts["time_s"].astype(float) * scale / 3600.0).values
+        idx = _decimate(len(ts))
+        x = (ts["time_s"].astype(float) * scale / 3600.0).values[idx]
         color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
         if "linepack_total_kg" in ts.columns:
             plotted = True
             fig.add_trace(
                 go.Scatter(
                     x=x,
-                    y=ts["linepack_total_kg"].astype(float).values,
+                    y=ts["linepack_total_kg"].astype(float).values[idx],
                     mode="lines",
                     line=dict(color=color, width=2),
                     name=label,
@@ -4932,7 +4973,7 @@ def extension_temporal_trajectories(
             fig.add_trace(
                 go.Scatter(
                     x=x,
-                    y=ts[col].astype(float).values,
+                    y=ts[col].astype(float).values[idx],
                     mode="lines",
                     line=dict(color=color, width=2, dash=dash),
                     name=label,
@@ -4997,3 +5038,202 @@ def extension_temporal_trajectories(
     fig.update_yaxes(title="temperature (K)", row=2, col=1)
     fig.update_xaxes(title="physical time (h)", row=2, col=1)
     return _save(_apply_theme(fig, title=title, height=620, legend_top=True), out_path)
+
+
+def _physical_hours(ts: pd.DataFrame, scenario: str) -> Any:
+    try:
+        scale = float(_scenario_value(scenario, "physics_time_scale") or 1.0)
+    except (ValueError, TypeError):
+        scale = 1.0
+    return (ts["time_s"].astype(float) * scale / 3600.0).values
+
+
+def extension_temporal_thermal_inertia(
+    pairs: list[tuple[str, pd.DataFrame, pd.DataFrame, str]],
+    out_path: Path,
+    *,
+    title: str = (
+        "Thermal inertia — junction temperature, no-LTC baseline vs LTC "
+        "(same seed)"
+    ),
+) -> Path:
+    """The temporal experiment's defining property: without thermal
+    capacitance every solve is an independent steady state, so the junction
+    snaps from its start temperature to the operating point in a single step;
+    the LTC extension replaces that discontinuity with a physical relaxation.
+
+    ``pairs`` = ``[(label, off_ts, on_ts, scenario), ...]`` — the max-junction
+    temperature (``max_t_k``) of the off (dashed) and on (solid) arm of the
+    same seed, over physical hours.
+    """
+    fig = go.Figure()
+    plotted = False
+    for i, (label, off_ts, on_ts, scenario) in enumerate(pairs):
+        color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
+        for ts, dash, arm in ((off_ts, "dash", "no LTC"), (on_ts, "solid", "LTC")):
+            if ts is None or ts.empty or "max_t_k" not in ts.columns:
+                continue
+            if "time_s" not in ts.columns:
+                continue
+            plotted = True
+            idx = _decimate(len(ts))
+            fig.add_trace(
+                go.Scatter(
+                    x=_physical_hours(ts, scenario)[idx],
+                    y=ts["max_t_k"].astype(float).values[idx],
+                    mode="lines",
+                    line=dict(color=color, width=2.2, dash=dash),
+                    name=f"{label} · {arm}",
+                    legendgroup=label,
+                    hovertemplate=(
+                        f"<b>{label} · {arm}</b><br>max T: %{{y:.2f}} K<br>"
+                        "t: %{x:.2f}h<extra></extra>"
+                    ),
+                )
+            )
+    if not plotted:
+        return _save(_empty_fig("no max_t_k in either arm", title), out_path)
+
+    for dash, name in (("dash", "no LTC (steady snap)"), ("solid", "LTC (relaxation)")):
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="lines",
+                line=dict(color="#666666", width=2.2, dash=dash),
+                name=name,
+                legendgroup="arm_style",
+                showlegend=True,
+            )
+        )
+    fig.update_yaxes(title="max junction temperature (K)")
+    fig.update_xaxes(title="physical time (h)")
+    return _save(_apply_theme(fig, title=title, height=560, legend_top=True), out_path)
+
+
+def _served_fraction_series(ts: pd.DataFrame) -> Any:
+    """Per-tick total served fraction from the ``tier_served_mw__*`` /
+    ``tier_demand_mw__*`` recordings (Σ served / Σ demand across tiers)."""
+    served_cols = [c for c in ts.columns if c.startswith("tier_served_mw__")]
+    demand_cols = [c for c in ts.columns if c.startswith("tier_demand_mw__")]
+    if not served_cols or not demand_cols:
+        return None
+    served = ts[served_cols].astype(float).sum(axis=1)
+    demand = ts[demand_cols].astype(float).sum(axis=1)
+    return (served / demand.where(demand > 0)).values
+
+
+def extension_temporal_ride_through(
+    pairs: list[tuple[str, pd.DataFrame, pd.DataFrame, str]],
+    out_path: Path,
+    *,
+    title: str = (
+        "Deficit ride-through — served fraction, no-extension vs linepack+LTC "
+        "(same seed)"
+    ),
+) -> Path:
+    """Served fraction over physical time, off (dashed) vs on (solid) arm of
+    the same seed. The temporal extensions' stored energy (gas linepack draw-
+    down, thermal inertia) lets the on arm sustain higher service through the
+    post-failure deficit window."""
+    fig = go.Figure()
+    plotted = False
+    for i, (label, off_ts, on_ts, scenario) in enumerate(pairs):
+        color = _QUAL_PALETTE[i % len(_QUAL_PALETTE)]
+        for ts, dash, arm in ((off_ts, "dash", "off"), (on_ts, "solid", "on")):
+            if ts is None or ts.empty or "time_s" not in ts.columns:
+                continue
+            frac = _served_fraction_series(ts)
+            if frac is None:
+                continue
+            plotted = True
+            idx = _decimate(len(ts))
+            fig.add_trace(
+                go.Scatter(
+                    x=_physical_hours(ts, scenario)[idx],
+                    y=frac[idx],
+                    mode="lines",
+                    line=dict(color=color, width=2.2, dash=dash),
+                    name=f"{label} · {arm}",
+                    legendgroup=label,
+                    hovertemplate=(
+                        f"<b>{label} · {arm}</b><br>served: %{{y:.3f}}<br>"
+                        "t: %{x:.2f}h<extra></extra>"
+                    ),
+                )
+            )
+    if not plotted:
+        return _save(_empty_fig("no tier served/demand recordings", title), out_path)
+
+    for dash, name in (("dash", "no extensions"), ("solid", "linepack+LTC")):
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="lines",
+                line=dict(color="#666666", width=2.2, dash=dash),
+                name=name,
+                legendgroup="arm_style",
+                showlegend=True,
+            )
+        )
+    fig.update_yaxes(title="served fraction", range=[0, 1.05], tickformat=".2f")
+    fig.update_xaxes(title="physical time (h)")
+    return _save(_apply_theme(fig, title=title, height=560, legend_top=True), out_path)
+
+
+def extension_islanding_recovery(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = (
+        "Islanding recovery — served load by sector, clean vs microgrid (scare)"
+    ),
+) -> Path:
+    """Where the islanding extension saves load: mean served fraction per
+    sector for the clean vs microgrid arm (scare variant). Grid-forming
+    promotion lets severed sub-islands keep serving their local demand, so the
+    microgrid bars sit above clean wherever islands self-anchored."""
+    if df.empty or "scenario" not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+    sectors = ("electricity", "gas", "heat")
+    frac_col = {s: f"outcomes__served_by_sector__{s}__fraction" for s in sectors}
+    present = [s for s in sectors if frac_col[s] in df.columns]
+    if not present:
+        return _save(_empty_fig("no served_by_sector fractions", title), out_path)
+
+    d = _completed(df).copy()
+    d = d[d["variant"] == "scare"]
+    d["arm"] = d["scenario"].map(
+        lambda s: {"clean": "clean", "microgrid": "microgrid"}.get(
+            _scenario_value(s, "kind") or ""
+        )
+    )
+    d = d[d["arm"].notna()]
+    if d.empty:
+        return _save(_empty_fig("no clean/microgrid scare rows", title), out_path)
+
+    fig = go.Figure()
+    for arm, color in (("clean", "#7F7F7F"), ("microgrid", _VARIANT_COLOR["scare"])):
+        sub = d[d["arm"] == arm]
+        if sub.empty:
+            continue
+        means = [float(sub[frac_col[s]].astype(float).mean()) for s in present]
+        fig.add_trace(
+            go.Bar(
+                name=arm,
+                x=[s for s in present],
+                y=means,
+                marker=_bar_marker(color),
+                hovertemplate=(
+                    f"<b>{arm}</b><br>%{{x}}: %{{y:.3f}} served<extra></extra>"
+                ),
+            )
+        )
+    fig.update_layout(barmode="group", bargap=0.3, bargroupgap=0.1)
+    fig.update_yaxes(title="mean served fraction", range=[0, 1.05], tickformat=".2f")
+    fig.update_xaxes(title="sector")
+    return _save(
+        _apply_theme(fig, title=title, height=520, width=_BAR_FIG_WIDTH, legend_top=True),
+        out_path,
+    )

@@ -381,6 +381,13 @@ def _extensions(campaign: CampaignData, out_dir: Path) -> list[str]:
         figs.append(
             str(plots.extension_islanding_ab(isl, out_dir / "islanding_ab.png"))
         )
+        figs.append(
+            str(
+                plots.extension_islanding_recovery(
+                    isl, out_dir / "islanding_recovery.png"
+                )
+            )
+        )
         micro = isl[
             (isl["variant"] == "scare")
             & isl["scenario"].str.contains("kind=microgrid", na=False)
@@ -402,6 +409,38 @@ def _extensions(campaign: CampaignData, out_dir: Path) -> list[str]:
         figs.append(
             str(plots.extension_temporal_ab(tmp, out_dir / "temporal_ab.png"))
         )
+        # Pair the off and on arm of each seed (scare) for the inertia /
+        # ride-through overlays: same seed shares the failure draw.
+        scare = tmp[tmp["variant"] == "scare"]
+        on = scare[scare["scenario"].str.contains("linepack=True", na=False)]
+        off = scare[~scare["scenario"].str.contains("linepack=True", na=False)]
+        off_by_seed = {int(r["seed"]): int(r["task_id"]) for _, r in off.iterrows()}
+        pairs = []
+        for _, row in on.sort_values("seed").iterrows():
+            seed = int(row["seed"])
+            on_task = campaign.task(int(row["task_id"]))
+            off_tid = off_by_seed.get(seed)
+            off_ts = (
+                campaign.task(off_tid).timeseries
+                if off_tid is not None
+                else on_task.timeseries.iloc[0:0]
+            )
+            pairs.append((f"seed {seed}", off_ts, on_task.timeseries, on_task.scenario))
+        if pairs:
+            figs.append(
+                str(
+                    plots.extension_temporal_thermal_inertia(
+                        pairs, out_dir / "temporal_thermal_inertia.png"
+                    )
+                )
+            )
+            figs.append(
+                str(
+                    plots.extension_temporal_ride_through(
+                        pairs, out_dir / "temporal_ride_through.png"
+                    )
+                )
+            )
         b_arm = tmp[tmp["scenario"].str.contains("linepack=True", na=False)]
         tasks = []
         for _, row in b_arm[b_arm["variant"] == "scare"].sort_values("seed").iterrows():
