@@ -484,7 +484,27 @@ class HolonicCommunityRole(Role):
         else:
             self._maybe_schedule_rebalance()
 
+    def _acts_as_leader(self) -> bool:
+        """True iff this agent should run L2 for the active scope.
+
+        Component scope: any group leader (holon formation is not run, so
+        ``HolonicAssignment`` is never set). Legacy holon/sector scope: a
+        formation-assigned holon leader (holon_id set, no parent).
+        """
+        if self.admm_scope == "component":
+            try:
+                return topology_characteristic(self, tid="groups") == "leader"
+            except Exception:
+                return False
+        assignment = self.context.get_or_create_model(HolonicAssignment)
+        return assignment.holon_id is not None and assignment.parent_addr is None
+
     async def _try_form_holon(self) -> None:
+        # Component scope elects a coordinator per connected component and never
+        # uses the holon clique; skip formation entirely (the ``holons`` topology
+        # is not even built in that scope).
+        if self.admm_scope == "component":
+            return
         if topology_characteristic(self, tid="groups") != "leader":
             return
 
@@ -802,9 +822,8 @@ class HolonicCommunityRole(Role):
         Update per-publisher CP-setpoint memory, skip stale repeats, and (if
         the predicate accepts) schedule a rebalance.
         """
-        # Only the holon leader acts; members would double-trigger.
-        assignment = self.context.get_or_create_model(HolonicAssignment)
-        if assignment.holon_id is None or assignment.parent_addr is not None:
+        # Only the leader acts; members would double-trigger.
+        if not self._acts_as_leader():
             return
         # Echo guard: a CP commit caused by our own allocation isn't news.
         if (
@@ -847,10 +866,9 @@ class HolonicCommunityRole(Role):
 
         A fresh ``CoalitionConstraint`` carries per-tier fractions to honour;
         re-run L2 now to re-merge with the store and re-dispatch. Only the
-        holon leader acts; the throttle bounds rapid coalitions.
+        leader acts; the throttle bounds rapid coalitions.
         """
-        assignment = self.context.get_or_create_model(HolonicAssignment)
-        if assignment.holon_id is None or assignment.parent_addr is not None:
+        if not self._acts_as_leader():
             return
         self._maybe_schedule_rebalance()
 
@@ -896,13 +914,8 @@ class HolonicCommunityRole(Role):
         (``_try_rebalance`` re-checks the gates). Gates by ``admm_scope``:
         ``"component"`` ⇒ any group leader; else only holon-leaders.
         """
-        if self.admm_scope == "component":
-            if topology_characteristic(self, tid="groups") != "leader":
-                return
-        else:
-            assignment = self.context.get_or_create_model(HolonicAssignment)
-            if assignment.holon_id is None or assignment.parent_addr is not None:
-                return
+        if not self._acts_as_leader():
+            return
         # Mark dirty before the throttle so a throttled trigger is picked up
         # by the watchdog next tick.
         self._rebalance_dirty = True

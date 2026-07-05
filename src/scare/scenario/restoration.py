@@ -844,6 +844,9 @@ def _make_balance_role(
         enable_actuated_ledger_writeback=config.enable_actuated_ledger_writeback,
         enable_nominal_slack_supply=config.enable_nominal_slack_supply,
         enable_cp_aware_slack_supply=config.enable_cp_aware_slack_supply,
+        component_scope=(
+            config.enable_holonic and config.holon_admm_scope == "component"
+        ),
     )
 
 
@@ -1599,10 +1602,14 @@ def _build_topologies(
 
     # Holons topology (L2): chunk same-sector leaders into ``max_holon_size``
     # cliques (one initiator each); collect coalition unions per holon.
+    # Legacy holon/sector scope only — component scope elects a coordinator per
+    # connected component (via the holon_summary mesh below) and never reads the
+    # clique topology, so building it would be dead work + a misleading per-holon
+    # diagnostic over arbitrary lex chunks.
     holon_members_by_sector: dict[str, dict[int, list[str]]] = {
         s.value: {} for s in _SECTORS
     }
-    if config.enable_holonic:
+    if config.enable_holonic and config.holon_admm_scope != "component":
         holon_chunk_size = config.holon_max_size
         with create_topology(tid="holons") as holon_topo:
             for sector, leaders in group_leaders_by_sector.items():

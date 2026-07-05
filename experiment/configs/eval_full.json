@@ -516,7 +516,10 @@
       ],
       "n_seeds": 15,
       "variants": [
-        "scare"
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
       ],
       "ablations": [
         {},
@@ -893,7 +896,15 @@
       ]
     },
     {
-      "name": "holon_size_sweep",
+      "$comment": [
+        "Community-size sweep — varies community_label_propagation_radius, the",
+        "≤radius-hop ball bound on each L1 sub-community under the default",
+        "label_propagation partition (restoration.py:1219).  Larger radius ⇒ fewer,",
+        "bigger communities that pool more local flexibility but coordinate over a",
+        "wider neighbourhood; radius 1 ⇒ many tiny single-hop groups.  Complements",
+        "holon_size_sweep (L2 clique size) by moving the L1 partition granularity."
+      ],
+      "name": "community_size_sweep",
       "grids": [
         "simbench_lv"
       ],
@@ -903,16 +914,19 @@
       ],
       "sweeps": [
         {
-          "holon_max_size": 2
+          "community_label_propagation_radius": 1
         },
         {
-          "holon_max_size": 4
+          "community_label_propagation_radius": 2
         },
         {
-          "holon_max_size": 8
+          "community_label_propagation_radius": 3
         },
         {
-          "holon_max_size": 16
+          "community_label_propagation_radius": 4
+        },
+        {
+          "community_label_propagation_radius": 5
         }
       ],
       "scenarios": [

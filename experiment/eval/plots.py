@@ -795,6 +795,220 @@ _STRESS_CLASS_ORDER: list[tuple[str, str]] = [
 ]
 
 
+# Compliance-composition categories: a run is ``valid`` when it passes both
+# gates, else labelled by the sole violated *gating* constraint (temperature is
+# audited but non-gating, so it is never a failure reason), or ``multi`` when
+# more than one gating constraint is violated. (key, display label, colour,
+# hatch). Colours/patterns sit alongside the variant palette without colliding
+# with it (oracle green / scare blue / single-level orange / component purple),
+# and every violation category carries a hatch so the stack reads at
+# two-column scale; ``valid`` stays solid as the clean baseline.
+_COMPLIANCE_CATS: list[tuple[str, str, str, str]] = [
+    ("valid", "valid", "#7FB069", ""),
+    ("slack", "slack budget", "#C44E52", "x"),
+    ("voltage", "voltage", "#5B8FB0", "/"),
+    ("pressure", "pressure", "#A16BB0", "\\"),
+    ("line_load", "line loading", "#E1A44C", "-"),
+    ("multi", "multi", "#555555", "+"),
+]
+
+
+def _compliance_category(df: pd.DataFrame) -> pd.Series:
+    """Per-row compliance category over ``_COMPLIANCE_CATS`` keys."""
+    slack_ok = (
+        df["claims__slack_budget_compliance__passed"].fillna(False).astype(bool)
+    )
+    cc_ok = df["claims__constraint_compliance__passed"].fillna(False).astype(bool)
+
+    def nv(v: str) -> pd.Series:
+        c = f"claims__constraint_compliance__detail__by_variable__{v}__n_violations"
+        return (df[c].fillna(0) > 0) if c in df.columns else pd.Series(
+            False, index=df.index
+        )
+
+    reasons = {
+        "slack": ~slack_ok,
+        "voltage": nv("voltage"),
+        "pressure": nv("pressure"),
+        "line_load": nv("line_load"),
+    }
+    n_reasons = sum(m.astype(int) for m in reasons.values())
+    compliant = slack_ok & cc_ok
+    cat = pd.Series("valid", index=df.index, dtype=object)
+    cat[~compliant] = "multi"  # non-compliant with >1 (or 0) reasons
+    single = (~compliant) & (n_reasons == 1)
+    for key, mask in reasons.items():
+        cat[single & mask] = key
+    return cat
+
+
+def variant_pwsf_compliance_bar(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    groups: list[tuple[str, str]],
+    group_col: str,
+    group_label: str,
+    metric_col: str = "outcomes__priority_weighted_fraction",
+    title: str = "Served fraction and compliance by variant",
+) -> Path:
+    """Two-panel figure sharing a category (grid / stress class) y-axis:
+
+    - Left: grouped bars of compliant-subset \\ac{PWSF} per variant.
+    - Right: a stacked bar per variant showing the compliance composition of
+      *all* completed runs -- the ``valid`` (compliant) share plus the share
+      that failed on each gating constraint (or ``multi``).
+
+    Carries two horizontal legends (variants, compliance categories) on top.
+    """
+    if df.empty or metric_col not in df.columns or "variant" not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+    have = set(df[group_col].dropna().unique())
+    present = [(k, lbl) for k, lbl in groups if k in have]
+    if not present:
+        return _save(_empty_fig("no groups present", title), out_path)
+    labels = [lbl for _, lbl in present]
+
+    work = df.copy()
+    work["_cat"] = _compliance_category(work)
+    compliant = work[_compliant_mask(work)]
+    variants = sorted(work["variant"].dropna().unique())
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        shared_yaxes=True,
+        horizontal_spacing=0.06,
+        column_widths=[0.55, 0.45],
+    )
+    # Left — PWSF grouped bars.
+    for variant in variants:
+        means: list[float] = []
+        cis: list[float] = []
+        for key, _ in present:
+            vals = (
+                compliant[
+                    (compliant[group_col] == key) & (compliant["variant"] == variant)
+                ][metric_col]
+                .dropna()
+                .tolist()
+            )
+            m, ci = _mean_ci(vals) if vals else (float("nan"), 0.0)
+            means.append(m)
+            cis.append(0.0 if ci != ci else ci)
+        fig.add_trace(
+            go.Bar(
+                y=labels,
+                x=means,
+                orientation="h",
+                offsetgroup=variant,
+                name=alias_variant(variant),
+                legend="legend",
+                marker=_bar_marker(
+                    _variant_color(variant),
+                    pattern_shape=_VARIANT_PATTERN.get(variant, ""),
+                ),
+                error_x=dict(
+                    type="data",
+                    array=cis,
+                    visible=True,
+                    thickness=1.2,
+                    width=4,
+                    color=_MUTED_COLOR,
+                ),
+                hovertemplate=(
+                    f"<b>{alias_variant(variant)}</b><br>{group_label}: "
+                    "%{y}<br>PWSF: %{x:.3f}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+    # Right — compliance composition, stacked per variant. Only categories that
+    # actually occur in this campaign get a bar + legend entry (e.g. pressure
+    # never fails here), so the legend stays compact.
+    present_cats = set(work["_cat"].unique())
+    cats = [c for c in _COMPLIANCE_CATS if c[0] in present_cats]
+    for key, lbl, color, hatch in cats:
+        for vi, variant in enumerate(variants):
+            fracs: list[float] = []
+            for gkey, _ in present:
+                sub = work[
+                    (work[group_col] == gkey) & (work["variant"] == variant)
+                ]
+                fracs.append((sub["_cat"] == key).mean() if len(sub) else float("nan"))
+            fig.add_trace(
+                go.Bar(
+                    y=labels,
+                    x=fracs,
+                    orientation="h",
+                    offsetgroup=variant,
+                    name=lbl,
+                    legendgroup=key,
+                    showlegend=(vi == 0),
+                    legend="legend2",
+                    marker=_bar_marker(color, pattern_shape=hatch),
+                    hovertemplate=(
+                        f"<b>{lbl}</b> · {alias_variant(variant)}<br>{group_label}: "
+                        "%{y}<br>share: %{x:.0%}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=2,
+            )
+
+    fig.update_layout(barmode="relative", bargap=0.28, bargroupgap=0.06)
+    fig.update_xaxes(range=[0, 1.05], title="PWSF", tickformat=".2f", row=1, col=1)
+    fig.update_xaxes(
+        range=[0, 1.001], title="share of runs", tickformat=".0%", row=1, col=2
+    )
+    fig.update_yaxes(title=group_label, row=1, col=1)
+
+    base_h = _hbar_height(len(labels), len(variants))
+    height = base_h + 90  # top room for title + one shared legend row
+    width = 1400  # wide enough for both legends side by side on one row
+    themed = _apply_theme(fig, title=title, height=height, width=width, font_bump=2)
+    lf = _LEGEND_FONT_SIZE
+    # Two legends on the SAME horizontal row: variants left-anchored, compliance
+    # categories right-anchored, no legend titles.
+    legend_y = 1.0 - 62 / height
+    themed.update_layout(
+        title=dict(
+            text=title,
+            yref="container",
+            yanchor="top",
+            y=0.985,
+            x=0.5,
+            xanchor="center",
+            font=dict(
+                family=_TITLE_FONT_FAMILY, size=_TITLE_FONT_SIZE + 2, color=_AXIS_COLOR
+            ),
+        ),
+        legend=dict(
+            orientation="h",
+            yref="container",
+            xref="container",
+            y=legend_y,
+            x=0.01,
+            xanchor="left",
+            yanchor="top",
+            font=dict(size=lf),
+        ),
+        legend2=dict(
+            orientation="h",
+            yref="container",
+            xref="container",
+            y=legend_y,
+            x=0.99,
+            xanchor="right",
+            yanchor="top",
+            font=dict(size=lf),
+        ),
+        margin=dict(l=90, r=40, t=130, b=80),
+    )
+    return _save(themed, out_path)
+
+
 def stress_class_variant_bar(
     df: pd.DataFrame,
     out_path: Path,
@@ -1301,6 +1515,7 @@ _SWEEP_PARAM_DEFAULTS: dict[str, float] = {
     "ttl_hops": 3.0,
     "cp_bridge_cost": 2.0,
     "holon_max_size": 4.0,
+    "community_label_propagation_radius": 2.0,
     "comms_packet_loss_pct": 0.0,
     "comms_latency_jitter_ms": 0.0,
 }
@@ -1484,14 +1699,18 @@ def sweep_curve_dual(
         )
 
     fig.update_yaxes(
-        title="priority-weighted served fraction (compliant)",
+        title="PWSF (compliant)",
         range=[0, 1.05],
         color=_VARIANT_COLOR["scare"],
         secondary_y=False,
         tickformat=".2f",
     )
     fig.update_xaxes(title=x_label)
-    return _save(_apply_theme(fig, title=title, font_bump=4), out_path)
+    themed = _apply_theme(fig, title=title, font_bump=4, legend_top=True)
+    # ``legend_top`` reclaims the right margin, but this figure keeps a
+    # right-hand secondary axis (wallclock), so give that axis its room back.
+    themed.update_layout(margin_r=150)
+    return _save(themed, out_path)
 
 
 # Per-tier served (Pillars 1, 4)

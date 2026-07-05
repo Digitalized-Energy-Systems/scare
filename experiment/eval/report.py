@@ -116,26 +116,50 @@ def _optimality_gap(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 
 def _stress_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
-    """Single combined grouped bar: PWSF per variant across every hard stress
-    scenario class, replacing the one-panel-per-class figures."""
+    """Combined stress view: PWSF per variant AND the compliance composition,
+    across every hard stress scenario class, in one two-panel figure."""
     done = _completed_sims(campaign.summary)
     if done.empty:
         return []
     return [
         str(
-            plots.stress_class_variant_bar(
+            plots.variant_pwsf_compliance_bar(
                 done,
                 out_dir / "stress_class_variants.png",
+                groups=plots._STRESS_CLASS_ORDER,
+                group_col="experiment",
+                group_label="stress class",
+                title="Served fraction and compliance by variant across stress classes",
             )
         )
     ]
+
+
+_VC_GRID_ORDER = (
+    "simbench_lv",
+    "simbench_lv_cp_heavy_dependent",
+    "simbench_lv_medium",
+    "simbench_lv_small",
+)
 
 
 def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
     sub = _completed_sims(campaign.by_experiment("variant_comparison"))
     if sub.empty:
         return []
+    grids_present = [g for g in _VC_GRID_ORDER if g in set(sub["grid"].dropna().unique())]
+    vc_groups = [(g, alias_grid(g)) for g in grids_present]
     return [
+        str(
+            plots.variant_pwsf_compliance_bar(
+                sub,
+                out_dir / "served_and_compliance.png",
+                groups=vc_groups,
+                group_col="grid",
+                group_label="grid",
+                title="Variant comparison: served fraction and compliance",
+            )
+        ),
         str(
             plots.variant_comparison_bar(
                 sub,
@@ -319,10 +343,10 @@ def _sweeps(campaign: CampaignData, out_dir: Path) -> list[str]:
             "TTL sweep — served + wallclock",
         ),
         (
-            "holon_size_sweep",
-            "holon_max_size",
-            "max holon size",
-            "Holon-size sweep — served + wallclock",
+            "community_size_sweep",
+            "community_label_propagation_radius",
+            "community radius (hops)",
+            "Community-size sweep — served + wallclock",
         ),
     ):
         sub = campaign.by_experiment(exp_name)

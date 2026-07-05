@@ -263,10 +263,15 @@ class EnergyBalanceNegotiator(Role):
         enable_actuated_ledger_writeback: bool = True,
         enable_nominal_slack_supply: bool = False,
         enable_cp_aware_slack_supply: bool = False,
+        component_scope: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
         self.sector = sector
+        # True when L2 runs per connected component (holon cliques are not
+        # built). Upward reactive triggers then go to the leader's own L2 and
+        # the component-peer mesh, not the arbitrary ``holons`` chunk topology.
+        self._component_scope = bool(component_scope)
         # Monotonic counter for DETERMINISTIC negotiation IDs. The id feeds
         # hash-based gossip routing; a uuid4 id (os.urandom, immune to seeding)
         # made routing vary run-to-run. ``aid/seq`` is unique and reproducible.
@@ -1436,26 +1441,39 @@ class EnergyBalanceNegotiator(Role):
                     sector=self.sector.value,
                     detail=f"residual={residual:.4f}",
                 )
-                request = LocalGenerationRequest(
-                    sector=self.sector, residual_deficit=residual
-                )
-                # Route through L2: it triggers an early ADMM rebalance and
-                # replies with the residual it couldn't absorb. With no holon
-                # peers, approve locally so the fallback fires.
-                try:
-                    holon_peers = list(topology_neighbors(self, tid="holons"))
-                except KeyError:
-                    holon_peers = []
-                if holon_peers:
-                    for addr in holon_peers:
-                        await self.context.send_message(request, receiver_addr=addr)
-                else:
+                # Component scope: the leader's own component ADMM was already
+                # re-triggered by the local NegotiationFinishedEvent above (the
+                # coordinator re-solves and floors what it can route); approve
+                # the local-DG fallback for the residual it cannot. Legacy holon
+                # scope: escalate to holon-clique peers so their L2 arbitrates
+                # first, else self-approve when the clique is empty.
+                if self._component_scope:
                     self.context.emit_event(
                         LocalGenerationApproval(
                             sector=self.sector,
                             residual_deficit=residual,
                         )
                     )
+                else:
+                    request = LocalGenerationRequest(
+                        sector=self.sector, residual_deficit=residual
+                    )
+                    try:
+                        holon_peers = list(topology_neighbors(self, tid="holons"))
+                    except KeyError:
+                        holon_peers = []
+                    if holon_peers:
+                        for addr in holon_peers:
+                            await self.context.send_message(
+                                request, receiver_addr=addr
+                            )
+                    else:
+                        self.context.emit_event(
+                            LocalGenerationApproval(
+                                sector=self.sector,
+                                residual_deficit=residual,
+                            )
+                        )
 
         # Local event: consumed by this agent's own L2 (_on_member_finished_local)
         # and L3 (CP channel) — the upward self-trigger. Gate on change.
@@ -1483,14 +1501,20 @@ class EnergyBalanceNegotiator(Role):
         # so a no-op finish does not re-trigger the cascade. The priority-aware
         # payload is re-fetched in ``_try_rebalance``.
         if notify_upward:
-            try:
-                holon_peers = topology_neighbors(self, tid="holons")
-            except KeyError:
-                holon_peers = []
-            for addr in holon_peers:
-                await self.context.send_message(finished_msg, receiver_addr=addr)
+            # Component scope drives L2 off each leader's own local finish
+            # (emitted above) plus the coordinator's per-leader report buffer, so
+            # the cross-leader holon-clique nudge is redundant there (and the
+            # clique is an arbitrary lex chunk, not the coordination set). Legacy
+            # holon scope still fans the finish out to clique peers.
+            if not self._component_scope:
+                try:
+                    holon_peers = topology_neighbors(self, tid="holons")
+                except KeyError:
+                    holon_peers = []
+                for addr in holon_peers:
+                    await self.context.send_message(finished_msg, receiver_addr=addr)
 
-            # Leader also notifies CP connectors
+            # Leader also notifies CP connectors (both scopes)
             if topology_characteristic(self, tid="groups") == "leader":
                 cp_connectors = list(topology_connectors(self, tid="groups"))
                 if cp_connectors:
@@ -2375,6 +2399,7 @@ def create_energy_balance_role(
     enable_actuated_ledger_writeback: bool = True,
     enable_nominal_slack_supply: bool = False,
     enable_cp_aware_slack_supply: bool = False,
+    component_scope: bool = False,
 ) -> EnergyBalanceNegotiator:
     if priority is None:
         priority = obs_priority(obs)
@@ -2395,4 +2420,5 @@ def create_energy_balance_role(
         enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,
         enable_nominal_slack_supply=enable_nominal_slack_supply,
         enable_cp_aware_slack_supply=enable_cp_aware_slack_supply,
+        component_scope=component_scope,
     )
