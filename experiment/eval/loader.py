@@ -163,17 +163,35 @@ class CampaignData:
         return sorted({e for e in self.summary["experiment"].dropna() if e})
 
     def representative_task(
-        self, experiment: str, variant: str = "scare"
+        self,
+        experiment: str,
+        variant: str = "scare",
+        *,
+        scenario_contains: str | None = None,
     ) -> TaskArtefacts | None:
         """Pick one OK task in the given experiment for trajectory plots.
 
-        Prefers tasks with no solver infeasibilities (a frozen
-        ``_net_results`` snapshot flatlines every observation-based metric).
-        Falls back to the lowest task_id when the column is unavailable.
+        ``scenario_contains`` restricts to tasks whose ``scenario`` key holds
+        that substring FIRST — for A/B experiments this picks the arm that
+        actually exercises the feature (e.g. ``linepack=True`` for the
+        temporal experiment, ``kind=microgrid`` for islanding), so the
+        representative plot showcases the extension rather than its baseline.
+
+        Within the (optionally filtered) set, prefers tasks with no solver
+        infeasibilities (a frozen ``_net_results`` snapshot flatlines every
+        observation-based metric); falls back to the lowest task_id. The
+        scenario filter outranks the freshness preference — an extension arm
+        with benign early infeasibilities is still the fitting run.
         """
         df = self.by_experiment(experiment)
         df = df[df["variant"] == variant]
         df = df[df["status"] == "ok"]
+        if scenario_contains and "scenario" in df.columns:
+            arm = df[
+                df["scenario"].astype(str).str.contains(scenario_contains, regex=False)
+            ]
+            if not arm.empty:
+                df = arm
         if df.empty:
             return None
         fresh_col = "solver_failures"

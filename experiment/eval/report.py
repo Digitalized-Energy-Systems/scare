@@ -607,6 +607,16 @@ def _constraints(campaign: CampaignData, out_dir: Path) -> list[str]:
     ]
 
 
+# For A/B extension experiments the representative trajectory must come from
+# the arm that exercises the feature, not its baseline (the freshness
+# preference otherwise picks the extension-off arm, which has no solver
+# failures). Substring is matched against the flattened ``scenario`` key.
+_EXTENSION_REP_ARM = {
+    "extension_temporal": "linepack=True",
+    "extension_islanding": "kind=microgrid",
+}
+
+
 def _per_experiment_trajectories(
     campaign: CampaignData,
     plots_root: Path,
@@ -638,7 +648,11 @@ def _per_experiment_trajectories(
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
-            rep = campaign.representative_task(str(exp_name), str(variant))
+            rep = campaign.representative_task(
+                str(exp_name),
+                str(variant),
+                scenario_contains=_EXTENSION_REP_ARM.get(str(exp_name)),
+            )
             if rep is None:
                 continue
             out_dir = plots_root / "trajectories" / str(exp_name) / str(variant)

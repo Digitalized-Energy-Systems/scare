@@ -404,6 +404,24 @@ def _save(fig: go.Figure, out_path: Path) -> Path:
     return out_path
 
 
+def _time_axis(t_seconds: Any) -> tuple[Any, str, float]:
+    """Pick a readable time unit for a trajectory x-axis from its span.
+
+    Returns ``(scaled_values, axis_label, scale)``. ``scale`` multiplies any
+    other quantity in seconds (event/failure times, stale-region bounds) so
+    they stay aligned with the rescaled series. Long agent-time runs (the
+    temporal experiments reach ~6 h of sim time) become unreadable in
+    seconds; short runs keep seconds.
+    """
+    t = np.asarray(t_seconds, dtype=float)
+    tmax = float(t.max()) if t.size else 0.0
+    if tmax >= 7200.0:  # >= 2 h
+        return t / 3600.0, "simulation time (h)", 1.0 / 3600.0
+    if tmax >= 600.0:  # >= 10 min
+        return t / 60.0, "simulation time (min)", 1.0 / 60.0
+    return t, "simulation time (s)", 1.0
+
+
 def _empty_fig(message: str, title: str) -> go.Figure:
     fig = go.Figure()
     fig.add_annotation(
@@ -3347,9 +3365,12 @@ def constraint_envelope_trajectory(
         col=1,
     )
 
-    x = timeseries["time_s"].values
+    x, x_title, x_scale = _time_axis(timeseries["time_s"].values)
     x_list = list(x)
     x_band = x_list + x_list[::-1]
+    # Stale boundary in the (possibly rescaled) x-axis unit.
+    stale_x = None if stale_from_t is None else stale_from_t * x_scale
+    x_hover = x_title.split("(")[-1].rstrip(")")
 
     for row_idx, (avg_col, min_col, max_col, y_label, bounds, line_color) in enumerate(
         present, start=1
@@ -3380,11 +3401,11 @@ def constraint_envelope_trajectory(
         )
 
         # Stale-snapshot overlay
-        if stale_from_t is not None:
+        if stale_x is not None:
             x_max = float(x[-1])
-            if x_max > stale_from_t:
+            if x_max > stale_x:
                 fig.add_vrect(
-                    x0=stale_from_t,
+                    x0=stale_x,
                     x1=x_max,
                     fillcolor="rgba(150, 150, 150, 0.20)",
                     line=dict(width=0),
@@ -3442,9 +3463,9 @@ def constraint_envelope_trajectory(
             # Solid up to the freshness boundary, dotted afterwards to
             # demote the held-over snapshot; split segments share a
             # legend group.
-            if stale_from_t is not None:
-                fresh_mask = x <= stale_from_t
-                stale_mask = x >= stale_from_t
+            if stale_x is not None:
+                fresh_mask = x <= stale_x
+                stale_mask = x >= stale_x
                 if fresh_mask.any():
                     fig.add_trace(
                         go.Scatter(
@@ -3457,7 +3478,7 @@ def constraint_envelope_trajectory(
                             showlegend=_once(legend_group),
                             hovertemplate=(
                                 f"<b>{y_label} — {hover_label}</b><br>"
-                                "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                                f"t: %{{x:.2f}}{x_hover}<br>value: %{{y:.4f}}<extra></extra>"
                             ),
                         ),
                         row=row_idx,
@@ -3476,7 +3497,7 @@ def constraint_envelope_trajectory(
                             showlegend=_once(legend_group),
                             hovertemplate=(
                                 f"<b>{y_label} — {hover_label} (held over)</b><br>"
-                                "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                                f"t: %{{x:.2f}}{x_hover}<br>value: %{{y:.4f}}<extra></extra>"
                             ),
                         ),
                         row=row_idx,
@@ -3494,7 +3515,7 @@ def constraint_envelope_trajectory(
                         showlegend=_once(legend_group),
                         hovertemplate=(
                             f"<b>{y_label} — {hover_label}</b><br>"
-                            "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                            f"t: %{{x:.2f}}{x_hover}<br>value: %{{y:.4f}}<extra></extra>"
                         ),
                     ),
                     row=row_idx,
@@ -3537,7 +3558,7 @@ def constraint_envelope_trajectory(
                     continue
                 for tx in ev["t"].astype(float).unique():
                     fig.add_vline(
-                        x=float(tx),
+                        x=float(tx) * x_scale,
                         line=dict(color=style["color"], dash=style["dash"], width=1),
                         opacity=0.6,
                         row=row_idx,
@@ -3545,7 +3566,7 @@ def constraint_envelope_trajectory(
                     )
         elif failure_t is not None:
             fig.add_vline(
-                x=failure_t,
+                x=failure_t * x_scale,
                 line=dict(color="#1A1A1A", dash="dash", width=1),
                 opacity=0.6,
                 row=row_idx,
@@ -3571,7 +3592,7 @@ def constraint_envelope_trajectory(
             col=1,
         )
 
-    fig.update_xaxes(title="simulation time (s)", row=len(present), col=1)
+    fig.update_xaxes(title=x_title, row=len(present), col=1)
     height = max(_FIG_HEIGHT, 200 * len(present) + 100)
     return _save(
         _apply_theme(
@@ -4806,6 +4827,15 @@ def extension_islanding_events(
         vertical_spacing=0.12,
         subplot_titles=[p[2] for p in panels],
     )
+    # Unit from the widest span across tasks so every trace shares one axis.
+    _tmax = max(
+        (float(ts["time_s"].astype(float).max())
+         for _, ts in tasks
+         if not ts.empty and "time_s" in ts.columns),
+        default=0.0,
+    )
+    _, x_title, x_scale = _time_axis(np.array([_tmax]))
+    x_hover = x_title.split("(")[-1].rstrip(")")
     plotted = False
     for i, (label, ts) in enumerate(tasks):
         if ts.empty or "time_s" not in ts.columns:
@@ -4817,7 +4847,7 @@ def extension_islanding_events(
             plotted = True
             fig.add_trace(
                 go.Scatter(
-                    x=ts["time_s"].astype(float).values,
+                    x=ts["time_s"].astype(float).values * x_scale,
                     y=ts[col].astype(float).values,
                     mode="lines",
                     # Counts change stepwise at solve boundaries.
@@ -4827,7 +4857,7 @@ def extension_islanding_events(
                     showlegend=(row_idx == 1),
                     hovertemplate=(
                         f"<b>{label}</b><br>{panel_lbl}: %{{y:.0f}}<br>"
-                        "t: %{x:.2f}s<extra></extra>"
+                        f"t: %{{x:.2f}}{x_hover}<extra></extra>"
                     ),
                 ),
                 row=row_idx,
@@ -4838,7 +4868,7 @@ def extension_islanding_events(
 
     fig.update_yaxes(title="nodes", rangemode="tozero", row=1, col=1)
     fig.update_yaxes(title="events", rangemode="tozero", row=2, col=1)
-    fig.update_xaxes(title="simulation time (s)", row=2, col=1)
+    fig.update_xaxes(title=x_title, row=2, col=1)
     return _save(_apply_theme(fig, title=title, height=620, legend_top=True), out_path)
 
 
