@@ -152,20 +152,28 @@ class TestClampToConstraints:
         obs = {"p_mw": 10.0, "vm_pu": 1.0}
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY) == 5.0
 
-    def test_near_bound_reduces(self):
-        # vm_pu=1.04 => util=0.8 => allowed=0.2 => max_abs=2.0
-        obs = {"p_mw": 10.0, "vm_pu": 1.04}
+    def test_undervoltage_load_reduces(self):
+        # Load, vm_pu=0.952 => below centre => serving (which pulls V down)
+        # worsens it => util=0.96, deadband 0.85 => allowed=(1-.96)/.15=0.267.
+        obs = {"p_mw": 10.0, "vm_pu": 0.952}
         result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY)
-        assert result == pytest.approx(2.0)
+        assert result == pytest.approx(2.667, abs=1e-2)
+
+    def test_overvoltage_load_not_reduced(self):
+        # Direction-aware: over-voltage is RELIEVED by serving load (it draws V
+        # down), so a load is NOT capped by a high-side reading.
+        obs = {"p_mw": 10.0, "vm_pu": 1.048}
+        assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY) == 5.0
 
     def test_zero_capacity(self):
         obs = {"p_mw": 0.0, "vm_pu": 1.04}
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY) == 5.0
 
     def test_negative_setpoint(self):
-        obs = {"p_mw": 10.0, "vm_pu": 1.04}
+        # Under-voltage load, negative setpoint clamps symmetrically in magnitude.
+        obs = {"p_mw": 10.0, "vm_pu": 0.952}
         result = clamp_to_constraints(-5.0, obs, Sector.ELECTRICITY)
-        assert result == pytest.approx(-2.0)
+        assert result == pytest.approx(-2.667, abs=1e-2)
 
 
 # ===================================================================

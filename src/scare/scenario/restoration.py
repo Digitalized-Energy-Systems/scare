@@ -84,6 +84,7 @@ from scare.base.util import (
     register_sector,
     register_slack,
     sector_from_grid,
+    set_directional_constraint_cap,
 )
 from scare.community.coalition_store import CoalitionConstraintStore
 from scare.community.dynamic_holon import DynamicHolonRole
@@ -390,6 +391,7 @@ def create_restoration_scenario_world(
     behavior: RestorationEnvironmentBehavior = world.environment.behavior
     # Stash config so components read flags lazily without threading it through.
     behavior._scare_config = config
+    set_directional_constraint_cap(config.enable_directional_constraint_cap)
     _cd_override = getattr(config, "energy_flow_cooldown_s_override", None)
     if _cd_override is not None and hasattr(behavior, "_energy_flow_cooldown_s"):
         behavior._energy_flow_cooldown_s = float(_cd_override)

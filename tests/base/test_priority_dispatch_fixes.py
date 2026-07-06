@@ -43,11 +43,11 @@ class TestTierAwareClamp:
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=4) == 5.0
 
     def test_critical_tier_resists_clamp_past_default_deadband(self):
-        # vm_pu=1.048 → util=0.96.  Tier 4 deadband 0.85 ⇒
-        # allowed=(1-0.96)/0.15 ≈ 0.267, max_abs≈2.67, so a low-tier
-        # 5 MW setpoint is throttled to ~2.67 MW.  Tier 1 is immune
-        # ⇒ no clamp regardless of util.
-        obs = {"p_mw": 10.0, "vm_pu": 1.048}
+        # UNDER-voltage vm_pu=0.952 → util=0.96 (serving a load worsens the low
+        # bound).  Tier 4 deadband 0.85 ⇒ allowed=(1-0.96)/0.15 ≈ 0.267,
+        # max_abs≈2.67, so a low-tier 5 MW setpoint is throttled to ~2.67 MW.
+        # Tier 1 is immune ⇒ no clamp regardless of util.
+        obs = {"p_mw": 10.0, "vm_pu": 0.952}
         low_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=4)
         high_tier_result = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
         assert abs(low_tier_result) < 5.0  # was throttled
@@ -59,10 +59,10 @@ class TestTierAwareClamp:
         assert clamp_to_constraints(5.0, obs, Sector.ELECTRICITY) == 5.0
 
     def test_tier1_immune_even_under_extreme_stress(self):
-        # At vm_pu=1.0499 (util ≈ 0.998) a tier-2 load clamps to near zero,
-        # but tier-1 immunity dominates the soft clamp and passes through
-        # unmodified.
-        obs = {"p_mw": 10.0, "vm_pu": 1.0499}
+        # At under-voltage vm_pu=0.9501 (util ≈ 0.998) a tier-2 load clamps to
+        # near zero, but tier-1 immunity dominates the soft clamp and passes
+        # through unmodified.
+        obs = {"p_mw": 10.0, "vm_pu": 0.9501}
         tier1 = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=1)
         tier2 = clamp_to_constraints(5.0, obs, Sector.ELECTRICITY, tier=2)
         assert tier1 == 5.0  # immune

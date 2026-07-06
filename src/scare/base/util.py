@@ -1435,6 +1435,19 @@ def clamp_to_constraints(
     return setpoint
 
 
+# Direction-aware constraint capping (see constraint_allowed_fraction). Set per
+# build from ``RestorationConfiguration.enable_directional_constraint_cap``.
+# Module-global (not threaded through every caller) because it is a physics
+# invariant, not a per-actor policy; each task rebuilds and re-sets it.
+_DIRECTIONAL_CONSTRAINT_CAP: bool = True
+
+
+def set_directional_constraint_cap(enabled: bool) -> None:
+    """Toggle the direction-aware serving cap in :func:`constraint_allowed_fraction`."""
+    global _DIRECTIONAL_CONSTRAINT_CAP
+    _DIRECTIONAL_CONSTRAINT_CAP = bool(enabled)
+
+
 def constraint_allowed_fraction(
     obs: dict,
     sector: Sector,
@@ -1444,9 +1457,19 @@ def constraint_allowed_fraction(
     """Tightest constraint-allowed served fraction ``∈ [0, 1]`` from local
     measurements (same tier deadband as :func:`clamp_to_constraints`).
 
-    The capacity fraction the load may be served at given local physics,
-    before the priority decision. Shared with the L2 priority-floor so the
-    floor relaxes by exactly the amount the clamp sheds.
+    The capacity fraction the actor may be served at given local physics, before
+    the priority decision. Shared with the L2 priority-floor so the floor relaxes
+    by exactly the amount the clamp sheds.
+
+    DIRECTION-AWARE. Serving more (larger ``|setpoint|``) moves node state
+    variables (vm_pu, pressure_pu, t_k) DOWN for a load (consumption pulls them
+    down) and UP for a generator (injection pushes them up). Only the bound that
+    serving pushes the value TOWARD may cap: capping the other side would
+    shed/curtail the very actor that RELIEVES the violation. The canonical case:
+    over-voltage on a PV-surplus feeder is relieved by SERVING load (it draws the
+    surplus down), so a load must not be capped by an over-voltage reading — the
+    symmetric ``constraint_utilization`` used to do exactly that and strand the
+    load shed. Over-voltage still caps GENERATORS (they cause it). Tier-1 immune.
     """
     # Tier 1 immune to the soft clamp; a true ConstraintViolation re-checks it.
     if tier is not None and int(tier) == 1:
@@ -1457,6 +1480,9 @@ def constraint_allowed_fraction(
         deadband = _CLAMP_DEFAULT_DEADBAND
     width = max(1e-9, 1.0 - deadband)
 
+    # Generators (cap < 0) inject → serving raises state vars; loads → lowers.
+    serving_raises = obs_capacity(obs) < 0
+
     tightest_fraction = 1.0
     for var, (lo, hi) in SECTOR_CONSTRAINTS.get(sector, {}).items():
         if var not in obs:
@@ -1464,7 +1490,20 @@ def constraint_allowed_fraction(
         val = float(obs[var])
         if not math.isfinite(val):
             continue
-        util = constraint_utilization(val, lo, hi)
+        if _DIRECTIONAL_CONSTRAINT_CAP:
+            half = (hi - lo) / 2.0
+            if half <= 0.0:
+                continue
+            mid = (lo + hi) / 2.0
+            # One-sided utilization in the WORSENING direction only. Serving
+            # raises val (generator) ⇒ the HIGH bound worsens; serving lowers
+            # val (load) ⇒ the LOW bound worsens. The opposite side is relieved
+            # by serving → no cap.
+            util = (val - mid) / half if serving_raises else (mid - val) / half
+            util = max(0.0, min(1.0, util))
+        else:
+            # Legacy symmetric behaviour: caps on proximity to EITHER bound.
+            util = constraint_utilization(val, lo, hi)
         if util <= deadband:
             allowed = 1.0
         else:

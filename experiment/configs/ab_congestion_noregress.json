@@ -1,0 +1,43 @@
+{
+  "$comment": "No-regression A/B for enable_line_congestion_price now DEFAULT ON. Arm {} = ON (new default), arm {enable_line_congestion_price:false} = OFF (legacy). Confirms no regression on non-LV-S grids + import-driven line_stress where the fix should be neutral. Guard: Δserved>=0, Δagent_shed<=0, Δpwsf>=~0 per grid.",
+  "name": "ab_congestion_noregress",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1200.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 8, "failure_lambda": 1.0, "max_failures": 3 },
+  "experiments": [
+    {
+      "name": "lv50_clean",
+      "grids": ["simbench_lv"],
+      "n_seeds": 8, "variants": ["scare"],
+      "ablations": [ {}, { "enable_line_congestion_price": false } ],
+      "scenarios": [ { "kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45 } ]
+    },
+    {
+      "name": "lvm_clean",
+      "grids": ["simbench_lv_medium"],
+      "n_seeds": 8, "variants": ["scare"],
+      "ablations": [ {}, { "enable_line_congestion_price": false } ],
+      "scenarios": [ { "kind": "clean", "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45 } ]
+    },
+    {
+      "name": "cpheavy_clean",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 6, "variants": ["scare"],
+      "ablations": [ {}, { "enable_line_congestion_price": false } ],
+      "scenarios": [ { "kind": "clean", "failure_type": "mixed", "generator_share": 0.5, "max_failures": 3, "priority_assignment": "skewed", "slack_budget_pct": 0.45 } ]
+    },
+    {
+      "name": "line_stress",
+      "grids": ["simbench_lv"],
+      "n_seeds": 8, "variants": ["scare"],
+      "ablations": [ {}, { "enable_line_congestion_price": false } ],
+      "scenarios": [ { "kind": "line_stress", "load_scale": 1.8, "ampacity_scale": 0.5, "max_failures": 2, "priority_assignment": "skewed", "slack_budget_pct": 0.45 } ]
+    }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "02:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 64 }
+}

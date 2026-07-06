@@ -57,10 +57,19 @@ def test_allowed_fraction_tier1_immune():
     assert constraint_allowed_fraction(obs, Sector.ELECTRICITY, tier=1) == 1.0
 
 
-def test_allowed_fraction_drops_under_pressure():
-    obs = {"p_mw": 10.0, "vm_pu": 1.09}
+def test_allowed_fraction_drops_under_voltage():
+    # UNDER-voltage: serving the load (which pulls V down) worsens it, so the
+    # served fraction is capped. (Over-voltage does NOT cap a load — see below.)
+    obs = {"p_mw": 10.0, "vm_pu": 0.953}
     frac = constraint_allowed_fraction(obs, Sector.ELECTRICITY, tier=4)
     assert 0.0 <= frac < 1.0
+
+
+def test_allowed_fraction_load_not_capped_by_overvoltage():
+    # Direction-aware: over-voltage is relieved by serving load, so a load is
+    # NOT capped by a high-side reading (the old symmetric cap wrongly shed it).
+    obs = {"p_mw": 10.0, "vm_pu": 1.09}
+    assert constraint_allowed_fraction(obs, Sector.ELECTRICITY, tier=4) == 1.0
 
 
 # --- l2_effective_floor ------------------------------------------------
@@ -83,7 +92,7 @@ def test_effective_floor_capped_by_constraint():
     # achievable fraction below 1.0 → floor relaxes to the constraint.
     b = _Behavior()
     _l2_floor_store(b)["load-1"] = 1.0
-    obs = {"p_mw": 1.0, "vm_pu": 1.09}
+    obs = {"p_mw": 1.0, "vm_pu": 0.953}
     eff = l2_effective_floor(b, "load-1", obs, Sector.ELECTRICITY, 4)
     assert eff < 1.0
     assert eff == constraint_allowed_fraction(obs, Sector.ELECTRICITY, tier=4)

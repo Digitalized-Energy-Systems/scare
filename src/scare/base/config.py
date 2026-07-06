@@ -172,6 +172,15 @@ class RestorationConfiguration:
     # proportional auction. Electricity line-relief only.
     enable_line_relief_waterfall: bool = True
 
+    # Direction-aware constraint capping in ``constraint_allowed_fraction`` /
+    # ``clamp_to_constraints``. True: a load's served fraction is capped only by
+    # the bound that SERVING pushes toward (voltage/pressure/temperature all fall
+    # as a load draws), so over-voltage no longer sheds load — it is relieved by
+    # serving load and is instead curtailed at generators. False (legacy):
+    # symmetric cap that sheds load on over-voltage too (wrong lever on a
+    # PV-surplus feeder; strands load shed while the slack has headroom).
+    enable_directional_constraint_cap: bool = True
+
     # Constraint-aware participation scaling in the gossip step. False:
     # participation_scale = 1 always.
     enable_constraint_aware_gossip: bool = True
