@@ -87,9 +87,14 @@ def apply_microgrid_islanding(
             and "electricity" in carrier_set
         ):
             p_max = max(1e-6, abs(float(getattr(m, "p_mw", 0.0) or 0.0)))
-            q_max = max(
-                1e-6, abs(float(getattr(m, "q_mvar", 0.0) or 0.0)) + 0.1 * p_max
-            )
+            # Full four-quadrant reactive capability (|Q| up to the active
+            # rating). A grid-forming inverter must supply the island's whole
+            # reactive demand + line charging while pinning bus voltage; the
+            # old 0.1*p_max headroom made a severed island's Q-balance
+            # infeasible (IIS: node Q-balance vs gf q_mvar bound), so a
+            # post-failure island solve failed every step. Feasibility
+            # threshold measured at ~0.2*p_max; p_max keeps ample margin.
+            q_max = max(1e-6, abs(float(getattr(m, "q_mvar", 0.0) or 0.0)), p_max)
             child.model = GridFormingGenerator(
                 p_mw_max=p_max,
                 q_mvar_max=q_max,

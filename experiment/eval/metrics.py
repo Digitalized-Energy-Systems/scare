@@ -293,6 +293,21 @@ def _is_gas_consumer_sink(child: Any, monee_net: Any) -> bool:
     return "gas" in grid_name
 
 
+def _gas_load_mw_factor(node: Any) -> float:
+    """kg/s -> MW energy-content factor for a gas load on ``node``'s grid.
+
+    Uses that grid's higher heating value (``higher_heating_value_kwh_per_kg``,
+    falling back to :data:`DEFAULT_GAS_HHV_KWH_PER_KG`) and the same
+    ``KGPS_KWHPERKG_TO_MW`` constant :func:`_cp_output` applies to converter gas
+    throughput, so terminal gas demand enters PWSF on the identical energy basis
+    as the electricity and heat MW.
+    """
+    hhv = getattr(getattr(node, "grid", None), "higher_heating_value_kwh_per_kg", None)
+    if not (isinstance(hhv, (int, float)) and hhv > 0):
+        hhv = DEFAULT_GAS_HHV_KWH_PER_KG
+    return float(hhv) * KGPS_KWHPERKG_TO_MW
+
+
 def served_by_load(
     monee_net: Any,
     behavior: Any,
@@ -361,6 +376,12 @@ def served_by_load(
         # level (see ``_line_feasibility_factor``).
         if sec is Sector.ELECTRICITY:
             served *= line_factor.get(child.node_id, 1.0)
+        # Gas demand/served are mass flow (kg/s); convert to MW energy content
+        # so every row shares the electricity/heat unit (see _gas_load_mw_factor).
+        if sec is Sector.GAS:
+            gas_mw = _gas_load_mw_factor(node)
+            cap *= gas_mw
+            served *= gas_mw
         if priorities is not None and aid in priorities:
             tier = int(priorities[aid])
         else:
@@ -409,7 +430,7 @@ def served_breakdown(
         "by_tier_sector": {sector: {tier: {demand, served, fraction}}},
         "by_sector":      {sector: {demand, served, fraction}},
         "by_tier":        {tier:   {demand, served, fraction, weight}}
-                          (MW sectors only — gas is kg/s and stays per-sector),
+                          (all sectors in MW; gas HHV-converted from kg/s),
         "priority_weighted_served": float,
         "priority_weighted_demand": float,
         "priority_weighted_fraction": float,
@@ -502,6 +523,15 @@ def served_breakdown(
         # restoration_breakdown can net it out of agent_shed (mirroring the
         # constraint-throttled exclusion in claims.py's priority invariant).
         served_constraint_capped = max(0.0, served_pre_gate - served)
+        # Gas demand/served are mass flow (kg/s); convert to MW energy content
+        # (grid HHV x KGPS_KWHPERKG_TO_MW, the same basis _cp_output uses) so gas
+        # terminal load joins the electricity/heat MW aggregate consistently.
+        if sec is Sector.GAS:
+            gas_mw = _gas_load_mw_factor(node)
+            demand *= gas_mw
+            served *= gas_mw
+            demand_disc *= gas_mw
+            served_constraint_capped *= gas_mw
         if priorities is not None and aid in priorities:
             tier = int(priorities[aid])
         else:
@@ -523,24 +553,22 @@ def served_breakdown(
         by_sector[sec_key]["demand_disconnected"] += demand_disc
         by_sector[sec_key]["served_constraint_capped"] += served_constraint_capped
 
-        # by_tier sums MW across sectors; gas demand/served is mass-flow (kg/s)
-        # and would corrupt the mixed-unit buckets — gas stays in the per-sector
-        # views (by_sector / by_tier_sector) only.
-        if sec is not Sector.GAS:
-            by_tier.setdefault(
-                tier,
-                {
-                    "demand": 0.0,
-                    "served": 0.0,
-                    "weight": w,
-                    "demand_disconnected": 0.0,
-                    "served_constraint_capped": 0.0,
-                },
-            )
-            by_tier[tier]["demand"] += demand
-            by_tier[tier]["served"] += served
-            by_tier[tier]["demand_disconnected"] += demand_disc
-            by_tier[tier]["served_constraint_capped"] += served_constraint_capped
+        # by_tier sums MW across sectors; gas is converted to MW above, so all
+        # three sectors share the bucket.
+        by_tier.setdefault(
+            tier,
+            {
+                "demand": 0.0,
+                "served": 0.0,
+                "weight": w,
+                "demand_disconnected": 0.0,
+                "served_constraint_capped": 0.0,
+            },
+        )
+        by_tier[tier]["demand"] += demand
+        by_tier[tier]["served"] += served
+        by_tier[tier]["demand_disconnected"] += demand_disc
+        by_tier[tier]["served_constraint_capped"] += served_constraint_capped
 
         by_tier_sector.setdefault(sec_key, {})
         by_tier_sector[sec_key].setdefault(
@@ -553,12 +581,10 @@ def served_breakdown(
         pw_by_sector.setdefault(sec_key, {"demand": 0.0, "served": 0.0})
         pw_by_sector[sec_key]["demand"] += w * demand
         pw_by_sector[sec_key]["served"] += w * served
-        # Cross-sector aggregate stays in MW (electricity + heat). Gas demand is
-        # mass-flow (kg/s), so it is reported per-sector only and never summed
-        # into the mixed-unit aggregate scalar.
-        if sec is not Sector.GAS:
-            pw_demand += w * demand
-            pw_served += w * served
+        # Cross-sector aggregate is MW: electricity, heat, and (HHV-converted)
+        # gas terminal load all contribute.
+        pw_demand += w * demand
+        pw_served += w * served
         if served < 1e-9 and demand > 1e-9:
             n_zero += 1
 
@@ -580,11 +606,12 @@ def served_breakdown(
         "by_tier_sector": by_tier_sector,
         "by_sector": by_sector,
         "by_tier": by_tier,
-        # Aggregate PWSF: electricity + heat (MW), gas excluded (kg/s units).
+        # Aggregate PWSF over electricity + heat + gas, all in MW (gas HHV-
+        # converted from kg/s to the same energy basis).
         "priority_weighted_demand": pw_demand,
         "priority_weighted_served": pw_served,
         "priority_weighted_fraction": (pw_served / pw_demand if pw_demand > 0 else 1.0),
-        # Per-sector PWSF — the unit-safe way to read gas; no cross-sector mixing.
+        # Per-sector PWSF — same MW basis, split by carrier.
         "priority_weighted_demand_by_sector": {
             s: v["demand"] for s, v in pw_by_sector.items()
         },
@@ -649,9 +676,9 @@ def restoration_breakdown(
 
     sector_baseline = baseline.get("by_sector", {})
     sector_post = post.get("by_sector", {})
-    # Raw MW totals sum electricity + heat only; gas (by_sector) is mass-flow
-    # (kg/s) and is reported per-sector (ratio) rather than added to MW totals.
-    _mw_sectors = (Sector.ELECTRICITY.value, Sector.HEAT.value)
+    # Raw MW totals sum all three sectors; gas by_sector is already HHV-converted
+    # to MW in served_breakdown, so it adds on the same energy basis.
+    _mw_sectors = (Sector.ELECTRICITY.value, Sector.HEAT.value, Sector.GAS.value)
     total_demand = sum(
         s.get("demand", 0.0) for k, s in sector_baseline.items() if k in _mw_sectors
     )
@@ -742,7 +769,7 @@ def restoration_breakdown(
         }
 
     # Campaign-level disconnect / constraint / agent split (per-sector sums);
-    # gas is kg/s, so only MW sectors sum (same filter as the totals above).
+    # all three sectors are MW (gas HHV-converted), same filter as the totals.
     total_disconnect_lost = sum(
         s.get("disconnect_lost_mw", 0.0)
         for k, s in by_sector_out.items()
@@ -1261,18 +1288,16 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
     return rows
 
 
-# Constraint variables whose breach is governed by LOCAL PHYSICS and is already
-# reflected in the served-load metric, so gating compliance on them would
-# double-penalise the sector.  Heat junction temperature (``t_k``): a
-# temperature-infeasible heat node serves zero/less load (its
-# ``constraint_allowed`` fraction collapses), so the served-fraction / PWSF
-# metric already counts the cold node against the run; counting the ``t_k``
-# breach here too punishes the heat grid twice for one local hydraulic-thermal
-# limit that no extra slack can buy back.  Canonical for both the
+# Constraint variables audited but excluded from the compliance gate. Empty:
+# every operating bound in ``SECTOR_CONSTRAINTS`` gates. Heat junction
+# temperature (``t_k``) gates on the same footing as voltage, pressure, and line
+# loading — a temperature-infeasible heat node is a genuine envelope breach, so a
+# run that leaves junctions out of band is non-compliant even though the served-
+# fraction metric also debits the cold load. Canonical for both the
 # ``constraint_violations_final`` scan (SCARE outcome + oracle claim) and the
 # ``_check_constraint_compliance`` CSV claim (which imports this set), so SCARE
 # and the oracle gate on identical flags.
-NON_GATING_CONSTRAINT_VARIABLES: frozenset[str] = frozenset({"t_k"})
+NON_GATING_CONSTRAINT_VARIABLES: frozenset[str] = frozenset()
 
 # Canonical display label per raw ``SECTOR_CONSTRAINTS`` variable, for the
 # per-variable-type violation tally that accompanies the compliance gate.
@@ -1318,11 +1343,12 @@ def constraint_violations_final(monee_net: Any) -> dict[str, Any]:
     slack budget and in-bounds grid state, so the PWSF gap to the oracle is a
     real allocation gap, not feasibility bought by violations.
 
-    Heat junction temperature (``t_k``) is NON-GATING (see
-    :data:`NON_GATING_CONSTRAINT_VARIABLES`): a temperature-infeasible heat node
-    already serves no load, so the served-fraction metric penalises it — gating
-    here as well would double-count. ``t_k`` breaches are still reported (in
-    ``by_sector`` and ``nongating_violations``) but do not flip ``passed``.
+    All operating bounds gate, including heat junction temperature (``t_k``): a
+    temperature-infeasible heat node breaches its envelope just as an out-of-band
+    voltage or pressure does, so it flips ``passed`` (see
+    :data:`NON_GATING_CONSTRAINT_VARIABLES`, now empty). De-energised / isolated
+    junctions are still filtered out upstream in :func:`constraint_rows` and do
+    not count as breaches.
     """
     rows = constraint_rows(monee_net)
     by_sector: dict[str, dict[str, Any]] = {}

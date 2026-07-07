@@ -121,7 +121,7 @@ class TestScanOnRealGrid:
         assert "voltage" in by_var
         assert by_var["voltage"]["n_checked"] > 0
         if "temperature" in by_var:
-            assert by_var["temperature"]["gating"] is False
+            assert by_var["temperature"]["gating"] is True
 
     def _gas_junction(self, net):
         from experiment.eval.metrics import sector_from_grid

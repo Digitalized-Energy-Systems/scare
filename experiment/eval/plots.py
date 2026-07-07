@@ -68,9 +68,8 @@ _SECTOR_COLOR = {
 }
 
 # Constraint-variable-type palette + canonical order for the per-variable
-# violation tally. ``temperature`` is non-gating (diagnostic only — see
-# ``claims.NON_GATING_CONSTRAINT_VARIABLES``); rendered with a hatch so it
-# reads as a companion stat, not a compliance failure.
+# violation tally. All variable types gate (see
+# ``claims.NON_GATING_CONSTRAINT_VARIABLES``, now empty), temperature included.
 _CONSTRAINT_VARIABLE_COLOR = {
     "voltage": "#1F77B4",
     "pressure": "#2CA02C",
@@ -85,7 +84,7 @@ _CONSTRAINT_VARIABLE_ORDER = (
     "slack",
     "temperature",
 )
-_NONGATING_VARIABLE_TYPES = frozenset({"temperature"})
+_NONGATING_VARIABLE_TYPES: frozenset[str] = frozenset()
 
 # Qualitative palette for ablations / sweeps / scenarios — colourblind-safe.
 _QUAL_PALETTE = [
@@ -749,8 +748,8 @@ def pwsf_by_sector_bar(
     """Grouped per-sector PWSF: one bar group per variant, a bar per sector.
 
     Companion to the aggregate ``variant_comparison_bar`` (the single headline
-    electricity+heat PWSF). This breaks the metric out by sector so gas — kept
-    in its own mass-flow units and excluded from the aggregate — is visible.
+    electricity+heat+gas PWSF). This breaks the metric out by sector so each
+    carrier's served fraction — including gas — is visible on its own.
     The segments are INDEPENDENT fractions in [0, 1] (no cross-sector unit
     mixing), so they are shown GROUPED (not stacked): stacking three independent
     [0,1] fractions produced a meaningless y-axis reaching ~2.3 that visually
@@ -829,9 +828,9 @@ _STRESS_CLASS_ORDER: list[tuple[str, str]] = [
 
 
 # Compliance-composition categories: a run is ``valid`` when it passes both
-# gates, else labelled by the sole violated *gating* constraint (temperature is
-# audited but non-gating, so it is never a failure reason), or ``multi`` when
-# more than one gating constraint is violated. (key, display label, colour,
+# gates, else labelled by the sole violated *gating* constraint, or ``multi``
+# when more than one gating constraint is violated. Temperature gates like the
+# other envelope bounds, so it is a failure reason. (key, display label, colour,
 # hatch). Colours/patterns sit alongside the variant palette without colliding
 # with it (oracle green / scare blue / single-level orange / component purple),
 # and every violation category carries a hatch so the stack reads at
@@ -841,6 +840,7 @@ _COMPLIANCE_CATS: list[tuple[str, str, str, str]] = [
     ("slack", "slack budget", "#C44E52", "x"),
     ("voltage", "voltage", "#5B8FB0", "/"),
     ("pressure", "pressure", "#A16BB0", "\\"),
+    ("temperature", "temperature", "#D62728", "."),
     ("line_load", "line loading", "#E1A44C", "-"),
     ("multi", "multi", "#555555", "+"),
 ]
@@ -863,6 +863,7 @@ def _compliance_category(df: pd.DataFrame) -> pd.Series:
         "slack": ~slack_ok,
         "voltage": nv("voltage"),
         "pressure": nv("pressure"),
+        "temperature": nv("temperature"),
         "line_load": nv("line_load"),
     }
     n_reasons = sum(m.astype(int) for m in reasons.values())
@@ -2816,15 +2817,22 @@ def cp_influence_bar(
     """Two panels, shared grid axis, pooled over every completed run.
 
     LEFT — CP contribution: mean delivered coupling-point converter output
-    per task in MW, from ``outcomes.cp_generation.total_mw`` (end-of-sim
-    solved net; el + heat + gas-as-energy across every CHP / P2H / G2P /
-    P2G / G2H unit). Hover breaks the total down by output carrier and
-    reports how many CP units were actively producing. The oracle records
-    the same measure off its solved LP, so its bar is the CP-usage ceiling.
-    On campaigns recorded before ``cp_generation`` existed the panel falls
-    back to the CP-ADMM regulate-action count from
-    ``outcomes.regulates_by_reason`` (``cp*`` reasons; oracle dropped there
-    — it never fires the regulate path).
+    per task in MW, from ``outcomes.cp_generation`` (end-of-sim solved net;
+    el + heat + gas-as-energy across every CHP / P2H / G2P / P2G / G2H unit),
+    STACKED BY CARRIER (gas at the base, then el, then heat). Colour keys the
+    method (as in the right panel); the hatch + stack position key the carrier.
+    Splitting by carrier is deliberate: the raw oracle>scare total is ~97% gas
+    (PowerToGas), and that gas block is NOT a served-load signal — the oracle
+    solves converter ``regulation`` as a free variable that carries no weight in
+    the min-load-shedding objective (``include_coupling_points`` is left False),
+    and gas Sinks are absent from served accounting, so the oracle's gas
+    dispatch is closer to an unpriced free-variable resting point than a usage
+    ceiling. The only load-relevant carrier is heat (small MW, but the piece
+    that tracks the PWSF gap); reading it against the gas block it sits on keeps
+    "SCARE under-uses its CPs" from being over-read off the total. On campaigns
+    recorded before ``cp_generation`` existed the panel falls back to a single
+    CP-ADMM regulate-action-count bar from ``outcomes.regulates_by_reason``
+    (``cp*`` reasons; oracle dropped there — it never fires the regulate path).
 
     RIGHT — restored load: compliant-mean PWSF for the same (grid, variant)
     cells, so a grid steered heavily through its coupling points can be read
@@ -2842,7 +2850,7 @@ def cp_influence_bar(
         if c.startswith(prefix) and c[len(prefix) :].startswith("cp")
     ]
     mw_col = "outcomes__cp_generation__total_mw"
-    use_mw = mw_col in df.columns and (
+    use_mw = mw_col in df.columns and bool(
         pd.to_numeric(df[mw_col], errors="coerce").notna().any()
     )
     pwsf_col = "outcomes__priority_weighted_fraction"
@@ -2898,7 +2906,7 @@ def cp_influence_bar(
         horizontal_spacing=0.06,
         subplot_titles=(
             (
-                "CP generation delivered (MW) / task"
+                "CP generation delivered (MW) / task — stacked by carrier"
                 if use_mw
                 else "CP-ADMM converter actions / task"
             ),
@@ -2913,12 +2921,34 @@ def cp_influence_bar(
             if vals:
                 pwsf_mean[(grid, variant)] = float(pd.Series(vals).mean())
 
+    # LEFT panel stacks the delivered MW BY CARRIER. Stack order puts the
+    # PWSF-neutral gas block at the base with the load-relevant heat/el on top:
+    # the oracle>scare CP-MW gap is ~97% gas (a converter free variable the shed
+    # LP never prices, so the oracle's gas dispatch is not a served-load optimum
+    # — see the module docstring), and gas Sinks are absent from served
+    # accounting, so a single total bar reads as "scare under-uses CPs" when the
+    # only load-relevant gap (heat) is small. Colour stays keyed to method (as in
+    # the right panel); carrier is the hatch + stack channel.
+    carrier_stack = (("gas", "gas_mw"), ("el", "el_mw"), ("heat", "heat_mw"))
+    carrier_label = {"gas": "gas (P2G)", "el": "electricity", "heat": "heat"}
+    carrier_sector = {"gas": "gas", "el": "electricity", "heat": "heat"}
+    # Same method hue for every segment (variant is the colour, as in the right
+    # panel); carrier separates by fill opacity + hatch. The gradient is
+    # semantic: the PWSF-neutral gas base is faded, the load-relevant heat cap is
+    # solid, so the eye is drawn to the carrier that actually tracks restored
+    # load rather than to the (usually larger) gas block.
+    carrier_alpha = {"gas": 0.5, "el": 0.72, "heat": 1.0}
+
+    def _nz(v: Any) -> float:
+        return 0.0 if v is None or v != v else float(v)
+
     for variant in variants:
         cp_means: list[float] = []
         cp_cis: list[float] = []
         shares: list[float] = []
         ns: list[int] = []
         hover_cp: list[str] = []
+        carrier_hover: dict[str, list[str]] = {c: [] for c, _ in carrier_stack}
         for grid, g_lbl in zip(grids, grids_lbl):
             vals = cp_vals.get((grid, variant), [])
             mean, ci = _mean_ci(vals)
@@ -2929,27 +2959,24 @@ def cp_influence_bar(
             shares.append(cp_total / total if total > 0 else float("nan"))
             ns.append(len(vals))
             if use_mw:
-
-                def _nz(v: Any) -> float:
-                    return 0.0 if v is None or v != v else float(v)
-
-                detail = ""
-                el = _nz(bd_means.get("el_mw", {}).get((grid, variant)))
-                ht = _nz(bd_means.get("heat_mw", {}).get((grid, variant)))
-                gs = _nz(bd_means.get("gas_mw", {}).get((grid, variant)))
-                if el or ht or gs:
-                    detail += (
-                        f"el: {el:.3f} · heat: {ht:.3f} · gas: {gs:.3f} MW<br>"
-                    )
+                by_c = {
+                    "el": _nz(bd_means.get("el_mw", {}).get((grid, variant))),
+                    "heat": _nz(bd_means.get("heat_mw", {}).get((grid, variant))),
+                    "gas": _nz(bd_means.get("gas_mw", {}).get((grid, variant))),
+                }
                 n_act = _nz(bd_means.get("n_active", {}).get((grid, variant)))
                 n_cp = _nz(bd_means.get("n_cp", {}).get((grid, variant)))
-                if n_cp:
-                    detail += f"active CP units: {n_act:.1f} of {n_cp:.0f}<br>"
-                hover_cp.append(
-                    f"<b>{alias_variant(variant)}</b><br>grid: {g_lbl}<br>"
-                    f"mean CP generation: {mean:.3f} MW/task<br>"
-                    f"95% CI: {_ci_label(ci)}<br>" + detail + f"n = {len(vals)}"
+                units = (
+                    f"active CP units: {n_act:.1f} of {n_cp:.0f}<br>" if n_cp else ""
                 )
+                for c, _mk in carrier_stack:
+                    carrier_hover[c].append(
+                        f"<b>{alias_variant(variant)}</b> — {carrier_label[c]}<br>"
+                        f"grid: {g_lbl}<br>"
+                        f"{carrier_label[c]}: {by_c[c]:.3f} MW/task<br>"
+                        f"all-carrier total: {mean:.3f} MW/task "
+                        f"(95% CI {_ci_label(ci)})<br>" + units + f"n = {len(vals)}"
+                    )
             else:
                 share = shares[-1]
                 hover_cp.append(
@@ -2963,31 +2990,61 @@ def cp_influence_bar(
                     )
                     + f"n = {len(vals)}"
                 )
-        fig.add_trace(
-            go.Bar(
-                name=alias_variant(variant),
-                legendgroup=variant,
-                y=grids_lbl,
-                x=cp_means,
-                orientation="h",
-                error_x=dict(
-                    type="data",
-                    array=cp_cis,
-                    visible=True,
-                    thickness=1.2,
-                    width=4,
-                    color=_MUTED_COLOR,
+        if use_mw:
+            for c, mw_key in carrier_stack:
+                xs = [
+                    _nz(bd_means.get(mw_key, {}).get((grid, variant)))
+                    for grid in grids
+                ]
+                fig.add_trace(
+                    go.Bar(
+                        name=alias_variant(variant),
+                        legendgroup=variant,
+                        offsetgroup=variant,
+                        showlegend=False,
+                        y=grids_lbl,
+                        x=xs,
+                        orientation="h",
+                        marker=_bar_marker(
+                            _hex_to_rgba(
+                                _variant_color(variant), carrier_alpha[c]
+                            ),
+                            pattern_shape=_SECTOR_PATTERN.get(
+                                carrier_sector[c], ""
+                            ),
+                        ),
+                        hovertemplate="%{customdata}<extra></extra>",
+                        customdata=carrier_hover[c],
+                    ),
+                    row=1,
+                    col=1,
+                )
+        else:
+            fig.add_trace(
+                go.Bar(
+                    name=alias_variant(variant),
+                    legendgroup=variant,
+                    y=grids_lbl,
+                    x=cp_means,
+                    orientation="h",
+                    error_x=dict(
+                        type="data",
+                        array=cp_cis,
+                        visible=True,
+                        thickness=1.2,
+                        width=4,
+                        color=_MUTED_COLOR,
+                    ),
+                    marker=_bar_marker(
+                        _variant_color(variant),
+                        pattern_shape=_VARIANT_PATTERN.get(variant, ""),
+                    ),
+                    hovertemplate="%{customdata}<extra></extra>",
+                    customdata=hover_cp,
                 ),
-                marker=_bar_marker(
-                    _variant_color(variant),
-                    pattern_shape=_VARIANT_PATTERN.get(variant, ""),
-                ),
-                hovertemplate="%{customdata}<extra></extra>",
-                customdata=hover_cp,
-            ),
-            row=1,
-            col=1,
-        )
+                row=1,
+                col=1,
+            )
 
         if not have_pwsf:
             continue
@@ -3027,7 +3084,10 @@ def cp_influence_bar(
             go.Bar(
                 name=alias_variant(variant),
                 legendgroup=variant,
-                showlegend=False,
+                offsetgroup=variant,
+                # In MW mode the left panel's bars are carrier-stacked and carry
+                # no legend, so the variant key is sourced here.
+                showlegend=use_mw,
                 y=grids_lbl,
                 x=p_means,
                 orientation="h",
@@ -3050,7 +3110,31 @@ def cp_influence_bar(
             col=2,
         )
 
-    fig.update_layout(barmode="group", bargap=0.32, bargroupgap=0.12)
+    if use_mw:
+        # Carrier key for the stacked left panel (grey swatches, hatch = carrier).
+        # Purely informational — real bars stay grouped by method for toggling.
+        for c, _mk in carrier_stack:
+            fig.add_trace(
+                go.Bar(
+                    name=f"{carrier_label[c]} (fill)",
+                    legendgroup="__carrier__",
+                    y=[None],
+                    x=[None],
+                    orientation="h",
+                    marker=_bar_marker(
+                        _hex_to_rgba("#777777", carrier_alpha[c]),
+                        pattern_shape=_SECTOR_PATTERN.get(carrier_sector[c], ""),
+                        pattern_fg="#333333",
+                    ),
+                    hoverinfo="skip",
+                ),
+                row=1,
+                col=1,
+            )
+
+    fig.update_layout(
+        barmode="stack" if use_mw else "group", bargap=0.32, bargroupgap=0.12
+    )
     fig.update_xaxes(
         title_text=(
             "mean delivered MW per task" if use_mw else "mean actions per task"
@@ -3773,9 +3857,9 @@ def constraint_violations_by_variable_bar(
     breaches, complementing the binary ``constraint_compliance`` /
     ``slack_budget_compliance`` pass/fail and the per-sector violation integral.
 
-    ``temperature`` (heat ``t_k``) is non-gating: a temperature-infeasible node
-    already serves no load, so it is penalised via the served metric, not the
-    compliance gate. It is shown hatched as a diagnostic, not a failure.
+    ``temperature`` (heat ``t_k``) gates like the other envelope bounds: a
+    temperature-infeasible node is a compliance failure, counted here alongside
+    voltage, pressure, and line loading.
 
     Reads the flattened claim-detail columns (see ``_VIOLATION_VAR_COLS``);
     missing columns count as zero so a campaign that never recorded a given

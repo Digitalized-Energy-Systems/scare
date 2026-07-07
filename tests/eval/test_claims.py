@@ -799,10 +799,9 @@ class TestConstraintCompliance:
         assert res["detail"]["n_checked"] == 2
 
     def test_gating_violation_fails_and_ranks_worst_first(self, tmp_path):
-        # A GATING (electricity/gas) violation fails the run; the heat ``t_k``
-        # breach is NON-GATING (already penalised via served load) so it is
-        # tracked but does not flip ``passed`` and is kept out of the gating
-        # ``violations`` ranking.
+        # Every envelope breach gates, so the voltage and the heat ``t_k``
+        # violations both fail the run and both enter the gating ``violations``
+        # ranking, worst overshoot first (the t_k breach, overshoot 1.626).
         _write_constraints_final(
             tmp_path / "constraints_final.csv",
             [
@@ -843,29 +842,29 @@ class TestConstraintCompliance:
         )
         res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
         assert res["passed"] is False
-        # Gating count excludes the t_k breach; it is surfaced separately.
-        assert res["detail"]["n_violations"] == 1
-        assert res["detail"]["n_nongating_violations"] == 1
-        # Worst GATING violation first (t_k, larger overshoot, is excluded).
-        assert res["detail"]["violations"][0]["variable"] == "vm_pu"
-        assert res["detail"]["nongating_violations"][0]["variable"] == "t_k"
-        # by_sector still tracks the t_k breach for visibility.
+        # Both breaches gate; nothing is surfaced as non-gating.
+        assert res["detail"]["n_violations"] == 2
+        assert res["detail"]["n_nongating_violations"] == 0
+        # Worst GATING violation first (t_k, overshoot 1.626 > vm_pu 0.6).
+        assert res["detail"]["violations"][0]["variable"] == "t_k"
+        assert res["detail"]["violations"][1]["variable"] == "vm_pu"
+        assert res["detail"]["nongating_violations"] == []
+        # by_sector tracks the t_k breach.
         assert res["detail"]["by_sector"]["heat"]["worst_overshoot"] == 1.626
         assert res["detail"]["by_sector"]["heat"]["n_violations"] == 1
         assert res["detail"]["by_sector"]["gas"]["n_violations"] == 0
-        # Per-variable-type tally: voltage gating, temperature non-gating.
+        # Per-variable-type tally: voltage and temperature both gating.
         by_var = res["detail"]["by_variable"]
         assert by_var["voltage"]["n_violations"] == 1
         assert by_var["voltage"]["gating"] is True
         assert by_var["temperature"]["n_violations"] == 1
-        assert by_var["temperature"]["gating"] is False
+        assert by_var["temperature"]["gating"] is True
         assert by_var["pressure"]["n_violations"] == 0
         assert by_var["pressure"]["n_checked"] == 1
 
-    def test_heat_temperature_alone_is_non_gating(self, tmp_path):
-        # A heat ``t_k`` breach with NO electricity/gas breach PASSES: the cold
-        # node already serves no load (constraint_allowed collapses), so the
-        # served-fraction metric penalises it — gating here would double-count.
+    def test_heat_temperature_alone_gates(self, tmp_path):
+        # A heat ``t_k`` breach with NO electricity/gas breach now FAILS: the
+        # temperature envelope gates like voltage/pressure/line loading.
         _write_constraints_final(
             tmp_path / "constraints_final.csv",
             [
@@ -883,12 +882,11 @@ class TestConstraintCompliance:
             ],
         )
         res = _check_constraint_compliance(tmp_path / "constraints_final.csv")
-        assert res["passed"] is True
-        assert res["detail"]["n_violations"] == 0
-        assert res["detail"]["n_nongating_violations"] == 1
-        # Still visible in the per-sector breakdown.
+        assert res["passed"] is False
+        assert res["detail"]["n_violations"] == 1
+        assert res["detail"]["n_nongating_violations"] == 0
         assert res["detail"]["by_sector"]["heat"]["n_violations"] == 1
-        assert res["detail"]["nongating_violations"][0]["variable"] == "t_k"
+        assert res["detail"]["violations"][0]["variable"] == "t_k"
 
     def test_wired_into_evaluate_task(self, tmp_path):
         # A violated row surfaces as a failing claim through evaluate_task.

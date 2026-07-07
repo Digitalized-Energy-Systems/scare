@@ -90,6 +90,7 @@ class CPPriorityAdmmRole(Role):
         algorithm: str = "lexicographic",
         r_regularization: float = 0.1,
         heat_supply_from_deficit: bool = False,
+        demand_union: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -99,6 +100,10 @@ class CPPriorityAdmmRole(Role):
         # When set, heat's L3 base supply is delivered heat (Σ served) not the
         # unbounded heat-slack budget, so unmet demand drives heat CPs to ramp.
         self.heat_supply_from_deficit = bool(heat_supply_from_deficit)
+        # Gossip only: build the round demand set over every sector, not just the
+        # (dynamically elected, usually non-heat) initiator's bridged sectors, so
+        # heat demand always reaches the round. See RestorationConfiguration.
+        self.demand_union = bool(demand_union)
         self.home_node_id = home_node_id
         self.watchdog_s = watchdog_s
         # Freshness bound on cached HolonSummary entries; the leader watchdog
@@ -117,9 +122,12 @@ class CPPriorityAdmmRole(Role):
         self._version = MonotonicVersion()
         # Peer caches keyed by publisher aid.
         self._peer_cps: dict[str, CPSummary] = {}
-        # sector_value -> {leader_aid: HolonSummary}
+        # sector_value -> {leader_aid: HolonSummary}. Under demand_union a CP
+        # caches summaries for every sector (it may build demand for sectors it
+        # doesn't itself bridge), so pre-seed all sectors' buckets.
+        summary_sectors = list(Sector) if self.demand_union else self.bridged_sectors
         self._leader_summaries: dict[str, dict[str, HolonSummary]] = {
-            s.value: {} for s in self.bridged_sectors
+            s.value: {} for s in summary_sectors
         }
 
         # Throttle / dirty-tracking.
@@ -167,13 +175,17 @@ class CPPriorityAdmmRole(Role):
 
             return _sync
 
-        # Inbound from L2 — only summaries on sectors we bridge.
+        # Inbound from L2. Normally only summaries on sectors we bridge; under
+        # demand_union take every sector so the round demand set can include
+        # sectors this CP doesn't bridge (e.g. heat, when this CP is the elected
+        # gossip initiator but bridges only electricity+gas).
         bridged = {s.value for s in self.bridged_sectors}
         self.context.subscribe_message(
             self,
             _wrap(self._on_holon_summary),
             lambda msg, meta: (
-                isinstance(msg, HolonSummary) and msg.sector.value in bridged
+                isinstance(msg, HolonSummary)
+                and (self.demand_union or msg.sector.value in bridged)
             ),
         )
         # Inbound from peer CPs on the CP-only mesh.
@@ -363,7 +375,11 @@ class CPPriorityAdmmRole(Role):
         if reachable is _UNRESOLVED:
             reachable = self._reachable_node_set()
         demands: list[SectorDemand] = []
-        for sector in self.bridged_sectors:
+        # Under demand_union, build across every sector present in the community
+        # (not just this initiator's bridged sectors); sectors with no admitted
+        # summaries fall through the empty-demand guard below.
+        build_sectors = list(Sector) if self.demand_union else self.bridged_sectors
+        for sector in build_sectors:
             sec_v = sector.value
             bucket = self._leader_summaries.get(sec_v, {})
             agg_demand: dict[int, float] = {}

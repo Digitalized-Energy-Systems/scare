@@ -806,13 +806,11 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
     Reads ``constraints_final.csv`` (one row per checked variable, off the
     final solved network).  Passed iff no GATING row is flagged ``violated``.
 
-    Heat junction temperature (``t_k``) is NON-GATING (see
-    ``NON_GATING_CONSTRAINT_VARIABLES``): a temperature-infeasible heat node
-    already serves no load (its ``constraint_allowed`` collapses to ~0), so the
-    served-fraction metric already penalises it.  Counting the ``t_k`` breach
-    here as well would punish the heat grid twice for the same local physics.
-    The ``t_k`` breaches are still reported in the detail (``by_sector`` and
-    ``nongating_violations``) but do not affect ``passed``.
+    Every operating bound gates, including heat junction temperature (``t_k``):
+    a temperature-infeasible heat node breaches its envelope like an out-of-band
+    voltage or pressure and flips ``passed`` (``NON_GATING_CONSTRAINT_VARIABLES``
+    is now empty). De-energised / isolated junctions are filtered upstream in the
+    ``constraints_final`` scan and never reach this gate.
 
     Grid-feasibility companion to ``slack_budget_compliance``: together they
     make a run "compliant" only when it honoured both the operator slack budget
@@ -865,8 +863,8 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
             "value": r.get("value", ""),
             "overshoot": round(overshoot, 6),
         }
-        # Temperature (t_k) breaches are tracked but do NOT gate the run — the
-        # cold node is already penalised via the served-load metric.
+        # NON_GATING_CONSTRAINT_VARIABLES is empty, so every breach (temperature
+        # included) gates; the branch is kept for forward compatibility.
         if var in NON_GATING_CONSTRAINT_VARIABLES:
             entry["n_nongating_violations"] += 1
             nongating.append(rec)
@@ -879,15 +877,15 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
         "passed": not gating,
         "detail": {
             "n_checked": len(rows),
-            # ``n_violations`` is the GATING count (drives ``passed``); the
-            # non-gating (``t_k``) breaches are surfaced separately.
+            # ``n_violations`` is the GATING count (drives ``passed``); with an
+            # empty non-gating set the nongating list is always empty.
             "n_violations": len(gating),
             "n_nongating_violations": len(nongating),
             "nongating_variables": sorted(NON_GATING_CONSTRAINT_VARIABLES),
             "by_sector": by_sector,
             # Per-variable-type tally (voltage / pressure / temperature /
-            # line_load) — a compliance-accompanying diagnostic; ``temperature``
-            # is non-gating. Slack violations are tallied by the separate
+            # line_load) — a compliance-accompanying diagnostic; all gate now.
+            # Slack violations are tallied by the separate
             # ``slack_budget_compliance`` claim.
             "by_variable": by_variable,
             "violations": gating[:5],

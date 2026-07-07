@@ -13,6 +13,7 @@ import networkx as nx
 
 from mango_energy_environments import Failure
 from monee.model.child import ExtPowerGrid, HeatGenerator, PowerGenerator, Source
+from monee.model.extension import GridFormingGenerator, GridFormingSource
 from monee.model.grid import PowerGrid
 from monee.model.multi import (
     CHP,
@@ -99,10 +100,14 @@ def _sample_island_failures(
         for c in monee_net.childs
         if c.active and isinstance(c.model, ExtPowerGrid)
     }
+    # Grid-forming generators count as anchors: under microgrid islanding
+    # apply_microgrid_islanding promotes every PowerGenerator to a
+    # GridFormingGenerator (not a PowerGenerator subclass) BEFORE sampling,
+    # so matching only PowerGenerator would strand no generator-bearing island.
     gen_nodes = {
         c.node_id
         for c in monee_net.childs
-        if c.active and isinstance(c.model, PowerGenerator)
+        if c.active and isinstance(c.model, (PowerGenerator, GridFormingGenerator))
     }
     if not roots or not gen_nodes:
         return []
@@ -313,7 +318,15 @@ def _iter_generator_candidates(monee_net: Any):
     """Yield ``(kind, component)`` for each deactivatable generator-class
     component; ``kind`` picks the dispatch rule in the caller.
     """
-    child_classes = (PowerGenerator, HeatGenerator, Source)
+    # Include grid-forming promotions so generator failures still find targets
+    # after apply_microgrid_islanding (see _sample_island_failures).
+    child_classes = (
+        PowerGenerator,
+        HeatGenerator,
+        Source,
+        GridFormingGenerator,
+        GridFormingSource,
+    )
     compound_classes = (CHP, CHPHG, PowerToHeat)
     branch_classes = (GasToPower, PowerToGas, PowerToHeatHG)
 
@@ -336,11 +349,11 @@ def _generator_carrier(kind: str, component: Any, monee_net: Any) -> str:
     the gap.
     """
     m = getattr(component, "model", component)
-    if isinstance(m, PowerGenerator):
+    if isinstance(m, (PowerGenerator, GridFormingGenerator)):
         return "electricity"
     if isinstance(m, HeatGenerator):
         return "heat"
-    if isinstance(m, Source):
+    if isinstance(m, (Source, GridFormingSource)):
         try:
             gname = str(
                 getattr(monee_net.node_by_id(component.node_id).grid, "name", "")

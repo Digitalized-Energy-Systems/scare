@@ -167,8 +167,8 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
                 title="Priority-weighted served by variant",
             )
         ),
-        # Per-sector breakdown of the headline PWSF (gas is excluded from the
-        # aggregate above as it is in mass-flow units; here it shows per sector).
+        # Per-sector breakdown of the headline PWSF (electricity / heat / gas,
+        # all on the MW energy basis the aggregate uses).
         str(
             plots.pwsf_by_sector_bar(
                 sub,
@@ -948,8 +948,8 @@ def _table_variant_means(campaign: CampaignData) -> str:
     cohort asymmetrically (oracle is never claims_failed) and presented
     non-comparable per-variant subsets as if comparable. This table is still
     UNPAIRED and pooled across grids — for the apples-to-apples comparison see
-    the paired ``Variant vs oracle`` table in ``summary.md``. PWSF is
-    electricity+heat only (gas is in mass-flow units, reported per-sector).
+    the paired ``Variant vs oracle`` table in ``summary.md``. PWSF covers
+    electricity, heat, and gas, all on the MW energy basis (gas HHV-converted).
     """
     df = campaign.summary
     metric = "outcomes__priority_weighted_fraction"

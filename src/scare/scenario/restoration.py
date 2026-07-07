@@ -988,6 +988,7 @@ def _attach_cp_priority_admm_role(
             algorithm=config.cp_admm_algorithm,
             r_regularization=config.cp_admm_r_regularization,
             heat_supply_from_deficit=config.enable_heat_cp_supply,
+            demand_union=config.enable_cp_demand_union,
         )
     )
 
@@ -1663,7 +1664,18 @@ def _build_topologies(
                 agent = world._agents.get(aid_)
                 if agent is None:
                     continue
-                for sec in meta.get("sectors", []):
+                # Normally a CP joins only its bridged sectors' summary meshes.
+                # Under demand_union it joins ALL sector meshes so any CP (e.g. a
+                # P2G elected gossip initiator, which bridges electricity+gas)
+                # physically receives heat HolonSummary and can fold heat demand
+                # into the broadcast round. CPs are passive mesh members (no
+                # HolonSummaryRole), so extra membership only adds delivery.
+                join_secs = (
+                    list(cp_agents_by_sector)
+                    if config.enable_cp_demand_union
+                    else meta.get("sectors", [])
+                )
+                for sec in join_secs:
                     if sec in cp_agents_by_sector:
                         cp_agents_by_sector[sec].append(agent)
         for sector, leaders in group_leaders_by_sector.items():

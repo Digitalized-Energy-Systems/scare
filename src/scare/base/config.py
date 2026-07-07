@@ -51,6 +51,17 @@ class RestorationConfiguration:
     # Biases the step, not the fixed point. α=0 is correct but can oscillate.
     cp_admm_r_regularization: float = 0.1
 
+    # Gossip only: build the round's demand set over the UNION of every sector
+    # present in the community (all bridged sectors), not just the elected
+    # initiator's. The gossip initiator is the lowest cp_id, which on cp_heavy
+    # grids is always a P2G ("branch-*" < "node-*", P2G ids sort before P2H), so
+    # it bridges electricity+gas only and heat NEVER enters the broadcast demand
+    # set — every heat CP (CHP/P2H) then commits regulation 0 while real tier-1
+    # heat demand goes unserved. The replicated lexicographic path has no such
+    # gap (each CP self-includes its own bridged sectors), so this realigns
+    # gossip with it. False restores the initiator-only demand set.
+    enable_cp_demand_union: bool = True
+
     # Distributed FailureNotice propagation via ProblemDetector. False:
     # centralised callback triggers all leaders (legacy ablation).
     enable_distributed_failure_notice: bool = True
