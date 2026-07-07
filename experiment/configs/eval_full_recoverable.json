@@ -1051,7 +1051,7 @@
     "cpus": 1,
     "max_concurrent": 64,
     "aggregate": true,
-    "nodelist": "mpcb014,mpcb015"
+    "nodelist": "mpcb014,mpcb016"
   },
   "slurm_eval": {
     "partition": "rosa_express.p",
