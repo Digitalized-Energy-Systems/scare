@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from monee import run_energy_flow_optimization
-from monee.model.child import ExtHydrGrid, ExtPowerGrid
+from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink, Source
 from monee.model.core import Var
 from monee.model.formulation import make_heat_convex_milp_formulation, GAS_NONCONVEX_MIQCQP_FORMULATION
 from monee.model.node import Bus
@@ -302,6 +302,27 @@ def _collect_slack_budgets(monee_net: Any) -> dict[str, float | None]:
     return out
 
 
+def _heat_throughput_kgs(monee_net: Any) -> float:
+    """Total heat-side boundary mass flow the heat slack may have to carry:
+    the sum of |mass_flow_kgs| over Sinks/Sources on water junctions. Sink
+    flows are non-regulatable, so this is a hard lower bound on a feasible
+    heat-slack envelope."""
+    total = 0.0
+    for child in monee_net.childs:
+        m = child.model
+        if not isinstance(m, (Sink, Source)):
+            continue
+        try:
+            grid_name = str(
+                getattr(monee_net.node_by_id(child.node_id).grid, "name", "")
+            ).lower()
+            if "water" in grid_name:
+                total += abs(float(getattr(m, "mass_flow_kgs", 0.0) or 0.0))
+        except Exception:
+            continue
+    return total
+
+
 def _slack_budget_summary(monee_net: Any) -> dict[str, Any]:
     """Realised slack draw vs operator budget on the post-LP network. Returns
     ``{aid: {budget, draw, violated}}`` for every slack child carrying an
@@ -452,11 +473,17 @@ def _build_min_shed_problem(
         (-budgets["gas"], +budgets["gas"]) if budgets["gas"] is not None else (-10, 10)
     )
     # Heat-side ExtHydrGrid is left unbounded by ``apply_slack_budget`` (heating
-    # loop mass flow is constrained by HE physics, not policy); keep the default.
+    # loop mass flow is constrained by HE physics, not policy). Size the
+    # envelope from the grid's heat-side throughput: the Sink mass flows are
+    # non-regulatable (shedding only zeroes HeatLoad q, never Sink flow), so
+    # the slack MUST be able to carry their sum — a fixed default silently
+    # turns the oracle infeasible on grids above LV scale (the MVLV grid
+    # carries ~179 kg/s against the old ±10 default; LV ~5).
+    heat_envelope_kgs = max(10.0, 2.0 * _heat_throughput_kgs(monee_net))
     ext_grid_heat_bounds = (
         (-budgets["heat"], +budgets["heat"])
         if budgets["heat"] is not None
-        else (-10, 10)
+        else (-heat_envelope_kgs, +heat_envelope_kgs)
     )
     logger.info(
         "oracle: ext-grid budget bounds — el=%s, gas=%s, heat=%s",
@@ -1071,6 +1098,7 @@ def compose_oracle_result(
             "served_by_tier_sector": served["by_tier_sector"],
             "n_loads": served["n_loads"],
             "n_loads_served_zero": served["n_loads_served_zero"],
+            "n_net_nodes": len(getattr(solved_net, "nodes", []) or []),
             "constraint_violation_integral": integral,
             "constraint_violations_final": constraints_final,
             "time_to_stabilise_s": 0.0,

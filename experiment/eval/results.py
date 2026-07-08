@@ -105,6 +105,7 @@ def compose_result(
             "served_by_tier_sector": served["by_tier_sector"],
             "n_loads": served["n_loads"],
             "n_loads_served_zero": served["n_loads_served_zero"],
+            "n_net_nodes": len(getattr(monee_net, "nodes", []) or []),
             "constraint_violation_integral": integral,
             "constraint_violations_final": constraints_final,
             "time_to_stabilise_s": t_stable,

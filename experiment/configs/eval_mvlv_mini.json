@@ -1,0 +1,61 @@
+{
+  "$comment": [
+    "Mini campaign for the new MV+LV distribution scaling grid (simbench_mvlv,",
+    "1-MVLV-urban-5.303, ~778 MES nodes / 45 CPs). Mirrors the eval_full scaling",
+    "pillar (scare vs oracle, the two clean scenarios, 45% slack budget) but at a",
+    "small seed count and with the LV large grid alongside as a size-scaling",
+    "reference. Purpose: confirm the retuned gas/heat overlay runs end-to-end",
+    "through the full restoration + oracle pipeline (not just a one-shot solve)",
+    "and see how PWSF / compliance land vs the established LV grid."
+  ],
+  "name": "eval_mvlv_mini",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 10.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 1.0,
+  "write_timeseries": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 1,
+    "failure_lambda": 1.5,
+    "max_failures": 3
+  },
+  "experiments": [
+    {
+      "name": "scaling",
+      "grids": [
+        "simbench_lv",
+        "simbench_mvlv"
+      ],
+      "n_seeds": 3,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa.p",
+    "time": "00:40:00",
+    "mem": "4G",
+    "cpus": 1,
+    "max_concurrent": 16,
+    "aggregate": true
+  }
+}

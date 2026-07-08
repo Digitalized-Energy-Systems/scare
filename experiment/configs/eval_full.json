@@ -657,17 +657,19 @@
     },
     {
       "$comment": [
-        "Pillar 7 — Scaling.  Three simbench LV variants spanning roughly a decade of node count:",
+        "Pillar 7 — Scaling.  Four simbench distribution grids spanning roughly a decade of MES node count:",
         "  small  ≈   36 nodes (1-LV-rural1)",
         "  medium ≈  137 nodes (1-LV-semiurb4)",
-        "  large  ≈  396 nodes (1-LV-rural3, the established benchmark)",
+        "  large  ≈  396 nodes (1-LV-rural3, the established LV benchmark)",
+        "  mvlv   ≈  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay)",
         "All run with the same 45 % slack budget so the only varying axis is grid size."
       ],
       "name": "scaling",
       "grids": [
         "simbench_lv_small",
         "simbench_lv_medium",
-        "simbench_lv"
+        "simbench_lv",
+        "simbench_mvlv"
       ],
       "n_seeds": 10,
       "variants": [

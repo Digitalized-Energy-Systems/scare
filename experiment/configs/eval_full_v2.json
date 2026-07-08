@@ -1,0 +1,2396 @@
+{
+  "$comment": [
+    "eval_full_v2 — the complete campaign. Composition:",
+    "  base:   eval_full_recoverable.json (recoverable-loss pillars, line_stress split, 30-seed core)",
+    "  merge:  eval_full.json scaling (4 grids incl. simbench_mvlv ~778 MES nodes) + ablation_reconfig (4-variant)",
+    "  append: extension_campaign.json (islanding + temporal extensions)",
+    "  append: eval_config_justification.json (per-lever justification: just_*/deadcheck_*/sweep_*)",
+    "  dropped: cooldown_sweep (superseded by sweep_cooldown w/ target_metrics; ttl/community sweeps likewise superseded)",
+    "task_timeout_s=5400: extension_temporal (6 h physical horizon) and MVLV scaling tasks exceed the old 2400.",
+    "slurm mem=16G / time=02:00:00: islanding native-gurobi MILP and the 778-node MVLV grid need the headroom."
+  ],
+  "name": "eval_full_v2",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 5400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 30,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "$comment": "Pillar 1 — Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
+      "name": "functional_baseline",
+      "grids": [
+        "simbench_lv",
+        "simbench_lv_cp_heavy_dependent",
+        "simbench_lv_small",
+        "simbench_lv_medium"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        },
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.6
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Bullet 1 headline — island self-anchoring, the ONLY recovery path ",
+        "that converts disconnect_lost load back to SERVED (reconfig/coalition ",
+        "only move loss into agent_shed). ENABLED 2026-07-07 after three fixes:",
+        "  B) samplers were blind to GridForming* after microgrid promotion -> ",
+        "     0 failures; fixed in failure_sampling.py (now 1-2 island/seed).",
+        "  A) infeasibility root-caused: promoted grid-formers had q_mvar_max=",
+        "     0.1*p_max, too small for a severed island's reactive balance -> ",
+        "     every post-failure solve infeasible (IIS: island Q-balance vs gf ",
+        "     q_mvar). Fixed in modifiers.py (q_mvar_max=p_max). simbench_lv ",
+        "     8/8 seeds feasible; end-to-end 256/259->0 infeasible solves.",
+        "  C) a mango async clock-freeze hang (one branch agent await across ",
+        "     the cut) was fixed separately; task now completes 109s, 0 failed.",
+        "DESIGN: paired microgrid-vs-clean A/B on IDENTICAL seeded cuts ",
+        "(verified 6/6 seeds identical); only GF promotion differs, so the ",
+        "delta isolates islanding. HEADLINE METRIC = the disconnect_lost -> ",
+        "served shift (microgrid arm vs clean control), NOT the oracle gap: ",
+        "scare>oracle in this regime (0.685>0.652) because the oracle min-shed ",
+        "LP and scare min-de-energisation objective disagree on islanding, so ",
+        "the oracle is NOT a valid ceiling here (open: characterise that ",
+        "asymmetry). simbench_lv ONLY — medium still needs active headroom ",
+        "(formulation forces e=1 at all GF buses); small untested."
+      ],
+      "name": "recoverable_islanding",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "$label": "recoverable_microgrid",
+          "kind": "microgrid",
+          "failure_type": "island",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        },
+        {
+          "$label": "control_no_islanding",
+          "kind": "clean",
+          "heat_mccormick": true,
+          "failure_type": "island",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Bullet 1 (runnable) — FLISR / feeder-reconfiguration recovery.",
+        "simbench_lv_reconfig carries normally-open backup ties. A branch ",
+        "failure strands downstream load that is recoverable by closing a tie ",
+        "(GridReconfigurator) rather than de-energising it. Tight slack (0.30) ",
+        "forbids trivial external backfill so the reconfiguration decision is ",
+        "load-bearing; all 4 variants give the oracle-vs-baseline spread the ",
+        "existing scare-only reconfiguration pillar lacks. Loss lands as ",
+        "reconfig-recoverable, not disconnect_lost."
+      ],
+      "name": "recoverable_reconfig",
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Bullet 1 (runnable) — coalition / cross-sector-redispatch recovery.",
+        "On cp_heavy_dependent a generator (incl. CP) failure creates a deficit ",
+        "recoverable by ramping remaining generation and routing through ",
+        "coupling points (CP-ADMM + coalitions) — a decision-recoverable loss, ",
+        "not a topological one. Very tight slack (0.15) forbids external ",
+        "backfill so the MAS must actually redispatch; 4 variants expose the ",
+        "spread at the low-slack corner where Lens D found the benchmark bites."
+      ],
+      "name": "recoverable_coalition",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        },
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 2 — Optimality gap.  Pairs every scare run with an oracle on the same (grid, seed).",
+      "name": "optimality_gap",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        },
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.6
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 3 — variant comparison: scare vs single-level (gossip only) vs oracle.",
+      "name": "variant_comparison",
+      "grids": [
+        "simbench_lv",
+        "simbench_lv_cp_heavy_dependent",
+        "simbench_lv_small",
+        "simbench_lv_medium"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Pillar 4 — ablation matrix, split by theme so each flag runs in a",
+        "scenario that can actually exercise it.  Replaces the original",
+        "single-scenario design that left ~14/22 flags inert (their gating",
+        "conditions — CPs, voltage stress, heat sector, line overload,",
+        "Hebbian warmup, etc. — never fired in the concentrated-5 LV regime).",
+        "Each block names the flag set it tests + the scenario that triggers",
+        "them; the {} default in each block is the per-block baseline."
+      ],
+      "name": "ablation_core",
+      "$comment_block": "Holonic / QP-gossip / priority core.  Concentrated 5-failure on simbench_lv drives the deficit-heavy holon ADMM, gossip, and priority-allocation paths.",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_holonic": false,
+          "enable_cp_admm": false
+        },
+        {
+          "enable_holonic": false
+        },
+        {
+          "enable_qp_gossip": false
+        },
+        {
+          "enable_priority_holon_allocation": false
+        },
+        {
+          "enable_tier_stratified_holon_admm": false
+        },
+        {
+          "enable_monotonic_floor": false
+        },
+        {
+          "enable_distributed_failure_notice": false
+        },
+        {
+          "enable_dynamic_holon_topology": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent + generator failures + slack 0.15 means restoration must flow through CPs — the only regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions all have signal.",
+      "name": "ablation_cross_sector",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_cp_admm": false
+        },
+        {
+          "enable_dynamic_cp_topology": false
+        },
+        {
+          "enable_cross_sector_coalitions": false
+        },
+        {
+          "enable_holon_coalition": false,
+          "enable_cross_sector_coalitions": false
+        },
+        {
+          "enable_holon_summary": false,
+          "enable_holon_coalition": false,
+          "enable_cross_sector_coalitions": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ]
+    },
+    {
+      "$comment_block": "Line-loading / constraint-aware path.  line_stress (load_scale=1.8, ampacity_scale=0.5) forces lines into overload — the only regime where line_loading_constraint, constraint_aware_gossip, multihop_constraint, and curtailment_auction all fire.",
+      "name": "ablation_line_stress",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_line_loading_constraint": false
+        },
+        {
+          "enable_constraint_aware_gossip": false
+        },
+        {
+          "enable_multihop_constraint": false
+        },
+        {
+          "enable_curtailment_auction": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Voltage support.  pv_peak pushes vm_pu past the 1.03 pu deadband so the Q-V droop role actually fires.",
+      "name": "ablation_voltage",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_vvw_coordination": false
+        },
+        {
+          "enable_qv_droop": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ]
+    },
+    {
+      "$comment_block": "Thermal stress.  cold_day on cp_heavy forces a heat-sector deficit so the heat-control stack has signal: enable_heat_frontier (temperature-frontier controller vs bang-bang), enable_heat_priority_waterfall (tier-aware shedding vs tier-blind), enable_heat_cp_supply (heat->L3 coupling-point supply link vs idle CPs), plus clpu_ramp (ramp-rate-gated).  Replaces the retired enable_heat_recovery flag.",
+      "name": "ablation_thermal",
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_heat_frontier": false
+        },
+        {
+          "enable_heat_priority_waterfall": false
+        },
+        {
+          "enable_heat_cp_supply": false
+        },
+        {
+          "enable_clpu_ramp": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "cold_day",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment_block": "Reconfiguration ranking.  simbench_lv_reconfig has alternative paths so the path-ranking flag has alternatives to choose between.",
+      "name": "ablation_reconfig",
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_reconfig_feasibility_ranking": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 5a — packet loss robustness.",
+      "name": "robustness_packet_loss",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "comms_packet_loss_pct": 0.0
+        },
+        {
+          "comms_packet_loss_pct": 5.0
+        },
+        {
+          "comms_packet_loss_pct": 10.0
+        },
+        {
+          "comms_packet_loss_pct": 20.0
+        },
+        {
+          "comms_packet_loss_pct": 50.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 5b — latency jitter.",
+      "name": "robustness_latency",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "comms_latency_jitter_ms": 0.0
+        },
+        {
+          "comms_latency_jitter_ms": 50.0
+        },
+        {
+          "comms_latency_jitter_ms": 200.0
+        },
+        {
+          "comms_latency_jitter_ms": 1000.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 6 — multi-failure / cascading.",
+      "name": "cascading",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "n_failures": 1,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "n_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "n_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Voltage-stress pillar — VDE-AR-N 4105 operating point.  Sunny midday: PV runs near nameplate while residential load drops to the morning trough, reversing feeder power flow.  ``vm_pu`` drifts toward the upper bound; without the Q-V droop the constraint monitor must shed real-power injection to recover (lost served energy).  With the droop, local Q absorption keeps voltage in deadband and full PV output is preserved.",
+        "Two-row ablation in a single experiment: scare-with-droop vs scare-without-droop on identical (grid, seed, scenario) — direct attribution of the droop's contribution."
+      ],
+      "name": "voltage_stress",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Line-loading stress pillar — exercises the line-thermal constraint pipeline.  Loads are scaled up 1.8x and every PowerLine's ampacity is halved, guaranteeing overload after a single branch failure redirects flow.  Three-row ablation in one experiment: full pipeline vs monitor-off vs reconfig-ranking-off — direct attribution of each new mechanism.",
+        "With the full pipeline: branch-mode monitor fires on overload, sends StartBalanceNegotiation to the lower-priority endpoint group, the reconfigurator's 6c ranking avoids the most-loaded restoration path.",
+        "Monitor-off baseline shows what the system does when line overload is silent (the legacy behaviour).  Ranking-off baseline tests whether the priority-aware shedding alone is enough without changing reconfiguration choices."
+      ],
+      "name": "line_stress",
+      "grids": [
+        "simbench_lv",
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "ablations": [
+        {}
+      ]
+    },
+    {
+      "$comment": [
+        "Line-loading stress pillar — exercises the line-thermal constraint pipeline.  Loads are scaled up 1.8x and every PowerLine's ampacity is halved, guaranteeing overload after a single branch failure redirects flow.  Three-row ablation in one experiment: full pipeline vs monitor-off vs reconfig-ranking-off — direct attribution of each new mechanism.",
+        "With the full pipeline: branch-mode monitor fires on overload, sends StartBalanceNegotiation to the lower-priority endpoint group, the reconfigurator's 6c ranking avoids the most-loaded restoration path.",
+        "Monitor-off baseline shows what the system does when line overload is silent (the legacy behaviour).  Ranking-off baseline tests whether the priority-aware shedding alone is enough without changing reconfiguration choices."
+      ],
+      "name": "line_stress_ablation",
+      "grids": [
+        "simbench_lv",
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_line_loading_constraint": false
+        },
+        {
+          "enable_reconfig_feasibility_ranking": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Cold-day thermal stress — narrows heat sector against its lower bound; CP plants matter when they can convert gas/power to extra heat output.",
+      "name": "cold_day_stress",
+      "grids": [
+        "simbench_lv",
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "cold_day",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Generator-class failures — the historical CP-flexibility scenario.  Compares branch / generator / mixed contingency populations.",
+      "name": "generator_failure",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Pillar 7 — Scaling.  Four simbench distribution grids spanning roughly a decade of MES node count:",
+        "  small  ≈   36 nodes (1-LV-rural1)",
+        "  medium ≈  137 nodes (1-LV-semiurb4)",
+        "  large  ≈  396 nodes (1-LV-rural3, the established LV benchmark)",
+        "  mvlv   ≈  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay)",
+        "All run with the same 45 % slack budget so the only varying axis is grid size."
+      ],
+      "name": "scaling",
+      "grids": [
+        "simbench_lv_small",
+        "simbench_lv_medium",
+        "simbench_lv",
+        "simbench_mvlv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Pillar 8 — Reconfiguration.  Uses simbench_lv_reconfig: the constrained LV grid",
+        "augmented with 5 normally-open backup branches per sector (15 total).  Failures",
+        "bias toward branches because the reconfiguration pathway only fires on",
+        "BranchFailureEvent; generator failures don't test reconfiguration."
+      ],
+      "name": "reconfiguration",
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Pillar 9 — CP flexibility shift.  The headline experiment for the cross-sector ADMM",
+        "layer.  Uses three new grid variants built with monee's cp_size_multiplier and",
+        "replace_primary_generation knobs:",
+        "  cp_heavy_45            : CP rated output 2x, additive (loss of CP recoverable)",
+        "  cp_dependent_45        : CP rated output 1x, replaces primary gen (loss of CP",
+        "                            disables BOTH the unit and the displaced primary gen)",
+        "  cp_heavy_dependent_45  : both knobs combined (maximum cross-carrier dependence)",
+        "On the dependent variants, gossip + local-gen fallback alone cannot recover from a CP",
+        "failure because the displaced primary gen is gone — the cross-sector ADMM is",
+        "the only path to compensate.",
+        "Failures: generator-class so CPs themselves are part of the failure population."
+      ],
+      "name": "cp_flexibility",
+      "grids": [
+        "simbench_lv_cp_heavy",
+        "simbench_lv_cp_dependent",
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.6,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Concentrated imbalance.  failure_type=concentrated picks a load-rich node and",
+        "BFS-walks outward, producing spatially-clustered failures that target one",
+        "sub-community with stark deficit while neighbours retain slack capacity.",
+        "This is the test designed to surface the holonic ADMM's inter-group",
+        "redistribution; on the cp_heavy_dependent grid the CP-ADMM may also engage."
+      ],
+      "name": "concentrated_imbalance",
+      "grids": [
+        "simbench_lv",
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        },
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 6,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.3
+        }
+      ]
+    },
+    {
+      "$comment": "CP-size sweep — measures how PWSF varies with CP rated output on the dependent variant.  Replaces the old todo for sizing studies.",
+      "name": "cp_size_sweep",
+      "grids": [
+        "simbench_lv_cp_dependent",
+        "simbench_lv_cp_heavy",
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 5,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Agent dropout robustness pillar — pending a mango scheduling hook for",
+        "mid-sim agent unregister.  Empty grids keep this entry as a placeholder."
+      ],
+      "name": "robustness_dropout_TODO",
+      "grids": [],
+      "n_seeds": 15,
+      "notes": "Pending: requires a mid-sim agent unregister mechanism in mango"
+    },
+    {
+      "$comment": "Scenario row 1 = baseline (no islanding: sub-islands without a slack lose their load); row 2 = islanding extension + GridForming promotion. Same seeds and failure draws across rows. heat_mccormick on row 1 puts the clean arm on the SAME relaxed heat physics the microgrid arm needs for its MILP solve, so the paired delta isolates the islanding extension instead of confounding it with the heat relaxation.",
+      "name": "extension_islanding",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 5,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "ablations": [
+        {}
+      ],
+      "sweeps": [
+        {}
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "heat_mccormick": true,
+          "failure_type": "island",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "microgrid",
+          "failure_type": "island",
+          "n_failures": 5,
+          "carriers": [
+            "electricity",
+            "water",
+            "gas"
+          ],
+          "promote_all_generators": true,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Scenario row 1 = multi-hour horizon WITHOUT temporal extensions; row 2 = same horizon with gas linepack + thermal LTC. Heat+gas generator failures + tight slack (0.15) put the deficit on the storage carriers. physics_time_scale=1 (sim clock = physical time), interval 10 => dt 10s, dur 21600 => 6h/2160 steps; sector_timescale sets physical control cadences (elec 30s, gas 120s, heat 600s poll). Periodic-only physics solving (ablation cooldown/max_acts) settles at converged agent states each step; stays feasible (0% solve fail) with PWSF flat vs coarser intervals — benchmarked ~7 min MAS / ~3 min oracle per task at 6h on the tiny LV-S (each MILP ~0.09s). Note interval < elec poll (30s) so physics updates faster than agents observe; finer than 30s only refines trajectory resolution. Tuned LV-S keeps the per-step solve cheap.",
+      "name": "extension_temporal",
+      "grids": [
+        "simbench_lv_small_tuned"
+      ],
+      "n_seeds": 5,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "$ablation_comment": "physics_time_scale=1 makes the sim clock physical time; pair it with periodic-only physics solving (huge cooldown + max_acts=0) so the physics settles at CONVERGED agent states each 10-s step instead of re-solving mid-negotiation on every setpoint write — the latter caused ~27% infeasible-then-stale solves at the slow real-time cadence. Applies to both scenario rows and both variants, so no A/B confound.",
+      "ablations": [
+        {
+          "energy_flow_cooldown_s_override": 1000000.0,
+          "energy_flow_max_acts": 0
+        }
+      ],
+      "sweeps": [
+        {}
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "generator_carriers": [
+            "heat",
+            "gas"
+          ],
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15,
+          "simulation_duration_s": 21600.0,
+          "physics_time_scale": 1.0,
+          "physics_interval_s": 10.0,
+          "sector_timescale": {
+            "electricity": {
+              "poll_period_s": 30.0,
+              "decision_delay_s": 5.0
+            },
+            "gas": {
+              "poll_period_s": 120.0,
+              "decision_delay_s": 30.0
+            },
+            "heat": {
+              "poll_period_s": 600.0,
+              "decision_delay_s": 120.0
+            }
+          }
+        },
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "generator_carriers": [
+            "heat",
+            "gas"
+          ],
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15,
+          "simulation_duration_s": 21600.0,
+          "physics_time_scale": 1.0,
+          "physics_interval_s": 10.0,
+          "sector_timescale": {
+            "electricity": {
+              "poll_period_s": 30.0,
+              "decision_delay_s": 5.0
+            },
+            "gas": {
+              "poll_period_s": 120.0,
+              "decision_delay_s": 30.0
+            },
+            "heat": {
+              "poll_period_s": 600.0,
+              "decision_delay_s": 120.0
+            }
+          },
+          "linepack": true,
+          "ltc": true
+        }
+      ]
+    },
+    {
+      "$comment_block": "L2 holonic / ADMM core. Concentrated-5 on simbench_lv drives a deep one-community deficit so holon redistribution, priority allocation, tier stratification, summary inversion-detection and the change-only cascade all fire. Metric: PWSF + priority-inversion count + churn/abandonment (NOT raw PWSF alone).",
+      "name": "just_holonic_core",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_holonic": false
+        },
+        {
+          "enable_dynamic_holon_topology": false
+        },
+        {
+          "enable_priority_holon_allocation": false
+        },
+        {
+          "enable_tier_stratified_holon_admm": false
+        },
+        {
+          "enable_holon_summary": false
+        },
+        {
+          "enable_distributed_failure_notice": false
+        },
+        {
+          "enable_l2_priority_floor": false
+        },
+        {
+          "enable_actuated_ledger_writeback": false
+        },
+        {
+          "enable_change_only_dispatch": false
+        },
+        {
+          "enable_monotonic_floor": true
+        },
+        {
+          "holon_admm_scope": "sector"
+        },
+        {
+          "holon_admm_scope": "holon"
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__priority_invariant__passed",
+        "diary__abandoned",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "$comment_block": "L1 gossip / sub-community dispatch. Same concentrated-5 deficit. enable_qp_gossip OFF reverts to legacy equal-share; clpu_ramp OFF removes inrush throttling; modularity vs label-propagation changes partitioning. Metric: PWSF, share-stall events, ramp-violation, community-size dispersion.",
+      "name": "just_gossip_l1",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_qp_gossip": false
+        },
+        {
+          "enable_clpu_ramp": false
+        },
+        {
+          "community_partition_method": "modularity"
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "diary__abandoned",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "$comment_block": "L3 cross-sector / CP layer. cp_heavy_dependent + generator failures + slack 0.15: restoration MUST flow through coupling points (the displaced primary gen is gone), the only regime where CP-ADMM, dynamic CP filtering, coalitions and heat->L3 supply have signal. Metric: served on dependent grid, cross-sector recovery, slack compliance.",
+      "name": "just_cross_sector",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_cp_admm": false
+        },
+        {
+          "enable_cp_admm": false,
+          "enable_cp_priority_admm": false
+        },
+        {
+          "enable_cp_priority_admm": false
+        },
+        {
+          "cp_admm_algorithm": "lexicographic"
+        },
+        {
+          "enable_dynamic_cp_topology": false
+        },
+        {
+          "enable_holon_coalition": true
+        },
+        {
+          "enable_holon_coalition": true,
+          "enable_cross_sector_coalitions": true
+        },
+        {
+          "enable_cp_admm": false,
+          "cps_join_communities": true,
+          "community_partition_method": "connected_component",
+          "enable_multihop_constraint": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__priority_invariant__passed",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment_block": "Line-loading / curtailment pipeline. line_stress (load 1.8, ampacity 0.5) forces overload after a branch redirect, the only regime where the line monitor, constraint-aware gossip, multihop forwarding, auction + gating/targeting, reassert, branch-downstream relief and the reverse-priority waterfall all fire. Metric: line-loading violation integral, shed efficiency, priority-inversion under relief.",
+      "name": "just_line_curtail",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_line_loading_constraint": false
+        },
+        {
+          "enable_constraint_aware_gossip": false
+        },
+        {
+          "enable_multihop_constraint": false
+        },
+        {
+          "enable_curtailment_auction": false
+        },
+        {
+          "enable_line_relief_reassert": true
+        },
+        {
+          "enable_branch_downstream_relief": false
+        },
+        {
+          "enable_line_relief_waterfall": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "claims__constraint_compliance__detail__by_variable__line_load__n_violations",
+        "outcomes__constraint_violation_integral__electricity",
+        "claims__priority_invariant__passed",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment_block": "Voltage support. pv_peak on simbench_lv_small (the SMALL grid actually over-volts; the large grid never does) pushes vm_pu past the 1.03 deadband. Tests droop, VVW, the experimental auction-coordination hand-off + its feeder gate, the curtail-ramp interlock, recompute-on-failure and the end-of-sim settle tail. Metric: voltage-violation integral, over-voltage clear rate, PV curtailment, limit-cycle count.",
+      "name": "just_voltage",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_qv_droop": false
+        },
+        {
+          "enable_vvw_coordination": false
+        },
+        {
+          "enable_curtail_ramp_interlock": false
+        },
+        {
+          "enable_recompute_on_failure": false
+        },
+        {
+          "enable_end_of_sim_settle": true
+        },
+        {
+          "enable_qv_auction_coordination": true
+        },
+        {
+          "enable_qv_auction_coordination": true,
+          "enable_qv_feeder_gate": false
+        },
+        {
+          "enable_curtail_auction_gating": true
+        },
+        {
+          "enable_curtail_auction_targeting": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ],
+      "target_metrics": [
+        "claims__constraint_compliance__detail__by_variable__voltage__n_violations",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment_block": "Heat sector. cold_day (supply 343.15 K, heat load 1.5x) on cp_heavy forces a heat deficit so the frontier controller, tier waterfall, curtail-lock and heat->L3 CP supply link all have signal. Metric: heat served, heat priority-inversion, CP heat dispatch, heat curtail limit-cycle.",
+      "name": "just_heat",
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_heat_frontier": false
+        },
+        {
+          "enable_heat_priority_waterfall": false
+        },
+        {
+          "enable_heat_curtail_lock": false
+        },
+        {
+          "enable_heat_cp_supply": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction_by_sector__heat",
+        "claims__heat_priority__passed",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "$comment_block": "Slack-budget enforcement + supply-utilisation levers. cp_heavy_dependent + generator failures + slack 0.15 makes the budget bind and the converter draw ride the slack. Tests the monitor, loss-compensating feedback, the OFF-by-default restore/serve-more + gen-ramp-to-full + nominal/cp-aware supply levers, and L2 generator ramp. Metric: slack-budget compliance, served, gen dispatch % and slack utilisation vs the oracle 100%/100%.",
+      "name": "just_slack_budget",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_slack_budget_monitor": false
+        },
+        {
+          "enable_slack_budget_feedback": false
+        },
+        {
+          "enable_l2_generator_ramp": false
+        },
+        {
+          "enable_slack_restore": true
+        },
+        {
+          "enable_gen_ramp_to_full": true
+        },
+        {
+          "enable_slack_restore": true,
+          "enable_gen_ramp_to_full": true
+        },
+        {
+          "enable_nominal_slack_supply": true
+        },
+        {
+          "enable_cp_aware_slack_supply": true
+        },
+        {
+          "enable_nominal_slack_supply": true,
+          "enable_slack_restore": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "target_metrics": [
+        "claims__slack_budget_compliance__passed",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment_block": "Gas pressure regulator. clean 4-failure on simbench_lv produces genuine gas under-pressure (de-energised ~0 cases are excluded at aggregation per DEENERGISED_PRESSURE_PU). Regulator walks the slack pressure_pu setpoint before shedding. Metric: genuine gas under-pressure task count + gas served.",
+      "name": "just_gas_pressure",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_gas_pressure_regulator": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "claims__constraint_compliance__detail__by_variable__pressure__n_violations",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment_block": "Reconfiguration ranking. simbench_lv_reconfig (5 backup branches/sector) + branch-4 failures give the path search alternatives to rank by peak loading. scare only: the reconfig oracle is a 15-binary MILP that times out (no S4 baseline) so variant comparison is excluded here. Metric: restored-path peak loading, served.",
+      "name": "just_reconfig",
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_reconfig_feasibility_ranking": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "$comment_block": "Architectural attribution (cross-sector). Same three variants on cp_heavy_dependent generator @0.15 where the L3 CP layer is load-bearing.",
+      "name": "just_architecture_cross_sector",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level"
+      ],
+      "ablations": [
+        {}
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment_block": "Architectural attribution (deficit). scare vs flat single_level vs component_level on the concentrated-5 deficit — the whole-hierarchy value that per-lever LOO cannot isolate. Paired variant deltas vs scare.",
+      "name": "just_architecture_deficit",
+      "grids": [
+        "simbench_lv"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level"
+      ],
+      "ablations": [
+        {}
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "--- Phase-1 dead-candidate probes. Sim has unseeded-uuid4 nondeterminism (balance.py gossip routing) so compare the 5-seed metric DISTRIBUTION, not bit-identical runs: if the flipped rows are statistically indistinguishable from {}, the field is dead -> delete. Any separation => the field is live.",
+      "name": "deadcheck_slack_target_fraction",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "slack_target_fraction": 0.5
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "qv_dvdq_prior should be inert with auction-coordination OFF (default). If these two rows differ, the prior leaks into the default path (a bug).",
+      "name": "deadcheck_qv_dvdq_prior",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "qv_dvdq_prior": 0.1
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ],
+      "target_metrics": [
+        "claims__constraint_compliance__detail__by_variable__voltage__n_violations",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "--- Tuning sweeps (Phase 3). Each shows the metric flat / at a knee around the default.",
+      "name": "sweep_holon_admm",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "holon_admm_max_iters": 10
+        },
+        {
+          "holon_admm_max_iters": 25
+        },
+        {
+          "holon_admm_max_iters": 50
+        },
+        {
+          "holon_admm_max_iters": 100
+        },
+        {
+          "holon_admm_abs_tol": 0.01
+        },
+        {
+          "holon_admm_abs_tol": 0.001
+        },
+        {
+          "holon_admm_abs_tol": 0.0001
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "name": "sweep_holon_size",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "holon_max_size": 2
+        },
+        {
+          "holon_max_size": 4
+        },
+        {
+          "holon_max_size": 8
+        },
+        {
+          "holon_max_size": 16
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "name": "sweep_holon_summary",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "holon_summary_period_s": 0.1
+        },
+        {
+          "holon_summary_period_s": 0.25
+        },
+        {
+          "holon_summary_period_s": 0.5
+        },
+        {
+          "holon_summary_period_s": 1.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "$comment": "Coalition tunables only bite with the coalition lever ON, so every row enables it.",
+      "name": "sweep_coalition",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "enable_holon_coalition": true,
+          "holon_coalition_constraint_ttl_s": 4.0
+        },
+        {
+          "enable_holon_coalition": true,
+          "holon_coalition_constraint_ttl_s": 8.0
+        },
+        {
+          "enable_holon_coalition": true,
+          "holon_coalition_constraint_ttl_s": 16.0
+        },
+        {
+          "enable_holon_coalition": true,
+          "holon_coalition_accept_window_s": 0.5
+        },
+        {
+          "enable_holon_coalition": true,
+          "holon_coalition_accept_window_s": 1.0
+        },
+        {
+          "enable_holon_coalition": true,
+          "holon_coalition_accept_window_s": 2.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "name": "sweep_cp_admm",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "cp_admm_r_regularization": 0.0
+        },
+        {
+          "cp_admm_r_regularization": 0.1
+        },
+        {
+          "cp_admm_r_regularization": 0.3
+        },
+        {
+          "cp_bridge_cost": 1
+        },
+        {
+          "cp_bridge_cost": 2
+        },
+        {
+          "cp_bridge_cost": 4
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "name": "sweep_ttl",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "ttl_hops": 1
+        },
+        {
+          "ttl_hops": 2
+        },
+        {
+          "ttl_hops": 3
+        },
+        {
+          "ttl_hops": 5
+        },
+        {
+          "ttl_hops": 10
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "name": "sweep_gossip",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "gossip_termination_tolerance": 0.0001
+        },
+        {
+          "gossip_termination_tolerance": 1e-05
+        },
+        {
+          "gossip_termination_tolerance": 1e-06
+        },
+        {
+          "gossip_max_hops": 25
+        },
+        {
+          "gossip_max_hops": 50
+        },
+        {
+          "gossip_max_hops": 100
+        },
+        {
+          "gossip_max_hops": 200
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "name": "sweep_community",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "community_label_propagation_radius": 1
+        },
+        {
+          "community_label_propagation_radius": 2
+        },
+        {
+          "community_label_propagation_radius": 3
+        },
+        {
+          "community_partition_method": "modularity",
+          "community_modularity_resolution": 0.5
+        },
+        {
+          "community_partition_method": "modularity",
+          "community_modularity_resolution": 1.0
+        },
+        {
+          "community_partition_method": "modularity",
+          "community_modularity_resolution": 2.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "$comment": "CP-oscillation guard tunables only bite on the component_level path (cps_join_communities), so every row sets it.",
+      "name": "sweep_cp_osc",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "component_level"
+      ],
+      "sweeps": [
+        {
+          "cp_oscillation_ema_alpha": 0.1
+        },
+        {
+          "cp_oscillation_ema_alpha": 0.3
+        },
+        {
+          "cp_oscillation_ema_alpha": 0.5
+        },
+        {
+          "cp_oscillation_deadband_mw": 0.01
+        },
+        {
+          "cp_oscillation_deadband_mw": 0.05
+        },
+        {
+          "cp_oscillation_deadband_mw": 0.1
+        },
+        {
+          "cp_oscillation_min_interval_s": 0.5
+        },
+        {
+          "cp_oscillation_min_interval_s": 1.0
+        },
+        {
+          "cp_oscillation_min_interval_s": 2.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "name": "sweep_gas",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "gas_pressure_regulator_gain": 0.25
+        },
+        {
+          "gas_pressure_regulator_gain": 0.5
+        },
+        {
+          "gas_pressure_regulator_gain": 0.75
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "claims__constraint_compliance__detail__by_variable__pressure__n_violations",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "name": "sweep_slack",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "slack_budget_violation_tol": 0.02
+        },
+        {
+          "slack_budget_violation_tol": 0.05
+        },
+        {
+          "slack_budget_violation_tol": 0.1
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "target_metrics": [
+        "claims__slack_budget_compliance__passed",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "name": "sweep_reconfig",
+      "grids": [
+        "simbench_lv_reconfig"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "reconfig_path_window_s": 0.5
+        },
+        {
+          "reconfig_path_window_s": 1.5
+        },
+        {
+          "reconfig_path_window_s": 3.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "$comment": "Voltage tunables: re-centred droop ref, the auction-coordination dV/dQ prior (rows enable the hand-off so it bites), and the observation-lag act bound.",
+      "name": "sweep_voltage",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "qv_droop_voltage_ref_pu": 0.98
+        },
+        {
+          "qv_droop_voltage_ref_pu": 1.0
+        },
+        {
+          "qv_droop_voltage_ref_pu": 1.02
+        },
+        {
+          "enable_qv_auction_coordination": true,
+          "qv_dvdq_prior": 0.01
+        },
+        {
+          "enable_qv_auction_coordination": true,
+          "qv_dvdq_prior": 0.03
+        },
+        {
+          "enable_qv_auction_coordination": true,
+          "qv_dvdq_prior": 0.1
+        },
+        {
+          "energy_flow_max_acts": 4
+        },
+        {
+          "energy_flow_max_acts": 8
+        },
+        {
+          "energy_flow_max_acts": 16
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ],
+      "target_metrics": [
+        "claims__constraint_compliance__detail__by_variable__voltage__n_violations",
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "name": "sweep_cooldown",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "cooldown_s": 0.0
+        },
+        {
+          "cooldown_s": 0.05
+        },
+        {
+          "cooldown_s": 0.1
+        },
+        {
+          "cooldown_s": 0.5
+        },
+        {
+          "cooldown_s": 1.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "name": "sweep_packet_loss",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "comms_packet_loss_pct": 0.0
+        },
+        {
+          "comms_packet_loss_pct": 5.0
+        },
+        {
+          "comms_packet_loss_pct": 10.0
+        },
+        {
+          "comms_packet_loss_pct": 20.0
+        },
+        {
+          "comms_packet_loss_pct": 50.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    },
+    {
+      "name": "sweep_latency",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare"
+      ],
+      "sweeps": [
+        {
+          "comms_latency_jitter_ms": 0.0
+        },
+        {
+          "comms_latency_jitter_ms": 50.0
+        },
+        {
+          "comms_latency_jitter_ms": 200.0
+        },
+        {
+          "comms_latency_jitter_ms": 1000.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "compliant"
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "02:00:00",
+    "mem": "16G",
+    "cpus": 1,
+    "max_concurrent": 64,
+    "aggregate": true,
+    "nodelist": "mpcb014,mpcb016"
+  },
+  "slurm_eval": {
+    "partition": "rosa_express.p",
+    "time": "2:00:00",
+    "mem": "32G",
+    "cpus": 1,
+    "max_concurrent": 64,
+    "aggregate": true,
+    "nodelist": "mpcb014,mpcb015"
+  }
+}

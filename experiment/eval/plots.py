@@ -1638,6 +1638,91 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
     return _save(_apply_theme(fig, title=title), out_path)
 
 
+# Scaling (Pillar 7) — metric vs grid size
+
+# MES node counts for runs that predate ``outcomes.n_net_nodes`` (older
+# result.json files); current runs carry the real count per task.
+_GRID_MES_NODES: dict[str, int] = {
+    "simbench_lv_small": 47,
+    "simbench_lv_medium": 134,
+    "simbench_lv": 393,
+    "simbench_mvlv": 778,
+}
+
+
+def scaling_curve(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    metric: str,
+    y_label: str,
+    title: str,
+    variants: tuple[str, ...] = ("scare", "oracle"),
+) -> Path:
+    """Metric vs MES node count, one mean±95%-CI ribbon line per variant —
+    the sweep-style scaling read (wallclock, time-to-stabilise, ...)."""
+    if df.empty or metric not in df.columns:
+        return _save(_empty_fig("no data", title), out_path)
+
+    parsed = df.copy()
+    if "outcomes__n_net_nodes" in parsed.columns:
+        parsed["x"] = parsed["outcomes__n_net_nodes"]
+    else:
+        parsed["x"] = pd.NA
+    parsed["x"] = parsed["x"].fillna(parsed["grid"].map(_GRID_MES_NODES))
+    parsed = parsed.dropna(subset=["x", metric])
+    if parsed.empty:
+        return _save(_empty_fig("no node-count data", title), out_path)
+
+    fig = go.Figure()
+    for variant in variants:
+        sub = parsed[parsed["variant"] == variant]
+        if sub.empty:
+            continue
+        grouped = sub.groupby("x")[metric].agg(["mean", "count"])
+        grouped["ci"] = sub.groupby("x")[metric].apply(lambda s: _mean_ci(s)[1])
+        grouped = grouped.sort_index()
+        x = grouped.index.tolist()
+        band = grouped["ci"].fillna(0)
+        upper = (grouped["mean"] + band).tolist()
+        lower = (grouped["mean"] - band).tolist()
+        color = _VARIANT_COLOR.get(variant, _VARIANT_COLOR["scare"])
+        fig.add_trace(
+            go.Scatter(
+                x=x + x[::-1],
+                y=upper + lower[::-1],
+                fill="toself",
+                fillcolor=_hex_to_rgba(color, 0.16),
+                line=dict(color="rgba(0,0,0,0)"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=grouped["mean"].tolist(),
+                mode="lines+markers",
+                name=variant,
+                line=dict(color=color, width=_DATA_LINE_WIDTH),
+                marker=dict(
+                    size=_MARKER_SIZE, color=color, line=dict(color="white", width=1)
+                ),
+                customdata=[
+                    f"nodes: {int(xv)}<br>{y_label}: {m:.2f}<br>"
+                    f"95% CI: {_ci_label(c)}<br>n: {int(n)}"
+                    for xv, m, c, n in zip(
+                        x, grouped["mean"], grouped["ci"], grouped["count"]
+                    )
+                ],
+                hovertemplate="%{customdata}<extra></extra>",
+            )
+        )
+    fig.update_yaxes(title=y_label, rangemode="tozero")
+    fig.update_xaxes(title="MES nodes")
+    return _save(_apply_theme(fig, title=title), out_path)
+
+
 # Sensitivity sweeps (Pillar 7)
 
 

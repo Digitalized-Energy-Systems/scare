@@ -327,6 +327,38 @@ def _cascading(campaign: CampaignData, out_dir: Path) -> list[str]:
     ]
 
 
+def _scaling(campaign: CampaignData, out_dir: Path) -> list[str]:
+    """Scaling pillar: wallclock and time-to-stabilise vs MES node count,
+    mean±CI over seeds (sweep-style line + deviation band)."""
+    sub = campaign.by_experiment("scaling")
+    if sub.empty:
+        return []
+    done = _completed_sims(sub)
+    figs = [
+        str(
+            plots.scaling_curve(
+                done,
+                out_dir / "wallclock_vs_nodes.png",
+                metric="wallclock_s",
+                y_label="task wallclock (s)",
+                title="Scaling — wallclock vs grid size",
+            )
+        ),
+        str(
+            plots.scaling_curve(
+                # Oracle stabilisation time is vacuous (one-shot LP, 0.0).
+                done[done["variant"] == "scare"],
+                out_dir / "time_to_stabilise_vs_nodes.png",
+                metric="outcomes__time_to_stabilise_s",
+                y_label="time to stabilise (s)",
+                title="Scaling — time to stabilise vs grid size",
+                variants=("scare",),
+            )
+        ),
+    ]
+    return figs
+
+
 def _sweeps(campaign: CampaignData, out_dir: Path) -> list[str]:
     figs: list[str] = []
     for exp_name, param, label, title in (
@@ -1066,6 +1098,7 @@ def generate_report(
         ("Time to stabilise", _restoration_time, "restoration_time"),
         ("Robustness", _robustness, "robustness"),
         ("Cascading", _cascading, "cascading"),
+        ("Scaling", _scaling, "scaling"),
         ("Sensitivity sweeps", _sweeps, "sweeps"),
         ("Restoration vs baseline", _restoration, "restoration"),
         (

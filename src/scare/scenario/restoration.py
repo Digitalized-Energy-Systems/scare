@@ -491,7 +491,7 @@ def _flush_pending_negotiations(world: SimulationWorld) -> None:
     """Drain in-flight gossip into the diary so a short duration doesn't
     drop abandoned negotiations from the per-event account.
     """
-    for agent in world._agents.values():
+    for agent in world.agents.values():
         for role in getattr(agent, "roles", []):
             if isinstance(role, EnergyBalanceNegotiator):
                 role.flush_pending()
@@ -667,7 +667,7 @@ def _populate_nodes(
         child_addrs: list[Any] = []
         for cid in getattr(node, "child_ids", []):
             child_aid = _child_aid(cid)
-            child_agent = world._agents.get(child_aid)
+            child_agent = world.agents.get(child_aid)
             if child_agent is not None:
                 child_addrs.append(child_agent.addr)
         roles: list[Any] = [
@@ -1112,7 +1112,7 @@ def _branch_downstream_load_addrs(monee_net: Any, world: Any) -> dict[str, list[
             continue
         if cap <= 0:  # generators/non-loads can't be shed
             continue
-        ag = world._agents.get(f"child-{child.id}")
+        ag = world.agents.get(f"child-{child.id}")
         if ag is not None:
             node_loads[child.node_id].append(ag.addr)
 
@@ -1199,7 +1199,7 @@ def _build_topologies(
     if config.enable_line_loading_constraint:
         for branch in monee_net.branches:
             b_aid = create_branch_aid(branch.id)
-            agent_obj = world._agents.get(b_aid)
+            agent_obj = world.agents.get(b_aid)
             if agent_obj is None:
                 continue
             if _is_cp_branch(branch):
@@ -1397,7 +1397,7 @@ def _build_topologies(
         f"child-{c.id}": c.node_id for c in monee_net.childs
     }
     aid_to_addr: dict[str, Any] = {
-        aid: agent.addr for aid, agent in world._agents.items()
+        aid: agent.addr for aid, agent in world.agents.items()
     }
     sector_branches_by_sector: dict[Sector, dict[tuple, tuple[Any, Any]]] = {
         s: {} for s in _SECTORS
@@ -1441,7 +1441,7 @@ def _build_topologies(
             if cp_type is None:
                 continue
             aid = f"node-{node.id}"
-            agent = world._agents.get(aid)
+            agent = world.agents.get(aid)
             if agent is None:
                 continue
             obs = dict(node.model.values)
@@ -1458,7 +1458,7 @@ def _build_topologies(
                 continue
             branch_type = _model_type_name(branch)
             aid = create_branch_aid(branch.id)
-            agent = world._agents.get(aid)
+            agent = world.agents.get(aid)
             if agent is None:
                 continue
             obs = dict(branch.model.values)
@@ -1661,7 +1661,7 @@ def _build_topologies(
         cp_agents_by_sector: dict[Sector, list[Any]] = {sec: [] for sec in _SECTORS}
         if config.enable_cp_priority_admm:
             for aid_, meta in cp_meta_by_aid.items():
-                agent = world._agents.get(aid_)
+                agent = world.agents.get(aid_)
                 if agent is None:
                     continue
                 # Normally a CP joins only its bridged sectors' summary meshes.
@@ -1701,10 +1701,10 @@ def _build_topologies(
             if not _is_cp_branch(branch):
                 continue
             b_aid = create_branch_aid(branch.id)
-            if b_aid not in world._agents:
+            if b_aid not in world.agents:
                 continue
             for sector in _sectors_for_cp_type(_model_type_name(branch)):
-                mark_as_connector(world._agents[b_aid], connector_type=sector.value)
+                mark_as_connector(world.agents[b_aid], connector_type=sector.value)
 
         # Mark CP node agents as connectors for the sectors they bridge.
         for node in monee_net.nodes:
@@ -1712,10 +1712,10 @@ def _build_topologies(
             if cp_type is None:
                 continue
             n_aid = _node_aid(node.id)
-            if n_aid not in world._agents:
+            if n_aid not in world.agents:
                 continue
             for sector in _sectors_for_cp_type(cp_type):
-                mark_as_connector(world._agents[n_aid], connector_type=sector.value)
+                mark_as_connector(world.agents[n_aid], connector_type=sector.value)
 
         # Link the CP topology to the groups topology for each sector.
         for sector in _SECTORS:
@@ -1724,7 +1724,7 @@ def _build_topologies(
     # L3 dynamic CP-connector filter, built after the CP topology so it can
     # walk the populated EnergyConverterRole agents. Purely additive.
     if config.enable_cp_admm and config.enable_dynamic_cp_topology:
-        for agent in world._agents.values():
+        for agent in world.agents.values():
             cp_role = None
             for role in getattr(agent, "roles", []):
                 if isinstance(role, EnergyConverterRole):
@@ -1754,7 +1754,7 @@ def _build_topologies(
     # Wire multi-sector L3 state on every CP role under ``enable_cp_admm``
     # (coord election + dispatch are core); before this it's legacy per-CP.
     if config.enable_cp_admm:
-        for agent in world._agents.values():
+        for agent in world.agents.values():
             cp_role = None
             for role in getattr(agent, "roles", []):
                 if isinstance(role, EnergyConverterRole):
@@ -1780,7 +1780,7 @@ def _build_topologies(
         peer_cp_node_ids = {
             aid_: meta["node_id"] for aid_, meta in cp_meta_by_aid.items()
         }
-        for agent in world._agents.values():
+        for agent in world.agents.values():
             cp_role = None
             for role in getattr(agent, "roles", []):
                 if isinstance(role, CPPriorityAdmmRole):

@@ -44,6 +44,7 @@ _GRID_PRETTY: dict[str, str] = {
     "simbench_lv_small": "LV, small",
     "simbench_lv_small_tuned": "LV, small (in-bounds heat)",
     "simbench_lv_medium": "LV, medium",
+    "simbench_mvlv": "MV+LV, urban",
     "simbench_lv_reconfig": "LV with backup branches",
     "simbench_lv_cp_heavy": "CP-heavy (2x, additive)",
     "simbench_lv_cp_dependent": "CP-dependent (replacing)",
@@ -55,6 +56,7 @@ _SIMBENCH_PRETTY: dict[str, str] = {
     "1-LV-rural1--1-no_sw": "1-LV-rural1",
     "1-LV-rural3--1-no_sw": "1-LV-rural3",
     "1-LV-semiurb4--1-no_sw": "1-LV-semiurb4",
+    "1-MVLV-urban-5.303-2-no_sw": "1-MVLV-urban-5.303",
 }
 
 

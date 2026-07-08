@@ -8,6 +8,7 @@ from statistics import median
 import monee.express as mx
 import simbench
 from monee.io.from_pandapower import from_pandapower_net
+from monee.model.child import ExtPowerGrid
 from monee.model.formulation import EL_MISOCP_FORMULATION,GAS_NONCONVEX_MIQCQP_FORMULATION
 from monee.model.grid import STANDARD_ATMOSPHERE_PA
 from monee.network import generate_supply_return_mes_based_on_power_net
@@ -31,6 +32,8 @@ def create_large_lv_simbench(
     cp_size_multiplier: float = 1.0,
     replace_primary_generation: bool = False,
     heat_kwargs: dict | None = None,
+    gas_kwargs: dict | None = None,
+    slack_vm_pu: float | None = None,
 ):
     """Build a simbench LV multi-energy network.
 
@@ -71,6 +74,20 @@ def create_large_lv_simbench(
         to flow) keep supply temperatures inside the operating envelope on
         the tiny LV grids, where distributed low-flow heat injection
         otherwise saturates junctions at the t_pu ceiling.
+    gas_kwargs:
+        Overrides merged onto :data:`_GAS_KWARGS`. The LV defaults size
+        gas pipes by a structural ``diameter_tiers`` taper, which under-
+        sizes the mains on an MV-scale grid (gas demand ∝ the much larger
+        electrical magnitudes) and blows the Weymouth pressure drop past
+        the nonconvex formulation's piecewise range. Pass e.g.
+        ``diameter_tiers=None`` + ``auto_diameter=True`` (pipes sized to
+        the flow they carry) + a higher ``pressure_ref_pa`` for the MV
+        grids — see ``simbench_mvlv``.
+    slack_vm_pu:
+        When set, pins every ``ExtPowerGrid`` slack voltage after build.
+        The MV grids' native slack setpoint (~1.025) lets loaded feeder
+        buses droop below the 0.95 gate; lifting it shifts the whole
+        profile back in-bounds. Left ``None`` the simbench default stands.
     """
 
     def create():
@@ -88,8 +105,14 @@ def create_large_lv_simbench(
                 "replace_primary_generation": replace_primary_generation,
             },
             heat_kwargs={"node_based_heat_loads": True, **(heat_kwargs or {})},
-            gas_kwargs=_GAS_KWARGS,
+            gas_kwargs={**_GAS_KWARGS, **(gas_kwargs or {})},
         )
+
+        if slack_vm_pu is not None:
+            for child in mes.childs:
+                if isinstance(child.model, ExtPowerGrid):
+                    child.model.vm_pu = slack_vm_pu
+
         mes.apply_formulation(EL_MISOCP_FORMULATION)
         mes.apply_formulation(GAS_NONCONVEX_MIQCQP_FORMULATION)
 
@@ -139,6 +162,30 @@ GRIDS: dict[str, Callable[[], "object"]] = {
     ),
     "simbench_lv_medium": create_large_lv_simbench(
         0.2, simbench_code="1-LV-semiurb4--1-no_sw"
+    ),
+    # Scaling pillar — MV+LV distribution top end (~778 MES nodes, 45 CPs, the
+    # largest pure-distribution simbench grid; no HV/transmission). MV demand
+    # is ~90-100x the LV grids', so the LV-tuned overlay defaults are re-tuned
+    # to solve clean-but-stressed (voltage/gas near their gates); a handful of
+    # degree-1 heat leaf junctions sit at the McCormick-DHS relaxation floor
+    # (known monee t_k artifact, not an operating breach).
+    "simbench_mvlv": create_large_lv_simbench(
+        0.2,
+        simbench_code="1-MVLV-urban-5.303-2-no_sw",
+        cp_size_multiplier=0.4,
+        gas_kwargs={
+            "pressure_ref_pa": 1e5,
+            "diameter_tiers": None,
+            "auto_diameter": True,
+            "auto_diameter_v_mps": 6.0,
+            "gas_load_share": 1.0,
+        },
+        heat_kwargs={
+            "node_heat_gen_share": 0.8,
+            "auto_diameter": True,
+            "heat_load_share": 0.5,
+        },
+        slack_vm_pu=1.05,
     ),
     # Reconfiguration pillar — default LV grid plus five seeded backup
     # branches per sector so the GridReconfigurator has alternative paths

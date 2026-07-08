@@ -93,7 +93,7 @@ def _skewed_priorities(net) -> dict[str, int]:
 def _count_role_instances(world, role_cls) -> int:
     """Number of *role_cls* instances installed across all agents."""
     n = 0
-    for agent in world._agents.values():
+    for agent in world.agents.values():
         for role in getattr(agent, "roles", []):
             if isinstance(role, role_cls):
                 n += 1
@@ -103,7 +103,7 @@ def _count_role_instances(world, role_cls) -> int:
 def _cp_aids(world) -> set[str]:
     """aids of every agent that carries a :class:`CPPriorityAdmmRole`."""
     out: set[str] = set()
-    for agent in world._agents.values():
+    for agent in world.agents.values():
         for role in getattr(agent, "roles", []):
             if isinstance(role, CPPriorityAdmmRole):
                 out.add(str(agent.aid))
@@ -129,7 +129,7 @@ def _role_commits_per_cp(world) -> dict[str, float | None]:
     """Per-CP ``_last_committed_factor`` read from the role itself,
     independent of the diagnostics ledger for cross-checking."""
     out: dict[str, float | None] = {}
-    for agent in world._agents.values():
+    for agent in world.agents.values():
         for role in getattr(agent, "roles", []):
             if isinstance(role, CPPriorityAdmmRole):
                 out[str(agent.aid)] = role._last_committed_factor
