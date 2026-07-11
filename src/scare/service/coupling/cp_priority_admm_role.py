@@ -91,6 +91,7 @@ class CPPriorityAdmmRole(Role):
         r_regularization: float = 0.1,
         heat_supply_from_deficit: bool = False,
         demand_union: bool = False,
+        gossip_warm_start: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -104,6 +105,9 @@ class CPPriorityAdmmRole(Role):
         # (dynamically elected, usually non-heat) initiator's bridged sectors, so
         # heat demand always reaches the round. See RestorationConfiguration.
         self.demand_union = bool(demand_union)
+        # Gossip only: carry ADMM state across rounds (see
+        # RestorationConfiguration.enable_cp_gossip_warm_start).
+        self.gossip_warm_start = bool(gossip_warm_start)
         self.home_node_id = home_node_id
         self.watchdog_s = watchdog_s
         # Freshness bound on cached HolonSummary entries; the leader watchdog
@@ -204,6 +208,7 @@ class CPPriorityAdmmRole(Role):
                 cp_id=self.cp_id,
                 capacity_by_sector=self.capacity_by_sector,
                 on_commit=self._on_gossip_commit,
+                warm_start=self.gossip_warm_start,
             )
             self.context.subscribe_message(
                 self,

@@ -145,6 +145,35 @@ def _branch_sector_str(branch: Any, monee_net: Any) -> str:
     return sec.value if sec else ""
 
 
+def _heat_component_by_node(monee_net: Any) -> dict[Any, int]:
+    """Build-time connected components of the water/heat network (component
+    index per node id). Scopes the heat priority waterfall to peers that share
+    hydraulics; a mid-run pipe split degrades to the unscoped mesh reach, never
+    worse."""
+    adj: dict[Any, list[Any]] = {}
+    for branch in monee_net.branches:
+        if _branch_sector_str(branch, monee_net) != Sector.HEAT.value:
+            continue
+        a, b = branch.id[0], branch.id[1]
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    component: dict[Any, int] = {}
+    idx = 0
+    for start in adj:
+        if start in component:
+            continue
+        stack = [start]
+        component[start] = idx
+        while stack:
+            node = stack.pop()
+            for neighbour in adj.get(node, []):
+                if neighbour not in component:
+                    component[neighbour] = idx
+                    stack.append(neighbour)
+        idx += 1
+    return component
+
+
 def _node_aid(node_id: Any) -> str:
     return f"node-{node_id}"
 
@@ -523,6 +552,7 @@ def _populate_children(
     priorities: dict[str, int],
     config: RestorationConfiguration,
 ) -> None:
+    heat_component_by_node = _heat_component_by_node(monee_net)
     for child in monee_net.childs:
         aid = _child_aid(child.id)
         # Read the model directly: observe() needs energyflow, which only
@@ -584,6 +614,11 @@ def _populate_children(
                     enable_multihop_constraint=config.enable_multihop_constraint,
                     enable_heat_frontier=config.enable_heat_frontier,
                     enable_heat_priority_waterfall=config.enable_heat_priority_waterfall,
+                    heat_component_id=(
+                        heat_component_by_node.get(child.node_id)
+                        if sector == Sector.HEAT
+                        else None
+                    ),
                     enable_qv_auction_coordination=config.enable_qv_auction_coordination,
                     enable_qv_feeder_gate=config.enable_qv_feeder_gate,
                 )
@@ -850,6 +885,7 @@ def _make_balance_role(
         enable_actuated_ledger_writeback=config.enable_actuated_ledger_writeback,
         enable_nominal_slack_supply=config.enable_nominal_slack_supply,
         enable_cp_aware_slack_supply=config.enable_cp_aware_slack_supply,
+        enable_heat_l2_dispatch=config.enable_heat_l2_dispatch,
         component_scope=(
             config.enable_holonic and config.holon_admm_scope == "component"
         ),
@@ -989,6 +1025,7 @@ def _attach_cp_priority_admm_role(
             r_regularization=config.cp_admm_r_regularization,
             heat_supply_from_deficit=config.enable_heat_cp_supply,
             demand_union=config.enable_cp_demand_union,
+            gossip_warm_start=config.enable_cp_gossip_warm_start,
         )
     )
 
@@ -1530,6 +1567,11 @@ def _build_topologies(
                         admm_scope=config.holon_admm_scope,
                         enable_priority_allocation=config.enable_priority_holon_allocation,
                         enable_change_only_dispatch=config.enable_change_only_dispatch,
+                        heat_rebalance_period_s=(
+                            config.heat_l2_rebalance_s
+                            if config.enable_heat_l2_dispatch
+                            else None
+                        ),
                         live_member_filter=dyn_holon_role,
                         coalition_constraint_store=coalition_store,
                         my_node_id=leader_node,
@@ -1593,6 +1635,7 @@ def _build_topologies(
                         priority_tiers=config.priority_tiers,
                         admm_max_iters=config.holon_admm_max_iters,
                         admm_abs_tol=config.holon_admm_abs_tol,
+                        cp_budget_nominal=config.enable_cp_nominal_budget,
                         my_node_id=aid_to_node_id.get(leader.aid),
                         member_node_ids=summary_member_nodes,
                         mirror=mirror,

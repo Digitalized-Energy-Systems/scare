@@ -799,11 +799,11 @@
     {
       "$comment": [
         "Pillar 7 — Scaling.  Four simbench distribution grids spanning roughly a decade of MES node count:",
-        "  small  ≈   36 nodes (1-LV-rural1)",
+        "  small  ≈   36+ nodes (1-LV-rural1 — since 2026-07-11 the TUNED recipe: density 0.5, 0.4x CPs, slack-fed heat, auto pipes)",
         "  medium ≈  137 nodes (1-LV-semiurb4)",
         "  large  ≈  396 nodes (1-LV-rural3, the established LV benchmark)",
-        "  mvlv   ≈  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay)",
-        "All run with the same 45 % slack budget so the only varying axis is grid size."
+        "  mvlv   ≈  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay; gas_gen_share pinned 0.0 vs 1.5 on the LV rungs)",
+        "All run with the same 45 % slack budget. CAVEAT: grid size is NOT the only varying axis — the small rung differs in coupling recipe and the mvlv rung in gas supply topology; treat the ladder as size-dominated, not size-pure, and prefer within-LV (medium/large) contrasts for clean scaling claims."
       ],
       "name": "scaling",
       "grids": [
@@ -1029,7 +1029,7 @@
       "$comment": "Scenario row 1 = multi-hour horizon WITHOUT temporal extensions; row 2 = same horizon with gas linepack + thermal LTC. Heat+gas generator failures + tight slack (0.15) put the deficit on the storage carriers. physics_time_scale=1 (sim clock = physical time), interval 10 => dt 10s, dur 21600 => 6h/2160 steps; sector_timescale sets physical control cadences (elec 30s, gas 120s, heat 600s poll). Periodic-only physics solving (ablation cooldown/max_acts) settles at converged agent states each step; stays feasible (0% solve fail) with PWSF flat vs coarser intervals — benchmarked ~7 min MAS / ~3 min oracle per task at 6h on the tiny LV-S (each MILP ~0.09s). Note interval < elec poll (30s) so physics updates faster than agents observe; finer than 30s only refines trajectory resolution. Tuned LV-S keeps the per-step solve cheap.",
       "name": "extension_temporal",
       "grids": [
-        "simbench_lv_small_tuned"
+        "simbench_lv_small"
       ],
       "n_seeds": 5,
       "variants": [
@@ -1253,6 +1253,12 @@
           "cps_join_communities": true,
           "community_partition_method": "connected_component",
           "enable_multihop_constraint": false
+        },
+        {
+          "enable_cp_nominal_budget": false
+        },
+        {
+          "enable_cp_gossip_warm_start": false
         }
       ],
       "scenarios": [

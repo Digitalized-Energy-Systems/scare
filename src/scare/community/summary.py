@@ -168,6 +168,7 @@ class HolonSummaryRole(Role):
         peer_leader_addrs: dict[Sector, dict[str, Any]] | None = None,
         enable_heat_cp_supply: bool = False,
         heat_refresh_s: float = 2.0,
+        cp_budget_nominal: bool = True,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -177,6 +178,7 @@ class HolonSummaryRole(Role):
         # keep the delivered-heat deficit flowing to the CP-ADMM.
         self.enable_heat_cp_supply = bool(enable_heat_cp_supply)
         self.heat_refresh_s = float(heat_refresh_s)
+        self.cp_budget_nominal = bool(cp_budget_nominal)
         # Slow safety-net cadence re-running publish + check + re-assert
         # even when idle; the dominant trigger is event-driven (see setup).
         self.watchdog_s = watchdog_s
@@ -392,11 +394,23 @@ class HolonSummaryRole(Role):
             if cap < 0:
                 # Generator / slack injector feeds L3's supply pool. A
                 # slack advertises its (effective) budget, not raw |cap|.
-                if lookup_slack(self.behavior, aid) is not None:
+                slack_meta = lookup_slack(self.behavior, aid)
+                if slack_meta is not None:
                     eff = lookup_slack_eff_budget(self.behavior, aid)
                     v = float(eff) if eff is not None else abs(cap)
                     supply_total += v
-                    slack_budget_total += v
+                    # The CP input cap must NOT see the wound-down eff
+                    # budget: the integral feedback exists to make L1/L2
+                    # shed native load toward B, but with it a converter
+                    # (Ση<1) has zero input headroom and its converged
+                    # optimum is r=0 — starving the one actuator that can
+                    # relieve the over-draw. The CP kernel's cascade
+                    # arbitrates native serving vs CP input inside the
+                    # same B, so give it the nominal operator budget.
+                    if self.cp_budget_nominal:
+                        slack_budget_total += abs(slack_meta.cap)
+                    else:
+                        slack_budget_total += v
                 else:
                     supply_total += abs(cap)
                 continue

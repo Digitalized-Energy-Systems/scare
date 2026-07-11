@@ -89,6 +89,16 @@ _THRESHOLD_ABS_FLOOR: float = 1e-6
 # target. Below the 0.85 warning so gossip triggers pre-violation.
 _HEAT_CLEAR_FRACTION: float = 0.6
 
+# Heat L2 supply probe: share of the unserved heat gap offered on top of the
+# delivered total each flex cycle (see ``_handle_ask_flex``). Geometric climb
+# to the feasibility frontier; the frontier controller trims overreach.
+# 0.2 is the A/B-validated value (ab_heat_priority_v2). It converges slowly
+# for the ~6 effective rebalance rounds of a 30 s task (tier-4 settles below
+# its feasible level on well-supplied grids, costing heat PWSF) — 0.3-0.5 is
+# the knob to try, but the 0.4 probe A/B was confounded by concurrent CP-fix
+# tree changes and needs a clean campaign.
+_HEAT_L2_PROBE_SHARE: float = 0.2
+
 _MAX_HOPS = 100
 
 # Freshness (sim-s) of a congestion-price ceiling read in ``_apply_setpoint``;
@@ -268,6 +278,7 @@ class EnergyBalanceNegotiator(Role):
         enable_actuated_ledger_writeback: bool = True,
         enable_nominal_slack_supply: bool = False,
         enable_cp_aware_slack_supply: bool = False,
+        enable_heat_l2_dispatch: bool = False,
         component_scope: bool = False,
     ) -> None:
         super().__init__()
@@ -321,6 +332,10 @@ class EnergyBalanceNegotiator(Role):
         # the SlackBudgetMonitor's measured over-draw so the holon balances
         # native load NET of the cross-sector (CP) draw riding the slack.
         self.enable_cp_aware_slack_supply = bool(enable_cp_aware_slack_supply)
+        # Heat L2 reconnect (opt-in): actuate holon service fractions for heat
+        # (dispatch-only; gossip stays heat-excluded) and report delivered heat
+        # as the sector's flex supply pool.
+        self.enable_heat_l2_dispatch = bool(enable_heat_l2_dispatch)
 
         # Sector-specific convergence rate unless overridden.
         ts = SECTOR_TIMESCALE.get(sector, {})
@@ -1724,6 +1739,30 @@ class EnergyBalanceNegotiator(Role):
             if sp > 0 and available > 0:
                 total_shedded += available
 
+        # Heat L2 reconnect: heat has no bounded slack pool (the unbounded
+        # ExtHydrGrid never registers a rating), so the gen-only ledger reads
+        # supply=0 for gen-less groups — and the allocation's no-supply branch
+        # would shed every tier. Report heat DELIVERED TO LOADS instead: that
+        # total is the pool the per-tier waterfall can reallocate. Replaces
+        # (not max) the gen ledger — an in-group CHP's injection is the same
+        # MW the consuming groups' loads already report, and the component
+        # merge sums supplies across leaders.
+        #
+        # Plus an upward PROBE: delivered alone ratchets DOWN — the fractions
+        # it produces cap the loads, so delivered can never rise above the
+        # (transient) level it was sampled at, and L2-shed tiers stay shed
+        # forever. Offering a share of the unserved gap each cycle lets the
+        # estimate climb to the true feasibility frontier (physics delivers
+        # the probe ⇒ next sample is higher; it doesn't ⇒ the frontier sheds
+        # the overreach back with a restorable curtail-lock).
+        if self.enable_heat_l2_dispatch:
+            sec_heat = Sector.HEAT.value
+            delivered = sum(served_by_sector_priority.get(sec_heat, {}).values())
+            demand = sum(demand_by_sector_priority.get(sec_heat, {}).values())
+            supply_by_sector[sec_heat] = delivered + _HEAT_L2_PROBE_SHARE * max(
+                0.0, demand - delivered
+            )
+
         reply = AvailableFlexAnswer(
             flex=total_flex,
             balance=total_balance,
@@ -1790,8 +1829,29 @@ class EnergyBalanceNegotiator(Role):
     ) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
             return
-        # MW balance deactivated for heat: ignore L2/L3 overrides.
+        # MW balance deactivated for heat: gossip and scalar overrides never
+        # run. With the heat L2 reconnect on, Route-A service fractions ARE
+        # actuated (dispatch-only) — the tier-graded allocation heat otherwise
+        # lacks entirely; the curtail-lock keeps temperature-feasibility
+        # authority with the frontier (L2 raises defer, L2 sheds pass).
         if self.sector == Sector.HEAT:
+            if not self.enable_heat_l2_dispatch:
+                return
+            service_frac = getattr(
+                message, "service_fraction_by_sector_priority", None
+            )
+            if not service_frac or not self._heat_fractions_meaningful(
+                service_frac
+            ):
+                return
+            if (
+                self.enable_change_only_dispatch
+                and self._service_fraction_unchanged(service_frac)
+            ):
+                return
+            self.context.schedule_instant_task(
+                self._dispatch_service_fractions(service_frac)
+            )
             return
         # Route A (supply-priority): highest precedence; holon-global service
         # fractions applied per local-load-tier.
@@ -2010,6 +2070,20 @@ class EnergyBalanceNegotiator(Role):
                 ):
                     ramped += 1
         return ramped
+
+    def _heat_fractions_meaningful(
+        self, service_fraction: dict[str, dict[int, float]]
+    ) -> bool:
+        """Degenerate-allocation guard for the heat dispatch-only path. An
+        all-zero heat allocation (the waterfall's no-supply branch, e.g. a
+        transient delivered-heat readout of 0) must not zero every heat load:
+        a fully dark region would stay dark — the L2 shed passes, sets no
+        curtail-lock, and delivered heat (the supply estimate) never recovers.
+        """
+        tiers = service_fraction.get(Sector.HEAT.value)
+        if not tiers:
+            return False
+        return any(v > 0.0 for v in tiers.values())
 
     def _service_fraction_unchanged(
         self, new: dict[str, dict[int, float]]
@@ -2424,6 +2498,7 @@ def create_energy_balance_role(
     enable_actuated_ledger_writeback: bool = True,
     enable_nominal_slack_supply: bool = False,
     enable_cp_aware_slack_supply: bool = False,
+    enable_heat_l2_dispatch: bool = False,
     component_scope: bool = False,
 ) -> EnergyBalanceNegotiator:
     if priority is None:
@@ -2445,5 +2520,6 @@ def create_energy_balance_role(
         enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,
         enable_nominal_slack_supply=enable_nominal_slack_supply,
         enable_cp_aware_slack_supply=enable_cp_aware_slack_supply,
+        enable_heat_l2_dispatch=enable_heat_l2_dispatch,
         component_scope=component_scope,
     )

@@ -19,7 +19,15 @@ _GAS_KWARGS = {
     "pressure_ref_pa": 0.3e5,  # 300 mbar nominal (gauge)
     "pressure_ambient_pa": STANDARD_ATMOSPHERE_PA,  # gauge convention
     "diameter_tiers": [(20, 0.110), (5, 0.063), (0, 0.032)],
-    "gas_gen_share": 0.0,  # single-fed; P2G CPs carry distributed injection
+    # Distributed gas feed-in (sized off the electrical gen fleet). 0.0 made
+    # the gas grid single-fed with the ext budget at 30-60% of demand, so gas
+    # was ALWAYS in deficit: burning gas in a CHP forfeited tier-weighted Sink
+    # service, i.e. CHPs were never economical (oracle agreed) and P2G was
+    # the only gas lever. 1.5 gives the grid occasional headroom — measured
+    # sources+budget-sinks on simbench_lv: -0.0084 kg/s @pct 0.3 (still
+    # stressed), -0.0015 @0.45 (break-even), +0.0053 @0.6 — so CHP dispatch
+    # can sometimes pay off while the tight-budget scenarios stay hard.
+    "gas_gen_share": 1.5,
 }
 
 
@@ -136,25 +144,22 @@ GRIDS: dict[str, Callable[[], "object"]] = {
     "simbench_lv": create_large_lv_simbench(0.2),
     "simbench_lv_high": create_large_lv_simbench(0.3),
     # Scaling pillar — three LV variants spanning ~a decade in node count:
-    # small  (~15 buses, 1-LV-rural1)
+    # small  (~15 buses, 1-LV-rural1 — tuned, see below)
     # medium (~44 buses, 1-LV-semiurb4)
     # large  (~129 buses, 1-LV-rural3 — the default ``simbench_lv``)
-    # Same coupling density; slack budget keeps operator policy orthogonal.
-    "simbench_lv_small": create_large_lv_simbench(
-        0.2, simbench_code="1-LV-rural1--1-no_sw"
-    ),
-    # Tuned LV-S for the temporal (linepack + LTC) experiment. Two goals:
-    # (1) keep the born heat field inside the envelope — the stock LV-S
-    # saturates supply junctions at the ~620 K t_pu ceiling (distributed
+    # Slack budget keeps operator policy orthogonal.
+    # Tuned LV-S (formerly ``simbench_lv_small_tuned``, now the default LV-S).
+    # Two goals: (1) keep the born heat field inside the envelope — the stock
+    # LV-S saturates supply junctions at the ~620 K t_pu ceiling (distributed
     # HeatGenerators + oversized CPs injecting into low-flow DHS junctions), so
-    # the LTC steady-state start would settle onto an out-of-bounds field.
+    # a steady-state start would settle onto an out-of-bounds field.
     # Slack-fed heat (node_heat_gen_share=0.0), flow-sized pipes
     # (auto_diameter) and smaller CPs (0.4) fix that. (2) Actually populate the
-    # coupling points the temporal deficit must bite: at density 0.5 rural1
+    # coupling points a cross-sector deficit must bite: at density 0.5 rural1
     # carries CHP + P2H + a PowerToGas injector (the gas producer whose failure
     # a linepack draw-down needs — density 0.2 gave none), while the field
     # lands 324-383 K (100% in-bounds) and voltage stays stressed near 1.1.
-    "simbench_lv_small_tuned": create_large_lv_simbench(
+    "simbench_lv_small": create_large_lv_simbench(
         0.5,
         simbench_code="1-LV-rural1--1-no_sw",
         cp_size_multiplier=0.4,
@@ -179,6 +184,11 @@ GRIDS: dict[str, Callable[[], "object"]] = {
             "auto_diameter": True,
             "auto_diameter_v_mps": 6.0,
             "gas_load_share": 1.0,
+            # Pin single-fed: the MV overlay is hand-calibrated, and MV-scale
+            # gen would size sources at ~1.5x the (gas_load_share=1.0) sinks,
+            # trivialising the gas sector. Revisit deliberately if MVLV CHP
+            # dispatch should be studied.
+            "gas_gen_share": 0.0,
         },
         heat_kwargs={
             "node_heat_gen_share": 0.8,

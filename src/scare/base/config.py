@@ -62,6 +62,28 @@ class RestorationConfiguration:
     # gossip with it. False restores the initiator-only demand set.
     enable_cp_demand_union: bool = True
 
+    # L3 CP input cap uses the NOMINAL operator budget instead of the
+    # SlackBudgetMonitor's wound-down effective budget. The eff-budget integral
+    # feedback (floor 0) exists to make L1/L2 shed native load toward B; feeding
+    # the same signal to the CP kernel gives every η<1 converter zero input
+    # headroom, so its converged optimum is r=0 — no CP ever dispatches (v2
+    # campaign: SCARE CP gas output ≈ 0 vs oracle at nameplate). The kernel's
+    # cascade LP arbitrates native serving vs CP input within Σserved + B
+    # (input_capped_mode), so the pool can transiently over-credit the
+    # slack-fed share of served load by up to B; the SlackBudgetMonitor still
+    # enforces the physical draw at B, bounding the effect to over-commit /
+    # churn rather than sustained over-draw (local A/B: no violation increase).
+    # False restores the starved signal.
+    enable_cp_nominal_budget: bool = True
+
+    # Gossip only: warm-start each cascade round from the previous round's
+    # ADMM state (r/x/z/u) instead of zeros. A round budget of ~11 iterations
+    # (round_timeout_s / iter_timeout_s) cannot converge cold for N=20-33 CPs,
+    # so every commit was an early partial iterate (~0); with carry-over the
+    # rounds continue one another and converge across rounds. False restores
+    # cold starts.
+    enable_cp_gossip_warm_start: bool = True
+
     # Distributed FailureNotice propagation via ProblemDetector. False:
     # centralised callback triggers all leaders (legacy ablation).
     enable_distributed_failure_notice: bool = True
@@ -232,8 +254,10 @@ class RestorationConfiguration:
     # (q_max = p·tanφ, which shrinks as active power is curtailed — too weak to
     # clear over-voltage once curtailment bites). True: each inverter uses its full
     # apparent-power circle (IEEE 1547-2018), so reactive GROWS as p is curtailed.
-    # Validated on simbench_lv_small/pv_peak (n=40 deterministic, once the
-    # observation-lag bug was fixed via ``energy_flow_max_acts``): VVW clears
+    # Validated on the PRE-2026-07-11 stock simbench_lv_small (density 0.2 —
+    # the name now denotes the tuned 0.5-density grid) under pv_peak (n=40
+    # deterministic, once the observation-lag bug was fixed via
+    # ``energy_flow_max_acts``): VVW clears
     # over-voltage on 98% of seeds (vs 68% for the cos-φ-capped droop) at ~10-12pp
     # LESS PV curtailment. The earlier "VVW makes curtailment worse" reading was an
     # artifact of stale power-flow observations, not VVW. The auction-coordination
@@ -313,12 +337,40 @@ class RestorationConfiguration:
     enable_heat_frontier: bool = True
 
     # Priority waterfall for the heat frontier controller. True: a cold heat
-    # load defers its own (otherwise tier-blind) shed while a strictly lower-
-    # priority load in range still has reducible draw, AND actively sends that
-    # peer a bounded CurtailmentRequest each poll (one target per poll,
-    # per-peer cooldown) — the shed authority that makes the deferral a real
-    # waterfall instead of a wait-until-peers-freeze no-op. Heat-scoped.
-    enable_heat_priority_waterfall: bool = True
+    # load defers its own (otherwise tier-blind) shed while strictly lower-
+    # priority same-component loads hold enough reducible draw to cover the
+    # step (sufficiency-gated, defer-budget-bounded), AND actively sends those
+    # peers bounded CurtailmentRequests each poll — the shed authority that
+    # makes the deferral a real waterfall instead of a wait-until-peers-freeze
+    # no-op. Heat-scoped.
+    #
+    # DEFAULT FALSE since the heat L2 reconnect (enable_heat_l2_dispatch)
+    # subsumes it: the A/B (ab_heat_priority_v2, 16 paired seeds) shows the
+    # combined arm is dominated by L2-dispatch-alone on every gate (pass rate,
+    # compliance, heat PWSF) — the local peer sheds fight the global per-tier
+    # allocation. Re-enable only as the fallback heat-priority lever when L2
+    # dispatch is ablated off.
+    enable_heat_priority_waterfall: bool = False
+
+    # Reconnect heat to the L2 holon per-tier allocation. True: heat leaders
+    # actuate the component ADMM's per-(sector, tier) service fractions
+    # (gossip stays heat-excluded), holon flex reports delivered heat as the
+    # sector supply (the physics-delivered total the priority waterfall can
+    # reallocate across tiers), and heat holons re-run the component
+    # allocation periodically (heat has no gossip/failure trigger of its
+    # own). The frontier + curtail-lock keep temperature-feasibility
+    # authority: L2 raises defer on locked loads, L2 sheds always pass.
+    # A/B-validated (ab_heat_priority_v2, 16 paired seeds): heat_priority
+    # pass 0-6% -> 50-69%, inversions 2.4 -> 0.3/task, tier-1 heat +0.09..
+    # +0.12, compliance no worse; costs bounded tier-4 over-shed on well-
+    # supplied grids (heat PWSF -0.01 stress / -0.04 clean; probe share is
+    # the tuning knob). The frontier peer-shed waterfall FIGHTS this lever
+    # (worse on every gate combined than alone) — prefer disabling
+    # enable_heat_priority_waterfall wherever this is on.
+    enable_heat_l2_dispatch: bool = True
+    # Cadence (s) of the heat holon's periodic rebalance trigger; aligned by
+    # default with heat_cp_supply_refresh_s so allocations track the summary.
+    heat_l2_rebalance_s: float = 2.0
 
     # Local Q-V droop at every inverter-coupled PV. VDE-AR-N 4105 Q(U): piecewise-
     # linear, 0.97–1.03 pu deadband, ±Q_max at 0.95/1.05, Q_max bounded by the

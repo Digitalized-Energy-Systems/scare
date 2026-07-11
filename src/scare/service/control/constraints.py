@@ -208,6 +208,7 @@ class GridConstraintMonitor(Role):
         enable_multihop_constraint: bool = True,
         enable_heat_frontier: bool = True,
         enable_heat_priority_waterfall: bool = True,
+        heat_component_id: Any = None,
         enable_qv_auction_coordination: bool = False,
         enable_qv_feeder_gate: bool = True,
         branch_id: Any = None,
@@ -241,6 +242,9 @@ class GridConstraintMonitor(Role):
         # Heat priority-waterfall gate: a cold load defers its own shed while
         # lower-priority reducible heat load remains in its hydraulic region.
         self.enable_heat_priority_waterfall = enable_heat_priority_waterfall
+        # Static water-subnetwork id (build-time connected component); scopes
+        # waterfall partners to peers that actually share hydraulics.
+        self._heat_component_id = heat_component_id
         # Coordinated Q(U)/auction hand-off: credit remaining reactive relief
         # before sizing an over-voltage shed, so active is shed only for the residual.
         self.enable_qv_auction_coordination = enable_qv_auction_coordination
@@ -259,7 +263,8 @@ class GridConstraintMonitor(Role):
         # Heat frontier controller: owns the priority-waterfall peer cache and
         # frontier step state, decides the move toward the t_k feasibility floor.
         self._heat_frontier = HeatFrontierController(
-            peer_freshness_s=2.0 * _FORWARD_FRESHNESS_S
+            peer_freshness_s=2.0 * _FORWARD_FRESHNESS_S,
+            component_id=heat_component_id,
         )
 
         # Dedup of forwarded state: (origin, variable) -> (best_hops, t, value).
@@ -714,6 +719,7 @@ class GridConstraintMonitor(Role):
             origin_addr=origin,
             priority_tier=prio_tier,
             reducible=reducible,
+            component_id=self._heat_component_id if prio_tier is not None else None,
         )
         origin_key = (str(origin), variable)
         self._state_forwarded[origin_key] = (self.max_hops, now, utilization)
@@ -742,6 +748,7 @@ class GridConstraintMonitor(Role):
                 now,
                 message.priority_tier,
                 message.reducible,
+                component_id=getattr(message, "component_id", None),
             )
 
         # Dedup: forward only if the incoming copy improves on the last
@@ -1604,11 +1611,18 @@ class GridConstraintMonitor(Role):
             waterfall_enabled=self.enable_heat_priority_waterfall,
             aid=str(self.context.aid),
         )
+        too_cold = t < (
+            lo + HeatFrontierController.MARGIN_K - HeatFrontierController.DEADBAND_K
+        )
         if decision is None:
+            # Fully-shed (or sub-threshold) but still cold: peer shed is the
+            # only remaining lever — keep requesting while the node is cold.
+            if too_cold and self.enable_heat_priority_waterfall:
+                await self._request_waterfall_peer_shed(my_tier)
             return
         if decision.reason == "defer_waterfall":
-            # Own shed held — actively shed the lower-priority peer instead.
-            await self._request_waterfall_peer_shed(my_tier)
+            # Own shed held — actively shed the lower-priority peers instead.
+            await self._request_waterfall_peer_shed(my_tier, decision.needed_mw)
             return
 
         applied = apply_regulate(
@@ -1629,6 +1643,10 @@ class GridConstraintMonitor(Role):
                 cur,
                 decision.new_reg,
             )
+        # Safety-valve escalation: shedding self (insufficient peers or defer
+        # budget exhausted) still shifts what it can onto lower tiers.
+        if decision.reason == "curtail" and self.enable_heat_priority_waterfall:
+            await self._request_waterfall_peer_shed(my_tier, decision.needed_mw)
 
     # Bounded multiplicative shed step per peer request; the receiver's
     # ``_apply_curtail`` compounds repeated requests toward zero, so a single
@@ -1636,18 +1654,28 @@ class GridConstraintMonitor(Role):
     # the requester's own poll re-fires each cycle the node stays cold.
     _HEAT_WATERFALL_SHED_AMOUNT: float = 0.5
     _HEAT_WATERFALL_REQUEST_COOLDOWN_S: float = 1.0
+    _HEAT_WATERFALL_MAX_TARGETS: int = 3
 
-    async def _request_waterfall_peer_shed(self, my_tier: int) -> None:
-        """Actuate the heat priority waterfall: while this cold load's own
-        shed is deferred, send a bounded ``CurtailmentRequest`` to the
-        lowest-priority reducible peer in range (one per poll). The receiver
-        curtails with ``reason="curtail"``, taking the heat curtail-lock, so
-        L2 defers and its own frontier restores it once the region warms.
+    async def _request_waterfall_peer_shed(
+        self, my_tier: int, needed_mw: float = 0.0
+    ) -> None:
+        """Actuate the heat priority waterfall: send bounded
+        ``CurtailmentRequest``s to the lowest-priority reducible peers in the
+        own hydraulic component, until the expected relief covers this poll's
+        needed shed (or the per-poll target cap). The receiver curtails with
+        ``reason="curtail"``, taking the heat curtail-lock, so L2 defers and
+        its own frontier restores it once the region warms.
         """
         now = self.context.current_timestamp
+        sent = 0
+        expected_mw = 0.0
         for origin, tier, reducible in self._heat_frontier.waterfall_request_targets(
-            my_tier, now
+            my_tier, now, needed_mw
         ):
+            if sent >= self._HEAT_WATERFALL_MAX_TARGETS:
+                break
+            if needed_mw > 0.0 and expected_mw >= needed_mw:
+                break
             deadline = self._waterfall_request_cooldown.get(origin)
             if deadline is not None and now < deadline:
                 continue
@@ -1664,6 +1692,8 @@ class GridConstraintMonitor(Role):
                 ),
                 receiver_addr=addr,
             )
+            sent += 1
+            expected_mw += self._HEAT_WATERFALL_SHED_AMOUNT * reducible
             record_event(
                 t=now,
                 kind="heat_waterfall_peer_shed",
@@ -1671,10 +1701,10 @@ class GridConstraintMonitor(Role):
                 sector=self.sector.value,
                 detail=(
                     f"target={origin} tier={tier} reducible={reducible:.4f} "
-                    f"amount={self._HEAT_WATERFALL_SHED_AMOUNT}"
+                    f"amount={self._HEAT_WATERFALL_SHED_AMOUNT} "
+                    f"needed={needed_mw:.4f}"
                 ),
             )
-            return
 
     # ------------------------------------------------------------------
     # Public helpers

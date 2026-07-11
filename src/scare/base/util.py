@@ -788,16 +788,26 @@ def apply_regulate(
             else:
                 _lock[str(aid)] = factor
         elif reason in L2_ALLOCATION_REASONS and str(aid) in _lock:
-            # Auction owns this load — L2 must not correct it.
-            record_event(
-                t=float(timestamp),
-                kind="regulate_deferred_to_curtail_lock",
-                aid=str(aid),
-                sector=str(sector),
-                detail=f"reason={reason} lock={_lock[str(aid)]:.4f} "
-                f"requested_factor={factor:.4f}",
+            _current = _last_regulate_store(behavior).get(
+                str(aid), _lock[str(aid)]
             )
-            return False
+            if factor > float(_current) + tolerance:
+                # A restore: recovery of a temperature shed belongs to the
+                # frontier (restores when the region is warm) — L2 must not
+                # claw it back early.
+                record_event(
+                    t=float(timestamp),
+                    kind="regulate_deferred_to_curtail_lock",
+                    aid=str(aid),
+                    sector=str(sector),
+                    detail=f"reason={reason} lock={_lock[str(aid)]:.4f} "
+                    f"requested_factor={factor:.4f}",
+                )
+                return False
+            # A further shed passes — deepening only helps t_k feasibility.
+            # Track the deeper hold; the frontier still restores from the
+            # lock once the region warms.
+            _lock[str(aid)] = min(_lock[str(aid)], factor)
 
     # --- Electricity line-relief lock ---------------------------------
     # While the line-relief auction holds a load down for an overloaded line,

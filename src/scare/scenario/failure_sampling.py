@@ -330,8 +330,25 @@ def _iter_generator_candidates(monee_net: Any):
     compound_classes = (CHP, CHPHG, PowerToHeat)
     branch_classes = (GasToPower, PowerToGas, PowerToHeatHG)
 
+    def _is_gas_grid(child: Any) -> bool:
+        try:
+            grid = monee_net.node_by_id(child.node_id).grid
+        except Exception:  # noqa: BLE001
+            return False
+        return grid is not None and hasattr(grid, "higher_heating_value_kwh_per_kg")
+
     for child in monee_net.childs:
         if isinstance(child.model, child_classes):
+            # Distributed gas feed-in (gas_gen_share) places a ~sizing-floor
+            # Source at every gen bus. They are passive injections, not
+            # dispatchable plants: as candidates they would dilute the
+            # elec/heat pools and swamp the gas carrier group (breaking e.g.
+            # extension_temporal's targeting of the lone PowerToGas). Gas
+            # supply failures stay reachable via P2G CPs and gas pipes.
+            # Exact-type: microgrid promotion swaps the model class to
+            # GridFormingSource, so promoted grid-formers stay sampleable.
+            if type(child.model) is Source and _is_gas_grid(child):
+                continue
             yield ("child", child)
     for compound in getattr(monee_net, "compounds", []):
         if isinstance(compound.model, compound_classes):

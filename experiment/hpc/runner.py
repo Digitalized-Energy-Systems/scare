@@ -36,8 +36,10 @@ from mango.simulation.world import WorldRecording
 from experiment.eval.claims import evaluate_task
 from experiment.eval.oracle import (
     apply_oracle_heat_linearisation,
+    baseline_regulations,
     compose_oracle_result,
     compute_baseline_served,
+    oracle_solver_for_task,
 )
 from experiment.eval.results import (
     compose_result,
@@ -437,19 +439,30 @@ def _run_oracle(
         [f.branch_ids for f in failures],
     )
     priorities = _resolve_priorities(net, task, logger)
+    scenario = task.scenario or {}
+    # Temporal scenarios pick their own per-step solver inside the oracle.
+    temporal = bool(scenario.get("linepack") or scenario.get("ltc"))
+    solver = None if temporal else oracle_solver_for_task(task.grid, scenario)
+    warm_regs = baseline_regulations(
+        task.grid, scenario=scenario, priorities=priorities
+    )
+    if warm_regs:
+        logger.info("Oracle: warm-starting from baseline incumbent (%d regs)",
+                    len(warm_regs))
     started = _time.monotonic()
     payload = compose_oracle_result(
         monee_net=net,
         failures=failures,
         task_meta=task.to_dict(),
         wallclock_s=0.0,
+        solver=solver,
         priorities=priorities,
         baseline_served=baseline_served,
         out_dir=out_dir,
         simulation_duration_s=float(
-            (task.scenario or {}).get("simulation_duration_s")
-            or plan.simulation_duration_s
+            scenario.get("simulation_duration_s") or plan.simulation_duration_s
         ),
+        warm_start_regulations=warm_regs,
     )
     payload["wallclock_s"] = round(_time.monotonic() - started, 3)
     return net, failures, payload

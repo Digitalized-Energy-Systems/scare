@@ -13,11 +13,21 @@ import copy
 import json
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Any
 
 from monee import run_energy_flow_optimization
-from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink, Source
+from monee.model.child import (
+    ExtHydrGrid,
+    ExtPowerGrid,
+    HeatGenerator,
+    HeatLoad,
+    PowerGenerator,
+    PowerLoad,
+    Sink,
+    Source,
+)
 from monee.model.core import Var
 from monee.model.formulation import make_heat_convex_milp_formulation, GAS_NONCONVEX_MIQCQP_FORMULATION
 from monee.model.node import Bus
@@ -129,11 +139,53 @@ _ORACLE_TIER_WEIGHT: dict[int, float] = {1: 1e6, 2: 1e4, 3: 1e2, 4: 1.0}
 # can hide inside the absolute termination gap; MIPGap covers the relative
 # criterion. TimeLimit matches monee's default.
 _ORACLE_MIN_LOAD_MW = 1e-3
+
+
+def _oracle_threads() -> int:
+    """Match Gurobi's thread count to the actual core allocation.
+
+    Under slurm the task is cgroup-limited to ``cpus-per-task`` cores, but
+    Gurobi's default (Threads=0) spawns workers for every core it DETECTS on
+    the node — ~32 B&B threads contending for one allotted core: scheduler
+    thrash, higher memory (per-thread node pools vs the 16G cap), and far
+    less effective search per wall-second. Off-slurm defaults to 1, the
+    setting every solver preset here was validated at.
+    """
+    try:
+        return max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", "1")))
+    except ValueError:
+        return 1
+
+
 _ORACLE_GUROBI_PARAMS: dict[str, float] = {
     "MIPGap": 1e-9,
     "MIPGapAbs": 0.5 * WEIGHT_DEMAND * _ORACLE_TIER_WEIGHT[4] * _ORACLE_MIN_LOAD_MW,
     "TimeLimit": 300,
+    "Threads": _oracle_threads(),
 }
+
+# Grids/scenarios whose oracle MIQCQP stalls at the TimeLimit with weak or no
+# incumbents (eval_full_v2: reconfig gap median ~1.0 with 27/105 sol_count=0;
+# mvlv gap ~0.98 — the "oracle" was far off the optimum, so SCARE "beat" it).
+# Longer budget only; measured on the reproduced sol_count=0 reconfig task
+# (seed 200000002, Threads=1): MIPFocus=1/NoRelHeurTime made the BOUND
+# collapse (gap 0.81-0.90) while the failed-sector tie restriction
+# (_restrict_ties_to_failed_sectors) + baseline warm start close the gap to
+# 6e-4 at the stock search settings — so no focus/heuristic overrides here.
+_ORACLE_HARD_PRESET: dict[str, float] = {
+    "TimeLimit": 900,
+}
+_ORACLE_HARD_GRIDS = frozenset({"simbench_lv_reconfig", "simbench_mvlv"})
+
+
+def oracle_solver_for_task(
+    grid: str, scenario: dict[str, Any] | None = None
+) -> "_OracleGurobiSolver":
+    """Solver with per-grid termination params; extended budget for grids (or
+    microgrid/islanding scenarios) whose MIQCQP cannot converge inside the
+    default 300 s."""
+    hard = grid in _ORACLE_HARD_GRIDS or (scenario or {}).get("kind") == "microgrid"
+    return _OracleGurobiSolver(params=dict(_ORACLE_HARD_PRESET) if hard else None)
 
 
 class _OracleGurobiSolver(GurobipySolver):
@@ -551,12 +603,134 @@ def _build_min_shed_problem(
     return prob
 
 
+def _restrict_ties_to_failed_sectors(monee_net: Any, failures: list[Any]) -> None:
+    """Keep backup-tie ``on_off`` binaries free only in sectors hit by a
+    branch failure; pin ties in unaffected sectors open (the pre-failure
+    radial operating point).
+
+    With all 15 tie binaries free, fractional ``on_off`` in the relaxation
+    fictitiously bridges the whole network (root bound collapses to gap ~1)
+    and the ties' bilinear heat/Weymouth terms defeat every rounding
+    heuristic — 27/105 reconfig oracle solves in eval_full_v2 timed out with
+    NO incumbent. Ties in a sector without a failure are not a
+    reconfiguration DOF (nothing to reroute around), so pinning them shrinks
+    the binary coupling without weakening the oracle as a comparator. No-op
+    when no failed sector is identifiable (e.g. pure generator failures):
+    every tie then stays free.
+    """
+    from monee.model.branch import GasPipe, GenericPowerBranch, WaterPipe
+
+    def _sector(model: Any) -> str | None:
+        if isinstance(model, GenericPowerBranch):
+            return "power"
+        if isinstance(model, GasPipe):
+            return "gas"
+        if isinstance(model, WaterPipe):
+            return "water"
+        return None
+
+    branch_by_id = {b.id: b for b in monee_net.branches}
+    failed_sectors: set[str] = set()
+    for failure in failures:
+        sectors = set()
+        for bid in getattr(failure, "branch_ids", []) or []:
+            branch = branch_by_id.get(tuple(bid) if isinstance(bid, list) else bid)
+            if branch is not None:
+                sector = _sector(branch.model)
+                if sector is not None:
+                    sectors.add(sector)
+        if not sectors:
+            # Unlocalisable failure (generator / CP-branch / node failure):
+            # its deficit could make any sector's tie useful, so restricting
+            # would make the oracle weaker than SCARE's reconfigurator.
+            return
+        failed_sectors |= sectors
+    if not failed_sectors:
+        return
+    for branch in monee_net.branches:
+        m = branch.model
+        if not getattr(m, "backup", False):
+            continue
+        if _sector(m) in failed_sectors:
+            continue
+        m.backup = False
+        if hasattr(m, "on_off"):
+            m.on_off = 0
+
+
+def _stamp_warm_start(
+    monee_net: Any, regulations: dict[str, float] | None
+) -> None:
+    """Pre-promote decision attributes to Vars whose initial value seeds
+    Gurobi's MIP start (``inject_gurobi_vars_attr`` turns ``Var.value`` into
+    ``Var.Start``; monee's promotion skips attrs that are already Vars).
+
+    Without this, promotion resets every regulation to 1 and every backup
+    ``on_off`` to 1 — a serve-everything start that is infeasible under tight
+    slack budgets, so Gurobi gets no usable start at all (27 reconfig oracle
+    tasks in eval_full_v2 timed out with sol_count=0). Seeds instead:
+    - child regulation from the PRE-failure incumbent (feasible modulo the
+      failed branches; start-completion repairs the rest),
+    - backup ties open (the radial pre-failure operating point).
+
+    Bounds/integrality mirror the promotion exactly (``REGULATION_ATTR`` /
+    ``controllable_backup_lines``), so the problem itself is unchanged.
+    """
+    def _is_gas_grid(g: Any) -> bool:
+        grids = g if isinstance(g, list) else [g]
+        return any(
+            gg is not None and hasattr(gg, "higher_heating_value_kwh_per_kg")
+            for gg in grids
+        )
+
+    if regulations:
+        # Positive allow-list mirroring monee's promotion classes exactly
+        # (problem/core.py controllable_demands/generators). gurobipy injects
+        # EVERY Var attr regardless of promotion, so stamping any child the
+        # problem would not promote (GridForming* on microgrid nets, shunts,
+        # storages) would add a free regulation Var — and node balances
+        # multiply child flow by regulation, turning child-linear balances
+        # bilinear where the child's flow is itself a Var.
+        allowed = (PowerLoad, HeatLoad, PowerGenerator, HeatGenerator, Source, Sink)
+        for child in monee_net.childs:
+            model = child.model
+            if not isinstance(model, allowed):
+                continue
+            if not getattr(child, "active", True) or getattr(child, "ignored", False):
+                continue
+            # Water-grid Sinks are heating-loop mass flow — never promoted by
+            # min_load_shedding, so a stamped Var there would dangle. Water
+            # Sources WOULD be promoted (controllable_generators has no grid
+            # check); skipping them just costs their warm value, which is fine.
+            if isinstance(model, (Sink, Source)) and not _is_gas_grid(
+                getattr(child, "grid", None)
+            ):
+                continue
+            if not hasattr(model, "regulation"):
+                continue
+            if type(getattr(model, "regulation")) is Var:
+                continue
+            start = regulations.get(f"child-{child.id}")
+            if start is None:
+                continue
+            start = min(1.0, max(0.0, float(start)))
+            model.regulation = Var(start, 1, 0, name="regulation")
+    for branch in monee_net.branches:
+        m = branch.model
+        if not getattr(m, "backup", False) or not hasattr(m, "on_off"):
+            continue
+        if type(m.on_off) is Var:
+            continue
+        m.on_off = Var(0, 1, 0, True, name="on_off")
+
+
 def run_oracle(
     monee_net: Any,
     failures: list[Any],
     *,
     solver: Any = None,
     priorities: dict[str, int] | None = None,
+    warm_start_regulations: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Solve minimal load shedding on the post-failure network.
 
@@ -566,6 +740,10 @@ def run_oracle(
     # ``create_min_load_shedding_problem`` is exposed only via the submodule
     # ``monee.problem`` (filtered out of the top-level ``monee`` namespace).
     _apply_failures(monee_net, failures)
+    if failures:
+        _restrict_ties_to_failed_sectors(monee_net, failures)
+    if warm_start_regulations is not None:
+        _stamp_warm_start(monee_net, warm_start_regulations)
     prob = _build_min_shed_problem(monee_net, priorities)
     logger.info(
         "oracle: solving min-load-shedding LP on net (%d childs, %d branches)",
@@ -775,6 +953,9 @@ def run_temporal_oracle(
 
 
 _BASELINE_CACHE: dict[str, dict[str, Any]] = {}
+# Same keys as _BASELINE_CACHE: the baseline incumbent's per-child regulation,
+# kept for warm-starting the post-failure oracle solve.
+_BASELINE_REGS_CACHE: dict[str, dict[str, float]] = {}
 
 
 def _baseline_cache_key(
@@ -883,7 +1064,25 @@ def compute_baseline_served(
         )
     served = out["served"]
     _BASELINE_CACHE[cache_key] = copy.deepcopy(served)
+    # Side-cache the incumbent's per-child regulation for the post-failure
+    # oracle's MIP warm start (see baseline_regulations / _stamp_warm_start).
+    regs = out.get("regulations")
+    if regs:
+        _BASELINE_REGS_CACHE[cache_key] = dict(regs)
     return served
+
+
+def baseline_regulations(
+    grid_name: str,
+    *,
+    scenario: dict[str, Any] | None = None,
+    priorities: dict[str, int] | None = None,
+) -> dict[str, float] | None:
+    """Per-child regulation of the cached pre-failure baseline incumbent, or
+    ``None`` when :func:`compute_baseline_served` has not run for this key."""
+    return _BASELINE_REGS_CACHE.get(
+        _baseline_cache_key(grid_name, scenario, priorities)
+    )
 
 
 def compose_oracle_result(
@@ -897,6 +1096,7 @@ def compose_oracle_result(
     baseline_served: dict[str, Any] | None = None,
     out_dir: Path | None = None,
     simulation_duration_s: float | None = None,
+    warm_start_regulations: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build a result.json payload identical in shape to the scare
     composer so the aggregator can read both off the same schema.
@@ -938,7 +1138,13 @@ def compose_oracle_result(
                 physics_interval_s,
                 simulation_duration_s,
             )
-        out = run_oracle(monee_net, failures, solver=solver, priorities=priorities)
+        out = run_oracle(
+            monee_net,
+            failures,
+            solver=solver,
+            priorities=priorities,
+            warm_start_regulations=warm_start_regulations,
+        )
     served = out["served"]
     integral = out["constraint_violation_integral"]
     solver_stats = out.get("solver_stats", {})

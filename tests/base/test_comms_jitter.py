@@ -82,3 +82,48 @@ def test_packet_loss_preserved_with_jitter():
     msgs = [_pkg("a", "b", 1.0)]
     res = sim.calculate_communication(1.0, msgs).package_results[0]
     assert res.reached is False  # 100% loss → never reaches
+
+
+def test_install_perturbation_on_real_world():
+    """Guard against mango API drift: install_perturbation must work on a real
+    SimulationWorld, not just a mock (a mango refactor once made
+    communication_sim a read-only property, silently killing every comms
+    experiment)."""
+    from mango.simulation.communication import SimpleCommunicationSimulation
+    from mango.simulation.world import create_world
+
+    # Pure-loss path: seeded subclass with zero jitter (NOT mango's stock sim,
+    # whose loss draw is order-dependent via the global RNG).
+    world = create_world()
+    install_perturbation(
+        world, base_delay_s=0.02, packet_loss_pct=5.0, latency_jitter_ms=0.0
+    )
+    sim = world.communication_sim
+    assert isinstance(sim, SimpleCommunicationSimulation)
+    assert type(sim) is not SimpleCommunicationSimulation
+    assert sim.loss_percent == 0.05
+    assert sim._jitter_sigma_s == 0.0
+    msg = _pkg("a", "b", 1.0)
+    assert sim.calculate_communication(1.0, [msg]).package_results[0].delay_s == 0.02
+    # Jitter path installs the jitter subclass.
+    world = create_world()
+    install_perturbation(
+        world, base_delay_s=0.02, packet_loss_pct=5.0, latency_jitter_ms=50.0
+    )
+    assert world.communication_sim._jitter_sigma_s == 0.05
+    assert world.communication_sim.loss_percent == 0.05
+    # Guard against a future world-side cache diverging from the container.
+    assert world.container.communication_sim is world.communication_sim
+
+
+def test_pure_loss_is_order_independent():
+    """The same package must have the same loss fate regardless of what was
+    drawn before it (rerun determinism)."""
+    sim = _make_sim(jitter_ms=0.0, loss_pct=50.0)
+    probe = _pkg("s1", "leader", 7.0)
+    first = sim.calculate_communication(7.0, [probe]).package_results[0].reached
+    # Consume a lot of unrelated draws, then re-evaluate the same package.
+    noise = [_pkg(f"n{i}", "leader", 8.0) for i in range(200)]
+    sim.calculate_communication(8.0, noise)
+    again = sim.calculate_communication(7.0, [probe]).package_results[0].reached
+    assert first == again

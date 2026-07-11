@@ -29,7 +29,7 @@
     "                outcomes.oracle_islanding.",
     "",
     "  Experiment 2  extension_temporal — gas linepack + thermal LTC",
-    "                (LumpedThermalCapacitance) on simbench_lv_small_tuned",
+    "                (LumpedThermalCapacitance) on simbench_lv_small",
     "                (LV-S, 1-LV-rural1 at CP density 0.5, slack-fed heat +",
     "                flow-sized pipes + 0.4x CPs so the born heat field stays",
     "                inside [313,403] K instead of saturating at the ~620 K",
@@ -125,7 +125,7 @@
       "$comment": "Scenario row 1 = multi-hour horizon WITHOUT temporal extensions; row 2 = same horizon with gas linepack + thermal LTC. Heat+gas generator failures + tight slack (0.15) put the deficit on the storage carriers. physics_time_scale=1 (sim clock = physical time), interval 10 => dt 10s, dur 21600 => 6h/2160 steps; sector_timescale sets physical control cadences (elec 30s, gas 120s, heat 600s poll). Periodic-only physics solving (ablation cooldown/max_acts) settles at converged agent states each step; stays feasible (0% solve fail) with PWSF flat vs coarser intervals — benchmarked ~7 min MAS / ~3 min oracle per task at 6h on the tiny LV-S (each MILP ~0.09s). Note interval < elec poll (30s) so physics updates faster than agents observe; finer than 30s only refines trajectory resolution. Tuned LV-S keeps the per-step solve cheap.",
       "name": "extension_temporal",
       "grids": [
-        "simbench_lv_small_tuned"
+        "simbench_lv_small"
       ],
       "n_seeds": 5,
       "variants": [

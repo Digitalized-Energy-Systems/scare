@@ -470,6 +470,9 @@ class ConstraintStateMessage:
     # None on non-heat / legacy messages.
     priority_tier: int | None = None
     reducible: float | None = None
+    # Static water-subnetwork id of the origin — scopes waterfall partners to
+    # peers that share hydraulics. None = unknown (admit, legacy behavior).
+    component_id: Any = None
 
 
 @dataclass

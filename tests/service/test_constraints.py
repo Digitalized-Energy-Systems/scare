@@ -614,8 +614,9 @@ async def test_handle_constraint_state_populates_heat_peer_cache():
             msg, {"sender_addr": "peer-sender", "sender_id": "s0"}
         )
     assert "peer-9" in monitor._heat_frontier._peer_state
-    _t, tier, reducible = monitor._heat_frontier._peer_state["peer-9"]
+    _t, tier, reducible, component = monitor._heat_frontier._peer_state["peer-9"]
     assert tier == 4 and abs(reducible - 0.03) < 1e-9
+    assert component is None
 
 
 # ---------------------------------------------------------------------------

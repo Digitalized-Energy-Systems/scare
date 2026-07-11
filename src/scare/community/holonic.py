@@ -133,6 +133,7 @@ class HolonicCommunityRole(Role):
         admm_scope: str = "sector",
         enable_priority_allocation: bool = True,
         enable_change_only_dispatch: bool = True,
+        heat_rebalance_period_s: float | None = None,
         live_member_filter: LivePeerFilter | None = None,
         coalition_constraint_store: Any = None,
         my_node_id: Any = None,
@@ -188,6 +189,11 @@ class HolonicCommunityRole(Role):
         self.rebalance_period_s = rebalance_period_s
         self.rebalance_min_gap_s = rebalance_min_gap_s
         self.flex_timeout_s = flex_timeout_s
+        # Heat L2 reconnect: heat emits no NegotiationFinishedEvent (no gossip)
+        # and its ConstraintViolations dead-end before L2, so without a poll
+        # the component allocation would only recompute on topology/CP events —
+        # never as the thermal deficit evolves. None ⇒ off (non-heat / flag off).
+        self.heat_rebalance_period_s = heat_rebalance_period_s
 
         # Safety net for a leader that missed every trigger event.
         self.watchdog_s = watchdog_s
@@ -262,6 +268,13 @@ class HolonicCommunityRole(Role):
         # Rebalance is event-driven via the reactive handlers below plus this
         # watchdog; every cause of drift is itself an event (no drift probe).
         self.context.schedule_periodic_task(self._try_rebalance, delay=self.watchdog_s)
+        # Heat deficit poll (see __init__): drives the per-tier allocation as
+        # temperatures/delivered heat evolve. The min-gap fuse and the
+        # unchanged-dispatch guard on the balance side bound the churn.
+        if self.sector == Sector.HEAT and self.heat_rebalance_period_s:
+            self.context.schedule_periodic_task(
+                self._heat_periodic_rebalance, delay=self.heat_rebalance_period_s
+            )
 
         def _wrap(coro_fn):
             def _sync(msg, meta):
@@ -933,6 +946,11 @@ class HolonicCommunityRole(Role):
                     )
                 return
         self.context.schedule_instant_task(self._try_rebalance())
+
+    async def _heat_periodic_rebalance(self) -> None:
+        """Heat deficit poll: re-run the component allocation on a cadence
+        (heat has no reactive trigger of its own — see ``__init__``)."""
+        self._maybe_schedule_rebalance()
 
     async def _deferred_rebalance(self) -> None:
         """Fire a throttled rebalance once the ``rebalance_min_gap_s`` fuse

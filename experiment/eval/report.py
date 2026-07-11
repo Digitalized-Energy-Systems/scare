@@ -1020,6 +1020,46 @@ def _table_variant_means(campaign: CampaignData) -> str:
     return "\n".join(lines)
 
 
+def _table_oracle_quality(campaign: CampaignData) -> str:
+    """Per-(experiment, grid) oracle solver certification.
+
+    The oracle is a time-limited nonconvex MIQCQP incumbent, not always a
+    proven optimum — eval_full_v2 shipped reconfig oracles at MIP gap ~1.0
+    (SCARE "beat" them in 100% of pairs) with nothing in the report saying
+    so. Any vs-oracle aggregate whose certified rate is low measures solver
+    luck, not coordination quality; those rows are flagged.
+    """
+    df = campaign.summary
+    opt_col = "outcomes__oracle_solver_stats__solve_optimal"
+    gap_col = "outcomes__oracle_solver_stats__mip_gap"
+    if df.empty or opt_col not in df.columns or "variant" not in df.columns:
+        return ""
+    rows = df[(df["variant"] == "oracle") & df[opt_col].notna()]
+    if rows.empty:
+        return ""
+    lines = [
+        "",
+        "## Oracle certification",
+        "",
+        "_Share of oracle solves that reached proven optimality, and the "
+        "median MIP gap of the rest. Rows below 90% are flagged: their "
+        "vs-oracle comparisons use an under-converged incumbent as the "
+        '"optimum" and must not be read as a SCARE quality signal._',
+        "",
+        "| experiment | grid | n | certified | median gap (uncertified) |",
+        "|---|---|---|---|---|",
+    ]
+    for (exp, grid), g in rows.groupby(["experiment", "grid"]):
+        opt = g[opt_col].astype(str).str.lower().isin(("true", "1", "1.0"))
+        rate = 100.0 * opt.sum() / len(g)
+        rest = g.loc[~opt, gap_col].dropna() if gap_col in g.columns else []
+        med = f"{float(rest.median()):.3f}" if len(rest) else "—"
+        flag = " ⚠" if rate < 90.0 else ""
+        lines.append(f"| {exp} | {grid} | {len(g)} | {rate:.0f}%{flag} | {med} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _table_claims(campaign: CampaignData) -> str:
     df = campaign.summary
     if df.empty:
@@ -1183,6 +1223,7 @@ def _stitch(campaign: CampaignData, sections: list[tuple[str, list[str]]]) -> st
     parts.append("## Variant means")
     parts.append("")
     parts.append(_table_variant_means(campaign))
+    parts.append(_table_oracle_quality(campaign))
     parts.append(_table_claims(campaign))
 
     for label, figs in sections:
