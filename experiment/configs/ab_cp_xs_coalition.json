@@ -1,0 +1,40 @@
+{
+  "$comment": [
+    "Targeted A/B for Phase 3's cross-sector coalition fix (the child-118 elec overdraw path).",
+    "coalition_elec in ab_cp_slack_debit did NOT reproduce the overdraw because it only enabled enable_holon_coalition; eval_full_v2's child-118 1.68x was in cross-sector arms. Here BOTH arms enable_cross_sector_coalitions=True; the toggle is enable_coalition_delivered_supply, whose xs-actuatability gate SKIPS cross-sector coalitions under the default priority-ADMM L3 (no CPCommitment consumer). Arm {} (fix on) = xs coalitions gated/skipped; arm delivered_supply=false = xs coalitions run (legacy phantom-transfer behavior that raises own-sector fractions the slack must fund).",
+    "steady-state slack grading (write_timeseries=true). Judge on: claims__slack_budget_compliance passed + per_slack steady_peak/threshold for child-118, cross_sector_coalition_skipped_unactuatable events (fix arm) vs cross_sector_coalition_allocation events (legacy arm), PWSF, el_served."
+  ],
+  "name": "ab_cp_xs_coalition",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 8, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "xs_coalition_elec",
+      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "n_seeds": 8,
+      "variants": ["scare"],
+      "ablations": [
+        { "enable_holon_coalition": true, "enable_cross_sector_coalitions": true },
+        {
+          "enable_holon_coalition": true,
+          "enable_cross_sector_coalitions": true,
+          "enable_coalition_delivered_supply": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ]
+    }
+  ]
+}

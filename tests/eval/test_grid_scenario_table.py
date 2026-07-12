@@ -91,7 +91,9 @@ class TestCollect:
         # Distinct budgets preserved in first-appearance order, ∞ for none.
         assert scen[0].slack_budgets == [0.45, 0.30, None]
 
-    def test_distinct_grids_get_distinct_rows(self):
+    def test_distinct_grids_get_canonical_ids(self):
+        # IDs are pinned to the dissertation's tab:grid-scenarios, not
+        # first-appearance order: reconfig is S4 even when listed second.
         cfg = _cfg(
             [
                 {
@@ -106,7 +108,24 @@ class TestCollect:
             "simbench_lv",
             "simbench_lv_reconfig",
         ]
-        assert [s.scenario_id for s in scen] == ["S1", "S2"]
+        assert [s.scenario_id for s in scen] == ["S1", "S4"]
+
+    def test_canonical_order_beats_appearance_order(self):
+        cfg = _cfg(
+            [
+                {
+                    "name": "e",
+                    "grids": ["simbench_lv_small", "simbench_lv"],
+                    "scenarios": [{"kind": "clean", "slack_budget_pct": 0.45}],
+                }
+            ]
+        )
+        scen = collect_grid_scenarios(cfg, build=False)
+        assert [s.scenario_id for s in scen] == ["S1", "S5"]
+        assert [s.grid_name for s in scen] == [
+            "simbench_lv",
+            "simbench_lv_small",
+        ]
 
     def test_missing_slack_is_none(self):
         cfg = _cfg(

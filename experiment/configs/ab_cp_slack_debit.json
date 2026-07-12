@@ -1,0 +1,56 @@
+{
+  "$comment": [
+    "Paired flag A/B for Phases 2+3 of the CP-side compliance fix (slack-budget respect).",
+    "Phase 2 (enable_cp_slack_reserve_debit + feedback target shift, unflagged): the SlackBudgetMonitor's feedback deadband topped out exactly at the compliance claim's threshold B*1.05, and the CP kernel's input cap saw the nominal budget with no debit for the measured over-draw, so CP gas draw settled 2-16% over budget (eval_full_v2_20260711: 85% of slack fails, all marginal). The monitor now targets B*(1-0.05) and publishes a peak-hold/decay reserve that HolonSummaryRole debits from the CP-facing slack budget.",
+    "Phase 3 (enable_coalition_delivered_supply + xs-coalition actuatability gate): coalition acceptance pools credited generators at RATED capacity and slacks without the reserve debit; the resulting fractions are held as an L2 priority floor that clamps slack-budget override sheds UP for the TTL, structurally disarming budget enforcement (elec child-118 overdraw, median 1.68x, coalition arms only).",
+    "Arms: slack_gas experiment isolates Phase 2 on the marginal-gas population (slack_budget_pct=0.15 = the 70%-fail regime); coalition_elec isolates Phase 3 under enable_holon_coalition=true.",
+    "Judge on: claims__slack_budget_compliance__passed + per_slack steady_peak/threshold (gas child-287, elec child-118), outcomes__cp_generation n_active/gas_mw (CP wake-up must survive the debit), PWSF, temperature n_violations (must stay at the Phase-1-fixed level)."
+  ],
+  "name": "ab_cp_slack_debit",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 8, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "slack_gas",
+      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "n_seeds": 8,
+      "variants": ["scare"],
+      "ablations": [{}, { "enable_cp_slack_reserve_debit": false }],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ]
+    },
+    {
+      "name": "coalition_elec",
+      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "n_seeds": 6,
+      "variants": ["scare"],
+      "ablations": [
+        { "enable_holon_coalition": true },
+        {
+          "enable_holon_coalition": true,
+          "enable_coalition_delivered_supply": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    }
+  ]
+}

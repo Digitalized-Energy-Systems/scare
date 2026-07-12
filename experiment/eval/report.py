@@ -56,7 +56,7 @@ def _functional_baseline(campaign: CampaignData, out_dir: Path) -> list[str]:
             plots.variant_comparison_bar(
                 sub[sub["variant"] == "scare"],
                 out_dir / "served_per_grid.png",
-                title="Priority-weighted served, scare baseline by grid",
+                title="Priority-weighted served, SCARE baseline by grid",
             )
         )
     )
@@ -266,7 +266,7 @@ def _ablation(
                             plots_root / exp_name / f"ablation_impact_{grid}.png",
                             title=(
                                 f"Ablation impact — {alias_grid(grid)} "
-                                "(scare variant, compliant runs)"
+                                "(SCARE variant, compliant runs)"
                             ),
                         )
                     )

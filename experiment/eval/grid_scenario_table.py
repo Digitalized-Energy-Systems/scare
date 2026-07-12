@@ -34,6 +34,21 @@ from experiment.scenarios import GRIDS
 logger = logging.getLogger(__name__)
 
 
+# Canonical scenario IDs — pinned to the dissertation's ``tab:grid-scenarios``
+# so the same grid keeps the same ID across campaigns (plot labels in
+# ``display_aliases.json`` carry the same IDs). Grids outside this map get
+# the next free ``S<n>`` in first-appearance order.
+_GRID_ID: dict[str, str] = {
+    "simbench_lv": "S1",
+    "simbench_lv_cp_heavy_dependent": "S2",
+    "simbench_lv_cp_heavy": "S3",
+    "simbench_lv_reconfig": "S4",
+    "simbench_lv_small": "S5",
+    "simbench_lv_medium": "S6",
+    "simbench_lv_cp_dependent": "S7",
+    "simbench_mvlv": "S8",
+}
+
 # Pretty-name map
 # Labels for known grid factories; unknown keys fall back to
 # ``_grid_pretty``.
@@ -199,7 +214,8 @@ def _load_config(path: Path) -> CampaignConfig:
 def collect_grid_scenarios(
     cfg: CampaignConfig, *, build: bool = True
 ) -> list[GridScenario]:
-    """Return one row per unique grid, in first-appearance order.
+    """Return one row per unique grid, ordered by canonical ``_GRID_ID``
+    (unpinned grids follow in first-appearance order).
 
     Rows differing only in slack budget are collapsed (everything else is
     a grid property); the slack budget is carried as the list of distinct
@@ -230,14 +246,22 @@ def collect_grid_scenarios(
                 if slack not in slacks_by_grid[grid_name]:
                     slacks_by_grid[grid_name].append(slack)
 
+    pinned = sorted(
+        (g for g in order if g in _GRID_ID), key=lambda g: int(_GRID_ID[g][1:])
+    )
+    unpinned = [g for g in order if g not in _GRID_ID]
+    next_free = len(_GRID_ID) + 1
+    ids = {g: _GRID_ID[g] for g in pinned}
+    ids.update({g: f"S{next_free + i}" for i, g in enumerate(unpinned)})
+
     return [
         GridScenario(
-            scenario_id=f"S{i}",
+            scenario_id=ids[grid_name],
             grid_name=grid_name,
             slack_budgets=slacks_by_grid[grid_name],
             facts=facts_cache[grid_name],
         )
-        for i, grid_name in enumerate(order, start=1)
+        for grid_name in pinned + unpinned
     ]
 
 

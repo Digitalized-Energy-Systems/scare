@@ -169,6 +169,8 @@ class HolonSummaryRole(Role):
         enable_heat_cp_supply: bool = False,
         heat_refresh_s: float = 2.0,
         cp_budget_nominal: bool = True,
+        coalition_delivered_supply: bool = True,
+        cp_commitment_actuatable: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -179,6 +181,16 @@ class HolonSummaryRole(Role):
         self.enable_heat_cp_supply = bool(enable_heat_cp_supply)
         self.heat_refresh_s = float(heat_refresh_s)
         self.cp_budget_nominal = bool(cp_budget_nominal)
+        # Credit coalition-pool generators at delivered |sp| (not rated |cap|)
+        # so a curtailed generator can't fund the pool at nameplate; also gates
+        # cross-sector coalitions on the CP transfer being actuatable (see
+        # enable_coalition_delivered_supply).
+        self.coalition_delivered_supply = bool(coalition_delivered_supply)
+        # Whether a CPCommitment consumer exists (legacy EnergyConverterRole L3).
+        # Under the default priority-ADMM L3 it does not, so a cross-sector
+        # coalition's promised CP transfer never actuates — don't raise
+        # own-sector fractions on it (they'd be funded by the slack instead).
+        self.cp_commitment_actuatable = bool(cp_commitment_actuatable)
         # Slow safety-net cadence re-running publish + check + re-assert
         # even when idle; the dominant trigger is event-driven (see setup).
         self.watchdog_s = watchdog_s
@@ -727,6 +739,20 @@ class HolonSummaryRole(Role):
         No invitation round: uses build-time ``_cp_meta`` (CP capacity +
         coupling) and the registry's current per-tier state.
         """
+        # Don't raise own-sector service fractions on a CP transfer that has no
+        # actuator: under the default priority-ADMM L3 there is no CPCommitment
+        # consumer, so the promised inflow never materialises and the raised
+        # fractions get funded by the slack instead (the child-118 overdraw).
+        if self.coalition_delivered_supply and not self.cp_commitment_actuatable:
+            record_event(
+                t=float(self.context.current_timestamp),
+                kind="cross_sector_coalition_skipped_unactuatable",
+                aid=self.context.aid,
+                sector=own_sec.value,
+                detail=f"cp={cp_aid} peer={peer_sec.value} (no CPCommitment consumer)",
+            )
+            return
+
         meta = self._cp_meta.get(cp_aid)
         if meta is None:
             return
@@ -1055,6 +1081,12 @@ class HolonSummaryRole(Role):
                 if lookup_slack(self.behavior, aid) is not None:
                     eff = lookup_slack_eff_budget(self.behavior, aid)
                     add = float(eff) if eff is not None else abs(float(cap))
+                elif self.coalition_delivered_supply:
+                    # Generator: credit DELIVERED |sp|, not RATED |cap| — a
+                    # curtailed generator can't fund the pool at its nameplate
+                    # (mirrors the L2 supply pool in balance.py).
+                    sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
+                    add = abs(float(sp))
                 else:
                     add = abs(float(cap))
                 supply_by_sector[sec_v] = supply_by_sector.get(sec_v, 0.0) + add

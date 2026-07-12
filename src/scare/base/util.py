@@ -487,6 +487,49 @@ def line_congestion_ceiling(
     return max(0.0, min(1.0, 1.0 - total))
 
 
+# TTL (sim-s) for a CP heat-outlet ceiling entry. The guard republishes every
+# poll (~1 s); a stale entry means the guard died or its junction obs vanished
+# — release the cap rather than pin the CP down forever.
+_CP_HEAT_CEILING_TTL_S: float = 5.0
+
+
+def _cp_heat_ceiling_store(behavior: Any) -> dict[str, tuple]:
+    """Per-CP regulation ceiling from the heat-outlet guard:
+    ``aid -> (ceiling, t_set)``.
+
+    Written by ``CPHeatOutletGuard`` (the sensor/controller half); enforced in
+    :func:`apply_regulate` for every ``sector="cp"`` write. Enforcement must
+    live there — the L3 kernels re-commit the deficit-filling factor every
+    round (delivered heat is measured at load setpoints, which CP injection
+    can never raise), so a one-shot wind-down without a held cap is
+    immediately overwritten. Freshness-stamped."""
+    return _get_behavior_store(behavior, "_scare_cp_heat_ceiling")
+
+
+def publish_cp_heat_ceiling(
+    behavior: Any, aid: str, ceiling: float, now: float
+) -> None:
+    """Record the guard's regulation ceiling for CP *aid*. ``ceiling >= 1.0``
+    clears the entry (no cap)."""
+    store = _cp_heat_ceiling_store(behavior)
+    if ceiling >= 1.0:
+        store.pop(str(aid), None)
+    else:
+        store[str(aid)] = (max(0.0, float(ceiling)), float(now))
+
+
+def cp_heat_ceiling(behavior: Any, aid: str, now: float) -> float | None:
+    """Fresh regulation ceiling for CP *aid*, or None when none published or
+    the entry is stale (guard released / dead)."""
+    entry = _cp_heat_ceiling_store(behavior).get(str(aid))
+    if entry is None:
+        return None
+    ceiling, t_set = entry
+    if (now - float(t_set)) >= _CP_HEAT_CEILING_TTL_S:
+        return None
+    return float(ceiling)
+
+
 # Min fresh loading headroom (%-points below the limit) at which the line lock
 # hands active back (analogue of ``_QV_LOCK_RELEASE_MARGIN_PU``). The restore
 # step raises loading, so this cushion keeps the closed loop settling just
@@ -762,6 +805,27 @@ def apply_regulate(
     factor = max(0.0, min(1.0, factor))
 
     _cfg = getattr(behavior, "_scare_config", None)
+
+    # --- CP heat-outlet ceiling (converter writes only) ----------------
+    # Single funnel for every L3 commit path: clamp a CP write to the fresh
+    # ceiling the heat-outlet guard holds for an (almost) over-temperature
+    # outlet junction, so deficit-driven kernel re-commits cannot undo the
+    # guard's wind-down. Inert while no ceiling is published.
+    if str(sector) == "cp":
+        _cp_ceil = cp_heat_ceiling(behavior, str(aid), float(timestamp))
+        if _cp_ceil is not None and factor > _cp_ceil:
+            if factor > _cp_ceil + tolerance:
+                record_event(
+                    t=float(timestamp),
+                    kind="cp_regulate_capped_to_heat_ceiling",
+                    aid=str(aid),
+                    sector=str(sector),
+                    detail=(
+                        f"reason={reason} requested_factor={factor:.4f} "
+                        f"ceiling={_cp_ceil:.4f}"
+                    ),
+                )
+            factor = _cp_ceil
 
     # --- Heat curtailment-auction lock (heat sector only) -------------
     # While the auction holds a heat load down for a live temperature

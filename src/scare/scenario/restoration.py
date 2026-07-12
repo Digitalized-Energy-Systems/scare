@@ -101,6 +101,7 @@ from scare.service.balance.balance import (
     create_energy_balance_role,
 )
 from scare.service.control.constraints import GridConstraintMonitor
+from scare.service.control.cp_heat_guard import CPHeatOutletGuard
 from scare.service.control.gas_pressure import GasPressureRegulator
 from scare.service.control.local_generation import LocalGenerationFallbackRole
 from scare.service.control.slack_budget import SlackBudgetMonitor
@@ -737,6 +738,10 @@ def _populate_nodes(
                 _attach_cp_roles(roles, behavior, cp_type, obs, priorities.get(aid, 0))
             elif config.cps_join_communities:
                 _attach_multi_community_cp_role(roles, behavior, cp_type, config)
+            if config.enable_cp_heat_outlet_guard:
+                outlet_aid = _heat_outlet_aid_for_node(node, monee_net)
+                if outlet_aid is not None:
+                    roles.append(CPHeatOutletGuard(behavior, outlet_aid=outlet_aid))
 
         _register_agent(
             world, behavior, aid, roles, monee_id=node.id, monee_type="node"
@@ -792,6 +797,17 @@ def _populate_branches(
             cent = get_by_branch_id(centrality, branch.id)
             roles.append(GridTieSwitchOperator(behavior, branch.id, centrality=cent))
 
+        # Heat-outlet guard on heat-producing branch CPs: P2H/G2H inject
+        # q_mw_heat at the to-node. Independent of the CP-coordination elif
+        # chain above — the born regulation=1.0 injects at rated power even
+        # with every L3 layer off, so the guard must not ride on any of them.
+        if config.enable_cp_heat_outlet_guard and (
+            "powertoheat" in branch_type or "gastoheat" in branch_type
+        ):
+            roles.append(
+                CPHeatOutletGuard(behavior, outlet_aid=_node_aid(branch.id[1]))
+            )
+
         # Line-loading monitor on electricity power lines;
         # home_leader_addr is filled in after the groups topology is built.
         branch_sector = _branch_sector_str(branch, monee_net)
@@ -841,6 +857,31 @@ def _populate_world(
         world, monee_net, behavior, priorities, config, neighbour_sector_by_node
     )
     _populate_branches(world, monee_net, behavior, priorities, config, centrality)
+
+
+def _heat_outlet_aid_for_node(node: Any, monee_net: Any) -> str | None:
+    """aid whose observation carries the heat-outlet junction ``t_k`` for a
+    node-hosted heat-producing CP, or None when *node* itself is not one
+    (``_detect_cp_type_for_node`` also matches nodes merely incident to a CP
+    branch — those are guarded on the branch agent instead).
+
+    CHP-HG control nodes inject via a ``SubHG`` child attached at a DHS
+    junction — resolve that child's node. HX control nodes (non-HG CHP/P2H/
+    G2H variants) mix at their own junction and carry their own ``t_k``.
+    """
+    model = getattr(node, "model", None)
+    sub_hg = getattr(model, "_sub_hg", None)
+    if sub_hg is not None:
+        for child in monee_net.childs:
+            if child.model is sub_hg:
+                return _node_aid(child.node_id)
+        return None
+    own = _model_type_name(node)
+    if any(
+        s in own for s in ("chpcontrol", "powertoheatcontrol", "gastoheatcontrol")
+    ):
+        return _node_aid(node.id)
+    return None
 
 
 def _detect_cp_type_for_node(node: Any, monee_net: Any) -> str | None:
@@ -1636,6 +1677,13 @@ def _build_topologies(
                         admm_max_iters=config.holon_admm_max_iters,
                         admm_abs_tol=config.holon_admm_abs_tol,
                         cp_budget_nominal=config.enable_cp_nominal_budget,
+                        coalition_delivered_supply=(
+                            config.enable_coalition_delivered_supply
+                        ),
+                        cp_commitment_actuatable=(
+                            config.enable_cp_admm
+                            and not config.enable_cp_priority_admm
+                        ),
                         my_node_id=aid_to_node_id.get(leader.aid),
                         member_node_ids=summary_member_nodes,
                         mirror=mirror,

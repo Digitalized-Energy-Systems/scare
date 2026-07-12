@@ -48,6 +48,16 @@ _FEEDBACK_GAIN: float = 0.3
 # sheddable demand.
 _FEEDBACK_FLOOR_FRAC: float = 0.0
 
+# Feedback target margin (fraction of B). The feedback drives the draw toward
+# ``B·(1−margin)`` instead of ``B``, so the settle band ``[target−tol·B,
+# target+tol·B]`` tops out at exactly B — a real ``tol`` margin below the
+# compliance claim's ``B·(1+tol)`` threshold. Without it the old target B put
+# the band's upper edge at ``B·(1+tol)``, coincident with the claim line, so a
+# draw settling at the band edge failed the peak-graded claim by a hair
+# (eval_full_v2: gas steady_peak/threshold median 1.024). Sized == tol so the
+# lower edge stays at ``B·(1−2·tol)``, comfortably above zero.
+_FEEDBACK_TARGET_MARGIN: float = 0.05
+
 
 class SlackBudgetMonitor(Role):
     """Poll a slack's LP-chosen draw against the operator budget; on violation
@@ -131,12 +141,14 @@ class SlackBudgetMonitor(Role):
         except (TypeError, ValueError):
             return
         # Effective-budget feedback runs every poll (ahead of the cache gate so
-        # it converges at a steady draw). Drives the advertised budget to
-        # ``B - losses`` so the actual draw settles at ``B``.
+        # it converges at a steady draw). Drives the advertised budget so the
+        # actual draw settles at ``B·(1−margin)`` — the settle band's top edge is
+        # then B, a ``tol`` cushion below the compliance claim's ``B·(1+tol)``.
         if self.enable_feedback:
-            err = abs(val) - self.budget
-            # Deadband: stop correcting inside ``[B(1-tol), B(1+tol)]`` so the
-            # loop settles instead of hunting around exact ``B``.
+            target = self.budget * (1.0 - _FEEDBACK_TARGET_MARGIN)
+            err = abs(val) - target
+            # Deadband: stop correcting inside ``[target−tol·B, target+tol·B]``
+            # so the loop settles instead of hunting around the target.
             if abs(err) > self.tol * self.budget:
                 self._eff_budget -= _FEEDBACK_GAIN * err
                 lo = _FEEDBACK_FLOOR_FRAC * self.budget

@@ -106,6 +106,7 @@ def _build_role(
     cp_meta: dict[str, dict[str, Any]] | None = None,
     peer_leader_addrs: dict[Sector, dict[str, Any]] | None = None,
     constraint_store: CoalitionConstraintStore | None = None,
+    cp_commitment_actuatable: bool = True,
 ) -> HolonSummaryRole:
     role = HolonSummaryRole(
         behavior,
@@ -119,6 +120,11 @@ def _build_role(
         enable_cross_sector_coalitions=enable_cross_sector_coalitions,
         cp_meta=cp_meta or {},
         peer_leader_addrs=peer_leader_addrs or {},
+        # These tests exercise the cross-sector DISPATCH path, which is only
+        # meaningful when a CPCommitment consumer exists (legacy L3). Under the
+        # default priority-ADMM L3 the actuatability gate skips it (that gap is
+        # the child-118 overdraw fix — see TestCrossSectorActuatabilityGate).
+        cp_commitment_actuatable=cp_commitment_actuatable,
     )
     role._context = _FakeContext(aid)
     # Force cooldown into the past so the first tick may fire.
@@ -365,3 +371,58 @@ class TestCrossSectorCoalitionFlagSideBySide:
         ]
         assert len(cp_msgs_off) == 0
         assert len(cp_msgs_on) == 1
+
+
+class TestCrossSectorActuatabilityGate:
+    """Under the default priority-ADMM L3 the CPCommitment has no consumer, so a
+    cross-sector coalition's promised CP transfer never actuates. The gate must
+    then skip the coalition (no dispatch, no envelope) rather than raise
+    own-sector fractions the slack has to fund — the child-118 overdraw fix.
+    """
+
+    def test_unactuatable_cp_skips_dispatch(self) -> None:
+        behavior = SimpleNamespace()
+        _inject_inversion(behavior)
+        cp_addr = _Addr("p2h-1")
+        store = CoalitionConstraintStore()
+        role = _build_role(
+            behavior,
+            "leader-el-1",
+            Sector.ELECTRICITY,
+            enable_cross_sector_coalitions=True,
+            cp_meta=_p2h_meta(cp_addr),
+            peer_leader_addrs={Sector.HEAT: {"leader-heat-1": _Addr("leader-heat-1")}},
+            constraint_store=store,
+            cp_commitment_actuatable=False,
+        )
+        role._check_cross_sector_invariants()
+        if hasattr(role.context, "_pending"):
+            asyncio.run(role.context._pending)
+
+        cp_msgs = [
+            m for m in role.context.sent if isinstance(m.payload, CPCommitment)
+        ]
+        assert cp_msgs == []
+        assert not role._active_xs_coalitions
+        assert not store.has_active_cp_envelope("p2h-1", now=100.0)
+
+    def test_actuatable_cp_still_dispatches(self) -> None:
+        behavior = SimpleNamespace()
+        _inject_inversion(behavior)
+        cp_addr = _Addr("p2h-1")
+        role = _build_role(
+            behavior,
+            "leader-el-1",
+            Sector.ELECTRICITY,
+            enable_cross_sector_coalitions=True,
+            cp_meta=_p2h_meta(cp_addr),
+            peer_leader_addrs={Sector.HEAT: {"leader-heat-1": _Addr("leader-heat-1")}},
+            cp_commitment_actuatable=True,
+        )
+        role._check_cross_sector_invariants()
+        if hasattr(role.context, "_pending"):
+            asyncio.run(role.context._pending)
+        cp_msgs = [
+            m for m in role.context.sent if isinstance(m.payload, CPCommitment)
+        ]
+        assert len(cp_msgs) == 1

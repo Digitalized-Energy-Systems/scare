@@ -1,0 +1,61 @@
+{
+  "$comment": [
+    "Paired flag A/B for the heat-priority rework: (A) waterfall v2 — sufficiency-gated defer + defer budget + meaningful-target floor + multi-target peer shed + hydraulic-component scoping (replaces the deadlocking v1 under the same enable_heat_priority_waterfall flag); (B) enable_heat_l2_dispatch — heat leaders actuate the holon per-tier service fractions (delivered-heat supply reframe, direction-aware curtail-lock, periodic heat rebalance).",
+    "Arms: {} = waterfall v2 only (new default behavior); waterfall off = compliance reference (v1 deadlock made it the only compliant arm in eval_full_v2 just_heat); l2 = A+B; l2 no-waterfall = B isolated.",
+    "Judge on: claims__heat_priority__passed, per-tier heat served t1..t4 (served_by_load.csv), PWSF(heat)/PWSF, claims__constraint_compliance__passed, heat_waterfall_peer_shed event health (counts must decay within a task, defers must release)."
+  ],
+  "name": "ab_heat_priority_v2",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1200.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 16, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "heat_stress",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 16,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_heat_priority_waterfall": false },
+        { "enable_heat_l2_dispatch": true },
+        { "enable_heat_l2_dispatch": true, "enable_heat_priority_waterfall": false }
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "name": "heat_inversion",
+      "grids": ["simbench_lv_medium"],
+      "n_seeds": 16,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_heat_priority_waterfall": false },
+        { "enable_heat_l2_dispatch": true },
+        { "enable_heat_l2_dispatch": true, "enable_heat_priority_waterfall": false }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    }
+  ],
+  "slurm": { "partition": "rosa_express.p", "time": "02:00:00", "mem": "16G", "cpus": 1, "max_concurrent": 64 }
+}

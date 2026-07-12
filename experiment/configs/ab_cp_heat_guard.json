@@ -1,0 +1,49 @@
+{
+  "$comment": [
+    "Paired flag A/B for the CP heat-outlet guard (Phase 1 of the CP-side compliance fix).",
+    "Mechanism under test: heat-producing CPs (P2H/G2H/CHP) inject q_mw_heat into low-flow DHS junctions and drive t_k past the 403.15 K ceiling (eval_full_v2_20260711: hot CP outlets, e.g. node 371 on simbench_lv, dominate constraint-compliance failures at 98%). The guard (enable_cp_heat_outlet_guard) holds an AIMD regulation ceiling per CP, enforced against all L3 commits in apply_regulate and self-actuated for the born regulation=1.0 state.",
+    "Arms: {} = guard on (new default); guard off = eval_full_v2 baseline behavior.",
+    "Judge on: claims__constraint_compliance detail temperature n_violations/worst_overshoot (expect ~0 on guard arm), heat served fraction (expect neutral), outcomes__cp_generation n_active/heat_mw (CP wake-up must survive), PWSF, cp_heat_outlet_relief / cp_regulate_capped_to_heat_ceiling event health."
+  ],
+  "name": "ab_cp_heat_guard",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 10, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "hot_outlets_lv",
+      "grids": ["simbench_lv"],
+      "n_seeds": 10,
+      "variants": ["scare"],
+      "ablations": [{}, { "enable_cp_heat_outlet_guard": false }],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "name": "hot_outlets_cp_heavy",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 6,
+      "variants": ["scare"],
+      "ablations": [{}, { "enable_cp_heat_outlet_guard": false }],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    }
+  ]
+}

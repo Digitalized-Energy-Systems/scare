@@ -1207,6 +1207,13 @@ class GridConstraintMonitor(Role):
         if self.sector is Sector.GAS and variable == "pressure_pu" and value > hi:
             return
 
+        # Heat OVER-temperature: shedding load removes cooling draw from the
+        # hot junction — wrong direction (matters in frontier-ablated arms,
+        # where the t_k auction skip is off). The CP heat-outlet guard owns
+        # the injector side; never arm a load-shed for it.
+        if self.sector is Sector.HEAT and variable == "t_k" and value > hi:
+            return
+
         # In-flight guard: skip while an auction for this variable is open so
         # rounds don't stack; re-opening once it clears reaches feasibility.
         now = self.context.current_timestamp

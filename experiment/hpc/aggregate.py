@@ -21,7 +21,14 @@ from typing import Any
 
 import pandas as pd
 
-from experiment.eval.aliases import alias_experiment, alias_grid, alias_variant
+from experiment.eval.aliases import (
+    alias_ablation,
+    alias_experiment,
+    alias_grid,
+    alias_scenario,
+    alias_sweep,
+    alias_variant,
+)
 from experiment.eval.compliance import (
     COMPLIANCE_COLS,
     compliance_rate,
@@ -463,6 +470,13 @@ def _format_justification_sections(
                 )
             rows.append(row)
         rows.sort(key=lambda r: (r[0] != baseline_key, r[0]))
+        aliaser = {
+            "ablation": alias_ablation,
+            "sweep": alias_sweep,
+            "variant": alias_variant,
+        }[axis]
+        for r in rows:
+            r[0] = aliaser(r[0])
         pop_note = "all runs" if population == "all" else "compliant runs"
         body.append("")
         body.append(
@@ -716,9 +730,10 @@ def _format_eval_sections(
     )
     if "ablation" in abl.columns and abl["ablation"].nunique() > 1:
         parts.append("")
-        parts.append("## Ablation impact (scare variant only, compliant runs)")
+        parts.append("## Ablation impact (SCARE variant only, compliant runs)")
         parts.append(
-            "_Each ablation arm vs its OWN in-experiment `default` baseline "
+            "_Each ablation arm vs its OWN in-experiment baseline — the "
+            "unablated `default` arm, shown as *full system* — "
             "(same experiment + grid + scenario set). Pooling defaults across "
             "experiments/grids — as a single combined table did — diffs an arm "
             "against an unrelated population and manufactures spurious Δ. Read Δ "
@@ -771,13 +786,17 @@ def _format_eval_sections(
                     rows.append(row)
             if not rows:
                 continue
-            # Pin each grid's ``default`` row first within its grid block.
+            # Pin each grid's ``default`` row first within its grid block;
+            # alias to display names only after the raw-key sort.
             rows.sort(
                 key=lambda r: (r[0], r[1] != "default", r[1])
                 if multi_grid
                 else (r[0] != "default", r[0])
             )
-            header = ["ablation", "n_compliant/n_total", "compliance", "mean PWSF", "Δ vs default"]
+            key_idx = 1 if multi_grid else 0
+            for r in rows:
+                r[key_idx] = alias_ablation(r[key_idx])
+            header = ["ablation", "n_compliant/n_total", "compliance", "mean PWSF", "Δ vs full system"]
             if multi_grid:
                 header = ["grid"] + header
             parts.append("")
@@ -812,6 +831,8 @@ def _format_eval_sections(
                 ]
             )
         rows.sort(key=lambda r: (r[0] != "default", r[0]))
+        for r in rows:
+            r[0] = alias_sweep(r[0])
         parts.append(
             _markdown_table(
                 [
@@ -846,6 +867,8 @@ def _format_eval_sections(
                 ]
             )
         rows.sort(key=lambda r: r[0])
+        for r in rows:
+            r[0] = alias_scenario(r[0])
         parts.append(
             _markdown_table(
                 ["scenario", "n_compliant/n_total", "compliance", "mean PWSF"],
@@ -866,7 +889,7 @@ def _format_eval_sections(
         rest = rest.dropna(subset=[base_col, post_col])
         if not rest.empty:
             parts.append("")
-            parts.append("## Restoration vs no-failure baseline (scare, mean)")
+            parts.append("## Restoration vs no-failure baseline (SCARE, mean)")
             rows = []
             for grid, g in rest.groupby("grid"):
                 base_mw = float(g[base_col].mean())

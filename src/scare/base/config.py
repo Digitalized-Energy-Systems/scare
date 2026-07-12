@@ -21,6 +21,19 @@ class RestorationConfiguration:
     # delivered heat as L3 base supply, so unmet demand ramps heat CPs (CHP/P2H).
     # False: L3 sees the slack pool, judges heat supplied, leaves CPs idle.
     enable_heat_cp_supply: bool = True
+
+    # Outlet-temperature guard on heat-producing CPs (P2H/G2H/CHP). A CP injects
+    # q_mw_heat into its outlet junction as pure energy; on a low-flow junction
+    # the resulting ΔT = Q/(ṁ·c_p) drives t_k far past the envelope ceiling, and
+    # NOTHING pushes back: the L3 kernel sees only demand−delivered (delivered is
+    # measured at load setpoints, which injection can never raise), the heat
+    # frontier owns only the LOW side, the auction skips t_k, and CP branches are
+    # BORN at regulation=1.0 so even a zero-commit run injects at rated power
+    # (eval_full_v2_20260711: hot CP outlets = the dominant compliance failure).
+    # True: each heat-producing CP runs a reactive AIMD controller on its outlet
+    # junction's t_k that maintains a regulation CEILING, enforced against every
+    # L3 commit inside ``apply_regulate`` (sector="cp"). False: no guard.
+    enable_cp_heat_outlet_guard: bool = True
     # Refresh cadence (s) for a heat leader's HolonSummary so the delivered-heat
     # vector reaches L3 (heat's normal L1/L2 triggers are off).
     heat_cp_supply_refresh_s: float = 2.0
@@ -128,6 +141,22 @@ class RestorationConfiguration:
     # across CP-connected sectors and form a coalition spanning both sectors +
     # bridging CP(s). False: per-sector behaviour only.
     enable_cross_sector_coalitions: bool = False
+
+    # Coalition-pool supply accounting fix. The coalition acceptance pool
+    # (`_local_acceptance`) credited generators at RATED |cap| and slacks without
+    # the CP-reserve debit, so it allocated service fractions the slack must fund
+    # PAST its budget; those fractions are then merged over the L2 ADMM as a
+    # priority floor that clamps the SlackBudgetMonitor's override sheds UP for
+    # the coalition TTL — structurally disarming budget enforcement (eval_full_v2:
+    # elec child-118 draws 1.68× budget, coalition/cross-sector arms only). True:
+    # credit non-slack generators at delivered |sp| (mirrors the L2 pool,
+    # balance.py) and debit the slack's CP reserve, so coalition fractions stay
+    # inside B. Also gates cross-sector coalitions on the CP transfer being
+    # actuatable (a CPCommitment consumer exists — only under the legacy
+    # EnergyConverterRole L3), so own-sector fractions are never raised on a
+    # phantom transfer that the default L3 never delivers. See
+    # project_cp_fix_design. False: legacy rated-capacity crediting.
+    enable_coalition_delivered_supply: bool = True
 
     # Curtailment auction on hard violations. False: violations only emit a
     # BalanceProblem; no proportional curtailment broadcast.
@@ -495,6 +524,20 @@ class RestorationConfiguration:
     # curtailment via the CP priority ADMM — see enable_cp_priority_admm /
     # cp_admm_algorithm). See project_slack_compliance_rootcause.
     enable_cp_aware_slack_supply: bool = False
+
+    # NOTE: a CP-facing slack-budget reserve debit (feed the SlackBudgetMonitor's
+    # measured over-draw into the CP kernel's input cap) was prototyped and
+    # REFUTED by A/B (ab_cp_slack_debit_20260712, steady-state grading,
+    # simbench_lv_cp_heavy_dependent @0.15): the scenario was already 100%
+    # slack-compliant and the debit DROPPED it to 75% — a peak-hold reserve
+    # latches the un-actionable post-failure transient spike and suppresses CP
+    # dispatch, and on cp-heavy-dependent grids the CPs are net producers so
+    # winding them down shifts native load onto the slacks (same perverse loop as
+    # enable_cp_nominal_budget=False). Removed; a correct version must exclude the
+    # startup transient (e.g. N sustained over-budget polls). The paired feedback
+    # target shift (slack_budget.py, target B·(1−margin)) was kept — it is
+    # unconditional and the debit-off arm carrying it was 100% compliant. See
+    # project_cp_fix_design.
 
     # Layer-0 gas pressure regulator on each gas ExtHydrGrid slack. True: the
     # slack autonomously drives its ``pressure_pu`` setpoint (the regulator-

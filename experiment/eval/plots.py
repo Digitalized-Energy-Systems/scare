@@ -632,6 +632,7 @@ def _hbar_height(n_groups: int, n_series: int = 1) -> int:
 # Display-only alias helpers: map canonical summary.csv names to the
 # short figure labels in ``experiment/configs/display_aliases.json``.
 from experiment.eval.aliases import (  # noqa: E402
+    alias_ablation,
     alias_grid,
     alias_variant,
 )
@@ -684,7 +685,7 @@ def variant_comparison_bar(
             n_c.append(len(vals_c))
             n_t.append(len(vals_t))
         hover = [
-            f"<b>{alias_variant(variant)}</b><br>grid: {g}<br>"
+            f"<b>{alias_variant(variant)}</b><br>grid: {alias_grid(g)}<br>"
             f"mean PWSF (compliant): {m:.4f}<br>95% CI: {_ci_label(c)}<br>"
             f"compliant: {nc}/{nt}" + (f" ({nc / nt * 100:.0f}%)" if nt else "")
             for g, m, c, nc, nt in zip(grids, means, cis, n_c, n_t)
@@ -818,8 +819,8 @@ def pwsf_by_sector_bar(
 # Canonical order + display labels for the hardest scenario classes, combined
 # into a single grouped bar instead of one panel per class.
 _STRESS_CLASS_ORDER: list[tuple[str, str]] = [
-    ("generator_failure", "generator outage"),
-    ("line_stress", "line stress"),
+    ("generator_failure", "generator-fail"),
+    ("line_stress", "line-stress"),
     ("concentrated_imbalance", "concentrated"),
     ("cold_day_stress", "cold-day"),
     ("voltage_stress", "pv-peak"),
@@ -1172,7 +1173,7 @@ def _pair_key_label(key: Any) -> str:
 
 
 def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
-    title = "Optimality gap: scare vs centralised oracle (compliant pairs)"
+    title = "Optimality gap: SCARE vs centralized oracle (compliant pairs)"
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
@@ -1263,7 +1264,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
         title="oracle priority-weighted served", range=[0, 1.05], tickformat=".2f"
     )
     fig.update_yaxes(
-        title="scare priority-weighted served", range=[0, 1.05], tickformat=".2f"
+        title="SCARE priority-weighted served", range=[0, 1.05], tickformat=".2f"
     )
     return _save(_apply_theme(fig, title=title, font_bump=4), out_path)
 
@@ -1303,7 +1304,7 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
         )
     fig.add_hline(y=0, line=dict(color="#BBBBBB", dash="dash", width=1))
     fig.update_yaxes(
-        title="relative gap (oracle − scare) / oracle", tickformat=".2f", zeroline=False
+        title="relative gap (oracle − SCARE) / oracle", tickformat=".2f", zeroline=False
     )
     fig.update_xaxes(title="grid")
     fig.update_layout(showlegend=False, boxgap=0.45, boxgroupgap=0.2)
@@ -1327,7 +1328,7 @@ def ablation_impact_bar(
     df: pd.DataFrame,
     out_path: Path,
     *,
-    title: str = "Ablation impact (scare variant, compliant runs)",
+    title: str = "Ablation impact (SCARE variant, compliant runs)",
 ) -> Path:
     metric = "outcomes__priority_weighted_fraction"
     if df.empty or metric not in df.columns:
@@ -1356,17 +1357,17 @@ def ablation_impact_bar(
         n_total = int(full_counts.get(k, n))
         rate_str = f" ({n / n_total * 100:.0f}%)" if n_total else ""
         base = (
-            f"<b>{k}</b><br>mean PWSF (compliant): {m:.4f}<br>"
+            f"<b>{alias_ablation(k)}</b><br>mean PWSF (compliant): {m:.4f}<br>"
             f"95% CI: {_ci_label(c)}<br>compliant: {n}/{n_total}{rate_str}"
         )
         if baseline_mean is not None:
-            base += f"<br>Δ vs default: {(m - baseline_mean):+.4f}"
+            base += f"<br>Δ vs full system: {(m - baseline_mean):+.4f}"
         hover.append(base)
 
     fig = go.Figure(
         go.Bar(
             x=grouped["mean"],
-            y=grouped.index,
+            y=[alias_ablation(k) for k in grouped.index],
             orientation="h",
             marker=dict(
                 color=colors,
@@ -1703,7 +1704,7 @@ def scaling_curve(
                 x=x,
                 y=grouped["mean"].tolist(),
                 mode="lines+markers",
-                name=variant,
+                name=alias_variant(variant),
                 line=dict(color=color, width=_DATA_LINE_WIDTH),
                 marker=dict(
                     size=_MARKER_SIZE, color=color, line=dict(color="white", width=1)
@@ -2058,7 +2059,7 @@ def restoration_vs_baseline_bar(
     sub = df[df["variant"] == "scare"] if "scare" in df["variant"].unique() else df
     sub = sub.dropna(subset=[base_col, post_col])
     if sub.empty:
-        return _save(_empty_fig("no scare baseline rows", title), out_path)
+        return _save(_empty_fig("no SCARE baseline rows", title), out_path)
 
     # Ratio overlays only when their columns exist — substituting the raw
     # post-MW mean would put megawatts on the ratio axis.
@@ -2349,7 +2350,7 @@ def restoration_loss_split_by_tier_bar(
     )
     fig.update_layout(barmode="stack", bargap=0.36)
     fig.update_xaxes(
-        title="loss per task (MW, mean over scare tasks)",
+        title="loss per task (MW, mean over SCARE tasks)",
         rangemode="tozero",
         tickformat=".3f",
     )
@@ -2592,10 +2593,10 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
         ("diary__finished", "finished", "#2E7D32"),
         ("diary__stalled", "stalled", "#17BECF"),
         ("diary__cancelled", "cancelled", "#E07A1F"),
-        ("diary__timed_out", "timed_out", "#D62728"),
+        ("diary__timed_out", "timed out", "#D62728"),
         ("diary__abandoned", "abandoned", "#7F7F7F"),
-        ("diary__skipped_balanced", "skipped_balanced", "#1F4E96"),
-        ("diary__skipped_singleton", "skipped_singleton", "#9467BD"),
+        ("diary__skipped_balanced", "already balanced", "#1F4E96"),
+        ("diary__skipped_singleton", "no partners", "#9467BD"),
     ]
     cols = [c for c in cols if c[0] in df.columns]
     if df.empty or not cols:
@@ -2644,13 +2645,16 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
     fig.update_yaxes(title="variant")
     fig.update_xaxes(title="negotiations per task", rangemode="tozero")
     height = _hbar_height(len(variants_lbl)) + 30
+    # Seven outcome labels: use the wide canvas + a trimmed legend font so the
+    # horizontal legend packs several entries per row (multi-row strip) rather
+    # than degenerating into a one-per-row vertical column.
     return _save(
         _apply_theme(
             fig,
             title=title,
             height=height,
-            width=_BAR_FIG_WIDTH,
-            font_bump=2,
+            width=_FIG_WIDTH,
+            font_bump=-4,
             legend_top=True,
         ),
         out_path,
@@ -2798,17 +2802,20 @@ def solver_health_bar(
 _REGULATE_REASON_LABELS: dict[str, tuple[str, str]] = {
     # Balance / gossip layer
     "balance": ("balance gossip", "#1F4E96"),
-    "self_local_gen": ("balance self local-gen", "#3F6FBD"),
+    "self_local_gen": ("self local-gen", "#3F6FBD"),
     # Holonic ADMM
-    "holon_supply_priority": ("holon supply-priority", "#2E7D32"),
-    "holon_tier_alloc": ("holon tier-alloc", "#56A656"),
+    "holon_supply_priority": ("priority waterfall", "#2E7D32"),
+    "holon_tier_alloc": ("tier allocation", "#56A656"),
     # Cross-sector CP ADMM
-    "cp_admm": ("CP ADMM", "#17BECF"),
+    "cp_admm": ("CP-ADMM", "#17BECF"),
+    "cp_priority_admm": ("CP priority ADMM", "#4FA3AF"),
+    "cp_multi_community": ("CP multi-community", "#8C564B"),
     # Constraint-driven local actions
     "curtail": ("curtailment auction", "#E07A1F"),
-    "heat_recovery": ("heat recovery", "#FFA959"),
+    "heat_recovery": ("heat frontier", "#FFA959"),
     # Stability / local-gen fallback
     "stability": ("generation control", "#9467BD"),
+    "gen_ramp_to_full": ("gen ramp-to-full", "#BCBD22"),
     "local_gen_fallback": ("local-gen fallback", "#D62728"),
 }
 
@@ -4870,7 +4877,7 @@ def _extension_ab_bar(
         return _save(_empty_fig("no scare rows", title), out_path)
     pivot = scare.pivot_table(index=["grid", "seed"], columns="arm", values=metric)
     if pivot.empty or {"A", "B"} - set(pivot.columns):
-        return _save(_empty_fig("need both A and B arms (scare)", title), out_path)
+        return _save(_empty_fig("need both A and B arms (SCARE)", title), out_path)
     pivot = pivot.dropna(subset=["A", "B"]).sort_index()
     if pivot.empty:
         return _save(_empty_fig("no complete scare A/B pairs", title), out_path)
@@ -4975,7 +4982,7 @@ def extension_islanding_ab(
     df: pd.DataFrame,
     out_path: Path,
     *,
-    title: str = "Islanding extension — paired PWSF, clean vs microgrid (scare)",
+    title: str = "Islanding extension — paired PWSF, clean vs microgrid (SCARE)",
 ) -> Path:
     def arm_of(scenario: str) -> str | None:
         return {"clean": "A", "microgrid": "B"}.get(
@@ -4996,7 +5003,7 @@ def extension_temporal_ab(
     df: pd.DataFrame,
     out_path: Path,
     *,
-    title: str = "Temporal extensions — paired PWSF, off vs linepack+LTC (scare)",
+    title: str = "Temporal extensions — paired PWSF, off vs linepack+LTC (SCARE)",
 ) -> Path:
     def arm_of(scenario: str) -> str | None:
         on = _scenario_value(scenario, "linepack") in ("True", "true", "1")
@@ -5088,7 +5095,7 @@ def extension_temporal_trajectories(
     oracle_series: list[tuple[str, list[dict[str, Any]]]] | None = None,
     title: str = (
         "Temporal extensions — linepack + LTC temperature over physical time "
-        "(scare, B arm)"
+        "(SCARE, B arm)"
     ),
 ) -> Path:
     """Per-task ``linepack_total_kg`` (top) and LTC junction temperature
@@ -5356,7 +5363,7 @@ def extension_islanding_recovery(
     out_path: Path,
     *,
     title: str = (
-        "Islanding recovery — served load by sector, clean vs microgrid (scare)"
+        "Islanding recovery — served load by sector, clean vs microgrid (SCARE)"
     ),
 ) -> Path:
     """Where the islanding extension saves load: mean served fraction per
