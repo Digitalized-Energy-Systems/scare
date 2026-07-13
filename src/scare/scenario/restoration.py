@@ -917,6 +917,7 @@ def _make_balance_role(
         constraint_aware=config.enable_constraint_aware_gossip,
         enable_monotonic_floor=config.enable_monotonic_floor,
         enable_clpu_ramp=config.enable_clpu_ramp,
+        enable_island_blackstart=config.enable_island_blackstart,
         termination_tolerance=config.gossip_termination_tolerance,
         max_hops=config.gossip_max_hops,
         enable_qp_gossip=config.enable_qp_gossip,
@@ -2060,6 +2061,23 @@ def _add_system_behaviors(
                 world,
                 _trigger_balance,
                 on_global_event=BranchFailureEvent,
+                role_types=EnergyBalanceNegotiator,
+            )
+
+    # Island black-start: on every failure, a load severed into its own island
+    # sheds to zero (cold-load pickup). Wired independently of the FailureNotice
+    # flag and the strategy branch above — an islanded load drops out of gossip,
+    # so it must be reached by the broadcast failure event, not the negotiation.
+    if config.enable_island_blackstart:
+
+        def _trigger_island_blackstart(role: EnergyBalanceNegotiator, event: Any) -> None:
+            role.island_blackstart_shed()
+
+        for _ev in (BranchFailureEvent, CustomFailureEvent):
+            behavior_in(
+                world,
+                _trigger_island_blackstart,
+                on_global_event=_ev,
                 role_types=EnergyBalanceNegotiator,
             )
 

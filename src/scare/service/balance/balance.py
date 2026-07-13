@@ -165,6 +165,71 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
     return isinstance(child.model, (ExtPowerGrid, ExtHydrGrid))
 
 
+def _slack_fed_nodes(net: Any) -> set | None:
+    """Node ids reachable from an ``ExtPowerGrid`` slack over active, closed,
+    non-CP branches. ``None`` when the net has no electric slack — islanding
+    can't be judged then and black-start must not fire. CP branches are excluded
+    (so reachability stays within the electricity carrier)."""
+    try:
+        branches = list(net.branches)
+        childs = list(net.childs)
+    except Exception:  # noqa: BLE001
+        return None
+    slack_nodes = {c.node_id for c in childs if isinstance(c.model, ExtPowerGrid)}
+    if not slack_nodes:
+        return None
+    adj: dict[Any, list[Any]] = {}
+    for b in branches:
+        try:
+            if b.model.is_cp():
+                continue
+            if (
+                not getattr(b, "active", True)
+                or not getattr(b.model, "active", True)
+                or not int(getattr(b.model, "on_off", 1) or 0)
+            ):
+                continue
+            a, c = b.id[0], b.id[1]
+        except Exception:  # noqa: BLE001
+            continue
+        adj.setdefault(a, []).append(c)
+        adj.setdefault(c, []).append(a)
+    seen = set(slack_nodes)
+    frontier = list(slack_nodes)
+    while frontier:
+        nxt: list[Any] = []
+        for n in frontier:
+            for nb in adj.get(n, ()):
+                if nb not in seen:
+                    seen.add(nb)
+                    nxt.append(nb)
+        frontier = nxt
+    return seen
+
+
+def _load_islanded_from_slack(behavior: Any, aid: str, ts: float) -> bool:
+    """True iff *aid*'s node is severed from every ``ExtPowerGrid`` slack on the
+    current topology (its own island behind opened branches). Reachability is
+    cached per timestamp on the behavior — the topology is identical for every
+    agent within a step, so the BFS runs once per step, not once per agent."""
+    net = getattr(behavior, "_net", None)
+    if net is None or not aid.startswith("child-"):
+        return False
+    cache = getattr(behavior, "_island_fed_cache", None)
+    if cache is None or cache[0] != ts:
+        fed = _slack_fed_nodes(net)
+        behavior._island_fed_cache = (ts, fed)
+    else:
+        fed = cache[1]
+    if fed is None:
+        return False
+    try:
+        node_id = net.child_by_id(int(aid[len("child-") :])).node_id
+    except Exception:  # noqa: BLE001
+        return False
+    return node_id not in fed
+
+
 def _heat_thermal_deficit_mw(obs: dict) -> float:
     """MW of demand reduction contributed to the group's thermal-deficit target.
 
@@ -269,6 +334,7 @@ class EnergyBalanceNegotiator(Role):
         constraint_aware: bool = True,
         enable_monotonic_floor: bool = True,
         enable_clpu_ramp: bool = True,
+        enable_island_blackstart: bool = False,
         max_hops: int = _MAX_HOPS,
         step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
         enable_qp_gossip: bool = True,
@@ -299,6 +365,10 @@ class EnergyBalanceNegotiator(Role):
         self.constraint_aware = constraint_aware
         self.enable_monotonic_floor = enable_monotonic_floor
         self.enable_clpu_ramp = enable_clpu_ramp
+        # Island black-start: shed a newly-islanded load to zero, then let CLPU
+        # ramp it back under the island former's coordination (see config).
+        self.enable_island_blackstart = bool(enable_island_blackstart)
+        self._island_blackstart_active = False
         # L2 priority-floor: clamp gossip sheds up to the component ADMM's
         # per-load allocation, blocking the L2->L1 tier inversion.
         self.enable_l2_priority_floor = enable_l2_priority_floor
@@ -2243,6 +2313,49 @@ class EnergyBalanceNegotiator(Role):
         if topology_characteristic(self, tid="groups") == "leader":
             self.context.schedule_instant_task(self.trigger_balance_negotiation())
 
+    def island_blackstart_shed(self) -> None:
+        """Cold-load-pickup shed for a load severed into its own island.
+
+        Fired on every failure event (see ``_add_system_behaviors``), NOT from
+        the gossip path — an islanded load falls out of gossip/holon
+        coordination entirely and would otherwise stay frozen at its pre-island
+        setpoint, which a lone island former can't supply (so every solve is
+        infeasible). When this load's node is severed from every ExtPowerGrid
+        slack, drop it to zero and release the no-regret floor; recovery (ramp
+        back up) is left to whatever coordination the island re-forms. No-op
+        while reconnected. Electricity loads only.
+        """
+        if not self.enable_island_blackstart or self.sector is not Sector.ELECTRICITY:
+            return
+        aid = self.context.aid
+        obs = self.behavior.observe(aid) or {}
+        if obs_capacity(obs, behavior=self.behavior, aid=aid) <= 0:
+            return  # loads only (cap > 0)
+        if not _load_islanded_from_slack(
+            self.behavior, aid, self.context.current_timestamp
+        ):
+            self._island_blackstart_active = False
+            return
+        self._island_blackstart_active = True
+        self._restoration_floor = 0.0
+        self._last_regulate_factor = 0.0
+        applied = apply_regulate(
+            self.behavior,
+            aid,
+            0.0,
+            sector=self.sector.value,
+            reason="island_blackstart",
+            timestamp=self.context.current_timestamp,
+        )
+        if applied:
+            record_event(
+                t=self.context.current_timestamp,
+                kind="island_blackstart_shed",
+                aid=aid,
+                sector=self.sector.value,
+                detail="node severed from slack; shed to 0 for cold-load pickup",
+            )
+
     # ------------------------------------------------------------------
     # Setpoint application with monotonic progress guarantee
     # ------------------------------------------------------------------
@@ -2301,6 +2414,21 @@ class EnergyBalanceNegotiator(Role):
                 )
                 factor = held
 
+        # Island black-start (the shed itself is event-driven — see
+        # ``island_blackstart_shed`` — because an islanded load drops out of
+        # gossip and this path never runs for it). Here we only CLEAR the hold
+        # once the load is coordinated again while reconnected, so the no-regret
+        # floor re-engages for normal restoration.
+        if (
+            self.enable_island_blackstart
+            and self._island_blackstart_active
+            and self.sector is Sector.ELECTRICITY
+            and not _load_islanded_from_slack(
+                self.behavior, self.context.aid, self.context.current_timestamp
+            )
+        ):
+            self._island_blackstart_active = False
+
         # No-regret floor applies only during restoration (target > 0); shedding
         # (target < 0) legitimately reduces factor.
         target = self._gossip.target if self._gossip is not None else 0.0
@@ -2311,7 +2439,10 @@ class EnergyBalanceNegotiator(Role):
             if self.enable_monotonic_floor:
                 if factor > self._restoration_floor:
                     self._restoration_floor = factor
-                elif not self._constraint_violation_active:
+                elif (
+                    not self._constraint_violation_active
+                    and not self._island_blackstart_active
+                ):
                     factor = self._restoration_floor
 
             # CLPU rate limit: ramp-up only; decreases pass through.
@@ -2488,6 +2619,7 @@ def create_energy_balance_role(
     constraint_aware: bool = True,
     enable_monotonic_floor: bool = True,
     enable_clpu_ramp: bool = True,
+    enable_island_blackstart: bool = False,
     termination_tolerance: float = 1e-5,
     max_hops: int = _MAX_HOPS,
     step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
@@ -2510,6 +2642,7 @@ def create_energy_balance_role(
         constraint_aware=constraint_aware,
         enable_monotonic_floor=enable_monotonic_floor,
         enable_clpu_ramp=enable_clpu_ramp,
+        enable_island_blackstart=enable_island_blackstart,
         termination_tolerance=termination_tolerance,
         max_hops=max_hops,
         step_decay_k0=step_decay_k0,

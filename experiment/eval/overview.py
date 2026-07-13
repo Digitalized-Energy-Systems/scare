@@ -50,19 +50,19 @@ _STYLE = """
   body {
     margin: 0;
     padding: 1.5rem 2rem 4rem;
-    font-family: Inter, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: "Libertinus Sans", sans-serif;
     color: var(--fg);
     background: var(--bg);
     font-size: 14px;
     line-height: 1.45;
   }
   h1 {
-    font-family: Charter, Georgia, "Times New Roman", serif;
+    font-family: "Libertinus Sans", sans-serif;
     font-size: 1.6rem;
     margin: 0 0 .4rem;
   }
   h2 {
-    font-family: Charter, Georgia, "Times New Roman", serif;
+    font-family: "Libertinus Sans", sans-serif;
     font-size: 1.15rem;
     margin: 2rem 0 .8rem;
     padding-bottom: .25rem;

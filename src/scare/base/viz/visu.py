@@ -8,10 +8,13 @@ from scare.base.util import sector_color
 
 logger = logging.getLogger(__name__)
 
+_FONT_FAMILY = "Libertinus Sans, sans-serif"
+
 
 def _emit_figure(
     fig: Any, write_to: str | None, show: bool, *, log: bool = False
 ) -> None:
+    fig.update_layout(font=dict(family=_FONT_FAMILY))
     if write_to:
         if write_to.endswith(".html"):
             fig.write_html(write_to)

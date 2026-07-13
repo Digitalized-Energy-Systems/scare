@@ -100,8 +100,8 @@ _QUAL_PALETTE = [
     "#AEC7E8",
 ]
 
-_FONT_FAMILY = "Inter, -apple-system, Segoe UI, Roboto, sans-serif"
-_TITLE_FONT_FAMILY = "Charter, Georgia, 'Times New Roman', serif"
+_FONT_FAMILY = "Libertinus Sans, sans-serif"
+_TITLE_FONT_FAMILY = "Libertinus Sans, sans-serif"
 
 # Full-width landscape figures with generous label breathing room.
 _FIG_WIDTH = 1000

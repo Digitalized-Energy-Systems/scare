@@ -353,6 +353,17 @@ class RestorationConfiguration:
     # not throttled.
     enable_clpu_ramp: bool = True
 
+    # Island black-start (opt-in): when a load's electricity node is severed
+    # from every ExtPowerGrid slack (its own island behind opened branches), a
+    # lone island grid-former cannot catch the whole pre-island load in one
+    # step, so the fixed-injection physics solve is infeasible and skip-mode
+    # freezes observations -> the no-regret floor pins the loads and the island
+    # never recovers. On the island transition, drop the load to zero and
+    # release the floor; the CLPU ramp then picks it back up under the island
+    # former's supply-matched coordination (cold-load pickup). Requires
+    # ``enable_clpu_ramp`` for a graded recovery.
+    enable_island_blackstart: bool = False
+
     # Heat-only curtailment-auction lock. When a heat load is curtailed for a
     # live temperature violation, the L2 dispatch must DEFER rather than claw it
     # back (else the two layers limit-cycle). Lifts when the frontier controller

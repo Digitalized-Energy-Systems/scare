@@ -344,6 +344,25 @@ async def _run_simulation(
     net = factory()
     _apply_scenario(net, task, logger)
 
+    # Scale the per-solve cap to grid size. A numerically hard-infeasible solve
+    # grinds the *whole* cap; on a ~40-node grid (simbench_lv_small) repeated
+    # such solves at the flat 300s ceiling summed to 18*300s = task_timeout, so
+    # the task timed out with no useful signal. Healthy solve time scales with
+    # node count, so cap ~1s/node — unchanged (300s) on the large grids, but
+    # ~40-50s on the small ones, keeping the full sim under the task budget even
+    # if every step is infeasible. Floor 30s (async-preempt granularity).
+    n_nodes = sum(1 for _ in net.nodes)
+    scaled_cap = max(30.0, min(per_solve_cap, float(n_nodes)))
+    if scaled_cap < per_solve_cap:
+        per_solve_cap = scaled_cap
+        install_solver_time_limit(per_solve_cap)
+        logger.info(
+            "Scaled per-solve cap to %.0fs (%d nodes, grid=%s)",
+            per_solve_cap,
+            n_nodes,
+            task.grid,
+        )
+
     failures = _resolve_failures(net, plan, task)
     logger.info(
         "Resolved %d failure(s) for seed=%d: %s",
