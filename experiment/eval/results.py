@@ -6,7 +6,7 @@ Called once at the end of a run (from the runner), produces:
 - ``served.csv``     per-(sector, tier) demand / served / fraction
 - ``diary.csv``      one row per ``NegotiationRecord``
 - ``events.csv``     one row per ``EventRecord``
-- ``messages.csv``   per-message-type counts (off by default)
+- ``messages.csv``   one row per recorded message (t, type, sender, recipient; off by default)
 
 The schema is the source of truth for the aggregator and the claims
 checker; both read these artefacts back without going near the in-process

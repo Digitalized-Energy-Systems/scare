@@ -9,11 +9,10 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Ring buffer of recent regulate/switch/failure actions (<1 MB).
+# Ring buffer of recent regulate/switch actions (<1 MB).
 _MAX_ACTIONS = 10000
 _armed: bool = False
 _log: deque[ActionRecord] = deque(maxlen=_MAX_ACTIONS)
@@ -32,7 +31,7 @@ _trajectory_armed: bool = False
 @dataclass(frozen=True)
 class ActionRecord:
     t: float
-    kind: str  # "regulate" | "switch" | "failure"
+    kind: str  # "regulate" | "switch"
     aid: str
     sector: str  # "" if N/A
     value: float  # factor for regulate, NaN for switch
@@ -128,21 +127,6 @@ def record_switch(*, t: float, aid: str, reason: str) -> None:
     # Mirror into the event ledger so the aggregator counts tie-switch closes.
     _event_log.append(
         EventRecord(t=t, kind=f"switch:{reason}", aid=aid, sector="", detail="")
-    )
-
-
-def record_failure(*, t: float, branch_id: Any) -> None:
-    if not _armed:
-        return
-    _log.append(
-        ActionRecord(
-            t=t,
-            kind="failure",
-            aid=str(branch_id),
-            sector="",
-            value=float("nan"),
-            reason="branch_failure",
-        )
     )
 
 

@@ -13,12 +13,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 from scare.base.model import Sector
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +109,6 @@ class GridTopologyMirror:
 
     def is_broken(self, branch_id: tuple) -> bool:
         return branch_id in self._broken
-
-    def broken_branches(self) -> frozenset[tuple]:
-        return frozenset(self._broken)
 
     # ------------------------------------------------------------------
     # Reachability queries

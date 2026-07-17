@@ -633,7 +633,7 @@ class EnergyConverterRole(Role):
                 timestamp_s=float(self.context.current_timestamp),
                 cp_id=str(self.context.aid),
                 sector_flows_mw=sector_flows,
-                regulation_factor=float(applied_factor or 1.0),
+                regulation_factor=1.0 if applied_factor is None else float(applied_factor),
             )
             record_event(
                 t=float(self.context.current_timestamp),
@@ -642,7 +642,7 @@ class EnergyConverterRole(Role):
                 sector="cp",
                 detail=(
                     f"flows={{{', '.join(f'{s}: {v:.4f}' for s, v in sector_flows.items())}}} "
-                    f"reg={float(applied_factor or 1.0):.3f} "
+                    f"reg={1.0 if applied_factor is None else float(applied_factor):.3f} "
                     f"envelope_active={self._envelope_active()}"
                 ),
             )
@@ -903,14 +903,14 @@ class EnergyConverterRole(Role):
             sector="cp",
             detail=(
                 f"source=l3 round={message.round_id} flows={flows_mw} "
-                f"reg={float(applied_factor or 1.0):.3f}"
+                f"reg={1.0 if applied_factor is None else float(applied_factor):.3f}"
             ),
         )
 
     def _apply_result(self, result: list[float]) -> float | None:
         obs = self.behavior.observe(self.context.aid) or {}
         # result [0=EL, 1=HEAT, 2=GAS]. One regulation knob: apply the
-        # strongest-signal sector (largest |value|) so it drives the setpoint.
+        # strongest-signal sector (largest native-MW flow) so it drives the setpoint.
         best_factor: float | None = None
         best_weight = -1.0
         for sector, idx in _RESULT_INDEX.items():
@@ -925,7 +925,7 @@ class EnergyConverterRole(Role):
             if cap == 0.0:
                 continue
             factor = max(0.0, min(1.0, abs(value / cap)))
-            weight = abs(value)
+            weight = abs(result[idx])
             if weight > best_weight:
                 best_weight = weight
                 best_factor = factor

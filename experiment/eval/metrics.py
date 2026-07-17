@@ -721,7 +721,7 @@ def restoration_breakdown(
             )
         constraint_lost = max(0.0, min(capped_p, total_loss - disconnect_lost))
         agent_shed = max(0.0, total_loss - disconnect_lost - constraint_lost)
-        ratio = s_p / s_b if s_b > 1e-12 else (1.0 if d_b < 1e-12 else 0.0)
+        ratio = s_p / s_b if s_b > 1e-12 else 1.0
         # Agent-only ratio: share of the controllable baseline (physical
         # disconnect and gate-throttled load excluded) the agents kept.
         s_b_recoverable = max(1e-12, s_b - disconnect_lost - constraint_lost)

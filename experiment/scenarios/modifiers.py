@@ -443,8 +443,9 @@ def apply_line_stress(
       ``max_i_ka``; shifts the binding constraint from voltage to
       thermal.
     - ``affect_branch_fraction`` (default 1.0): fraction of PowerLines
-      to reduce, picked deterministically by sorted branch id. Sweep to
-      study concentrated vs distributed reductions.
+      to reduce, picked deterministically from the highest-``max_i_ka``
+      lines first (branch id breaks ties). Sweep to study concentrated
+      vs distributed reductions.
 
     Call once on a fresh net — calling twice stacks the scales.
     """

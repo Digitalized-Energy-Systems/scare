@@ -442,10 +442,10 @@ def write_overview(campaign: CampaignData) -> Path:
 
     # Constraints overview (dedicated)
     constraints_sections = _constraints_sections(plots_root, experiments)
-    if any(figs for _, figs in constraints_sections):
-        constraints_body = "".join(
-            _section(t, paths) for t, paths in constraints_sections
-        )
+    constraints_body = "".join(
+        _section(t, paths) for t, paths in constraints_sections
+    )
+    if constraints_body:
         n_env = sum(
             len([p for p in paths if "constraint_envelope" in p.name])
             for _, paths in constraints_sections

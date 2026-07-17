@@ -383,8 +383,8 @@ def _slack_budget_summary(monee_net: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for child in monee_net.childs:
         m = child.model
-        # After the Pyomo solve, model attributes are Var objects; ``.values``
-        # resolves each via ``pyomo.value(...)``.
+        # After the solve, model attributes hold solved Var objects; ``.values``
+        # resolves each to its numeric value.
         vals = m.values if hasattr(m, "values") else {}
         if isinstance(m, ExtPowerGrid):
             cap = getattr(m, "_scare_slack_budget_mw", None)

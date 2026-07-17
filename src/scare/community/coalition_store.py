@@ -46,9 +46,8 @@ class CoalitionConstraintStore:
 
     Per-(sector, tier) service fractions (``set`` / ``merge_into``,
     coalition wins on overlap) plus directional cross-sector CP setpoint
-    envelopes (``set_cp_envelope`` / ``cp_envelope_for``, read by L3's
-    EnergyConverterRole). ``prune`` drops past-TTL; ``clear`` invalidates
-    on failure.
+    envelopes (``set_cp_envelope`` / ``cp_envelope_for``). ``prune`` drops
+    past-TTL; ``clear`` invalidates on failure.
     """
 
     def __init__(self) -> None:

@@ -5,7 +5,8 @@ but runs identically without Slurm. Writes per-task artefacts under
 ``<campaign_dir>/tasks/<task_id>/``: config/failures/result/status JSON, run.log,
 diagnostics.txt, exception.json (on error), and optional timeseries.csv.
 
-Exit codes: 0 = ok, 2 = timeout, 1 = other error. status.json is always written.
+Exit codes: 0 = ok, 2 = timeout or killed (SIGTERM/Ctrl-C), 1 = other error.
+status.json is always written.
 """
 
 from __future__ import annotations
@@ -154,6 +155,16 @@ class _SolverFailureCounter(logging.Filter):
         return True
 
 
+# Solver-failure emitters the per-task counter attaches to; detached in run_task's
+# finally since run_local reuses worker processes across tasks.
+_SOLVER_FAILURE_LOGGERS: tuple[str, ...] = (
+    "monee.solver.pyo",
+    "pyomo.core",
+    "monee.solver.gurobipy",
+    "monee.simulation.stepper",
+)
+
+
 def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureCounter]:
     # Stamp every record with the current sim time (record.sim_t) so the
     # LOG_FORMAT's t=... field is always populated, including third-party logs.
@@ -193,12 +204,7 @@ def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureC
     # Listen on every infeasibility emitter; the counter dedupes pairs (an
     # absorbed stepper failure fires as gurobipy/pyo ERROR + stepper WARNING
     # within the dedupe window).
-    for logger_name in (
-        "monee.solver.pyo",
-        "pyomo.core",
-        "monee.solver.gurobipy",
-        "monee.simulation.stepper",
-    ):
+    for logger_name in _SOLVER_FAILURE_LOGGERS:
         logging.getLogger(logger_name).addFilter(counter)
     return handler, counter
 
@@ -1119,6 +1125,8 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         )
         logging.getLogger().removeHandler(handler)
         handler.close()
+        for _name in _SOLVER_FAILURE_LOGGERS:
+            logging.getLogger(_name).removeFilter(solver_counter)
         if _prev_term is not None:
             try:
                 signal.signal(signal.SIGTERM, _prev_term)

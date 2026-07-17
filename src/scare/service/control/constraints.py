@@ -267,7 +267,7 @@ class GridConstraintMonitor(Role):
             component_id=heat_component_id,
         )
 
-        # Dedup of forwarded state: (origin, variable) -> (best_hops, t, value).
+        # Dedup of forwarded state: (origin, variable) -> (best_hops, t, util).
         # Forward incoming only on better hops; re-broadcast own only on value
         # change or freshness elapse. Never cleared per-cycle (re-floods the group).
         self._state_forwarded: dict[tuple[str, str], tuple[int, float, float]] = {}

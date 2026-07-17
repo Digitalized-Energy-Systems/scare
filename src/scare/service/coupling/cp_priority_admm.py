@@ -25,8 +25,7 @@ amounts. Callers read ``factor_by_cp[self.cp_id]`` and commit ``r[0]``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -60,17 +59,3 @@ class SectorDemand:
     demand_by_tier: dict[int, np.ndarray]
     # length-H MW: base generator supply before any CP contribution.
     base_supply: np.ndarray
-
-
-@dataclass(frozen=True)
-class CPAdmmResult:
-    # cp_id -> length-H regulation factor in [0, 1].
-    factor_by_cp: dict[str, np.ndarray]
-    # sector -> tier -> length-H served amount (MW).
-    served_by_sector_tier: dict[str, dict[int, np.ndarray]]
-    iterations: int
-    primal_residual: float
-    dual_residual: float
-    converged: bool
-    # Diagnostics: per-iteration residuals, final marginal priorities.
-    history: dict[str, Any] = field(default_factory=dict)

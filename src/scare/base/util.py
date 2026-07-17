@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink
+from monee.model.extension import GridFormingGenerator, GridFormingSource
 
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.runtime.diagnostics import record_event, record_regulate
@@ -227,24 +228,6 @@ def lookup_slack_eff_budget(behavior: Any, aid: str) -> float | None:
     return _slack_eff_budget_store(behavior).get(aid)
 
 
-def _slack_cp_reserve_store(behavior: Any) -> dict[str, float]:
-    return _get_behavior_store(behavior, "_scare_slack_cp_reserve")
-
-
-def set_slack_cp_reserve(behavior: Any, aid: str, mw: float) -> None:
-    """Record the MW of a slack's budget already consumed beyond it — the
-    measured over-draw the SlackBudgetMonitor sees. The holon supply pool debits
-    the slack's credited budget by this so the electricity holon balances native
-    load against the budget NET of the cross-sector (CP) draw + losses riding
-    the slack, and sheds native load until the physical draw lands at B (the CP
-    draw is otherwise invisible to the holon — see project_slack_compliance_rootcause)."""
-    _slack_cp_reserve_store(behavior)[str(aid)] = max(0.0, float(mw))
-
-
-def lookup_slack_cp_reserve(behavior: Any, aid: str) -> float | None:
-    return _slack_cp_reserve_store(behavior).get(str(aid))
-
-
 def _slack_pressure_store(behavior: Any) -> dict[str, float]:
     return _get_behavior_store(behavior, "_scare_slack_pressure")
 
@@ -269,6 +252,30 @@ def lookup_slack_pressure(behavior: Any, aid: str) -> float | None:
     regulator has not actuated this slack yet (its boundary is still the
     ``ExtHydrGrid`` construction default)."""
     return _slack_pressure_store(behavior).get(aid)
+
+
+def _grid_former_rating_store(behavior: Any) -> dict[str, float]:
+    return _get_behavior_store(behavior, "_scare_grid_former_ratings")
+
+
+def register_grid_former_rating(behavior: Any, aid: str, rating: float) -> None:
+    """Record a promoted island reference (``GridForming*``) and its rated
+    capacity (|p_mw_max| / |mass_flow_max_kgs| from the Var bound).
+
+    A former's free p_mw/mass_flow flips ``obs_capacity``'s load/generator sign,
+    so the holon aggregation would count it as phantom demand when it absorbs the
+    island residual. Membership in this registry (populated at build time from
+    the child model, so it needs no live ``_net``) is the MAS's former-identity
+    signal: the holon classifies a former as a generator and credits its
+    DELIVERED injection as supply, never as a load. The rating is retained as the
+    reference's capacity metadata. Native unit (MW / kg/s), positive."""
+    r = abs(float(rating))
+    if r > 0.0:
+        _grid_former_rating_store(behavior)[str(aid)] = r
+
+
+def lookup_grid_former_rating(behavior: Any, aid: str) -> float | None:
+    return _grid_former_rating_store(behavior).get(str(aid))
 
 
 def _priority_store(behavior: Any) -> dict[str, int]:
@@ -754,6 +761,29 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
     return isinstance(child.model, (ExtPowerGrid, ExtHydrGrid))
 
 
+def is_grid_former_child(behavior: Any, aid: str) -> bool:
+    """True iff *aid* is a promoted island reference (``GridForming*``).
+
+    Like a slack, curtailing it (regulation < 1) collapses its island's balance;
+    the ``enable_grid_former_curtail_guard`` write path forces such writes to
+    full so the reference stays up.
+    """
+    if not aid.startswith("child-"):
+        return False
+    try:
+        cid = int(aid[len("child-") :])
+    except ValueError:
+        return False
+    net = getattr(behavior, "_net", None)
+    if net is None:
+        return False
+    try:
+        child = net.child_by_id(cid)
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(child.model, (GridFormingGenerator, GridFormingSource))
+
+
 def _is_heat_side_mass_flow_sink(behavior: Any, aid: str) -> bool:
     """True iff *aid* is a monee ``Sink`` child on a water/heat junction.
 
@@ -805,6 +835,25 @@ def apply_regulate(
     factor = max(0.0, min(1.0, factor))
 
     _cfg = getattr(behavior, "_scare_config", None)
+
+    # --- Grid-former curtailment guard --------------------------------
+    # A promoted GridForming* unit is its island's reference; curtailing it
+    # (factor < 1) collapses the island balance and the islanding solve goes
+    # infeasible. Force any curtailment write on a former back to full so it
+    # stays up. Inert unless enabled and the aid is a grid-former.
+    if (
+        factor < 1.0 - tolerance
+        and getattr(_cfg, "enable_grid_former_curtail_guard", False)
+        and is_grid_former_child(behavior, aid)
+    ):
+        record_event(
+            t=float(timestamp),
+            kind="grid_former_curtail_blocked",
+            aid=str(aid),
+            sector=str(sector),
+            detail=f"reason={reason} requested_factor={factor:.4f} forced=1.0",
+        )
+        factor = 1.0
 
     # --- CP heat-outlet ceiling (converter writes only) ----------------
     # Single funnel for every L3 commit path: clamp a CP write to the fresh
@@ -1452,24 +1501,6 @@ def tier_priority_weight_strict(
     P = max(1, int(priority_tiers))
     p = max(1, min(P, int(tier)))
     return float(P - p + 1)
-
-
-def remap_legacy_priority(tier: int) -> int:
-    """Map a legacy 10-tier value onto the 4-tier schedule.
-
-    Buckets: ``{1,2,3}→1``, ``{4,5}→2``, ``{6,7}→3``, ``{8,9,10}→4``.
-    Tier 0 (generator class) passes through unchanged.
-    """
-    t = int(tier)
-    if t <= 0:
-        return 0
-    if t <= 3:
-        return 1
-    if t <= 5:
-        return 2
-    if t <= 7:
-        return 3
-    return 4
 
 
 # Tier-aware deadbands for the clamp: higher deadband = measurement must drift

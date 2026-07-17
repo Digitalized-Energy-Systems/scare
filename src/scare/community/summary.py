@@ -1091,7 +1091,7 @@ class HolonSummaryRole(Role):
                     add = abs(float(cap))
                 supply_by_sector[sec_v] = supply_by_sector.get(sec_v, 0.0) + add
                 continue
-            if cap <= 0:  # slack / passive — skip
+            if cap <= 0:  # zero-capacity / passive — skip
                 continue
             if sec != self.sector:
                 continue  # sector-scoped invariant: skip other-sector demand

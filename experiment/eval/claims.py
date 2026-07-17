@@ -160,7 +160,9 @@ def _check_priority_invariant(
     """
     if not by_load_path.exists():
         if legacy_served_csv is not None and legacy_served_csv.exists():
-            return _check_priority_invariant_legacy(legacy_served_csv)
+            return _check_priority_invariant_legacy(
+                legacy_served_csv, skip_sectors=skip_sectors
+            )
         return {"passed": True, "detail": "no served_by_load.csv"}
     rows = _read_csv(by_load_path)
     if not rows:
@@ -169,7 +171,6 @@ def _check_priority_invariant(
     # Aggregate demand/served per (sector, component, tier); stranded
     # (disconnected) loads go to a separate bucket.
     agg: dict[tuple[str, str], dict[int, dict[str, float]]] = {}
-    stranded_by_sector: dict[str, dict[int, dict[str, float]]] = {}
     n_loads_stranded = 0
     stranded_demand_mw = 0.0
     n_loads_throttled = 0
@@ -196,10 +197,6 @@ def _check_priority_invariant(
         if disc_raw in ("1", "true", "True"):
             n_loads_stranded += 1
             stranded_demand_mw += demand
-            sec_strand = stranded_by_sector.setdefault(sec, {})
-            entry = sec_strand.setdefault(tier, {"demand": 0.0, "served": 0.0})
-            entry["demand"] += demand
-            entry["served"] += served
             continue
         # Constraint-throttled loads (physics-aware mode): capped by a
         # local constraint and serving at/near it — physically limited,
@@ -393,7 +390,9 @@ def heat_priority_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
+def _check_priority_invariant_legacy(
+    served_path: Path, *, skip_sectors: frozenset[str] = _LOCAL_PHYSICS_SECTORS
+) -> dict[str, Any]:
     """Fallback per-sector check on ``served.csv`` for runs lacking the
     per-load artefact."""
     rows = _read_csv(served_path)
@@ -408,6 +407,8 @@ def _check_priority_invariant_legacy(served_path: Path) -> dict[str, Any]:
         by_sector.setdefault(sec, []).append((tier, frac))
     inversions: list[dict[str, Any]] = []
     for sec, entries in by_sector.items():
+        if sec in skip_sectors:
+            continue
         entries.sort(key=lambda e: e[0])
         for i in range(1, len(entries)):
             t_prev, f_prev = entries[i - 1]

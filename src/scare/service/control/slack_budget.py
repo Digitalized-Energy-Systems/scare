@@ -1,10 +1,21 @@
 """Slack-budget enforcement on external-grid children.
 
 The LP Var bounds are widened to ``10 × budget`` for feasibility, so the LP
-over-draws past the operator budget unless pushed back. This role polls the
-slack draw and, when ``|draw| > budget·(1+tol)``, records a violation and
-emits a ``BalanceProblem`` to trigger a rebalance round. A re-fire suppressor
-keeps a persistent over-budget state from flooding the event ledger.
+over-draws past the operator budget unless pushed back. Enforcement runs two
+loops off the measured draw ``|obs|``:
+
+* Effective-budget integral (the dominant lever): each poll an integral
+  correction drives an advertised ``_eff_budget`` toward ``B·(1−margin)`` and
+  publishes it via ``set_slack_eff_budget``. The holon supply pool reads it and
+  sheds native load until the physical draw lands at B. This is what the
+  ``slack_budget_compliance`` claim actually turns on.
+* Over-budget override: when ``|draw| > B·(1+tol)`` the role records a
+  ``slack_budget_violation``, emits a ``ConstraintViolation``, and sends the
+  home leader a ``StartBalanceNegotiation(override_target)``. Its main effect is
+  to *trigger* an L2 rebalance round (so the integral above is read); the
+  override's own shed is clamped by the L2 priority floor. A re-fire cooldown
+  keeps a persistent over-budget state from flooding the event ledger. With no
+  leader it falls back to a local ``BalanceProblem``.
 """
 
 from __future__ import annotations
@@ -22,7 +33,7 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.runtime.diagnostics import record_event
-from scare.base.util import set_slack_cp_reserve, set_slack_eff_budget
+from scare.base.util import set_slack_eff_budget
 
 if TYPE_CHECKING:
     from mango import AgentAddress
@@ -31,8 +42,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Min sim-seconds between re-firing a violation on the same slack while
-# over-budget persists, sized so a gossip round completes between nudges.
+# Floor on sim-seconds between re-firing a violation on the same slack while
+# over-budget persists. The effective cooldown is ``max(this, 2·poll)`` (see
+# ``setup``) so it always spans at least two polls: on gas ``poll`` is itself
+# 2.0s, so a flat 2.0s cooldown re-fired on every poll and cancelled the
+# correction the previous nudge had started.
 _REFIRE_COOLDOWN_S: float = 2.0
 
 # Cache-gate tolerance in ``_monitor``: draw unchanged and no active
@@ -42,11 +56,6 @@ _MONITOR_DELTA_TOL: float = 1e-4
 # Effective-budget integral-feedback gain (per-poll move ``-gain·(|draw|-B)``).
 # 0.3 damps the one-cycle draw-tracking lag; aggressive gains overshoot.
 _FEEDBACK_GAIN: float = 0.3
-
-# Floor on effective budget as a fraction of nominal. 0 lets feedback wind
-# down as far as L1/L2 shedding needs; raise only for a sector with no
-# sheddable demand.
-_FEEDBACK_FLOOR_FRAC: float = 0.0
 
 # Feedback target margin (fraction of B). The feedback drives the draw toward
 # ``B·(1−margin)`` instead of ``B``, so the settle band ``[target−tol·B,
@@ -60,17 +69,18 @@ _FEEDBACK_TARGET_MARGIN: float = 0.05
 
 
 class SlackBudgetMonitor(Role):
-    """Poll a slack's LP-chosen draw against the operator budget; on violation
-    record an event and emit a BalanceProblem.
+    """Poll a slack's LP-chosen draw against the operator budget; enforce it via
+    the effective-budget integral (published to the holon supply pool) and an
+    over-budget override that triggers an L2 rebalance.
 
     Args:
         obs_key: ``"p_mw"`` (ExtPowerGrid) or ``"mass_flow_kgs"`` (ExtHydrGrid).
         budget: positive per-sector allowance.
         tol: relative tolerance; trigger threshold is ``budget·(1+tol)``.
-        home_leader_addr: when set, an excursion also sends
-            ``StartBalanceNegotiation(override_target=imbalance)`` so L1's QP
-            can shed without an L2 holon; ``None`` emits only the local
-            ``BalanceProblem``.
+        home_leader_addr: when set, an excursion sends
+            ``StartBalanceNegotiation(override_target=imbalance)`` to the leader
+            (triggering the L2 round that reads ``_eff_budget``); ``None`` falls
+            back to a local ``BalanceProblem``.
     """
 
     def __init__(
@@ -83,8 +93,6 @@ class SlackBudgetMonitor(Role):
         tol: float = 0.05,
         home_leader_addr: AgentAddress | None = None,
         enable_feedback: bool = True,
-        cp_aware: bool = False,
-        restore: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -94,16 +102,11 @@ class SlackBudgetMonitor(Role):
         self.tol = float(tol)
         self.home_leader_addr = home_leader_addr
         self.enable_feedback = bool(enable_feedback)
-        # CP-aware slack supply (opt-in): publish the measured over-draw so the
-        # holon supply pool debits the slack's budget by it (routes the deficit
-        # through holonic balancing). See enable_cp_aware_slack_supply.
-        self.cp_aware = bool(cp_aware)
-        # Restore lever (opt-in): when under budget, ask the leader to restore
-        # load up to B (positive override). See enable_slack_restore.
-        self.restore = bool(restore)
-        self._restore_emit_t: float = float("-inf")
         self._violation_active: bool = False
         self._last_emit_t: float = float("-inf")
+        # Effective re-fire cooldown; recomputed in ``setup`` as
+        # ``max(_REFIRE_COOLDOWN_S, 2·poll)`` once the poll period is known.
+        self._cooldown_s: float = _REFIRE_COOLDOWN_S
         # Last observed draw; poll skips when unchanged and no active violation.
         self._last_obs_val: float | None = None
         # Loss-compensated effective budget, tightened toward ``B - losses``
@@ -112,6 +115,7 @@ class SlackBudgetMonitor(Role):
 
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
+        self._cooldown_s = max(_REFIRE_COOLDOWN_S, 2.0 * poll)
         self.context.schedule_periodic_task(self._monitor, delay=poll)
 
     def _safe_observe(self) -> dict[str, Any] | None:
@@ -151,11 +155,9 @@ class SlackBudgetMonitor(Role):
             # so the loop settles instead of hunting around the target.
             if abs(err) > self.tol * self.budget:
                 self._eff_budget -= _FEEDBACK_GAIN * err
-                lo = _FEEDBACK_FLOOR_FRAC * self.budget
-                if self._eff_budget > self.budget:
-                    self._eff_budget = self.budget
-                elif self._eff_budget < lo:
-                    self._eff_budget = lo
+                # ``err`` is unbounded above, so a large excursion can drive the
+                # integral negative; clamp to ``[0, B]`` before publishing.
+                self._eff_budget = min(self.budget, max(0.0, self._eff_budget))
                 set_slack_eff_budget(self.behavior, self.context.aid, self._eff_budget)
         # Cache gate: skip when draw unchanged and no active violation. An
         # active violation keeps evaluating so cooldown/cleared transitions fire.
@@ -169,17 +171,10 @@ class SlackBudgetMonitor(Role):
         magnitude = abs(val)
         threshold = self.budget * (1.0 + self.tol)
         now = float(self.context.current_timestamp)
-        # CP-aware reserve: publish the over-draw EVERY over-budget poll (not
-        # cooldown-gated) so the holon supply pool tracks the latest excess and
-        # the shed converges to draw == B. Cleared below when in-budget.
-        if self.cp_aware:
-            set_slack_cp_reserve(
-                self.behavior, self.context.aid, max(0.0, magnitude - self.budget)
-            )
         if magnitude > threshold:
             if (
                 not self._violation_active
-                or (now - self._last_emit_t) >= _REFIRE_COOLDOWN_S
+                or (now - self._last_emit_t) >= self._cooldown_s
             ):
                 self._violation_active = True
                 self._last_emit_t = now
@@ -250,42 +245,3 @@ class SlackBudgetMonitor(Role):
         else:
             # Cleared: re-arm so the next over-budget excursion fires again.
             self._violation_active = False
-            if self.cp_aware:
-                set_slack_cp_reserve(self.behavior, self.context.aid, 0.0)
-            # Restore / serve-more lever: when genuinely UNDER budget (below the
-            # lower deadband edge), there is unused import headroom; ask the
-            # leader to restore load up to B. Positive override_target =>
-            # restoration (highest priority first). Deadband-gated (only below
-            # B*(1-tol)) and cooldown-gated so it can't oscillate with the shed
-            # path. Restore toward the lower deadband edge, leaving a tol margin
-            # so a restore does not immediately bounce into an over-budget shed.
-            if (
-                self.restore
-                and self.home_leader_addr is not None
-                and magnitude < self.budget * (1.0 - self.tol)
-                and (now - self._restore_emit_t) >= _REFIRE_COOLDOWN_S
-            ):
-                headroom = self.budget * (1.0 - self.tol) - magnitude
-                if headroom > _MONITOR_DELTA_TOL:
-                    self._restore_emit_t = now
-                    record_event(
-                        t=now,
-                        kind="slack_budget_restore",
-                        aid=self.context.aid,
-                        sector=self.sector.value,
-                        detail=(
-                            f"{self.obs_key}={val:.4f} budget={self.budget:.4f} "
-                            f"restore_headroom={headroom:.4f}"
-                        ),
-                    )
-                    try:
-                        await self.context.send_message(
-                            StartBalanceNegotiation(override_target=headroom),
-                            receiver_addr=self.home_leader_addr,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug(
-                            "[%s] slack-budget restore send failed: %s",
-                            self.context.aid,
-                            exc,
-                        )

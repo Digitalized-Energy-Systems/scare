@@ -353,16 +353,49 @@ class RestorationConfiguration:
     # not throttled.
     enable_clpu_ramp: bool = True
 
-    # Island black-start (opt-in): when a load's electricity node is severed
-    # from every ExtPowerGrid slack (its own island behind opened branches), a
-    # lone island grid-former cannot catch the whole pre-island load in one
-    # step, so the fixed-injection physics solve is infeasible and skip-mode
-    # freezes observations -> the no-regret floor pins the loads and the island
-    # never recovers. On the island transition, drop the load to zero and
-    # release the floor; the CLPU ramp then picks it back up under the island
-    # former's supply-matched coordination (cold-load pickup). Requires
-    # ``enable_clpu_ramp`` for a graded recovery.
-    enable_island_blackstart: bool = False
+    # Protect promoted island grid-formers from MAS curtailment. A GridForming*
+    # unit is its island's voltage/slack REFERENCE: at regulation=1 its p_mw is
+    # a free LP Var that absorbs the island residual automatically (exactly like
+    # an ExtGrid slack). The gossip/holon supply balancing otherwise treats it
+    # like an ordinary generator and curtails it toward 0 to match reduced
+    # post-failure demand — but a reference at regulation<1 can no longer anchor
+    # its island (the islanding solve forces its node energised with a source it
+    # can't supply), so every step goes infeasible (verified: restoring the
+    # curtailed formers to full makes the exact infeasible state feasible;
+    # shedding load does not).
+    #
+    # When set, a former is excluded from the MW gossip's curtailable set like
+    # the slack: its gossip δ-box is pinned to zero (the QP computes δ=0, marked
+    # saturated → dropped from the dual, so the MAS optimises AROUND the fixed
+    # reference) and its ``_apply_setpoint`` never actuates it. The actuator-side
+    # guard in ``apply_regulate`` stays as a BACKSTOP for any non-gossip write
+    # path (CP/coalition/auction) that would pull a former below full. Excluding
+    # it at the coordination level (rather than only overriding the actuator)
+    # stops the gossip/holon from fighting the guard every round — recovering
+    # served dispatch, not just feasibility. Only microgrid/islanding scenarios
+    # promote grid-formers, so this is inert elsewhere.
+    enable_grid_former_curtail_guard: bool = False
+
+    # NOTE (islanding gas slack): under the grid-former guard the gas slack
+    # settles UNDER budget (~61% of B) with gas loads still shed, which looks
+    # like reclaimable head-room — the eff-budget integral winds down hard on the
+    # naive first allocation's transient over-draw and the resulting shed then
+    # latches. Two "fixes" were prototyped and BOTH REFUTED on the repro
+    # (recoverable_islanding, simbench_lv, seed 100000023; baseline = PWSF 0.42,
+    # gas slack 61%, PASS):
+    #   * anti-windup FLOOR on ``_eff_budget`` (0.5·B): reclaims the gas (gas
+    #     tier-1 0.31 -> 1.00, PWSF 0.60) but the gas slack goes to 201% of B.
+    #   * DAMPED restore (0.3) with no floor: PWSF 0.39 (WORSE than baseline),
+    #     gas slack 126% of B, and it inverts priority (tier-4 0.22 > tier-1 0.09
+    #     — the restore re-serves whatever the gossip reaches first).
+    # Root cause of the refutation: the grid-formers are free-Var and the MAS has
+    # no lever to dispatch them, so serving gas draws the SLACK with a >1 gain
+    # (formers idle + network balancing). The eff-budget wind-down is therefore
+    # not starvation but correct budget enforcement — the "unused" head-room is
+    # not actually spendable on gas without breaching B. Closing the gas gap to
+    # the oracle (which serves gas 0.84 compliantly by dispatching its formers in
+    # a global hard-slack-constrained LP) needs former/P2G dispatch, not a slack
+    # lever. Do not re-attempt via the slack without a former-dispatch mechanism.
 
     # Heat-only curtailment-auction lock. When a heat load is curtailed for a
     # live temperature violation, the L2 dispatch must DEFER rather than claw it
@@ -464,17 +497,6 @@ class RestorationConfiguration:
     # throttled re-broadcast with mid-flight L2 preemption.
     enable_change_only_dispatch: bool = True
 
-    # Fix 2 (opt-in): size the holon's load-serving supply pool at the slack's
-    # nominal operator budget B (== abs(cap), the same hard ext-grid bound the
-    # oracle uses) instead of the SlackBudgetMonitor's loss-compensation
-    # eff_budget. The eff_budget feedback winds DOWN toward 0 whenever physical
-    # import exceeds budget (e.g. irreducible CP coupling draw on cp-heavy
-    # grids), shrinking the pool below what the network can physically serve and
-    # over-shedding feasible load. The eff_budget still governs the slack's own
-    # setpoint; with this flag it no longer also caps serviceable supply. False:
-    # unchanged eff_budget behaviour. See root-cause "cp-dependent over-shed".
-    enable_nominal_slack_supply: bool = False
-
     # Branch-side line-loading monitor. True: every PowerLine branch watches
     # loading_percent and, on overload, sends a relief-MW override to its home
     # leader (lower priority-weighted side) + ConstraintStateMessage to both
@@ -497,17 +519,6 @@ class RestorationConfiguration:
     # operator budget. False: advertises the nominal budget.
     enable_slack_budget_feedback: bool = True
 
-    # Restore / serve-more lever (opt-in). The SlackBudgetMonitor normally only
-    # sheds when OVER budget; nothing restores load when the slack sits UNDER
-    # budget, so after curtailment the import headroom is left unused and load is
-    # over-shed (the oracle uses 100% of the budget; SCARE ~54%). True: when the
-    # draw is below ``budget*(1-tol)`` the monitor sends a POSITIVE
-    # override_target (= headroom to B) to the home leader, whose L1 gossip
-    # restores load (highest priority first) up to the budget. Symmetric with the
-    # shed path and deadband-gated so it can't oscillate. False: shed-only.
-    # See project_oracle_quality_gap.
-    enable_slack_restore: bool = False
-
     # Generation ramp-to-full lever (opt-in). Generators are often left below
     # full output (mean reg ~0.78 vs the oracle's 1.0), wasting local supply that
     # would displace slack import and free budget to serve more load. True: each
@@ -519,22 +530,14 @@ class RestorationConfiguration:
     # project_oracle_quality_gap.
     enable_gen_ramp_to_full: bool = False
 
-    # CP-aware slack supply (opt-in correctness fix). On cp-heavy grids the
-    # cross-sector converter (power-to-heat / CHP) electricity draw rides the
-    # electricity slack but is invisible to the L2 holon balance (it is not a
-    # PowerLoad / community member), so the holon serves native load up to
-    # ``gen + B`` while the physical slack draws ``B + CP_draw`` — over budget.
-    # True: the SlackBudgetMonitor's measured over-draw is debited from the
-    # slack's credited supply in the holon pool, so the holon balances native
-    # load against the budget NET of the CP draw and sheds native load until the
-    # physical slack lands at B (the deficit is routed through holonic balancing
-    # before CP, as intended). False: legacy (CP draw uncounted). Default OFF:
-    # forensics showed this debits a CROSS-sector converter draw against the
-    # SAME-sector native-electricity pool, so it over-sheds native load without
-    # touching the converter draw (the real lever is the L3 CP converter
-    # curtailment via the CP priority ADMM — see enable_cp_priority_admm /
-    # cp_admm_algorithm). See project_slack_compliance_rootcause.
-    enable_cp_aware_slack_supply: bool = False
+    # NOTE: CP-aware slack supply (the flag ``enable_cp_aware_slack_supply``,
+    # which debited the SlackBudgetMonitor's measured over-draw from the slack's
+    # credited holon supply) was removed. It debited a CROSS-sector converter
+    # draw against the SAME-sector native-electricity pool, so it over-shed
+    # native load without touching the converter draw; the real lever is the L3
+    # CP converter curtailment via the CP priority ADMM (see
+    # enable_cp_priority_admm / cp_admm_algorithm). See
+    # project_slack_compliance_rootcause.
 
     # NOTE: a CP-facing slack-budget reserve debit (feed the SlackBudgetMonitor's
     # measured over-draw into the CP kernel's input cap) was prototyped and

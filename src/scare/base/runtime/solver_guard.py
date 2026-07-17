@@ -5,7 +5,8 @@ unbounded — and asyncio.wait_for can't preempt a synchronous solve until
 the next ``await``, letting a task overrun. :func:`install_solver_time_limit`
 patches ``PER_SOLVER_OPTIONS`` with the per-vendor time-limit option
 (default 60 s; override via ``limit_s`` / ``SCARE_SOLVER_TIMELIMIT_S``).
-Idempotent and additive — never lowers a limit downstream already chose.
+Idempotent; caps a larger or disabled (<=0) limit down to the target but
+never raises one a downstream already set lower.
 """
 
 from __future__ import annotations
@@ -58,7 +59,8 @@ def _resolve_limit_s(limit_s: float | None) -> float:
 def install_solver_time_limit(limit_s: float | None = None) -> None:
     """Seed a per-solve wall-clock limit for every Pyomo solver.
 
-    Idempotent; never reduces a limit downstream already chose. Returns
+    Idempotent; caps a larger or disabled limit down to ``seconds`` but
+    never raises a lower one. Returns
     silently when ``monee.solver.pyo`` is not importable.
     """
     seconds = _resolve_limit_s(limit_s)

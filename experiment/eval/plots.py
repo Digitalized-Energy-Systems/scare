@@ -1166,8 +1166,14 @@ def _gap_pair_pivot(df: pd.DataFrame, metric: str) -> pd.DataFrame:
     return df.pivot_table(index=idx, columns="variant", values=metric)
 
 
-def _pair_key_label(key: Any) -> str:
+def _pair_key_label(key: Any, names: Any = None) -> str:
     if isinstance(key, tuple):
+        if names is not None:
+            m = dict(zip(names, key))
+            seed = m.get("seed", key[0])
+            scenario = m.get("scenario")
+            base = f"seed: {seed}"
+            return f"{base}<br>scenario: {scenario}" if scenario is not None else base
         return f"seed: {key[0]}<br>scenario: {key[1]}"
     return f"seed: {key}"
 
@@ -1218,7 +1224,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
                 ),
                 customdata=[
                     f"<b>single run pair</b><br>grid: {alias_grid(grid)}<br>"
-                    f"{_pair_key_label(k)}<br>oracle: {r['oracle']:.4f}<br>"
+                    f"{_pair_key_label(k, sub.index.names)}<br>oracle: {r['oracle']:.4f}<br>"
                     f"scare: {r['scare']:.4f}<br>"
                     f"gap: {(r['oracle'] - r['scare']):.4f}"
                     for k, r in sub.iterrows()
@@ -3993,8 +3999,7 @@ def constraint_violations_by_variable_bar(
     for var in present:
         nongating = var in _NONGATING_VARIABLE_TYPES
         label = f"{var} (non-gating)" if nongating else var
-        # Each variable type gets a distinct hatch (CVD channel) on top of
-        # its hue; the non-gating temperature stays hatched as before.
+        # Each variable type gets a distinct hatch (CVD channel) on top of its hue.
         fig.add_trace(
             go.Bar(
                 name=label,
@@ -4521,6 +4526,7 @@ def system_state_overview(
         return _save(_empty_fig("no timeseries", title), out_path)
 
     x_full, x_title, x_scale = _time_axis(timeseries["time_s"].astype(float).values)
+    x_hover = x_title.split("(")[-1].rstrip(")")
     _dec = _decimate(len(x_full))
     x = x_full[_dec]
     if not isinstance(_dec, slice):
@@ -4607,7 +4613,7 @@ def system_state_overview(
                         showlegend=sec not in legend_seen,
                         hovertemplate=(
                             f"<b>slack {sec}/{aid}</b><br>"
-                            "t: %{x:.2f}s<br>value: %{y:.4f}<extra></extra>"
+                            f"t: %{{x:.2f}}{x_hover}<br>value: %{{y:.4f}}<extra></extra>"
                         ),
                     ),
                     row=panel_idx,
@@ -4637,7 +4643,7 @@ def system_state_overview(
                     customdata=raw,
                     hovertemplate=(
                         f"<b>{label}</b><br>"
-                        "t: %{x:.2f}s<br>"
+                        f"t: %{{x:.2f}}{x_hover}<br>"
                         "raw: %{customdata:.4f}<br>"
                         "normalised: %{y:.3f}"
                         "<extra></extra>"
@@ -4694,7 +4700,7 @@ def system_state_overview(
                     showlegend=True,
                     hovertemplate=(
                         f"<b>{label} loading</b><br>"
-                        "t: %{x:.2f}s<br>%{y:.1f} %%"
+                        f"t: %{{x:.2f}}{x_hover}<br>%{{y:.1f}} %%"
                         "<extra></extra>"
                     ),
                 ),
@@ -4730,7 +4736,7 @@ def system_state_overview(
                     showlegend=True,
                     hovertemplate=(
                         f"<b>tier {tier}</b><br>"
-                        "t: %{x:.2f}s<br>fraction: %{y:.3f}"
+                        f"t: %{{x:.2f}}{x_hover}<br>fraction: %{{y:.3f}}"
                         "<extra></extra>"
                     ),
                 ),
@@ -4762,7 +4768,7 @@ def system_state_overview(
                     showlegend=False,  # legend already shows tiers in panel 4
                     hovertemplate=(
                         f"<b>tier {tier}</b><br>"
-                        "t: %{x:.2f}s<br>served: %{y:.4f} MW"
+                        f"t: %{{x:.2f}}{x_hover}<br>served: %{{y:.4f}} MW"
                         "<extra></extra>"
                     ),
                 ),

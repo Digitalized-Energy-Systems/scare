@@ -120,6 +120,7 @@ def _aggregator_command(
         v = getattr(eval_slurm, k)
         if v:
             light_flags.append(f"--{k}={v}")
+    light_flags.extend(eval_slurm.extra_sbatch_args)
     return [
         "sbatch",
         "--parsable",

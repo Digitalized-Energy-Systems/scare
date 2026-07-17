@@ -39,8 +39,6 @@ class GridReconfigurator(Role):
         # search_id → sentinel for an in-flight search. Legacy drops on first
         # result; ranking keeps until the window closes.
         self._pending_searches: dict[str, Any] = {}
-        # search_id → addresses already asked by the originator.
-        self._asked_by_search: dict[str, set] = {}
         # Per-search forwarding dedup against BFS fan-out re-entry. Legacy:
         # forward once. Ranking: track lowest max_loading, re-forward if better.
         self._forwarded_searches: set[str] = set()
@@ -106,7 +104,6 @@ class GridReconfigurator(Role):
         search_id = str(uuid4())
         # Mark in-flight so ``_handle_path_result`` accepts its result.
         self._pending_searches[search_id] = True
-        self._asked_by_search[search_id] = {self.context.addr}
         if self.enable_ranking:
             self._search_results[search_id] = []
             # Close the ranking window after ``window_s``.
@@ -127,7 +124,6 @@ class GridReconfigurator(Role):
         )
 
         for addr in grid_neighbours:
-            self._asked_by_search[search_id].add(addr)
             await self.context.send_message(msg, receiver_addr=addr)
 
     async def _handle_path_message(self, message: GridPathMessage, meta: dict) -> None:
@@ -239,7 +235,6 @@ class GridReconfigurator(Role):
 
         # Legacy mode: first arrival wins; close switches immediately.
         self._pending_searches.pop(target_search, None)
-        self._asked_by_search.pop(target_search, None)
 
         await self._act_on_path_result(message)
 
@@ -251,7 +246,6 @@ class GridReconfigurator(Role):
         """
         candidates = self._search_results.pop(search_id, None)
         self._pending_searches.pop(search_id, None)
-        self._asked_by_search.pop(search_id, None)
         # Flush forwarder loading state.
         self._forwarded_loading.pop(search_id, None)
 

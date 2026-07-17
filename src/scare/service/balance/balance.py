@@ -48,9 +48,9 @@ from scare.base.util import (
     l2_effective_floor,
     last_actuated_factor,
     line_congestion_ceiling,
+    lookup_grid_former_rating,
     set_l2_priority_floor,
     lookup_slack,
-    lookup_slack_cp_reserve,
     lookup_slack_eff_budget,
     note_actuated_factor,
     obs_capacity,
@@ -85,8 +85,8 @@ _START_THRESHOLD: dict[Sector, float] = {}
 _THRESHOLD_CAPACITY_FRACTION: float = 0.005
 _THRESHOLD_ABS_FLOOR: float = 1e-6
 
-# Heat util above which an agent contributes headroom to the thermal-deficit
-# target. Below the 0.85 warning so gossip triggers pre-violation.
+# Heat util above which an agent would contribute headroom to the thermal-deficit
+# target. Feeds the now-disabled heat MW-balance path.
 _HEAT_CLEAR_FRACTION: float = 0.6
 
 # Heat L2 supply probe: share of the unserved heat gap offered on top of the
@@ -98,6 +98,28 @@ _HEAT_CLEAR_FRACTION: float = 0.6
 # the knob to try, but the 0.4 probe A/B was confounded by concurrent CP-fix
 # tree changes and needs a clean campaign.
 _HEAT_L2_PROBE_SHARE: float = 0.2
+
+# Grid-former supply probe (served-vs-slack-compliance trade-off knob).
+#
+# A promoted island reference is a free-Var source: the holon realises its
+# capacity only by allocating load, which the physics then makes it produce.
+# Crediting only its DELIVERED injection (share=0) is slack-safe but ratchets
+# DOWN (loads shed -> less drawn -> less produced -> credited less -> more shed),
+# leaving former-fed serving modest. Crediting ``delivered + share*(rating -
+# delivered)`` lets the holon offer the former's headroom as load; the free-Var
+# former then produces to meet it, recovering served.
+#
+# But a positive share OVER-credits where the former shares an island with a
+# budgeted slack: the offered load routes partly through the slack (the
+# feasibility solve has no cost bias toward the former, unlike the oracle's
+# hard-slack-constrained LP), and the resulting L2 priority floor blocks the
+# SlackBudgetMonitor from shedding it back. Measured on the recoverable_islanding
+# repro (simbench_lv, seed 100000023): share 0.0 -> PWSF 0.42, gas slack PASS;
+# 0.5 -> 0.66, gas slack FAIL (110% over); rating -> 0.77, FAIL (151%). Default 0
+# keeps the gas slack compliant; raise it to trade slack-budget compliance for
+# served recovery. Analogue of ``_HEAT_L2_PROBE_SHARE`` (heat has no slack budget
+# to breach, so it can run a positive share by default).
+_GRID_FORMER_SUPPLY_PROBE_SHARE: float = 0.0
 
 _MAX_HOPS = 100
 
@@ -163,71 +185,6 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return isinstance(child.model, (ExtPowerGrid, ExtHydrGrid))
-
-
-def _slack_fed_nodes(net: Any) -> set | None:
-    """Node ids reachable from an ``ExtPowerGrid`` slack over active, closed,
-    non-CP branches. ``None`` when the net has no electric slack — islanding
-    can't be judged then and black-start must not fire. CP branches are excluded
-    (so reachability stays within the electricity carrier)."""
-    try:
-        branches = list(net.branches)
-        childs = list(net.childs)
-    except Exception:  # noqa: BLE001
-        return None
-    slack_nodes = {c.node_id for c in childs if isinstance(c.model, ExtPowerGrid)}
-    if not slack_nodes:
-        return None
-    adj: dict[Any, list[Any]] = {}
-    for b in branches:
-        try:
-            if b.model.is_cp():
-                continue
-            if (
-                not getattr(b, "active", True)
-                or not getattr(b.model, "active", True)
-                or not int(getattr(b.model, "on_off", 1) or 0)
-            ):
-                continue
-            a, c = b.id[0], b.id[1]
-        except Exception:  # noqa: BLE001
-            continue
-        adj.setdefault(a, []).append(c)
-        adj.setdefault(c, []).append(a)
-    seen = set(slack_nodes)
-    frontier = list(slack_nodes)
-    while frontier:
-        nxt: list[Any] = []
-        for n in frontier:
-            for nb in adj.get(n, ()):
-                if nb not in seen:
-                    seen.add(nb)
-                    nxt.append(nb)
-        frontier = nxt
-    return seen
-
-
-def _load_islanded_from_slack(behavior: Any, aid: str, ts: float) -> bool:
-    """True iff *aid*'s node is severed from every ``ExtPowerGrid`` slack on the
-    current topology (its own island behind opened branches). Reachability is
-    cached per timestamp on the behavior — the topology is identical for every
-    agent within a step, so the BFS runs once per step, not once per agent."""
-    net = getattr(behavior, "_net", None)
-    if net is None or not aid.startswith("child-"):
-        return False
-    cache = getattr(behavior, "_island_fed_cache", None)
-    if cache is None or cache[0] != ts:
-        fed = _slack_fed_nodes(net)
-        behavior._island_fed_cache = (ts, fed)
-    else:
-        fed = cache[1]
-    if fed is None:
-        return False
-    try:
-        node_id = net.child_by_id(int(aid[len("child-") :])).node_id
-    except Exception:  # noqa: BLE001
-        return False
-    return node_id not in fed
 
 
 def _heat_thermal_deficit_mw(obs: dict) -> float:
@@ -334,7 +291,6 @@ class EnergyBalanceNegotiator(Role):
         constraint_aware: bool = True,
         enable_monotonic_floor: bool = True,
         enable_clpu_ramp: bool = True,
-        enable_island_blackstart: bool = False,
         max_hops: int = _MAX_HOPS,
         step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
         enable_qp_gossip: bool = True,
@@ -342,8 +298,6 @@ class EnergyBalanceNegotiator(Role):
         enable_change_only_dispatch: bool = True,
         enable_l2_priority_floor: bool = True,
         enable_actuated_ledger_writeback: bool = True,
-        enable_nominal_slack_supply: bool = False,
-        enable_cp_aware_slack_supply: bool = False,
         enable_heat_l2_dispatch: bool = False,
         component_scope: bool = False,
     ) -> None:
@@ -365,10 +319,6 @@ class EnergyBalanceNegotiator(Role):
         self.constraint_aware = constraint_aware
         self.enable_monotonic_floor = enable_monotonic_floor
         self.enable_clpu_ramp = enable_clpu_ramp
-        # Island black-start: shed a newly-islanded load to zero, then let CLPU
-        # ramp it back under the island former's coordination (see config).
-        self.enable_island_blackstart = bool(enable_island_blackstart)
-        self._island_blackstart_active = False
         # L2 priority-floor: clamp gossip sheds up to the component ADMM's
         # per-load allocation, blocking the L2->L1 tier inversion.
         self.enable_l2_priority_floor = enable_l2_priority_floor
@@ -395,13 +345,6 @@ class EnergyBalanceNegotiator(Role):
         self._last_dispatched_service_fraction: dict[str, dict[int, float]] | None = (
             None
         )
-        # Fix 2 (opt-in): credit a slack's supply contribution at the nominal
-        # operator budget B (abs(cap)) rather than the wound-down eff_budget.
-        self.enable_nominal_slack_supply = bool(enable_nominal_slack_supply)
-        # CP-aware slack supply (opt-in): debit the slack's credited budget by
-        # the SlackBudgetMonitor's measured over-draw so the holon balances
-        # native load NET of the cross-sector (CP) draw riding the slack.
-        self.enable_cp_aware_slack_supply = bool(enable_cp_aware_slack_supply)
         # Heat L2 reconnect (opt-in): actuate holon service fractions for heat
         # (dispatch-only; gossip stays heat-excluded) and report delivered heat
         # as the sector's flex supply pool.
@@ -876,23 +819,25 @@ class EnergyBalanceNegotiator(Role):
         El/gas: the raw setpoint (Σ s_i ≈ 0 ⇒ balanced). Heat: amplified by the
         local thermal deficit so a stressed group surfaces a negative target.
 
-        F2 — slack target: a registered slack reports its *target infeed*
-        ``slack_target_fraction · rating`` instead of the LP draw, reframing the
-        imbalance so the rest of the group balances to that target. Only
-        coherent when the slack's community spans the component
-        (``component_level``); else ``SlackBudgetMonitor`` enforces the budget.
+        F2 — slack target: with a positive ``slack_target_fraction`` a registered
+        slack reports its *target infeed* ``fraction · rating`` instead of the LP
+        draw, reframing the imbalance so the rest of the group balances to that
+        target. Only coherent when the slack's community spans the component
+        (``component_level``). At the default ``fraction == 0.0`` this branch is
+        SKIPPED — reporting ``0.0`` there is an implicit "drive the draw to zero"
+        target, strictly tighter than the operator budget B and fighting the
+        ``SlackBudgetMonitor``; instead the slack reports its true draw and the
+        monitor is the sole budget authority.
         """
         slack = lookup_slack(self.behavior, self.context.aid)
-        if slack is not None:
-            cfg = getattr(self.behavior, "_scare_config", None)
-            fraction = float(
-                getattr(cfg, "slack_target_fraction", 0.0) if cfg is not None else 0.0
-            )
+        cfg = getattr(self.behavior, "_scare_config", None)
+        fraction = float(
+            getattr(cfg, "slack_target_fraction", 0.0) if cfg is not None else 0.0
+        )
+        if slack is not None and fraction > 0.0:
             # ``slack.cap`` is generator-convention (negative); import target is
             # its magnitude.
-            rating = abs(slack.cap)
-            sp = fraction * rating
-            return sp
+            return fraction * abs(slack.cap)
         sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
         if self.sector == Sector.HEAT:
             sp += _heat_thermal_deficit_mw(obs)
@@ -947,6 +892,15 @@ class EnergyBalanceNegotiator(Role):
             if sec_enum is None:
                 continue
             sec = sec_enum.value
+            # A promoted island reference is a generator, never a load: credit
+            # its supply (delivered + headroom probe) to the pool and skip the
+            # load/gen bins (its free var otherwise reads as sign-flipping
+            # load/ratcheting supply).
+            if self._is_grid_former(aid):
+                pool += self._grid_former_supply_credit(
+                    aid, obs_setpoint(obs, behavior=self.behavior, aid=aid)
+                )
+                continue
             if cap > 0:
                 prio = obs_priority(obs, behavior=self.behavior, aid=aid)
                 sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
@@ -1119,6 +1073,11 @@ class EnergyBalanceNegotiator(Role):
         dmin_start, dmax_start = obs_min_max(
             obs, behavior=self.behavior, aid=self.context.aid
         )
+        if self._grid_former_excluded():
+            # Pin the island reference: a zero δ-box makes the QP compute δ=0
+            # (marked saturated → dropped from the dual denominator), so gossip
+            # never curtails the former and the MAS balances load AROUND it.
+            dmin_start = dmax_start = 0.0
 
         lambda_seed = compute_lambda_seed(
             target,
@@ -1278,6 +1237,8 @@ class EnergyBalanceNegotiator(Role):
             init_dmin, init_dmax = obs_min_max(
                 obs, behavior=self.behavior, aid=self.context.aid
             )
+            if self._grid_former_excluded():
+                init_dmin = init_dmax = 0.0  # pin the reference (see _start_gossip)
             # Adopt via ledger_merge so the incoming ledger gets the same
             # Byzantine clip as the merge path below.
             cap_byz = _BYZANTINE_DELTA_CAP_MULTIPLE * max(
@@ -1736,6 +1697,15 @@ class EnergyBalanceNegotiator(Role):
             available = cap - sp  # headroom
             # Per-sector breakdown for multi-dimensional ADMM.
             sec_key = sector.value
+            # A promoted island reference is a generator, never a load: credit
+            # its supply (delivered + headroom probe) and skip the
+            # flex/balance/demand accounting (its sign-flipping free var
+            # otherwise reads as phantom demand).
+            if self._is_grid_former(aid):
+                supply_by_sector[sec_key] = supply_by_sector.get(
+                    sec_key, 0.0
+                ) + self._grid_former_supply_credit(aid, sp)
+                continue
             flex_by_sector[sec_key] = flex_by_sector.get(sec_key, 0.0) + available
             balance_by_sector[sec_key] = balance_by_sector.get(sec_key, 0.0) + sp
             # Route-A supply pool (generators, cap < 0). Generators count
@@ -1743,35 +1713,10 @@ class EnergyBalanceNegotiator(Role):
             # can't inflate the pool. Slacks instead use the budgeted rating.
             if cap < 0:
                 if lookup_slack(self.behavior, aid) is not None:
-                    if self.enable_cp_aware_slack_supply:
-                        # CP-aware: single-controller form B - reserve. Base off
-                        # the nominal budget B (== abs(cap); see
-                        # _maybe_register_slack) and debit the budget already
-                        # consumed by the cross-sector (CP) draw + losses riding
-                        # this slack (the monitor's measured over-draw). The holon
-                        # then balances native load against the budget NET of the
-                        # CP draw and sheds native load until the physical slack
-                        # lands at B (re-measured each monitor poll => converges).
-                        # NB base off B, NOT eff_budget: the eff_budget feedback
-                        # ALSO winds down on the same over-draw, so eff_budget -
-                        # reserve would double-subtract the excess and over-shed.
-                        reserve = lookup_slack_cp_reserve(self.behavior, aid) or 0.0
-                        gen_supply = max(0.0, abs(cap) - float(reserve))
-                    elif self.enable_nominal_slack_supply:
-                        # Fix 2: nominal operator budget B (== abs(cap); see
-                        # _maybe_register_slack, which registers the slack at its
-                        # _scare_slack_budget_mw). The eff_budget the
-                        # SlackBudgetMonitor maintains is wound DOWN below B
-                        # whenever physical import exceeds budget (irreducible CP
-                        # draw on cp-heavy grids), shrinking the serviceable pool
-                        # and over-shedding feasible load; B is the same hard
-                        # bound the oracle serves against.
-                        gen_supply = abs(cap)
-                    else:
-                        # Slack: effective budget if loss-compensation set one
-                        # (targets ``B - losses``), else nominal.
-                        eff = lookup_slack_eff_budget(self.behavior, aid)
-                        gen_supply = float(eff) if eff is not None else abs(cap)
+                    # Slack: effective budget if loss-compensation set one
+                    # (targets ``B - losses``), else nominal.
+                    eff = lookup_slack_eff_budget(self.behavior, aid)
+                    gen_supply = float(eff) if eff is not None else abs(cap)
                 else:
                     gen_supply = abs(sp)  # generator: deliverable, not rated
                 supply_by_sector[sec_key] = (
@@ -1998,6 +1943,10 @@ class EnergyBalanceNegotiator(Role):
             gen_members: list[tuple[str, Sector, float, float]] = []
             for aid in members:
                 obs = self.behavior.observe(aid) or {}
+                # A promoted island reference is a generator, never a load: skip
+                # it so a positive free p_mw/mass_flow can't be shed as demand.
+                if self._is_grid_former(aid):
+                    continue
                 cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
                 if cap <= 0:  # generator/slack source
                     # R3: collect dispatchable DGs (cap<0, non-slack) to ramp
@@ -2313,58 +2262,59 @@ class EnergyBalanceNegotiator(Role):
         if topology_characteristic(self, tid="groups") == "leader":
             self.context.schedule_instant_task(self.trigger_balance_negotiation())
 
-    def island_blackstart_shed(self) -> None:
-        """Cold-load-pickup shed for a load severed into its own island.
-
-        Fired on every failure event (see ``_add_system_behaviors``), NOT from
-        the gossip path — an islanded load falls out of gossip/holon
-        coordination entirely and would otherwise stay frozen at its pre-island
-        setpoint, which a lone island former can't supply (so every solve is
-        infeasible). When this load's node is severed from every ExtPowerGrid
-        slack, drop it to zero and release the no-regret floor; recovery (ramp
-        back up) is left to whatever coordination the island re-forms. No-op
-        while reconnected. Electricity loads only.
-        """
-        if not self.enable_island_blackstart or self.sector is not Sector.ELECTRICITY:
-            return
-        aid = self.context.aid
-        obs = self.behavior.observe(aid) or {}
-        if obs_capacity(obs, behavior=self.behavior, aid=aid) <= 0:
-            return  # loads only (cap > 0)
-        if not _load_islanded_from_slack(
-            self.behavior, aid, self.context.current_timestamp
-        ):
-            self._island_blackstart_active = False
-            return
-        self._island_blackstart_active = True
-        self._restoration_floor = 0.0
-        self._last_regulate_factor = 0.0
-        applied = apply_regulate(
-            self.behavior,
-            aid,
-            0.0,
-            sector=self.sector.value,
-            reason="island_blackstart",
-            timestamp=self.context.current_timestamp,
-        )
-        if applied:
-            record_event(
-                t=self.context.current_timestamp,
-                kind="island_blackstart_shed",
-                aid=aid,
-                sector=self.sector.value,
-                detail="node severed from slack; shed to 0 for cold-load pickup",
-            )
-
     # ------------------------------------------------------------------
     # Setpoint application with monotonic progress guarantee
     # ------------------------------------------------------------------
 
+    def _grid_former_excluded(self) -> bool:
+        """True iff THIS agent is a promoted island reference excluded from the
+        MW gossip's curtailable set (``enable_grid_former_curtail_guard``).
+
+        A ``GridForming*`` unit is its island's slack/voltage reference: at
+        regulation=1 its ``p_mw`` is a free LP Var that absorbs the island
+        residual automatically, so curtailing it (regulation<1) collapses the
+        balance and the islanding solve goes infeasible. Excluded like the
+        ExtGrid slack — pinned δ-box + no actuation — so the MAS balances load
+        AROUND the fixed reference instead of fighting the actuator guard.
+        """
+        return self._is_grid_former(self.context.aid)
+
+    def _is_grid_former(self, aid: str) -> bool:
+        """True iff *aid* is a promoted island reference and the guard is on.
+
+        A ``GridForming*`` unit's free p_mw/mass_flow flips ``obs_capacity``'s
+        sign, so the holon reads it as phantom load demand when it absorbs the
+        island residual (starving real loads) and never as the supply it is. The
+        holon must classify it as a generator regardless of that sign; callers
+        credit its DELIVERED injection ``max(0, -sp)`` as supply (the codebase's
+        delivered-not-rated convention, so it can't disarm slack enforcement)."""
+        if not getattr(
+            getattr(self.behavior, "_scare_config", None),
+            "enable_grid_former_curtail_guard",
+            False,
+        ):
+            return False
+        return lookup_grid_former_rating(self.behavior, aid) is not None
+
+    def _grid_former_supply_credit(self, aid: str, sp: float) -> float:
+        """Supply to credit a grid-former: ``delivered + share*(rating -
+        delivered)`` (see ``_GRID_FORMER_SUPPLY_PROBE_SHARE``). ``delivered =
+        max(0, -sp)`` is its current injection; the probe offers a slice of its
+        unused headroom so the holon can allocate load the free-Var former then
+        produces to meet, instead of ratcheting down on delivered alone."""
+        delivered = max(0.0, -float(sp))
+        rating = lookup_grid_former_rating(self.behavior, aid)
+        if rating is None:
+            return delivered
+        return delivered + _GRID_FORMER_SUPPLY_PROBE_SHARE * max(
+            0.0, float(rating) - delivered
+        )
+
     def _apply_setpoint(self, new_setpoint: float) -> float | None:
         """Actuate ``new_setpoint`` (after clamp + floors); return the applied
         signed setpoint ``factor * cap``, or ``None`` when nothing is actuated
-        (cap=0, tier-1 hard-lock, slack). The caller writes the delta back to
-        the gossip ledger.
+        (cap=0, tier-1 hard-lock, slack, grid-former). The caller writes the
+        delta back to the gossip ledger.
         """
         obs = self.behavior.observe(self.context.aid) or {}
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
@@ -2380,6 +2330,12 @@ class EnergyBalanceNegotiator(Role):
         # residual; gossip must not curtail it. Use a class check, not the
         # registry: the unbounded heat-side ExtHydrGrid never registers a rating.
         if _is_slack_class_child(self.behavior, self.context.aid):
+            return None
+        # A promoted grid-former is a fixed island reference like the slack:
+        # never actuate its regulation (kept at its born 1.0 so its free p_mw
+        # anchors the island). Gossip already pins its δ-box to zero, so this is
+        # the actuation-side half of the same exclusion.
+        if self._grid_former_excluded():
             return None
 
         # Constraint-aware clamp near/beyond bounds. Pass the tier so critical
@@ -2414,21 +2370,6 @@ class EnergyBalanceNegotiator(Role):
                 )
                 factor = held
 
-        # Island black-start (the shed itself is event-driven — see
-        # ``island_blackstart_shed`` — because an islanded load drops out of
-        # gossip and this path never runs for it). Here we only CLEAR the hold
-        # once the load is coordinated again while reconnected, so the no-regret
-        # floor re-engages for normal restoration.
-        if (
-            self.enable_island_blackstart
-            and self._island_blackstart_active
-            and self.sector is Sector.ELECTRICITY
-            and not _load_islanded_from_slack(
-                self.behavior, self.context.aid, self.context.current_timestamp
-            )
-        ):
-            self._island_blackstart_active = False
-
         # No-regret floor applies only during restoration (target > 0); shedding
         # (target < 0) legitimately reduces factor.
         target = self._gossip.target if self._gossip is not None else 0.0
@@ -2439,10 +2380,7 @@ class EnergyBalanceNegotiator(Role):
             if self.enable_monotonic_floor:
                 if factor > self._restoration_floor:
                     self._restoration_floor = factor
-                elif (
-                    not self._constraint_violation_active
-                    and not self._island_blackstart_active
-                ):
+                elif not self._constraint_violation_active:
                     factor = self._restoration_floor
 
             # CLPU rate limit: ramp-up only; decreases pass through.
@@ -2619,7 +2557,6 @@ def create_energy_balance_role(
     constraint_aware: bool = True,
     enable_monotonic_floor: bool = True,
     enable_clpu_ramp: bool = True,
-    enable_island_blackstart: bool = False,
     termination_tolerance: float = 1e-5,
     max_hops: int = _MAX_HOPS,
     step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
@@ -2628,8 +2565,6 @@ def create_energy_balance_role(
     enable_change_only_dispatch: bool = True,
     enable_l2_priority_floor: bool = True,
     enable_actuated_ledger_writeback: bool = True,
-    enable_nominal_slack_supply: bool = False,
-    enable_cp_aware_slack_supply: bool = False,
     enable_heat_l2_dispatch: bool = False,
     component_scope: bool = False,
 ) -> EnergyBalanceNegotiator:
@@ -2642,7 +2577,6 @@ def create_energy_balance_role(
         constraint_aware=constraint_aware,
         enable_monotonic_floor=enable_monotonic_floor,
         enable_clpu_ramp=enable_clpu_ramp,
-        enable_island_blackstart=enable_island_blackstart,
         termination_tolerance=termination_tolerance,
         max_hops=max_hops,
         step_decay_k0=step_decay_k0,
@@ -2651,8 +2585,6 @@ def create_energy_balance_role(
         enable_change_only_dispatch=enable_change_only_dispatch,
         enable_l2_priority_floor=enable_l2_priority_floor,
         enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,
-        enable_nominal_slack_supply=enable_nominal_slack_supply,
-        enable_cp_aware_slack_supply=enable_cp_aware_slack_supply,
         enable_heat_l2_dispatch=enable_heat_l2_dispatch,
         component_scope=component_scope,
     )

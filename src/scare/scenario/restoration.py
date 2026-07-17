@@ -42,6 +42,7 @@ from monee.model.child import (
     PowerLoad,
     Sink,
 )
+from monee.model.extension import GridFormingGenerator, GridFormingSource
 
 from scare.base.channel import SectorImbalanceBeacon
 from scare.base.config import RestorationConfiguration
@@ -80,6 +81,7 @@ from scare.base.util import (
     obs_capacity,
     obs_constraint_values,
     obs_setpoint,
+    register_grid_former_rating,
     register_priority,
     register_sector,
     register_slack,
@@ -227,6 +229,30 @@ def _maybe_register_slack(behavior: Any, aid: str, child: Any) -> None:
             return
         rating = max(mags)
     register_slack(behavior, aid, rating_mw=rating, p_min=p_min, p_max=p_max)
+
+
+def _maybe_register_grid_former(behavior: Any, aid: str, child: Any) -> None:
+    """Register a promoted island reference's rated capacity.
+
+    A ``GridForming*`` unit's balancing var (``p_mw`` / ``mass_flow_kgs``) is a
+    free ``Var`` whose sign flips as it produces vs absorbs the island residual;
+    the rating is that Var's bound magnitude. Recording it lets the holon credit
+    the former as a fixed supply source rather than misreading a positive free
+    value as load demand. Only microgrid/islanding scenarios promote formers, so
+    this is inert elsewhere.
+    """
+    m = child.model
+    if isinstance(m, GridFormingGenerator):
+        var = getattr(m, "p_mw", None)
+    elif isinstance(m, GridFormingSource):
+        var = getattr(m, "mass_flow_kgs", None)
+    else:
+        return
+    if var is None:
+        return
+    mags = [abs(float(b)) for b in (getattr(var, "min", None), getattr(var, "max", None)) if b is not None]
+    if mags:
+        register_grid_former_rating(behavior, aid, max(mags))
 
 
 def _slack_budget_for_child(child: Any) -> tuple[str, float] | None:
@@ -565,9 +591,17 @@ def _populate_children(
         # Register slack-class children so gossip reports rated capacity
         # and treats them as generator-class regardless of flow direction.
         _maybe_register_slack(behavior, aid, child)
+        # Register a promoted island reference so the holon/gossip classify it as
+        # a generator (never a sign-flipping load) and credit its delivered
+        # injection as supply. Gated on the guard flag so default runs are
+        # byte-identical (the registry is read only under the flag).
+        if config.enable_grid_former_curtail_guard:
+            _maybe_register_grid_former(behavior, aid, child)
         explicit_priority = priorities.get(aid)
-        # Force slacks to tier 0: a slack is never shed. Otherwise
-        # obs_priority may read the LP p_mw sign and misclassify it as load.
+        # Force slacks to tier 0: a slack is never shed. Otherwise obs_priority
+        # may read the LP p_mw sign and misclassify it as load. (Formers are
+        # already excluded from the curtailable/load set under the guard, so
+        # their priority is not read there and needs no forcing here.)
         if explicit_priority is None:
             if lookup_slack(behavior, aid) is not None:
                 explicit_priority = 0
@@ -638,8 +672,6 @@ def _populate_children(
                             budget=budget_value,
                             tol=config.slack_budget_violation_tol,
                             enable_feedback=config.enable_slack_budget_feedback,
-                            cp_aware=config.enable_cp_aware_slack_supply,
-                            restore=config.enable_slack_restore,
                         )
                     )
 
@@ -917,7 +949,6 @@ def _make_balance_role(
         constraint_aware=config.enable_constraint_aware_gossip,
         enable_monotonic_floor=config.enable_monotonic_floor,
         enable_clpu_ramp=config.enable_clpu_ramp,
-        enable_island_blackstart=config.enable_island_blackstart,
         termination_tolerance=config.gossip_termination_tolerance,
         max_hops=config.gossip_max_hops,
         enable_qp_gossip=config.enable_qp_gossip,
@@ -925,8 +956,6 @@ def _make_balance_role(
         enable_change_only_dispatch=config.enable_change_only_dispatch,
         enable_l2_priority_floor=config.enable_l2_priority_floor,
         enable_actuated_ledger_writeback=config.enable_actuated_ledger_writeback,
-        enable_nominal_slack_supply=config.enable_nominal_slack_supply,
-        enable_cp_aware_slack_supply=config.enable_cp_aware_slack_supply,
         enable_heat_l2_dispatch=config.enable_heat_l2_dispatch,
         component_scope=(
             config.enable_holonic and config.holon_admm_scope == "component"
@@ -1120,7 +1149,7 @@ _LABEL_PROPAGATION_RADIUS: dict[Sector, int] = {
     Sector.HEAT: 2,
 }
 
-# Mirror of balance._PRIORITY_TIERS (local copy to avoid an import).
+# Weighting horizon for line-home demand ranking; must exceed the max priority tier.
 _LINE_HOME_PRIORITY_TIERS = 10
 
 
@@ -2061,23 +2090,6 @@ def _add_system_behaviors(
                 world,
                 _trigger_balance,
                 on_global_event=BranchFailureEvent,
-                role_types=EnergyBalanceNegotiator,
-            )
-
-    # Island black-start: on every failure, a load severed into its own island
-    # sheds to zero (cold-load pickup). Wired independently of the FailureNotice
-    # flag and the strategy branch above — an islanded load drops out of gossip,
-    # so it must be reached by the broadcast failure event, not the negotiation.
-    if config.enable_island_blackstart:
-
-        def _trigger_island_blackstart(role: EnergyBalanceNegotiator, event: Any) -> None:
-            role.island_blackstart_shed()
-
-        for _ev in (BranchFailureEvent, CustomFailureEvent):
-            behavior_in(
-                world,
-                _trigger_island_blackstart,
-                on_global_event=_ev,
                 role_types=EnergyBalanceNegotiator,
             )
 

@@ -159,10 +159,20 @@ GRIDS: dict[str, Callable[[], "object"]] = {
     # carries CHP + P2H + a PowerToGas injector (the gas producer whose failure
     # a linepack draw-down needs — density 0.2 gave none), while the field
     # lands 324-383 K (100% in-bounds) and voltage stays stressed near 1.1.
+    # (3) gas_gen_share detuned from the _GAS_KWARGS default (1.5, tuned on the
+    # PV-poor ``simbench_lv`` where gen≈0.6× load): rural1's PV fleet is ~10×
+    # its load, so at 1.5 the gen-scaled gas Sources (∝ p_gen_mw) land at ~4.9×
+    # the gas Sinks — a born, pre-failure gas EXPORT surplus (+0.0166 kg/s) that
+    # exceeds every operator slack budget and can never be met, since SCARE has
+    # no gas-Source curtailment actuator (the scarcity allocator only sheds
+    # loads). 0.15 puts the sector in the intended slight-deficit (import)
+    # regime like every other LV grid. Same oversized-fleet pathology the heat
+    # detune above and simbench_mvlv's gas_gen_share=0.0 already correct.
     "simbench_lv_small": create_large_lv_simbench(
         0.5,
         simbench_code="1-LV-rural1--1-no_sw",
         cp_size_multiplier=0.4,
+        gas_kwargs={"gas_gen_share": 0.15},
         heat_kwargs={"node_heat_gen_share": 0.0, "auto_diameter": True},
     ),
     "simbench_lv_medium": create_large_lv_simbench(
@@ -357,9 +367,6 @@ def add_backup_lines(
             try:
                 bid = _create_backup_branch(spec["creator"], mes, a, b, params, sector)
                 new_ids.append(bid)
-                # Record the edge so later iterations don't re-pick it.
-                adj[a].add(b)
-                adj[b].add(a)
             except Exception as exc:
                 # Skip pairs the constructor rejects (e.g. incompatible
                 # grid attributes).

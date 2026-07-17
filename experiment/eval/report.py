@@ -3,7 +3,7 @@
 Reads a campaign directory (must contain ``summary.csv`` from
 ``experiment.hpc.aggregate``), produces:
 
-- ``plots/<experiment>/*.png``  — one PNG per relevant plot
+- ``plots/<experiment>/*.{html,pdf}`` — interactive HTML + vector PDF per plot
 - ``REPORT.md``                  — Markdown stitching the figures and
                                    an at-a-glance numeric summary
 
@@ -916,7 +916,8 @@ def _missing_experiment_sections(
         "cascading",
         "cooldown_sweep",
         "ttl_sweep",
-        "holon_size_sweep",
+        "community_size_sweep",
+        "scaling",
         "extension_islanding",
         "extension_temporal",
     }
@@ -996,8 +997,8 @@ def _table_variant_means(campaign: CampaignData) -> str:
     lines = [
         "_Compliant-subset PWSF (slack + grid feasibility), unpaired, pooled "
         "across grids AND experiments (each variant is averaged over whatever "
-        "experiment mix it ran in); electricity+heat only. Paired comparison: "
-        "see `summary.md`._",
+        "experiment mix it ran in); electricity + heat + gas (gas HHV-converted). "
+        "Paired comparison: see `summary.md`._",
         "",
         "| variant | n_compliant/n_total | compliance | mean PWSF | 95% CI |",
         "|---|---|---|---|---|",
@@ -1233,12 +1234,17 @@ def _stitch(campaign: CampaignData, sections: list[tuple[str, list[str]]]) -> st
         for fig in figs:
             stem = Path(fig)
             png = stem.with_suffix(".png")
-            html = stem.with_suffix(".html")
-            png_rel = png.relative_to(campaign.campaign_dir)
-            parts.append(f"![{stem.stem}]({png_rel})")
-            if html.exists():
-                html_rel = html.relative_to(campaign.campaign_dir)
-                parts.append(f"_[interactive ↗]({html_rel})_")
+            if png.exists():
+                png_rel = png.relative_to(campaign.campaign_dir)
+                parts.append(f"![{stem.stem}]({png_rel})")
+            links = []
+            for suffix, label in ((".html", "interactive ↗"), (".pdf", "pdf ↗")):
+                sibling = stem.with_suffix(suffix)
+                if sibling.exists():
+                    rel = sibling.relative_to(campaign.campaign_dir)
+                    links.append(f"_[{label}]({rel})_")
+            if links:
+                parts.append(" ".join(links))
             parts.append("")
 
     parts.append(_todo_section(campaign))

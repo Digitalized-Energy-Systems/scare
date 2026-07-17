@@ -27,10 +27,6 @@ def set_sim_time(t: float) -> None:
         pass
 
 
-def get_sim_time() -> float:
-    return _SIM_T["t"]
-
-
 class SimTimeLogFilter(logging.Filter):
     """Stamp every log record with the current sim time as ``record.sim_t``.
 
