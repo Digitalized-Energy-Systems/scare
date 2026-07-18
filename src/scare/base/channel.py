@@ -261,7 +261,7 @@ class CPAllocation(Decision):
     multi-sector component.
 
     Result of the joint ADMM: per-sector flow targets applied via
-    ``_apply_result`` / ``apply_regulate`` (same as ``CPSetpoint.sector_flows_mw``),
+    ``CpActuator.apply`` / ``apply_regulate`` (same as ``CPSetpoint.sector_flows_mw``),
     addressed by ``cp_aid``. Coupling is already enforced in the ADMM, so the
     recipient just applies the dispatched flow.
     """

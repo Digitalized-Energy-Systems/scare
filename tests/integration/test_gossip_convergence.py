@@ -79,7 +79,7 @@ async def test_two_agent_gossip_converges():
     )
 
     async with world:
-        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
+        roles[0].context.schedule_instant_task(roles[0]._trigger.trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=5.0)
 
     regulate_calls = [
@@ -114,7 +114,7 @@ async def test_three_agent_gossip():
     )
 
     async with world:
-        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
+        roles[0].context.schedule_instant_task(roles[0]._trigger.trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=5.0)
 
     load_0_calls = [
@@ -158,7 +158,7 @@ async def test_priority_ordering():
     )
 
     async with world:
-        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
+        roles[0].context.schedule_instant_task(roles[0]._trigger.trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=5.0)
 
     high_calls = [

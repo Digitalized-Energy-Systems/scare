@@ -78,12 +78,12 @@ async def test_start_gossip_retires_superseded_originator():
         # First originator gossip; multi-member group so a real
         # ``started`` is recorded (not the singleton skip path).
         await leader._start_gossip(-0.05)
-        first_nid = leader._gossip.negotiation_id
-        assert leader._gossip.is_originator
+        first_nid = leader._sess.gossip.negotiation_id
+        assert leader._sess.gossip.is_originator
 
         # Second trigger arrives before the first terminated.
         await leader._start_gossip(-0.04)
-        assert leader._gossip.negotiation_id != first_nid
+        assert leader._sess.gossip.negotiation_id != first_nid
 
         # Sim-end flush retires the last still-in-flight gossip, just
         # like _flush_pending_negotiations in the real runner.

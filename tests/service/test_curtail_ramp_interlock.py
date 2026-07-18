@@ -115,14 +115,14 @@ def test_find_constraint_monitor_uses_get_role():
     role = EnergyBalanceNegotiator(MockBehavior(), Sector.ELECTRICITY)
     role._context = _FakeCtxWithGetRole(monitor)  # type: ignore[attr-defined]
     # Found via get_role, sector matches.
-    assert role._find_constraint_monitor() is monitor
+    assert role._listener.find_constraint_monitor() is monitor
 
 
 def test_find_constraint_monitor_sector_guard():
     monitor = _FakeMonitor(Sector.HEAT)  # wrong sector
     role = EnergyBalanceNegotiator(MockBehavior(), Sector.ELECTRICITY)
     role._context = _FakeCtxWithGetRole(monitor)  # type: ignore[attr-defined]
-    assert role._find_constraint_monitor() is None
+    assert role._listener.find_constraint_monitor() is None
 
 
 # --------------------------------------------------------------------------- #
@@ -156,7 +156,7 @@ def test_gossip_apply_setpoint_clamps_restore_to_curtail_lock():
     b = _gen_behavior(interlock=True)
     apply_regulate(b, "pv", 0.5, sector="electricity", reason="curtail", timestamp=0.0)
     role = _gossip_role(b, now=0.5)
-    applied = role._apply_setpoint(-10.0)  # gossip asks for full output
+    applied = role._actuator.apply_setpoint(-10.0)  # gossip asks for full output
     assert applied == pytest.approx(-5.0)  # held at 0.5 * cap, not deferred
     assert 1.0 not in _regulate_values(b)
     assert _regulate_values(b)[-1] == pytest.approx(0.5)
@@ -166,7 +166,7 @@ def test_gossip_apply_setpoint_shed_passes_under_gen_lock():
     b = _gen_behavior(interlock=True)
     apply_regulate(b, "pv", 0.5, sector="electricity", reason="curtail", timestamp=0.0)
     role = _gossip_role(b, now=0.5)
-    applied = role._apply_setpoint(-2.0)  # deeper shed is allowed
+    applied = role._actuator.apply_setpoint(-2.0)  # deeper shed is allowed
     assert applied == pytest.approx(-2.0)
     assert _regulate_values(b)[-1] == pytest.approx(0.2)
 
@@ -175,6 +175,6 @@ def test_gossip_apply_setpoint_restores_after_lock_expiry():
     b = _gen_behavior(interlock=True)
     apply_regulate(b, "pv", 0.5, sector="electricity", reason="curtail", timestamp=0.0)
     role = _gossip_role(b, now=10.0)  # past the 3 s lock TTL
-    applied = role._apply_setpoint(-10.0)
+    applied = role._actuator.apply_setpoint(-10.0)
     assert applied == pytest.approx(-10.0)
     assert _regulate_values(b)[-1] == pytest.approx(1.0)

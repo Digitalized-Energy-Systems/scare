@@ -2,7 +2,7 @@
 dropped while an L1 gossip is in flight.
 
 ``EnergyBalanceNegotiator._handle_start_balance`` returns early when
-``self._active`` is True. The supply-priority dispatch path doesn't
+``self._sess.active`` is True. The supply-priority dispatch path doesn't
 gossip (it just calls ``apply_regulate`` on the leader's group), so that
 guard lost authoritative L2 priority decisions whenever they collided
 with an in-flight L1 curtailment gossip.
@@ -76,7 +76,7 @@ def _build_leader_with_two_loads(
 async def test_l2_supply_priority_lands_while_gossip_active():
     """L2's supply-priority dispatch must reach the leader's regulate
     even when an L1 gossip is in flight (else the StartBalanceNegotiation
-    is dropped because ``self._active`` is True).
+    is dropped because ``self._sess.active`` is True).
     """
     behavior = MockBehavior()
     world, agents, roles = _build_leader_with_two_loads(behavior)
@@ -84,7 +84,7 @@ async def test_l2_supply_priority_lands_while_gossip_active():
 
     async with world:
         # Simulate an in-flight L1 gossip on the leader.
-        leader._active = True
+        leader._sess.active = True
 
         # Deliver an L2 supply-priority allocation; the dispatch must
         # shed both tier-2 loads to factor=0.0 despite _active.

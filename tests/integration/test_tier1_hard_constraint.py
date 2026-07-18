@@ -95,7 +95,7 @@ async def test_tier1_feasible_locked_at_one_qp_runs_for_lower_tiers():
         ],
     )
     async with world:
-        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
+        roles[0].context.schedule_instant_task(roles[0]._trigger.trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=30.0)
 
     f_t1 = _last_factor(behavior, "load-1")
@@ -148,7 +148,7 @@ async def test_tier1_infeasible_pro_rata_lower_tiers_zero_no_qp():
         ],
     )
     async with world:
-        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
+        roles[0].context.schedule_instant_task(roles[0]._trigger.trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=30.0)
 
     f_t1a = _last_factor(behavior, "load-1a")
@@ -197,7 +197,7 @@ async def test_tier1_no_deficit_all_loads_served():
         ],
     )
     async with world:
-        roles[0].context.schedule_instant_task(roles[0].trigger_balance_negotiation())
+        roles[0].context.schedule_instant_task(roles[0]._trigger.trigger_balance_negotiation())
         await discrete_step_until(world, max_advance_time_s=30.0)
 
     f_t1 = _last_factor(behavior, "load-1")
