@@ -112,6 +112,13 @@ class GridReconfigurator(Role):
                 self._finalise_ranked_search(search_id),
                 timestamp=deadline,
             )
+        else:
+            # Legacy has no ranking window: a no-path (dead-end) search never
+            # returns a result to clear _pending_searches, so GC it after window_s.
+            self.context.schedule_timestamp_task(
+                self._expire_search_state(search_id),
+                timestamp=self.context.current_timestamp + self.window_s,
+            )
 
         msg = GridPathMessage(
             source_addr=self.context.addr,
@@ -167,6 +174,12 @@ class GridReconfigurator(Role):
                 if message.search_id in self._forwarded_searches:
                     return
                 self._forwarded_searches.add(message.search_id)
+                # GC this forwarder's dedup entry after the window; the initiator
+                # is a different agent and can't clear our set.
+                self.context.schedule_timestamp_task(
+                    self._expire_search_state(message.search_id),
+                    timestamp=self.context.current_timestamp + self.window_s,
+                )
 
         for addr in grid_neighbours:
             if addr in already_asked:
@@ -196,8 +209,10 @@ class GridReconfigurator(Role):
                 max_loading_percent=new_max_loading,
             )
             await self.context.send_message(fwd, receiver_addr=addr)
-        # Dead-end branches stay silent — the initiator's timeout covers the
-        # no-path case; empty results would abort searches others could finish.
+        # Dead-end branches stay silent — the initiator never blocks waiting
+        # (fire-and-forget), so a no-path search simply never acts; sending
+        # empty results would instead abort searches other branches could still
+        # complete. (Only ranking mode adds a window-close timeout.)
 
     def _branch_loading_percent(self, neighbour_addr: Any) -> float:
         """Branch loading to a neighbour, percent convention of SECTOR_CONSTRAINTS."""
@@ -237,6 +252,14 @@ class GridReconfigurator(Role):
         self._pending_searches.pop(target_search, None)
 
         await self._act_on_path_result(message)
+
+    async def _expire_search_state(self, search_id: str) -> None:
+        """Legacy-mode GC of per-search bookkeeping after ``window_s`` so a
+        dead-end (no-path) search doesn't leak _pending_searches /
+        _forwarded_searches. Ranking mode uses _finalise_ranked_search."""
+        self._pending_searches.pop(search_id, None)
+        self._forwarded_searches.discard(search_id)
+        self._forwarded_loading.pop(search_id, None)
 
     async def _finalise_ranked_search(self, search_id: str) -> None:
         """Close the ranking window and act on the best candidate.
@@ -346,10 +369,10 @@ class GridReconfigurator(Role):
         return self.behavior.has_action(branch_aid, "switch")
 
     async def _close_tie_switches(self, uncertain: list[tuple[Any, Any]]) -> None:
-        # Shared in-flight ledger across all reconfigurator roles: switch acts
-        # don't trigger a re-solve, so the observed ``on_off`` can hold the
-        # pre-close snapshot indefinitely and the act-time re-check alone
-        # would double-toggle (re-open) a tie closed by a concurrent search.
+        # Shared cross-role in-flight ledger: switch acts don't re-solve, so
+        # observed ``on_off`` can hold the pre-close snapshot indefinitely; the
+        # act-time re-check alone would double-toggle (re-open) a tie a
+        # concurrent search just closed.
         inflight: set[str] = _get_behavior_store(
             self.behavior, "_scare_ties_closed_inflight", set
         )

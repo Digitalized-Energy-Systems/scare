@@ -22,17 +22,11 @@ class RestorationConfiguration:
     # False: L3 sees the slack pool, judges heat supplied, leaves CPs idle.
     enable_heat_cp_supply: bool = True
 
-    # Outlet-temperature guard on heat-producing CPs (P2H/G2H/CHP). A CP injects
-    # q_mw_heat into its outlet junction as pure energy; on a low-flow junction
-    # the resulting ΔT = Q/(ṁ·c_p) drives t_k far past the envelope ceiling, and
-    # NOTHING pushes back: the L3 kernel sees only demand−delivered (delivered is
-    # measured at load setpoints, which injection can never raise), the heat
-    # frontier owns only the LOW side, the auction skips t_k, and CP branches are
-    # BORN at regulation=1.0 so even a zero-commit run injects at rated power
-    # (eval_full_v2_20260711: hot CP outlets = the dominant compliance failure).
-    # True: each heat-producing CP runs a reactive AIMD controller on its outlet
-    # junction's t_k that maintains a regulation CEILING, enforced against every
-    # L3 commit inside ``apply_regulate`` (sector="cp"). False: no guard.
+    # Outlet-temp guard on heat-producing CPs (P2H/G2H/CHP). True: an AIMD
+    # controller holds a regulation CEILING on each CP outlet junction's t_k,
+    # enforced against every L3 commit in ``apply_regulate`` (sector="cp"); without
+    # it nothing pushes back on injection-driven over-temp. False: no guard.
+    # (eval_full_v2_20260711: hot CP outlets = the dominant compliance failure.)
     enable_cp_heat_outlet_guard: bool = True
     # Refresh cadence (s) for a heat leader's HolonSummary so the delivered-heat
     # vector reaches L3 (heat's normal L1/L2 triggers are off).
@@ -47,46 +41,31 @@ class RestorationConfiguration:
     # its own factor. False: legacy coordinator path; both False = no L3 role.
     enable_cp_priority_admm: bool = True
 
-    # L3 kernel: ``"gossip"`` (default) = coordinator-free peer-to-peer sharing
-    # ADMM, crash-fault tolerant; ``"lexicographic"`` = replicated full-problem
-    # solve keeping own row. NOTE: the gossip cascade was previously inert (its
-    # commit callback never fired in sim time, so the CP converter-curtailment
-    # actuator was dead and the electricity slack over-drew on cp-heavy grids).
-    # Fixed by (a) the initiator in-flight-round guard (GossipParticipant.
-    # is_round_active) so rounds aren't perpetually cancelled before committing,
-    # and (b) sim-cadence round/iter timeouts (2.0s/0.2s) so each round commits
-    # within the sim. Validated on cp_heavy_dependent @0.15: gossip == lexico
-    # (electricity slack 2.1xB -> ~0.4xB, compliant). See
-    # project_slack_compliance_rootcause.
+    # L3 kernel: ``"gossip"`` (default, coordinator-free CFT sharing ADMM) or
+    # ``"lexicographic"`` (replicated full solve). Gossip was previously inert
+    # (commit callback never fired -> CP curtailment dead, elec slack over-drew on
+    # cp-heavy); fixed by the in-flight-round guard (is_round_active) + sim-cadence
+    # 2.0s/0.2s timeouts. Validated cp_heavy_dependent @0.15: gossip == lexico,
+    # slack 2.1xB -> ~0.4xB. See project_slack_compliance_rootcause.
     cp_admm_algorithm: str = "gossip"
 
     # Proximal step-damping α ≥ 0 for the lexicographic cascade's projection.
     # Biases the step, not the fixed point. α=0 is correct but can oscillate.
     cp_admm_r_regularization: float = 0.1
 
-    # Gossip only: build the round's demand set over the UNION of every sector
-    # present in the community (all bridged sectors), not just the elected
-    # initiator's. The gossip initiator is the lowest cp_id, which on cp_heavy
-    # grids is always a P2G ("branch-*" < "node-*", P2G ids sort before P2H), so
-    # it bridges electricity+gas only and heat NEVER enters the broadcast demand
-    # set — every heat CP (CHP/P2H) then commits regulation 0 while real tier-1
-    # heat demand goes unserved. The replicated lexicographic path has no such
-    # gap (each CP self-includes its own bridged sectors), so this realigns
-    # gossip with it. False restores the initiator-only demand set.
+    # Gossip only: build the round demand set over the UNION of all bridged
+    # sectors, not just the initiator's. Initiator = lowest cp_id = a P2G on
+    # cp_heavy ("branch-*" < "node-*"), which bridges elec+gas only, so heat never
+    # enters the demand set and every heat CP commits reg 0 while tier-1 heat
+    # starves; the lexicographic path self-includes. False: initiator-only set.
     enable_cp_demand_union: bool = True
 
-    # L3 CP input cap uses the NOMINAL operator budget instead of the
-    # SlackBudgetMonitor's wound-down effective budget. The eff-budget integral
-    # feedback (floor 0) exists to make L1/L2 shed native load toward B; feeding
-    # the same signal to the CP kernel gives every η<1 converter zero input
-    # headroom, so its converged optimum is r=0 — no CP ever dispatches (v2
-    # campaign: SCARE CP gas output ≈ 0 vs oracle at nameplate). The kernel's
-    # cascade LP arbitrates native serving vs CP input within Σserved + B
-    # (input_capped_mode), so the pool can transiently over-credit the
-    # slack-fed share of served load by up to B; the SlackBudgetMonitor still
-    # enforces the physical draw at B, bounding the effect to over-commit /
-    # churn rather than sustained over-draw (local A/B: no violation increase).
-    # False restores the starved signal.
+    # L3 CP input cap uses the NOMINAL operator budget, not the wound-down
+    # eff-budget. The floor-0 eff-budget feedback (for L1/L2 native shed) gives
+    # every η<1 converter zero input headroom -> converged r=0, no CP dispatches
+    # (v2: SCARE CP gas output ≈ 0 vs oracle nameplate). Cascade LP +
+    # SlackBudgetMonitor bound the effect to over-commit/churn, not sustained
+    # over-draw (local A/B: no violation increase). False: starved signal.
     enable_cp_nominal_budget: bool = True
 
     # Gossip only: warm-start each cascade round from the previous round's
@@ -142,44 +121,23 @@ class RestorationConfiguration:
     # bridging CP(s). False: per-sector behaviour only.
     enable_cross_sector_coalitions: bool = False
 
-    # Coalition-pool supply accounting fix. The coalition acceptance pool
-    # (`_local_acceptance`) credited generators at RATED |cap| and slacks without
-    # the CP-reserve debit, so it allocated service fractions the slack must fund
-    # PAST its budget; those fractions are then merged over the L2 ADMM as a
-    # priority floor that clamps the SlackBudgetMonitor's override sheds UP for
-    # the coalition TTL — structurally disarming budget enforcement (eval_full_v2:
-    # elec child-118 draws 1.68× budget, coalition/cross-sector arms only). True:
-    # credit non-slack generators at delivered |sp| (mirrors the L2 pool,
-    # balance.py) and debit the slack's CP reserve, so coalition fractions stay
-    # inside B. Also gates cross-sector coalitions on the CP transfer being
-    # actuatable (a CPCommitment consumer exists — only under the legacy
-    # EnergyConverterRole L3), so own-sector fractions are never raised on a
-    # phantom transfer that the default L3 never delivers. See
-    # project_cp_fix_design. False: legacy rated-capacity crediting.
+    # Coalition-pool supply fix. True: credit non-slack gens at delivered |sp| +
+    # debit slack CP reserve (fractions stay inside B), gate cross-sector on an
+    # actuatable CPCommitment consumer. Legacy rated-|cap|/no-debit let coalition
+    # floors clamp SlackBudgetMonitor sheds UP, disarming enforcement (eval_full_v2:
+    # child-118 drew 1.68× budget, coalition arms only). project_cp_fix_design.
     enable_coalition_delivered_supply: bool = True
 
     # Curtailment auction on hard violations. False: violations only emit a
     # BalanceProblem; no proportional curtailment broadcast.
     enable_curtailment_auction: bool = True
 
-    # Generation-prioritised relief for excess-injection violations. True: an
-    # over-voltage (vm_pu > hi) auction bids GENERATORS only (by reducible
-    # output) and excludes loads, and an export line overload suppresses the
-    # load-shed waterfall the moment it is export-classified with curtailable
-    # downstream generation (instead of after the debounce). Cutting injection is
-    # the only lever that lowers voltage / reverse-flow line loading; shedding
-    # load on a PV-surplus feeder does not help.
-    #
-    # DEFAULT FALSE — the naive form is A/B-REFUTED on LV-S (paired Δpwsf
-    # -0.047 clean, -0.056 pv_peak; served DOWN, agent_shed UP, voltage no
-    # better). Root cause: relieving an export line by curtailing PV also removes
-    # the PV that serves LOCAL load, and the gen curtail-lock then holds it at 0
-    # (the balance layer's ramp-back requests are clamped), so the downstream
-    # region starves and balance sheds MORE than the waterfall did. A correct
-    # form must (a) bound the curtailment so PV keeps serving local load (cut
-    # only the export excess) and (b) add a line/voltage-clear gen handoff (cf.
-    # the line-relief lock's always-on bounded hand-off) so PV recovers to local service once the
-    # constraint clears. Kept as an opt-in flag + tested machinery for that work.
+    # Gen-prioritised relief for excess-injection: over-voltage/export-overload
+    # bid GENERATORS only, suppress the load-shed waterfall. DEFAULT FALSE — naive
+    # form A/B-REFUTED on LV-S (Δpwsf -0.047 clean, -0.056 pv_peak; served down,
+    # shed up, voltage no better): curtailing export PV starves local load +
+    # curtail-lock pins it at 0. Correct form bounds to export-excess + clear-time
+    # gen handoff; opt-in.
     enable_generation_priority_curtailment: bool = False
 
     # Gate the curtailment auction where it can't help (no-op if auction off).
@@ -195,23 +153,12 @@ class RestorationConfiguration:
     # loads nearest the violation. Pairs with ``enable_curtail_auction_gating``.
     enable_curtail_auction_targeting: bool = False
 
-    # Soft congestion-price line relief (v1: export/reverse-flow radial case).
-    # True: an overloaded branch with curtailable downstream generation drives a
-    # per-branch congestion price (AIMD integrator on the overshoot) instead of
-    # the hard curtail-to-0 + gen curtail-lock of ``_relieve_export_overload``.
-    # The price becomes a REVERSIBLE generation ceiling enforced softly in the
-    # gossip ``_apply_setpoint`` (min(requested, 1 - Σprice)) under
-    # ``reason='line_congestion'``, which does NOT arm the gen curtail-lock — so
-    # gossip can ramp PV back up to serve LOCAL load up to the export-clearing
-    # level, and the ceiling lifts as the line clears (price decays). Targets the
-    # A/B-refuted pathology where the lock pinned PV at 0 and starved downstream
-    # load. Load-shed on export lines stays suppressed. Electricity-only; leaves
-    # the forward-flow load waterfall, over-voltage interlock, and L2/L3 intact.
-    #
-    # DEFAULT TRUE. A/B-VALIDATED on LV-S (16 paired seeds): pv_peak Δpwsf +0.065
-    # (15/15 wins, served up, agent_shed down, voltage no worse), clean neutral
-    # (−0.0005) — the correct inversion of the refuted gen-priority fix. Broader
-    # no-regression validation (CP grids, line_stress, heat) still advisable.
+    # Soft congestion-price line relief (export/reverse-flow radial). True: an
+    # overloaded branch drives a per-branch AIMD price used as a REVERSIBLE gen
+    # ceiling in gossip ``_apply_setpoint`` (min(req, 1 - Σprice),
+    # reason='line_congestion') that does NOT arm the curtail-lock, so PV ramps
+    # back to serve local load. Elec-only. DEFAULT TRUE — A/B-validated LV-S
+    # (16 seeds): pv_peak Δpwsf +0.065 (15/15 wins), clean neutral (−0.0005).
     enable_line_congestion_price: bool = True
 
     # Iterative line-overload relief. False (legacy): relief sent ONCE per
@@ -278,21 +225,13 @@ class RestorationConfiguration:
     # time a restore resets the PV). TTL-lifted; electricity-only.
     enable_curtail_ramp_interlock: bool = True
 
-    # Volt-VAR-Watt support (DEFAULT ON — best voltage-control variant). False:
-    # Q(U) droop caps reactive at the VDE-AR-N 4105 displacement envelope
-    # (q_max = p·tanφ, which shrinks as active power is curtailed — too weak to
-    # clear over-voltage once curtailment bites). True: each inverter uses its full
-    # apparent-power circle (IEEE 1547-2018), so reactive GROWS as p is curtailed.
-    # Validated on the PRE-2026-07-11 stock simbench_lv_small (density 0.2 —
-    # the name now denotes the tuned 0.5-density grid) under pv_peak (n=40
-    # deterministic, once the observation-lag bug was fixed via
-    # ``energy_flow_max_acts``): VVW clears
-    # over-voltage on 98% of seeds (vs 68% for the cos-φ-capped droop) at ~10-12pp
-    # LESS PV curtailment. The earlier "VVW makes curtailment worse" reading was an
-    # artifact of stale power-flow observations, not VVW. The auction-coordination
-    # variant (``enable_qv_auction_coordination``) matched plain VVW within noise,
-    # so it is NOT enabled by default — plain VVW is the recommended variant.
-    # See project_pv_overvoltage_levers.
+    # Volt-VAR-Watt (DEFAULT ON, best voltage variant): inverters use the full
+    # apparent-power circle (IEEE 1547-2018) so reactive GROWS as active is
+    # curtailed; False = cos-φ/VDE-AR-N 4105 envelope droop (q_max=p·tanφ, too weak
+    # once curtailment bites). Validated pre-2026-07-11 simbench_lv_small pv_peak
+    # (n=40, after the ``energy_flow_max_acts`` obs-lag fix): clears over-voltage
+    # 98% vs 68% at ~10-12pp less curtailment — the earlier "VVW makes curtailment
+    # worse" reading was a stale-observation artifact. See project_pv_overvoltage_levers.
     enable_vvw_coordination: bool = True
 
     # Coordinated Q(U)-droop / auction hand-off (experimental, OFF). Fixes the
@@ -354,48 +293,22 @@ class RestorationConfiguration:
     enable_clpu_ramp: bool = True
 
     # Protect promoted island grid-formers from MAS curtailment. A GridForming*
-    # unit is its island's voltage/slack REFERENCE: at regulation=1 its p_mw is
-    # a free LP Var that absorbs the island residual automatically (exactly like
-    # an ExtGrid slack). The gossip/holon supply balancing otherwise treats it
-    # like an ordinary generator and curtails it toward 0 to match reduced
-    # post-failure demand — but a reference at regulation<1 can no longer anchor
-    # its island (the islanding solve forces its node energised with a source it
-    # can't supply), so every step goes infeasible (verified: restoring the
-    # curtailed formers to full makes the exact infeasible state feasible;
-    # shedding load does not).
-    #
-    # When set, a former is excluded from the MW gossip's curtailable set like
-    # the slack: its gossip δ-box is pinned to zero (the QP computes δ=0, marked
-    # saturated → dropped from the dual, so the MAS optimises AROUND the fixed
-    # reference) and its ``_apply_setpoint`` never actuates it. The actuator-side
-    # guard in ``apply_regulate`` stays as a BACKSTOP for any non-gossip write
-    # path (CP/coalition/auction) that would pull a former below full. Excluding
-    # it at the coordination level (rather than only overriding the actuator)
-    # stops the gossip/holon from fighting the guard every round — recovering
-    # served dispatch, not just feasibility. Only microgrid/islanding scenarios
-    # promote grid-formers, so this is inert elsewhere.
+    # unit is its island's free-Var slack reference at reg=1; curtailing it toward
+    # reduced post-failure demand leaves a reg<1 reference that can't anchor the
+    # island → every step infeasible (verified: restoring formers to full re-
+    # feasibilises the exact state, load-shed does not). Guard pins the former δ=0
+    # in the MW gossip (dropped from dual) + backstops ``apply_regulate`` for
+    # non-gossip writes; never actuated. Inert outside islanding.
     enable_grid_former_curtail_guard: bool = False
 
-    # NOTE (islanding gas slack): under the grid-former guard the gas slack
-    # settles UNDER budget (~61% of B) with gas loads still shed, which looks
-    # like reclaimable head-room — the eff-budget integral winds down hard on the
-    # naive first allocation's transient over-draw and the resulting shed then
-    # latches. Two "fixes" were prototyped and BOTH REFUTED on the repro
-    # (recoverable_islanding, simbench_lv, seed 100000023; baseline = PWSF 0.42,
-    # gas slack 61%, PASS):
-    #   * anti-windup FLOOR on ``_eff_budget`` (0.5·B): reclaims the gas (gas
-    #     tier-1 0.31 -> 1.00, PWSF 0.60) but the gas slack goes to 201% of B.
-    #   * DAMPED restore (0.3) with no floor: PWSF 0.39 (WORSE than baseline),
-    #     gas slack 126% of B, and it inverts priority (tier-4 0.22 > tier-1 0.09
-    #     — the restore re-serves whatever the gossip reaches first).
-    # Root cause of the refutation: the grid-formers are free-Var and the MAS has
-    # no lever to dispatch them, so serving gas draws the SLACK with a >1 gain
-    # (formers idle + network balancing). The eff-budget wind-down is therefore
-    # not starvation but correct budget enforcement — the "unused" head-room is
-    # not actually spendable on gas without breaching B. Closing the gas gap to
-    # the oracle (which serves gas 0.84 compliantly by dispatching its formers in
-    # a global hard-slack-constrained LP) needs former/P2G dispatch, not a slack
-    # lever. Do not re-attempt via the slack without a former-dispatch mechanism.
+    # NOTE (islanding gas slack): under the former guard the gas slack settles ~61%
+    # of B with gas still shed — NOT reclaimable. Both prototyped fixes REFUTED
+    # (recoverable_islanding, simbench_lv, seed 100000023; baseline PWSF 0.42/PASS):
+    # anti-windup floor 0.5·B -> gas tier-1 0.31->1.00, PWSF 0.60 but slack 201% B;
+    # damped restore 0.3 -> PWSF 0.39 (worse) + priority inversion (tier-4 0.22 >
+    # tier-1 0.09), slack 126%. Formers are free-Var with no MAS dispatch lever so
+    # serving gas draws the slack >1x — wind-down is correct enforcement; closing
+    # the oracle gap needs former/P2G dispatch, not a slack lever.
 
     # Heat-only curtailment-auction lock. When a heat load is curtailed for a
     # live temperature violation, the L2 dispatch must DEFER rather than claw it
@@ -481,20 +394,13 @@ class RestorationConfiguration:
     # following, no regulation knob). True: ramp; False: legacy shed-only.
     enable_l2_generator_ramp: bool = True
 
-    # Coordination overhaul: reactive notify-on-change cascade. When True:
-    # (a) UPWARD — an L1 gossip notifies L2/L3 only when its converged setpoint
-    #     actually moved (balance.py _finish_negotiation), so a re-converged-to-
-    #     same gossip does not re-trigger the holon ADMM;
-    # (b) DOWNWARD — an unchanged L2 allocation re-asserts the per-load priority
-    #     floor (set_l2_priority_floor) WITHOUT abandoning the in-flight gossip,
-    #     instead of preempting it (the dominant "yielding to L2" abandonment);
-    # (c) the rebalance_min_gap_s time-throttle is bypassed — the change-
-    #     detection makes the holon→member→finished→holon cascade self-terminate
-    #     at a fixed point, so the time fuse is no longer needed.
-    # Local A/B (v3, 2026-06-29): abandon-rate −15.3pp, priority + diary
-    # invariants 12/12, no feedback-storm, served/violations flat (one wart: a
-    # few un-abandoned gossips run to their convergence timeout). False: legacy
-    # throttled re-broadcast with mid-flight L2 preemption.
+    # Coordination overhaul: reactive notify-on-change cascade. True: (a) UPWARD an
+    # L1 gossip notifies L2/L3 only when its converged setpoint moved; (b) DOWNWARD
+    # an unchanged L2 alloc re-asserts the per-load priority floor without abandoning
+    # the in-flight gossip (was the dominant abandonment); (c) rebalance_min_gap_s
+    # throttle bypassed since change-detection self-terminates the cascade. Local
+    # A/B (v3, 2026-06-29): abandon-rate −15.3pp, 12/12 invariants, served/
+    # violations flat. False: legacy throttled re-broadcast + mid-flight preemption.
     enable_change_only_dispatch: bool = True
 
     # Branch-side line-loading monitor. True: every PowerLine branch watches

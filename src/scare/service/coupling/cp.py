@@ -146,7 +146,8 @@ class EnergyConverterRole(Role):
         # construction. Unwired => legacy per-CP path (see CPComponentView.enabled).
         self._component = CPComponentView()
 
-        # Latest applied L3 setpoint (warm-start + no-op dispatch suppression).
+        # Dead state: written by _handle_cp_allocation but never read. Wire it
+        # into _apply_result to suppress no-op re-dispatch, or delete both.
         self._last_l3_setpoint_by_sector: dict[str, float] = {}
         self._l3_round_counter: int = 0
         # True while the L3 collect->solve->dispatch cycle is in flight so reactive
@@ -413,7 +414,10 @@ class EnergyConverterRole(Role):
             message.new_setpoint,
             char,
         )
-        if char != "leader":
+        # Cps-leader gate (legacy mode only); in L3 the coordinator is the
+        # lex-smallest component aid, often not the cluster leader, and must
+        # still wake on gossip convergence (trigger_multi_sector_l3 re-gates).
+        if char != "leader" and not self._multi_sector_l3_enabled():
             return
         if self._active:
             return
@@ -527,10 +531,9 @@ class EnergyConverterRole(Role):
     async def _handle_flex_answer(
         self, message: AvailableFlexAnswer, meta: dict
     ) -> None:
-        # Route to the right ADMM driver based on which flow opened the
-        # collection.  ``_l3_active`` is set by ``trigger_multi_sector_l3``;
-        # ``_active`` is set by the legacy ``trigger_cp_negotiation``.
-        # Mutually exclusive by design — both guards reject re-entry.
+        # Route to the L3 (_l3_active, set by trigger_multi_sector_l3) vs legacy
+        # (_active, set by trigger_cp_negotiation) driver; the two are mutually
+        # exclusive by design and both guards below reject re-entry.
         if not self._l3_active and not self._active:
             return
         # Complete set already dispatched: a late same-round answer arriving
@@ -883,7 +886,11 @@ class EnergyConverterRole(Role):
         """Apply an L3-coord setpoint via _apply_result so it shares the legacy
         per-CP path. Idempotent: apply_regulate dedups same-value writes.
         """
-        if topology_characteristic(self, tid="cps") != "leader":
+        # CPAllocation is per-CP addressed (subscribe filter on cp_aid); in L3
+        # every CP applies its own setpoint, so gate on the cluster leader only
+        # in legacy mode (mirrors _handle_holon_allocation).
+        char = topology_characteristic(self, tid="cps")
+        if char != "leader" and not self._multi_sector_l3_enabled():
             return
         flows_mw = dict(message.sector_flows_mw)
         # Translate to the flat [el, heat, gas] vector; missing sectors stay 0.

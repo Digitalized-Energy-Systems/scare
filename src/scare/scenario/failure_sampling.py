@@ -36,22 +36,13 @@ def create_failures(
     generator_share: float = 0.5,
     generator_carriers: "tuple[str, ...] | list[str] | set[str] | None" = None,
 ) -> list[Failure]:
-    """Sample ``num_failures`` failure events on the network.
-
-    ``failure_type``: ``"branch"`` (non-CP branches), ``"generator"``
-    (generator-class childs/compounds/branch-CPs), ``"mixed"``
-    (``generator_share`` controls the gen fraction), ``"concentrated"``
-    (cluster cuts around a load-rich node), ``"island"`` (cuts the branch
-    above a generation-bearing subtree so it becomes a self-anchoring island
-    — the failure mode that actually exercises the microgrid/islanding
-    extension; concentrated/branch cuts strand load-only pockets no
-    grid-former can rescue).
-
-    ``generator_carriers`` (generator/mixed only) restricts the candidate
-    pool to producers of those carriers (``"electricity"``, ``"heat"``,
-    ``"gas"``, ``"water"``). Targeting ``("heat", "gas")`` bites the carriers
-    that carry temporal storage (LTC thermal mass, gas linepack) so the
-    deficit is one the storage extensions can actually buffer.
+    """Sample ``num_failures`` events. ``failure_type``: branch | generator | mixed
+    (``generator_share`` = gen fraction) | concentrated (cluster near a load-rich node) |
+    island (cut above a generation-bearing subtree so it self-anchors — the only mode
+    exercising the microgrid/islanding extension; concentrated/branch strand load-only
+    pockets no grid-former rescues). ``generator_carriers`` (generator/mixed) restricts
+    the pool; heat/gas carry temporal storage (thermal mass / linepack) storage
+    extensions buffer.
     """
     carriers = frozenset(generator_carriers) if generator_carriers else None
     if failure_type == "branch":
@@ -78,32 +69,20 @@ def create_failures(
 def _sample_island_failures(
     monee_net: Any, num_failures: int, delay_s_max: float
 ) -> list[Failure]:
-    """Cut power branches that each isolate a downstream subtree *containing a
-    generator* from the electricity slack, forming genuine self-anchoring
-    islands.
-
-    Rationale: with the microgrid extension every generator is promoted to a
-    ``GridForming`` reference, so a severed subtree that holds one stays
-    energised (the island self-anchors) whereas the clean arm de-energises it —
-    that is the paired contrast the islanding experiment is meant to show. The
-    ``concentrated`` sampler deliberately strands *load-rich* pockets, which
-    carry no generation and so cannot exercise islanding at all (every island
-    collapses identically in both arms).
-
-    Each cut is the branch nearest the slack on the path to a chosen generator,
-    so it maximises the islanded subtree; cuts are chosen to isolate *disjoint*
-    generator subtrees. Falls back to ``[]`` (caller may downgrade) when the
-    grid has no slack or no generator downstream of any single branch.
+    """Cut each power branch isolating a downstream generator-bearing subtree from the
+    slack into a self-anchoring island (microgrid ext promotes generators to
+    ``GridForming`` refs, so the subtree stays energised vs de-energised in the clean arm
+    — the paired contrast; concentrated strands load-only pockets that cannot island).
+    Cut = branch nearest the slack on the path to a generator (maximises the island);
+    islands kept disjoint. Falls back to ``[]`` with no slack/generator.
     """
     roots = {
         c.node_id
         for c in monee_net.childs
         if c.active and isinstance(c.model, ExtPowerGrid)
     }
-    # Grid-forming generators count as anchors: under microgrid islanding
-    # apply_microgrid_islanding promotes every PowerGenerator to a
-    # GridFormingGenerator (not a PowerGenerator subclass) BEFORE sampling,
-    # so matching only PowerGenerator would strand no generator-bearing island.
+    # Match GridFormingGenerator too: apply_microgrid_islanding promotes
+    # PowerGenerator to GridFormingGenerator (not a subclass) before sampling.
     gen_nodes = {
         c.node_id
         for c in monee_net.childs
@@ -339,14 +318,10 @@ def _iter_generator_candidates(monee_net: Any):
 
     for child in monee_net.childs:
         if isinstance(child.model, child_classes):
-            # Distributed gas feed-in (gas_gen_share) places a ~sizing-floor
-            # Source at every gen bus. They are passive injections, not
-            # dispatchable plants: as candidates they would dilute the
-            # elec/heat pools and swamp the gas carrier group (breaking e.g.
-            # extension_temporal's targeting of the lone PowerToGas). Gas
-            # supply failures stay reachable via P2G CPs and gas pipes.
-            # Exact-type: microgrid promotion swaps the model class to
-            # GridFormingSource, so promoted grid-formers stay sampleable.
+            # Skip passive gas-feed Sources (gas_gen_share sizing-floor injections): they
+            # dilute the elec/heat pools and swamp the gas group (breaking
+            # extension_temporal's lone-PowerToGas targeting); gas failures stay reachable
+            # via P2G CPs. Exact-type check keeps promoted GridFormingSource sampleable.
             if type(child.model) is Source and _is_gas_grid(child):
                 continue
             yield ("child", child)
@@ -359,11 +334,9 @@ def _iter_generator_candidates(monee_net: Any):
 
 
 def _generator_carrier(kind: str, component: Any, monee_net: Any) -> str:
-    """Carrier this generator-class component *supplies*: the one whose deficit
-    its failure creates. Gas-consuming converters (GasToPower) count as
-    electricity producers; gas/heat producers (Source, PowerToGas, CHP, P2H)
-    map to the carrier whose storage (linepack / thermal mass) must then cover
-    the gap.
+    """Carrier this component supplies (the one whose deficit its failure
+    creates): GasToPower counts as electricity; gas/heat producers map to the
+    carrier whose storage (linepack / thermal mass) must cover the gap.
     """
     m = getattr(component, "model", component)
     if isinstance(m, (PowerGenerator, GridFormingGenerator)):

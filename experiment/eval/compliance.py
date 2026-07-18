@@ -46,11 +46,9 @@ def compliance_rate(df: pd.DataFrame) -> float | None:
     return float(compliant_mask(df).sum() / len(df))
 
 
-# Two-sided 95% Student-t critical values t_{0.975, df} for df = 1..30 (no scipy
-# dependency). Above df=30 the value descends slowly toward the normal 1.96, so a
-# few coarse bands suffice. The previous 3-bucket table (2.776/2.262/1.96) was
-# anti-conservative at very small n (used 2.776 for df=2 where t=4.303) and used
-# the normal z=1.96 for all n>30 (t=2.042 at df=30), understating every CI there.
+# Two-sided 95% Student-t criticals t_{0.975,df} for df=1..30 (no scipy); coarse
+# bands above. Replaces a 3-bucket table that was anti-conservative: used 2.776 at
+# df=2 (true 4.303) and z=1.96 for all n>30 (true 2.042 at df=30).
 _T_975: dict[int, float] = {
     1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
     8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,

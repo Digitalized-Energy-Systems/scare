@@ -44,14 +44,9 @@ _solve_logger = logging.getLogger("scare.solve")
 
 @contextlib.contextmanager
 def optimization(label: str, *, logger: logging.Logger | None = None, **ctx):
-    """Bracket an optimization solve with START/DONE/FAIL log lines.
-
-    Use around any monee energyflow or distributed/ADMM solve — sync call or
-    ``await``ed coroutine. A solve that never returns leaves a ``SOLVE-START``
-    with no ``SOLVE-DONE``::
-
-        with optimization("energyflow", n_childs=len(net.childs)):
-            result = run_energy_flow(net)
+    """Bracket a monee energyflow or distributed/ADMM solve (sync call or awaited
+    coroutine) with START/DONE/FAIL log lines. A solve that never returns leaves a
+    ``SOLVE-START`` with no matching ``SOLVE-DONE``.
     """
     log = logger or _solve_logger
     detail = " ".join(f"{k}={v}" for k, v in ctx.items())

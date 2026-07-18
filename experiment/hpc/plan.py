@@ -250,12 +250,9 @@ def filter_task_ids(
 ) -> list[int]:
     """Pick task IDs whose on-disk status matches ``mode``.
 
-    ``failed`` covers ``error`` and ``killed`` only. OOM-killed tasks never
-    write status.json and read as ``missing``; pick them up with ``missing``
-    / ``incomplete`` — but only after the Slurm array has drained, since a
-    still-queued task also reads as ``missing`` and resubmitting it
-    double-runs the task (mutual artifact scrubbing). ``incomplete`` is
-    anything that isn't ``ok`` (crashed, timed-out, or never-started).
+    ``failed`` = error|killed; ``incomplete`` = anything not ``ok``. OOM-kills write
+    no status.json and read ``missing``; pick up via ``missing``/``incomplete`` ONLY
+    after the Slurm array drains (a queued task also reads ``missing``, so resubmitting double-runs it via mutual artifact scrubbing).
     """
     if mode == "all":
         return [t.task_id for t in tasks]
@@ -380,7 +377,11 @@ def main() -> None:
     cfg = CampaignConfig.from_json(args.config)
     timestamp_dir = False if args.no_timestamp else None  # None → use cfg.timestamp_dir
     if args.prebuild:
-        prebuild_grids([g.name for g in cfg.grids])
+        # cfg.grids is empty in eval mode (grids live under experiments[].grids),
+        # so union both or --prebuild warms nothing and array tasks race the build.
+        grid_names = {g.name for g in cfg.grids}
+        grid_names |= {g.name for e in cfg.experiments for g in e.grids}
+        prebuild_grids(sorted(grid_names))
     campaign_dir = create_campaign(
         cfg, source_path=args.config, timestamp_dir=timestamp_dir
     )

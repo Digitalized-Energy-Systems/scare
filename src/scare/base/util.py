@@ -233,15 +233,10 @@ def _slack_pressure_store(behavior: Any) -> dict[str, float]:
 
 
 def set_slack_pressure(behavior: Any, aid: str, value: float) -> None:
-    """Command a gas slack's pressure setpoint — the regulator lever.
-
-    Writes the ``ExtHydrGrid.pressure_pu`` boundary through the environment's
-    ``set_pressure`` action (marks the net dirty; the next energy-flow solve
-    re-pins the slack node, see ``ExtHydrGrid.overwrite``) and records the
-    commanded value so the regulator role and the slack recorder can read the
-    current setpoint. No-op on a child without the action (non-gas-slack) — the
-    store is written only when the action actually fires, so ``lookup`` never
-    reports a setpoint that was never applied."""
+    """Command a gas slack's pressure setpoint via the env ``set_pressure`` action
+    (writes ``ExtHydrGrid.pressure_pu``, marks the net dirty; the next solve re-pins
+    the slack node). Records the value only when the action fires, so ``lookup``
+    never reports an un-applied setpoint; no-op on a child without the action."""
     if behavior.has_action(aid, "set_pressure"):
         behavior.act(aid, "set_pressure", float(value))
         _slack_pressure_store(behavior)[aid] = float(value)
@@ -259,16 +254,11 @@ def _grid_former_rating_store(behavior: Any) -> dict[str, float]:
 
 
 def register_grid_former_rating(behavior: Any, aid: str, rating: float) -> None:
-    """Record a promoted island reference (``GridForming*``) and its rated
-    capacity (|p_mw_max| / |mass_flow_max_kgs| from the Var bound).
-
-    A former's free p_mw/mass_flow flips ``obs_capacity``'s load/generator sign,
-    so the holon aggregation would count it as phantom demand when it absorbs the
-    island residual. Membership in this registry (populated at build time from
-    the child model, so it needs no live ``_net``) is the MAS's former-identity
-    signal: the holon classifies a former as a generator and credits its
-    DELIVERED injection as supply, never as a load. The rating is retained as the
-    reference's capacity metadata. Native unit (MW / kg/s), positive."""
+    """Record a promoted island reference (``GridForming*``) and |rated capacity|
+    from its Var bound. A former's free p_mw/mass_flow flips ``obs_capacity``'s
+    load/generator sign, so registry membership (built from the child model, no
+    live ``_net``) is the former-identity signal: the holon credits its DELIVERED
+    injection as supply, never phantom demand. Native unit, positive."""
     r = abs(float(rating))
     if r > 0.0:
         _grid_former_rating_store(behavior)[str(aid)] = r
@@ -389,13 +379,10 @@ def _heat_curtail_lock_store(behavior: Any) -> dict[str, float]:
 
 
 def _line_curtail_lock_store(behavior: Any) -> dict[str, tuple]:
-    """Per-aid electricity line-relief lock: ``aid -> (factor, t_set)``.
-
-    Set by the line-relief auction (``curtail``). While fresh (re-asserted
-    within ``_LINE_CURTAIL_LOCK_TTL_S`` every poll the line is over), L2
-    writes DEFER else the holon re-serves a just-shed load. Freshness-lifted:
-    once the line clears the auction stops re-arming and it goes stale.
-    Electricity analogue of the heat curtail lock."""
+    """Per-aid electricity line-relief lock ``aid -> (factor, t_set)``. Set by the
+    curtail auction; while fresh (re-armed within ``_LINE_CURTAIL_LOCK_TTL_S`` each
+    poll the line is over) L2 restores DEFER, else the holon re-serves a just-shed
+    load. Freshness-lifted on clear; electricity analogue of the heat curtail lock."""
     return _get_behavior_store(behavior, "_scare_line_curtail_lock")
 
 
@@ -457,13 +444,10 @@ def line_relief_headroom(behavior: Any, aid: str, now: float) -> float | None:
 
 
 def _line_congestion_store(behavior: Any) -> dict[tuple[str, str], tuple]:
-    """Additive congestion price per ``(branch_key, aid)``: ``-> (price, t)``.
-
-    Each overloaded branch publishes a per-downstream-generator price
-    ``price = 1 - ceiling`` (0 = no curtail, 1 = full). Keyed by branch so a
-    generator downstream of several congested branches accumulates the SUM
-    (:func:`line_congestion_ceiling`), rather than a later branch overwriting an
-    earlier one. Freshness-stamped; a stale entry drops out of the sum."""
+    """Additive congestion price per ``(branch_key, aid) -> (price, t)``,
+    ``price = 1 - ceiling``. Keyed by branch so a generator under several congested
+    branches SUMS prices instead of one overwriting another. Freshness-stamped;
+    stale entries drop from the sum."""
     return _get_behavior_store(behavior, "_scare_line_congestion_price")
 
 
@@ -501,15 +485,11 @@ _CP_HEAT_CEILING_TTL_S: float = 5.0
 
 
 def _cp_heat_ceiling_store(behavior: Any) -> dict[str, tuple]:
-    """Per-CP regulation ceiling from the heat-outlet guard:
-    ``aid -> (ceiling, t_set)``.
-
-    Written by ``CPHeatOutletGuard`` (the sensor/controller half); enforced in
-    :func:`apply_regulate` for every ``sector="cp"`` write. Enforcement must
-    live there — the L3 kernels re-commit the deficit-filling factor every
-    round (delivered heat is measured at load setpoints, which CP injection
-    can never raise), so a one-shot wind-down without a held cap is
-    immediately overwritten. Freshness-stamped."""
+    """Per-CP regulation ceiling ``aid -> (ceiling, t_set)`` from
+    ``CPHeatOutletGuard``. Enforced in :func:`apply_regulate` on every
+    ``sector="cp"`` write because the L3 kernels re-commit the deficit factor each
+    round (delivered heat is measured at load setpoints, which CP injection can't
+    raise), so a one-shot wind-down without a held cap is overwritten. Freshness-stamped."""
     return _get_behavior_store(behavior, "_scare_cp_heat_ceiling")
 
 
@@ -643,10 +623,9 @@ _QV_LOCK_RESTORE_STEP: float = 0.1
 
 
 # --- Phase-2 feeder-voltage ledger -----------------------------------------
-# Shared blackboard of per-node voltage so an inverter's auction can see whether
-# the FEEDER (not just its own node) is over-voltage. Reuses the per-world
-# behaviour store (like the curtail-locks). Assumes one LV feeder per
-# electricity grid (true for the simbench_lv_* family).
+# Shared per-node voltage blackboard (reuses the per-world behaviour store, like
+# the curtail-locks) so an inverter's auction sees FEEDER (not just own-node)
+# over-voltage. Assumes one LV feeder per electricity grid (simbench_lv_* family).
 
 
 def _feeder_voltage_store(behavior: Any) -> dict[str, tuple]:
@@ -714,18 +693,18 @@ def _last_regulate_t_store(behavior: Any) -> dict[str, float]:
 
 
 def _stale_obs_state(behavior: Any) -> dict[str, Any]:
-    """Per-behavior tracker of regulate-on-stale-observation events.
-
-    ``behavior._net_results`` is replaced only on a successful solve, so its
-    ``id()`` is a cheap freshness oracle: if unchanged and an apply already
-    landed on it, the regulate is acting on stale state.
+    """Per-behavior tracker of regulate-on-stale-obs. ``_net_results`` is replaced
+    only on a successful solve, so its ``id()`` is a freshness oracle: a SECOND
+    regulate on the same aid against an unchanged id ⇒ acting on stale state.
+    Tracked per-aid so a batch of agents dispatched between two solves (each a
+    first write on a fresh snapshot) is not mislabelled stale.
     """
     return _get_behavior_store(
         behavior,
         "_scare_stale_obs_state",
         factory=lambda: {
             "last_id": None,
-            "applies_on_current_id": 0,
+            "applied_aids": set(),
             "stale_landed": 0,
             "warned_for_id": None,
         },
@@ -938,12 +917,9 @@ def apply_regulate(
         elif reason in L2_ALLOCATION_REASONS and has_line_curtail_lock(
             behavior, aid, float(timestamp)
         ):
-            # A further shed always passes (it only helps the line); only a
-            # RESTORE is interlocked. Mechanism B: hand active back one bounded
-            # step per cycle when the branch has fresh loading headroom below the
-            # limit, re-gated each tick — else a one-shot release slams the load
-            # to full and the line re-overloads (relaxation limit cycle leaving
-            # loading oscillating 40–170%).
+            # A further shed passes; only a RESTORE is interlocked. Mechanism B:
+            # hand back one bounded, headroom-gated step per tick — a one-shot
+            # release limit-cycles loading 40–170%.
             _current = _last_regulate_store(behavior).get(str(aid), 0.0)
             if factor > float(_current) + tolerance:  # a restore, not a shed
                 _headroom = line_relief_headroom(behavior, aid, float(timestamp))
@@ -997,12 +973,10 @@ def apply_regulate(
         elif reason in GEN_RESTORE_REASONS and has_gen_curtail_lock(
             behavior, aid, float(timestamp)
         ):
-            # Mechanism B (coordinated hand-off): hand active back only when the
-            # Q(U) droop is BOTH holding the node in-band (v ≤ ceiling) AND has
-            # spare reactive headroom to re-absorb the rise — and only one bounded
-            # STEP per cycle (closed-loop, re-gated each tick). A one-shot release
-            # re-breached over-voltage in validation v1.
-            # Saturated / still-elevated droop ⇒ keep deferring.
+            # Mechanism B: hand active back only when the Q(U) droop holds v
+            # in-band (v ≤ ceiling) AND has spare reactive headroom, one bounded
+            # step per tick. A one-shot release re-breached over-voltage in
+            # validation v1. Saturated / still-elevated droop ⇒ keep deferring.
             _qv_v = qv_relief_voltage(behavior, aid, float(timestamp))
             if (
                 getattr(_cfg, "enable_qv_auction_coordination", False)
@@ -1132,11 +1106,17 @@ def apply_regulate(
     if not behavior.has_action(aid, "regulate"):
         return False
 
-    # Stale-observation detector: an unchanged net_results since the last
-    # apply means this regulate computes against a stale snapshot.
+    # Stale-observation detector: a second regulate on THIS aid against an
+    # unchanged net_results means it computes against a stale snapshot. Keyed
+    # per-aid so batched multi-agent dispatch on one solve isn't flagged.
     state = _stale_obs_state(behavior)
     current_id = id(getattr(behavior, "_net_results", None))
-    if state["last_id"] == current_id and state["applies_on_current_id"] > 0:
+    if state["last_id"] != current_id:
+        state["last_id"] = current_id
+        state["applied_aids"] = set()
+        state["warned_for_id"] = None
+    aid_key = str(aid)
+    if aid_key in state["applied_aids"]:
         state["stale_landed"] += 1
         if state["warned_for_id"] != current_id:
             record_event(
@@ -1147,11 +1127,7 @@ def apply_regulate(
                 detail=(f"reason={reason} stale_landed_total={state['stale_landed']}"),
             )
             state["warned_for_id"] = current_id
-    elif state["last_id"] != current_id:
-        state["last_id"] = current_id
-        state["applies_on_current_id"] = 0
-        state["warned_for_id"] = None
-    state["applies_on_current_id"] += 1
+    state["applied_aids"].add(aid_key)
 
     behavior.act(aid, "regulate", factor)
     _last_regulate_store(behavior)[aid] = factor
@@ -1566,15 +1542,11 @@ def constraint_allowed_fraction(
     the priority decision. Shared with the L2 priority-floor so the floor relaxes
     by exactly the amount the clamp sheds.
 
-    DIRECTION-AWARE. Serving more (larger ``|setpoint|``) moves node state
-    variables (vm_pu, pressure_pu, t_k) DOWN for a load (consumption pulls them
-    down) and UP for a generator (injection pushes them up). Only the bound that
-    serving pushes the value TOWARD may cap: capping the other side would
-    shed/curtail the very actor that RELIEVES the violation. The canonical case:
-    over-voltage on a PV-surplus feeder is relieved by SERVING load (it draws the
-    surplus down), so a load must not be capped by an over-voltage reading — the
-    symmetric ``constraint_utilization`` used to do exactly that and strand the
-    load shed. Over-voltage still caps GENERATORS (they cause it). Tier-1 immune.
+    DIRECTION-AWARE: serving pushes state vars DOWN for a load, UP for a
+    generator; only the bound serving moves TOWARD may cap. Canonical case:
+    over-voltage on a PV feeder is relieved by serving load, so a load must not be
+    capped by it (the old symmetric ``constraint_utilization`` stranded the shed);
+    over-voltage still caps generators. Tier-1 immune.
     """
     # Tier 1 immune to the soft clamp; a true ConstraintViolation re-checks it.
     if tier is not None and int(tier) == 1:

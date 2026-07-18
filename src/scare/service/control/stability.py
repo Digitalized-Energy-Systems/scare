@@ -86,21 +86,17 @@ class GenerationController(Role):
         self.context.subscribe_event(
             self, NegotiationFinishedEvent, self._on_negotiation_finished
         )
-        # Electricity-only: the lever targets the electricity slack/oracle gap,
-        # and the electricity gen curtail-lock covers GEN_RESTORE_REASONS (so the
-        # ramp defers under over-voltage); the HEAT curtail-lock does NOT defer
-        # GEN_RESTORE, so ramping heat gens would only be guarded by the local
-        # t_k cap — out of scope and less safe, so skip it.
+        # Electricity-only: the elec gen curtail-lock defers GEN_RESTORE under
+        # over-voltage; the HEAT lock does not, so ramping heat gens would rely
+        # solely on the local t_k cap — out of scope and less safe.
         if self.ramp_to_full and self.sector is Sector.ELECTRICITY:
             poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
             self.context.schedule_periodic_task(self._ramp_to_full, delay=poll)
 
     _RAMP_TOL: float = 1e-3
-    # Respect a recent gossip/stability dispatch: if the dispatch path regulated
-    # this generator DOWN within this window, don't ramp it back up — else the
-    # ramp fights a legitimate over-supply/stability shed (a bounded but wasteful
-    # limit cycle). The ramp only lifts generators dispatch is not actively
-    # holding down.
+    # Don't ramp a generator back up within this window of a dispatch that held
+    # it DOWN, else the ramp fights a legitimate over-supply/stability shed
+    # (bounded but wasteful limit cycle).
     _RAMP_RESPECT_DISPATCH_S: float = 3.0
 
     async def _ramp_to_full(self) -> None:
@@ -244,8 +240,6 @@ class GenerationController(Role):
         # Generators (cap < 0) are exempt — they ramp both ways.
         if enable_floor and cap > 0 and factor < self._floor:
             factor = self._floor
-        if cap > 0:
-            self._floor = max(self._floor, factor)
 
         applied = apply_regulate(
             self.behavior,
@@ -259,3 +253,7 @@ class GenerationController(Role):
         if applied:
             self._last_factor = factor
             self._last_t = now
+            # Ratchet the floor only on an applied factor; a suppressed write
+            # (cooldown/dedup) must not raise the floor and clamp up a later shed.
+            if cap > 0:
+                self._floor = max(self._floor, factor)

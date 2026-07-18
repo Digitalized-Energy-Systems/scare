@@ -31,10 +31,9 @@ logger = logging.getLogger(__name__)
 
 
 def _completed_sims(df: pd.DataFrame) -> pd.DataFrame:
-    """Rows whose sim completed with valid metrics. ``claims_failed`` = a
-    fatal claim failed, not a missing measurement — figures must include it
-    like the tables do, else the population is variant-asymmetric (oracle ~0%
-    claims_failed vs single_level ~78%) and weak baselines look inflated."""
+    """Rows with valid metrics (status ok or claims_failed). Include
+    claims_failed like the tables do: dropping it is variant-asymmetric
+    (oracle ~0% vs single_level ~78% claims_failed) and inflates weak baselines."""
     if "status" not in df.columns:
         return df
     return df[df["status"].isin(("ok", "claims_failed"))]
@@ -101,11 +100,9 @@ def _functional_baseline(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 
 def _optimality_gap(campaign: CampaignData, out_dir: Path) -> list[str]:
-    # Pool EVERY completed run, not just the dedicated ``optimality_gap``
-    # experiment: the scatter/box pair scare vs oracle on task identity
-    # (experiment, grid, seed, scenario) and drop unpaired rows, so pooling
-    # all experiments that ran both variants integrates every grid family into
-    # one figure instead of the single S1 optimality-gap sweep.
+    # Pool every completed run (not just the optimality_gap experiment): the
+    # scatter/box pair scare vs oracle on task identity and drop unpaired rows,
+    # folding every grid family into one figure.
     sub = _completed_sims(campaign.summary)
     if sub.empty:
         return []
@@ -556,8 +553,8 @@ def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
     # Pick a representative OK scare task whose ``timeseries.csv`` carries the
     # richest recordings.  Walk ``functional_baseline``-first, preferring tasks
     # with slack columns, then coalition_balance, then the FB representative or
-    # first OK task.  Each required prefix is a superset of the next, so the
-    # newest match gives every subplot data.
+    # first OK task.  Picks the first matching task in iteration order (lowest
+    # task_id in the FB-first ordering), not the newest.
     fb_first = pd.concat(
         [
             ok[ok["experiment"] == "functional_baseline"],
@@ -974,15 +971,9 @@ def _table_status(campaign: CampaignData) -> str:
 
 
 def _table_variant_means(campaign: CampaignData) -> str:
-    """Per-variant PWSF on the COMPLIANT subset with 95% CI, matching the
-    campaign's primary methodology (compliance gate + CI; see
-    ``hpc.aggregate``). The earlier version reported an unpaired, un-gated,
-    no-CI mean over ``status=='ok'`` only, which both dropped the claims_failed
-    cohort asymmetrically (oracle is never claims_failed) and presented
-    non-comparable per-variant subsets as if comparable. This table is still
-    UNPAIRED and pooled across grids — for the apples-to-apples comparison see
-    the paired ``Variant vs oracle`` table in ``summary.md``. PWSF covers
-    electricity, heat, and gas, all on the MW energy basis (gas HHV-converted).
+    """Per-variant PWSF on the COMPLIANT subset with 95% CI (matches
+    ``hpc.aggregate``). UNPAIRED, pooled across grids+experiments — for the
+    paired view see ``summary.md``. PWSF = electricity + heat + gas (gas HHV).
     """
     df = campaign.summary
     metric = "outcomes__priority_weighted_fraction"
@@ -1022,13 +1013,10 @@ def _table_variant_means(campaign: CampaignData) -> str:
 
 
 def _table_oracle_quality(campaign: CampaignData) -> str:
-    """Per-(experiment, grid) oracle solver certification.
-
-    The oracle is a time-limited nonconvex MIQCQP incumbent, not always a
-    proven optimum — eval_full_v2 shipped reconfig oracles at MIP gap ~1.0
-    (SCARE "beat" them in 100% of pairs) with nothing in the report saying
-    so. Any vs-oracle aggregate whose certified rate is low measures solver
-    luck, not coordination quality; those rows are flagged.
+    """Per-(experiment, grid) oracle certification. The oracle is a
+    time-limited nonconvex MIQCQP incumbent, not always optimal — eval_full_v2
+    shipped reconfig oracles at MIP gap ~1.0 (SCARE "beat" them 100%). Low
+    certified-rate rows measure solver luck not coordination quality; flagged.
     """
     df = campaign.summary
     opt_col = "outcomes__oracle_solver_stats__solve_optimal"
@@ -1120,10 +1108,10 @@ def generate_report(
     """Generate plots + REPORT.md for *campaign_dir*.  Returns the Markdown
     path.
 
-    ``per_task_overviews`` (default ``False``) renders the
-    one-figure-per-OK-task ``system_state_overview`` panels — hundreds of files
-    on a large campaign.  Representative-task plots (one per experiment-variant)
-    are always rendered regardless.
+    ``per_task_overviews`` (default ``False``) renders one
+    ``system_state_overview`` panel per COMPLETED task (ok + claims_failed, not
+    OK-only) — hundreds of files on a large campaign.  Representative-task plots
+    (one per experiment-variant) are always rendered regardless.
     """
     campaign = load_campaign(campaign_dir)
     plots_root = campaign_dir / "plots"
@@ -1187,8 +1175,9 @@ def generate_report(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Per-experiment trajectories failed: %s — skipping", exc)
 
-    # One system-state overview HTML per OK task (slack + control vars + line
-    # loading + per-tier fulfilment).  Opt-in via ``--per-task-overviews``.
+    # One system-state overview HTML per completed task (ok + claims_failed;
+    # slack + control vars + line loading + per-tier fulfilment).  Opt-in via
+    # ``--per-task-overviews``.
     if per_task_overviews:
         try:
             for label, figs in _per_task_overviews(

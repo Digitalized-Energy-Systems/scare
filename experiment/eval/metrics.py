@@ -51,17 +51,9 @@ from scare.base.util import (
 logger = logging.getLogger(__name__)
 
 
-# Priority-tier weight schedule for the served-MAGNITUDE metric (PWSF):
-# moderate geometric ``w(tier) = 2^(Pi - tier)`` over Pi=4 tiers => {1:8, 2:4,
-# 3:2, 4:1} (8:1 across the range). Deliberately NOT a strict-priority weight
-# (e.g. 1e12/1e8/1e4/1): a tier-1-dominant weight collapses PWSF to ~the tier-1
-# fraction (since tier-1 is ~always served), erasing the tier 2-4 differences
-# that distinguish configs. PWSF answers "how much priority-weighted load was
-# served" (resolved across tiers); the SEPARATE gating ``priority_invariant``
-# claim answers "was it served in priority order" — order is policed there, not
-# by collapsing this scalar. PWSF is a weighted RATIO so only inter-tier ratios
-# matter (this is identical to the legacy 2^(10-tier)). Tier 0 (generators)
-# weighs 0; tiers clamp to [1, Pi].
+# Geometric tier weight w=2^(Pi-tier), Pi=4 => {1:8, 2:4, 3:2, 4:1}. NOT strict-
+# priority (1e12/1e8/...): that collapses PWSF to the ~always-served tier-1 fraction.
+# Weighted RATIO (identical to legacy 2^(10-tier)); order policed by priority_invariant.
 _PI = 4
 
 
@@ -100,10 +92,9 @@ _ENERGISATION_KEYS = ("e_el", "e_gas", "e_water")
 
 
 def _is_deenergised(obs: dict, node: Any) -> bool:
-    """Whether the islanding MILP de-energised this node (energisation binary
-    solved to 0). The binaries live on the solved node model; MAS observers
-    merge node values into ``obs``, the oracle adapter does not — fall back to
-    the node model for the latter (where the net IS the solved net)."""
+    """True iff an islanding energisation binary (e_el/e_gas/e_water) solved to
+    0. The binaries live on the solved node model; MAS observers merge them into
+    ``obs`` but the oracle adapter does not, hence the node.model fallback."""
     node_vals = None
     for key in _ENERGISATION_KEYS:
         v = obs.get(key)
@@ -453,11 +444,10 @@ def served_breakdown(
 
     disconnected = _disconnected_node_ids(monee_net)
     line_factor = _line_feasibility_factor(monee_net)
-    # Restrict to consumer loads: PowerLoad / HeatLoad (electricity / heat) plus
-    # gas-grid Sinks (real gas consumers, see ``_is_gas_consumer_sink``). The
-    # heat-side return Sink and ExtHydrGrid / ExtPowerGrid (slack injectors)
-    # carry mass-flow / p_mw fields that ``obs_capacity`` would otherwise pick
-    # up, inflating served past demand — they stay excluded.
+    # Consumer loads only: PowerLoad / HeatLoad plus gas-grid Sinks. Heat-return
+    # Sinks and ExtHydrGrid / ExtPowerGrid injectors carry mass_flow / p_mw that
+    # ``obs_capacity`` would count as demand (inflating served past demand), so
+    # they stay excluded (see ``_is_gas_consumer_sink``).
     _LOAD_CLASSES: tuple[type, ...] = (HeatLoad, PowerLoad)
 
     for child in monee_net.childs:
@@ -482,12 +472,14 @@ def served_breakdown(
                 cap = obs_capacity(dict(getattr(child.model, "values", {}) or {}))
             if not (cap > 0):
                 continue
+        sec = sector_from_grid(node.grid)
+        if sec is None:
+            continue
         n_loads += 1
-        # ``is_disconnected`` distinguishes the physical loss path
-        # (priority-blind: no path to a grid-forming source, or islanding
-        # de-energisation) from the agent-driven path (QP / ADMM priority
-        # weighting decides who sheds). restoration_breakdown uses this to
-        # split per-tier losses.
+        # ``is_disconnected`` = physical/priority-blind loss (no path to a
+        # grid-former, or islanding de-energisation); the agent-driven QP / ADMM
+        # shed path is everything else. restoration_breakdown uses this split to
+        # attribute per-tier losses.
         is_disconnected = (
             not getattr(child, "active", True)
             or child.node_id in disconnected
@@ -507,9 +499,6 @@ def served_breakdown(
         # per-tier loss; restoration_breakdown uses it to attribute losses.
         demand_disc = demand if is_disconnected else 0.0
 
-        sec = sector_from_grid(node.grid)
-        if sec is None:
-            continue
         # Don't credit heat served at an out-of-bounds node temperature.
         served_pre_gate = served
         if served > 0.0 and not _heat_served_feasible(obs, sec):
@@ -649,8 +638,11 @@ def restoration_breakdown(
         "total_served_baseline_mw": total_served_baseline,
         "total_served_post_mw":     total_served_post,
         "raw_restoration_ratio":   total_served_post / total_served_baseline,
-        "pwsf_baseline":           baseline.priority_weighted_fraction,
-        "pwsf_post":               post.priority_weighted_fraction,
+        "pwsf_baseline":           pw_served_baseline / BASELINE pw_demand,
+        "pwsf_post":               pw_served_post / BASELINE pw_demand
+                                   (both share the baseline denominator so they
+                                   compare directly; NOT post's own
+                                   priority_weighted_fraction),
         "pwsf_restoration_ratio":  pwsf_post / pwsf_baseline,
         "by_tier":   per-tier {demand_baseline_mw, served_baseline_mw,
                                 served_post_mw, post_fraction (=post/demand),
@@ -889,13 +881,10 @@ def constraint_violation_integral(world: Any) -> dict[str, float]:
     return out
 
 
-# Final constraint-violation scan (end-of-sim hard-bound feasibility)
-# Node-by-node / branch-by-branch feasibility of the final solved network
-# against the same ``SECTOR_CONSTRAINTS`` envelope the oracle LP enforces
-# (bounds_el / _gas / _heat + ``max_line_loading``). Flags a SCARE run that
-# "beats" the oracle's PWSF only by leaving voltages, pressures, temperatures,
-# or line loadings out of bounds, so the aggregator can exclude it from the
-# compliant-PWSF mean.
+# Final hard-bound feasibility scan of the solved net vs the same
+# ``SECTOR_CONSTRAINTS`` envelope the oracle LP enforces, so the aggregator can
+# exclude a run that only "beats" oracle PWSF by leaving voltage / pressure /
+# temperature / loading out of bounds.
 
 # Per-variable absolute tolerance: a reading violates only when it exceeds the
 # bound by more than this. ``vm_pu`` / ``pressure_pu`` are p.u.; ``t_k`` and
@@ -1128,19 +1117,10 @@ def _branch_loading_exact_percent(branch: Any, monee_net: Any) -> float | None:
 def _branch_loading_percent(branch: Any, monee_net: Any) -> float | None:
     """Worst (from/to) thermal loading of a branch in *percent*.
 
-    The reported ``loading_pu`` / ``loading_{from,to}_pu`` (per-unit fractions
-    in every formulation; ``loading_pu`` is a Python property, not in
-    ``model.values``, hence the per-side fallback) is the screen. An apparent
-    overload is then re-judged in the exact basis the oracle LP enforces —
-    MVA (``sqrt(p^2 + q^2) <= max_loading * max_s_mva``) when the branch is
-    MVA-rated, else the exact current implied by the solved flows and end
-    voltages against ``max_i_ka``: under MISOCP the loading intermediates
-    derive from the SOC-RELAXED current, which only OVERSTATES loading
-    (relaxation gap), so grading from them charged phantom overloads to
-    solutions satisfying the LP's cap — while a genuine overload always shows
-    in the screen. Re-judging (rather than grading the exact basis
-    unconditionally) also keeps unsolved nets, whose p/q sit at Var defaults,
-    from fabricating overloads.
+    ``loading_pu`` is a property (not in ``model.values``), so screen via the
+    per-side ``loading_{from,to}_pu`` fallback. Apparent overloads (>100%) are
+    re-judged in the oracle's exact MVA/current basis (SOC-RELAXED MISOCP current
+    only OVERSTATES); re-judging only overloads avoids unsolved-net Var-default phantoms.
     """
     model = getattr(branch, "model", None)
     if model is None:
@@ -1288,15 +1268,10 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
     return rows
 
 
-# Constraint variables audited but excluded from the compliance gate. Empty:
-# every operating bound in ``SECTOR_CONSTRAINTS`` gates. Heat junction
-# temperature (``t_k``) gates on the same footing as voltage, pressure, and line
-# loading — a temperature-infeasible heat node is a genuine envelope breach, so a
-# run that leaves junctions out of band is non-compliant even though the served-
-# fraction metric also debits the cold load. Canonical for both the
-# ``constraint_violations_final`` scan (SCARE outcome + oracle claim) and the
-# ``_check_constraint_compliance`` CSV claim (which imports this set), so SCARE
-# and the oracle gate on identical flags.
+# Constraint vars excluded from the compliance gate. Empty: every
+# ``SECTOR_CONSTRAINTS`` bound gates, including heat ``t_k``. Canonical for both
+# ``constraint_violations_final`` and the ``_check_constraint_compliance`` CSV
+# claim, so SCARE and oracle gate on identical flags.
 NON_GATING_CONSTRAINT_VARIABLES: frozenset[str] = frozenset()
 
 # Canonical display label per raw ``SECTOR_CONSTRAINTS`` variable, for the

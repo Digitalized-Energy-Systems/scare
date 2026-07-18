@@ -131,13 +131,9 @@ class GasPressureRegulator(Role):
 
     @staticmethod
     def _is_energised_pressure(val: float) -> bool:
-        """True for a physically meaningful junction pressure. Excludes BOTH
-        de-energised artifacts: a source-isolated region collapses to ~0, and a
-        zero-flow / P2G junction can saturate monee's relaxed-Weymouth
-        ``pressure_squared_pu`` box at its upper bound, reading pressure_pu~sqrt(3).
-        Acting on the high artifact made the regulator chase a phantom
-        over-pressure and walk the whole profile down to the floor. The
-        scan/monitor drop both the same way — see DEENERGISED_PRESSURE_*."""
+        """True for a real junction pressure; drops both de-energised artifacts:
+        source-isolated ~0, and a zero-flow/P2G junction saturating monee's
+        relaxed-Weymouth box at ~sqrt(3) (acting on that high one once walked the whole profile to the floor chasing phantom over-pressure)."""
         return DEENERGISED_PRESSURE_PU < val < DEENERGISED_PRESSURE_HIGH_PU
 
     def _fed_pressures(self, own_p: float | None, now: float) -> list[float]:
@@ -239,15 +235,9 @@ class GasPressureRegulator(Role):
                     ),
                 )
 
-        # Setpoint saturated: it cannot clear the breach alone (profile spread
-        # exceeds the band). The two sides differ in what can mop up the residual:
-        #   - UNDER-pressure: cutting flow shrinks the Weymouth drops and lifts
-        #     downstream pressure, so the existing GridConstraintMonitor
-        #     pressure_pu -> curtailment path genuinely helps. Leave it to that.
-        #   - OVER-pressure: cutting flow shrinks the drops and RAISES pressure,
-        #     making it WORSE. Shedding cannot relieve over-pressure; the
-        #     real-world resolution is pressure relief / slam-shut isolation.
-        #     Surface it as un-actionable rather than implying shedding clears it.
+        # Setpoint saturated (spread > band). UNDER-pressure: shedding lifts
+        # pressure — leave to the GridConstraintMonitor curtailment path. OVER:
+        # shedding RAISES pressure (worse), only relief/isolation → un-actionable.
         if saturated_kind:
             if saturated_kind == "gas_pressure_setpoint_saturated":
                 residual = "residual under-pressure left to curtailment path"

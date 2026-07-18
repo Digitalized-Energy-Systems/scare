@@ -12,14 +12,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from mango import Role
-from mango.express.topology import topology_characteristic, topology_connectors
 
-from scare.base.model import NegotiationFinishedEvent, Sector
-from scare.base.util import obs_capacity, obs_setpoint
+from scare.base.model import Sector
 
 if TYPE_CHECKING:
-    from mango_energy_environments import RestorationEnvironmentBehavior
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -39,19 +36,6 @@ class Decision:
     version: int
     caused_by: dict[str, int] = field(default_factory=dict)
     timestamp_s: float = 0.0
-
-
-@dataclass
-class SectorImbalanceUpdate(Decision):
-    """A group leader's local imbalance estimate for one sector.
-
-    Published by ``SectorImbalanceBeacon``. ``local_imbalance_mw`` is signed
-    (positive = exportable surplus, negative = import deficit) and is the leader's
-    own contribution, not the group sum — a cheap "should you wake up?" hint.
-    """
-
-    sector: Sector = Sector.ELECTRICITY
-    local_imbalance_mw: float = 0.0
 
 
 @dataclass
@@ -350,100 +334,3 @@ class SeenVersions:
 
     def latest(self, publisher: str) -> int:
         return self._seen.get(publisher, -1)
-
-
-# ---- Publisher role: SectorImbalanceBeacon --------------------------------
-
-
-class SectorImbalanceBeacon(Role):
-    """Event-driven publisher of ``SectorImbalanceUpdate`` on group leaders.
-
-    Installed alongside ``EnergyBalanceNegotiator`` on each ``groups`` leader when
-    ``enable_cp_admm`` is True; discovers CP destinations via the same link
-    ``EnergyConverterRole`` uses. Triggered by ``NegotiationFinishedEvent`` on
-    gossip convergence; a slow ``watchdog_s`` republishes for late joiners.
-    """
-
-    def __init__(
-        self,
-        behavior: RestorationEnvironmentBehavior,
-        sector: Sector,
-        *,
-        watchdog_s: float = 30.0,
-    ) -> None:
-        super().__init__()
-        self.behavior = behavior
-        self.sector = sector
-        self.watchdog_s = watchdog_s
-        self._version = MonotonicVersion()
-
-    def setup(self) -> None:
-        logger.debug(
-            "[%s] SectorImbalanceBeacon setup: sector=%s watchdog_s=%.2f",
-            self.context.aid,
-            self.sector.value,
-            self.watchdog_s,
-        )
-        # Primary trigger: same-agent emit on gossip convergence.
-        self.context.subscribe_event(
-            self, NegotiationFinishedEvent, self._on_negotiation_finished
-        )
-        # Watchdog: advances the version frontier for late joiners.
-        self.context.schedule_periodic_task(self._tick, delay=self.watchdog_s)
-
-    def _on_negotiation_finished(
-        self, event: NegotiationFinishedEvent, _src: Any
-    ) -> None:
-        if event.sector != self.sector:
-            return
-        self.context.schedule_instant_task(self._tick())
-
-    async def _tick(self) -> None:
-        if topology_characteristic(self, tid="groups") != "leader":
-            return
-        # CP connectors via ``tid="groups"`` (reverse link is on the groups side).
-        # Gotcha: mango's ``Topology._connectors`` dedups by agent uid, so a
-        # multi-sector CP appears under one connector type only — heat/gas leaders
-        # see none and the beacon stays silent there (fix at the mango layer).
-        connectors = topology_connectors(self, tid="groups")
-        if not connectors:
-            return
-
-        try:
-            obs = self.behavior.observe(self.context.aid) or {}
-        except (AttributeError, KeyError):
-            return
-        if not obs:
-            return
-
-        # Signed unmet flow post-regulation (positive = unmet demand,
-        # negative = unsupplied supply); same convention as cp.py:_run_admm.
-        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
-        sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
-        # Regulation gap, not static headroom ``cap``, so the predicate fires only
-        # on actual curtailment.
-        imbalance = cap - sp
-
-        # No publisher-side dead-band: gating on |Δimbalance| would freeze the
-        # version on a quiescent grid and starve subscribers. Dead-banding belongs
-        # in the predicate (``_PREDICATE_DEAD_BAND_MW`` in cp.py).
-        logger.debug(
-            "[%s] beacon publish: sector=%s imb=%.4f v=%d to %d cps",
-            self.context.aid,
-            self.sector.value,
-            imbalance,
-            self._version.current + 1,
-            len(connectors),
-        )
-
-        decision = SectorImbalanceUpdate(
-            publisher=self.context.aid,
-            version=self._version.next(),
-            caused_by={},
-            timestamp_s=float(self.context.current_timestamp),
-            sector=self.sector,
-            local_imbalance_mw=imbalance,
-        )
-
-        for addr in connectors:
-            await self.context.send_message(decision, receiver_addr=addr)

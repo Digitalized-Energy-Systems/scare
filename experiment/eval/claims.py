@@ -1,7 +1,8 @@
 """Post-run claims validation.
 
 Reads per-task artefacts (diary.csv, served*.csv, timeseries.csv,
-events.csv, constraints_final.csv) and checks each architectural claim.
+events.csv, constraints_final.csv, slack_meta.json) and checks each
+architectural claim.
 Returns a dict of pass/fail flags + supporting detail folded into
 ``result.json["claims"]`` by the runner.
 
@@ -92,29 +93,20 @@ def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
 # Priority invariant
 
 
-# A load is physically constraint-throttled (excluded from the physics-aware
-# check) when its local cap is below ~full AND it serves at/near that cap —
-# limited by physics, not a priority/balance shed.  A load served below its
-# cap was shed by a decision and still counts.
+# Constraint-throttled = local cap below ~full AND served at/near that cap
+# (physics-limited, excluded); served below cap is a decision-shed and counts.
 _THROTTLE_CAP_TOL: float = 0.02
 
-# Sectors excluded from the priority-ordering claims (``priority_invariant``,
-# its strict variant, ``monotonic_progress``).  Heat is governed by *local*
-# junction-temperature feasibility, not a global priority allocation: a heat
-# load on a flow-starved node must be shed regardless of tier, and shedding it
-# can recover the node so end-of-sim ``constraint_allowed`` reads ~1.0 —
-# making a temperature-forced shed indistinguishable from a priority shed.
-# Heat priority is instead tracked by the non-gating ``heat_priority``
-# diagnostic.
+# Sectors excluded from the priority-ordering claims.  Heat sheds by local
+# junction-temperature feasibility, not tier; that shed can recover the node
+# (``constraint_allowed`` ~1.0), so it is indistinguishable from a priority
+# shed and tracked separately by the non-gating ``heat_priority`` diagnostic.
 _LOCAL_PHYSICS_SECTORS: frozenset[str] = frozenset({"heat"})
 
-# Near-full exemption (physics-aware check only).  A higher-priority tier
-# served at/above this fraction is treated as essentially fully served: a
-# marginal shortfall below a fully-served lower tier is a ramp/convergence
-# residual, not a priority decision.  This guards the *higher* tier's
-# absolute service, not the gap width — a genuine inversion where both tiers
-# are under-served still has the higher tier below this floor and is flagged.
-# The strict variant keeps the raw 1e-3 signal (``near_full_exempt=False``).
+# Near-full exemption (physics-aware only): a higher tier served >= this
+# fraction counts as fully served, so a shortfall below a fully-served lower
+# tier reads as a ramp residual not a priority decision; guards absolute service
+# not the gap (both-under-served inversion still fails; strict off = ``near_full_exempt=False``).
 _NEAR_FULL_FRAC: float = 0.95
 
 
@@ -483,13 +475,12 @@ def _check_monotonic_progress(
     violations_by_sec = _violation_windows(events_path) if events_path.exists() else {}
     failure_windows = _failure_windows(events_path) if events_path.exists() else []
 
-    # Line-overload exemption (electricity): while a power line is over its
-    # thermal rating, the line-relief lever sheds through-load to restore
-    # feasibility — a constraint-driven shed (the oracle does the same), not a
-    # priority regret.  Derived from the ``max_line_loading_percent`` series
-    # rather than the deduped ``constraint_violation`` event so every overloaded
-    # instant is exempt.  The line analogue of the ``_LOCAL_PHYSICS_SECTORS``
-    # heat exemption.
+    # Line-overload exemption (electricity, the analogue of the
+    # ``_LOCAL_PHYSICS_SECTORS`` heat exemption): while a line is over thermal
+    # rating the relief lever sheds through-load (oracle does the same) — a
+    # constraint shed, not regret.  Derived from the ``max_line_loading_percent``
+    # series (not the deduped ``constraint_violation`` event) so every
+    # overloaded instant is exempt.
     line_overload_windows: list[tuple[float, float]] = []
     ml = series.get("max_line_loading_percent")
     if ml:
@@ -643,11 +634,10 @@ def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
     quiescence window in which a monotonic-progress drop is physical, not a
     regression.
 
-    Coalition / holon-priority re-allocations are *not* excluded: silencing
-    the aggregate-regulation drop they produce would mask exactly the
-    regret-switching this claim detects.  Small per-tick redistributions are
-    tolerated by the metric; a coalition flagged here redistributed enough to
-    deserve attention.
+    Coalition / holon-priority re-allocations are deliberately *not* excluded:
+    silencing their aggregate-regulation drop would mask the very
+    regret-switching this claim detects (small per-tick redistributions are
+    already within tolerance).
     """
     rows = _read_csv(events_path)
     windows: list[tuple[float, float]] = []
@@ -671,12 +661,10 @@ def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
 # Slack budget compliance
 
 
-# Settling window: the slack draw must be within budget at steady state, not
-# at every instant.  The initial-dispatch transient (LP draws full import
-# before the first MAS dispatch lands) fires a ``slack_budget_violation`` that
-# the controller clears within a rebalance round, so judge the draw over the
-# final ``_SLACK_SETTLE_S`` seconds: a recovering spike passes, a sustained
-# over-draw still fails.
+# Settling window: budget must hold at steady state, not every instant.  The
+# initial-dispatch transient (LP draws full import before first MAS dispatch)
+# fires a ``slack_budget_violation`` the controller clears within a rebalance
+# round, so judge the peak draw over only the final ``_SLACK_SETTLE_S`` seconds.
 _SLACK_SETTLE_S: float = 2.0
 _SLACK_TOL: float = 0.05
 
@@ -978,12 +966,10 @@ def _violation_windows(events_path: Path) -> dict[str, list[tuple[float, float]]
       * ``line_failure`` / ``node_failure`` / ``branch_failure`` — a physical
         disconnection; the balance drop is lost capacity, not a regression.
 
-    Each window runs from the event timestamp for ``_DISRUPTION_GRACE_S``
-    seconds (a fixed grace period rather than "until next event", which dense
-    same-timestamp events would collapse to zero).
-
-    Failure events carry no sector tag, so they open a window for every sector
-    under key ``"*"``, which the caller treats as universal.
+    Each window is a fixed ``_DISRUPTION_GRACE_S`` grace from the event
+    timestamp (not "until next event", which dense same-timestamp events would
+    collapse to zero).  Failure events carry no sector tag, so they open a
+    universal window under key ``"*"``.
     """
     rows = _read_csv(events_path)
     if not rows:

@@ -207,10 +207,9 @@ async def allocate_supply_priority(
             },
         )
 
-    # Feasibility cap on the target. When demand > supply the sharing-distance
-    # term can never close (box+coupling clamp Σ x_g at pool size), so the
-    # solver spuriously hits max-iters. Waterfall target gives
-    # sum(T) == holon_supply_total so ADMM converges with zero residual.
+    # Demand>supply: the box+coupling clamp Σ x_g at pool size so the sharing-
+    # distance term never closes → spurious max-iters. Waterfall target makes
+    # sum(T) == holon_supply_total for zero-residual convergence.
     total_demand_sum = float(total_demand_per_cell.sum())
     if total_demand_sum > holon_supply_total > 0:
         total_T = _waterfall_target(
@@ -226,22 +225,39 @@ async def allocate_supply_priority(
             float(total_T.sum()),
         )
 
-    # Waterfall short-circuit: with no reach overrides and no CP coupling,
-    # total_T already IS the priority-optimal allocation and dispatch reads
-    # only service_fraction = T/demand. Running ADMM would only solve the
-    # per-actor split, which its share-weighted S term handles badly.
+    # No overrides + no CP coupling: total_T already IS the priority-optimal
+    # allocation and dispatch reads only service_fraction = T/demand. ADMM would
+    # only solve the per-actor split, which its share-weighted S handles badly.
     if (
         actor_ub_overrides is None
         and (cp_coupling is None or len(cp_coupling) == 0)
         and holon_supply_total > 0
     ):
+        # No coupling: electricity/heat/gas are independent here, so waterfall
+        # each sector against its OWN supply. A shared pool credits a supply-poor
+        # sector's demand against another sector's supply -> marginal reads 0 where
+        # real stress exists (the multi-sector CP L3 coordinator lands on this path).
+        sc_supply_by_sector = {
+            sec: sum(float(s.get(sec, 0.0)) for s in actor_supplies) for sec in sectors
+        }
+        sc_T = np.zeros(n_dims)
+        for sec in sectors:
+            sec_demand = np.zeros(n_dims)
+            for tier in tiers:
+                jj = _flat_idx(sec, tier)
+                sec_demand[jj] = total_demand_per_cell[jj]
+            sec_supply = sc_supply_by_sector[sec]
+            if float(sec_demand.sum()) > sec_supply:
+                sc_T += _waterfall_target(sec_demand, priorities, sec_supply)
+            else:
+                sc_T += sec_demand
         service_fraction: dict[str, dict[int, float]] = {}
         for sec in sectors:
             service_fraction.setdefault(sec, {})
             for tier in tiers:
                 j = _flat_idx(sec, tier)
                 demand_cell = float(total_demand_per_cell[j])
-                target_cell = float(total_T[j])
+                target_cell = float(sc_T[j])
                 frac = (
                     1.0
                     if demand_cell <= 1e-9
@@ -259,9 +275,9 @@ async def allocate_supply_priority(
             service_fraction,
             [[0.0] * n_dims for _ in actor_supplies],
             {
-                "T_per_cell": total_T.tolist(),
+                "T_per_cell": sc_T.tolist(),
                 "demand_per_cell": total_demand_per_cell.tolist(),
-                "sum_x_per_cell": total_T.tolist(),
+                "sum_x_per_cell": sc_T.tolist(),
                 "actor_supply_total": [
                     sum(float(v) for v in s.values()) for s in actor_supplies
                 ],

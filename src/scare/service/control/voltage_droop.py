@@ -58,18 +58,13 @@ def _qv_coordination_enabled(behavior) -> bool:
     return bool(getattr(cfg, "enable_qv_auction_coordination", False))
 
 
-# dV/dQ sensitivity for the published reactive relief. The prior is a
-# cold-start placeholder, demoted by two guards so it never decides a shed:
-#   * confidence gate — advertise ZERO relief until the EMA has
-#     ``_DVDQ_MIN_SAMPLES`` real samples (matches default scare baseline);
-#   * safety asymmetry — advertise only ``_DVDQ_SAFETY`` of the measured relief,
-#     so the estimate under-credits reactive (costs energy, never stability).
+# dV/dQ prior: cold-start placeholder, two guards so it never decides a shed:
+# confidence gate (ZERO relief until EMA has ``_DVDQ_MIN_SAMPLES`` real samples)
+# + safety asymmetry (advertise only ``_DVDQ_SAFETY`` of relief ⇒ under-credit).
 _DVDQ_PRIOR: float = 0.03
-# Min |Δq| before a (Δv, Δq) pair is trusted (below this the ΔV is noise),
-# as a FRACTION of the inverter's reactive range ``q_max``. An absolute MVar
-# threshold starves calibration on small LV inverters whose entire reactive
-# swing is a few mMVar, so the confidence gate never opens and relief stays 0.
-# ``_DVDQ_MIN_DQ_ABS`` floors it so a degenerate q_max≈0 can't admit pure noise.
+# Min |Δq| to trust a (Δv, Δq) pair, as a FRACTION of ``q_max`` — an absolute
+# MVar threshold starves small LV inverters (few mMVar swing) so the gate never
+# opens; ``_DVDQ_MIN_DQ_ABS`` floors it against a degenerate q_max≈0.
 _DVDQ_MIN_DQ_FRAC: float = 0.02
 _DVDQ_MIN_DQ_ABS: float = 1e-6
 _DVDQ_EMA_ALPHA: float = 0.3

@@ -23,15 +23,10 @@ _CP_BRIDGE_COST: int = 2
 
 
 class ProblemDetector(Role):
-    """Per-node failure detector and distributed propagation hub.
-
-    On a ``BranchFailureEvent`` at an endpoint node, emits a local
-    ``LineFailure`` for the reconfigurator and gossips a sector-tagged,
-    TTL-bounded ``FailureNotice`` through grid neighbours, delivering it to
-    each node's children so negotiators react locally.
-
-    State: ``neighbour_branch_sectors`` (per-edge forwarding cost),
-    ``child_addrs`` (local notice recipients).
+    """Per-node detector: on a ``BranchFailureEvent`` at an endpoint, emits a local
+    ``LineFailure`` for the reconfigurator and gossips a sector-tagged, TTL-bounded
+    ``FailureNotice`` through grid neighbours to each node's children. State:
+    ``neighbour_branch_sectors`` (per-edge cost), ``child_addrs`` (local recipients).
     """
 
     def __init__(

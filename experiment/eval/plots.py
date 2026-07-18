@@ -400,6 +400,13 @@ def _save(fig: go.Figure, out_path: Path) -> Path:
         # PDF is for static inclusion only; HTML is canonical, so a
         # Kaleido failure shouldn't kill the report.
         pass
+    png_path = out_path.with_suffix(".png")
+    try:
+        # PNG is what REPORT.md embeds inline (Markdown can't inline PDF/HTML);
+        # best-effort so a Kaleido failure falls back to the interactive/pdf links.
+        fig.write_image(png_path, format="png")
+    except Exception:
+        pass
     return out_path
 
 

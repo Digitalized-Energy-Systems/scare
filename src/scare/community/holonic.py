@@ -168,10 +168,9 @@ class HolonicCommunityRole(Role):
         self.admm_scope = admm_scope
         # False ⇒ uniform per-tier weights (no-priority ablation).
         self.enable_priority_allocation = bool(enable_priority_allocation)
-        # Coordination overhaul: reactive cascade (see
-        # config.enable_change_only_dispatch). On the L2 side this only bypasses
-        # the rebalance_min_gap_s time-throttle; the change-detection that
-        # bounds the cascade lives on the UPWARD L1→L2 edge (balance.py).
+        # L2 side only bypasses the rebalance_min_gap_s throttle; the
+        # cascade-bounding change-detection lives on the upward L1→L2 edge
+        # (balance.py).
         self.enable_change_only_dispatch = bool(enable_change_only_dispatch)
         # Deliverability wiring (F6). When all three are present the supply-
         # priority ADMM caps each member's per-tier commitment at the demand
@@ -182,17 +181,15 @@ class HolonicCommunityRole(Role):
         # Node ids hosting a CP agent; the per-component path uses this to
         # detect a CP in the leader's multi-sector component. Empty ⇒ none.
         self._cp_node_ids: set[Any] = set(cp_node_ids or set())
-        # ``rebalance_period_s``: slow heartbeat catching drift from timeseries
-        # inputs that change without a NegotiationFinishedEvent.
-        # ``rebalance_min_gap_s``: feedback-loop fuse — lets one round of member
-        # gossip resolve before the next ADMM cycle (holon→gossip→finished→ADMM).
+        # ``rebalance_period_s``: slow drift heartbeat (timeseries changes with
+        # no NegotiationFinishedEvent). ``rebalance_min_gap_s``: fuse letting one
+        # member-gossip round resolve before the next ADMM cycle.
         self.rebalance_period_s = rebalance_period_s
         self.rebalance_min_gap_s = rebalance_min_gap_s
         self.flex_timeout_s = flex_timeout_s
-        # Heat L2 reconnect: heat emits no NegotiationFinishedEvent (no gossip)
-        # and its ConstraintViolations dead-end before L2, so without a poll
-        # the component allocation would only recompute on topology/CP events —
-        # never as the thermal deficit evolves. None ⇒ off (non-heat / flag off).
+        # Heat has no gossip finished-event and its ConstraintViolations
+        # dead-end before L2, so only this poll tracks the evolving thermal
+        # deficit. None ⇒ off (non-heat / flag off).
         self.heat_rebalance_period_s = heat_rebalance_period_s
 
         # Safety net for a leader that missed every trigger event.
@@ -254,10 +251,9 @@ class HolonicCommunityRole(Role):
         self._allocation_version_counter: int = 0
         # Latest dispatched allocation, re-sent to stale leaders. None until first.
         self._last_dispatched_allocation: Any = None  # ComponentAllocation
-        # Latest (coordinator aid, version) applied as an L2 leaf. Versions are
-        # per-publisher, so a re-elected coordinator's fresh low versions must
-        # not be judged against the old coordinator's high counter. Echoed in
-        # each report only when the publisher matches the current coordinator.
+        # Latest (coordinator aid, version) applied as a leaf. Versions are
+        # per-publisher (re-elected coordinator's low versions aren't judged vs
+        # the old high counter); echoed only when publisher == coordinator.
         self._last_applied_allocation_version: int = -1
         self._last_applied_allocation_publisher: str | None = None
 
@@ -601,7 +597,7 @@ class HolonicCommunityRole(Role):
             self.context.schedule_instant_task(self._try_form_holon())
             return
 
-        # Record the resolved member set (initiator + acceptors).
+        # Resolved acceptor set only (self/initiator tracked separately, +1 downstream).
         self._holon_member_addrs = list(accepted_addrs)
         self._holon_member_keys = {str(a) for a in accepted_addrs}
 
@@ -694,11 +690,9 @@ class HolonicCommunityRole(Role):
         Fired periodically and reactively; throttled by ``rebalance_min_gap_s``.
         """
         now = self.context.current_timestamp
-        # Throttle bypassed under the change-only cascade: the upward change-
-        # detection (not this time fuse) bounds the holon→member→finished→holon
-        # loop, and the _maybe_schedule_rebalance deferred-retry path is skipped
-        # when the flag is on, so throttling here would silently drop a within-
-        # gap reactive trigger until the slow watchdog.
+        # Under change-only dispatch the upward change-detection (not this fuse)
+        # bounds the loop and the deferred-retry path is off, so throttling here
+        # would drop a within-gap reactive trigger until the slow watchdog.
         if (
             not self.enable_change_only_dispatch
             and (now - self._last_rebalance_t) < self.rebalance_min_gap_s
@@ -1297,6 +1291,12 @@ class HolonicCommunityRole(Role):
         # no demand anywhere ⇒ fall back to the legacy path.
         sectors, tiers, total_demand = extract_demand_sectors_tiers(actor_demands)
         if not sectors or not tiers or total_demand < 1e-6:
+            # Restore the drained buffers + lock: the legacy fallback re-guards on
+            # _rebalance_active and re-reads _flex_answers, so without this it is a
+            # silent no-op (mirrors the component-path fallback at _emit_*).
+            self._flex_answers = answers
+            self._flex_answer_senders = senders
+            self._rebalance_active = True
             await self._run_legacy_per_sector_admm()
             return
 
@@ -1582,11 +1582,9 @@ class HolonicCommunityRole(Role):
         now = float(self.context.current_timestamp)
         leader_aid = self.context.aid
 
-        # Implicit ACK: echo the latest applied version so the coordinator can
-        # detect a missed dispatch — but only when it was published by the
-        # CURRENT coordinator. After re-election the old coordinator's high
-        # version would otherwise wedge the new one's ``_resend_allocation_
-        # if_stale`` (its counter restarts low).
+        # Echo the last applied version as an implicit ACK, but only if it was
+        # published by the CURRENT coordinator; else a re-elected coordinator
+        # (counter restarts low) is wedged by the old coordinator's high version.
         echo_version = (
             self._last_applied_allocation_version
             if self._last_applied_allocation_publisher == coord_aid
@@ -1816,12 +1814,10 @@ class HolonicCommunityRole(Role):
             f"n_communities={len(reports)} fractions={service_fraction}",
         )
 
-        # Dispatch the same ComponentAllocation to every leader (incl. self);
-        # each applies it via ``_handle_component_allocation``. The cascade is
-        # bounded by the UPWARD change-detection (L1 only notifies L2 when its
-        # converged setpoint moved), not by skipping this authoritative dispatch
-        # — skipping it would stale the per-load L2 priority floor (set inside
-        # ``apply_regulate``) and let a fresh L1 gossip invert priority.
+        # Dispatch to every leader incl. self; don't skip this authoritative
+        # dispatch, or a stale per-load L2 priority floor (set in apply_regulate)
+        # lets a fresh L1 gossip invert priority. The upward change-detection
+        # bounds the cascade instead.
         round_id = max(
             (self._component_report_buffer[a][0] for a in leader_aids),
             default="",
@@ -1885,12 +1881,9 @@ class HolonicCommunityRole(Role):
                 self.sector,
                 now,
             )
-            # Re-assert non-increasing-in-tier monotonicity AFTER the coalition
-            # merge. ``merge_into`` lets a per-tier store fraction win, which can
-            # lift a lower-priority tier above a higher one and reintroduce the
-            # exact inversion the coordinator's clamp removed. Without this, a
-            # competing coalition override silently breaks component priority
-            # order (the observed gas tier-1-victim inversions).
+            # Re-clamp after the coalition merge: merge_into can let a store
+            # fraction lift a low tier above a high one, reintroducing the
+            # observed gas tier-1-victim inversions.
             merged = service_fraction.get(self.sector.value)
             if merged:
                 clamp_tier_monotonic(merged)

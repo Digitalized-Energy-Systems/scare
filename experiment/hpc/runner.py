@@ -96,11 +96,11 @@ LOG_FORMAT = "%(asctime)s t=%(sim_t)8.3f %(levelname)s [%(name)s] %(message)s"
 
 
 class _SolverFailureCounter(logging.Filter):
-    """Count solver-status escalations to report per-task solver health.
+    """Count solver-status escalations for per-task health.
 
-    An infeasible solve fires as a pair (monee ERROR + pyomo.core WARNING),
-    deduped within ``_DEDUPE_WINDOW_S``. Also catches Gurobi/Pyomo env
-    strings so env issues are distinguishable from algorithm bugs.
+    An infeasible solve fires as a monee-ERROR + pyomo-WARNING pair, deduped
+    within ``_DEDUPE_WINDOW_S``; Gurobi/Pyomo env strings are also caught to
+    separate env issues from algorithm bugs.
     """
 
     _SOLVER_ERROR_MARKERS: tuple[str, ...] = (
@@ -218,9 +218,9 @@ def ensure_deterministic_hashing(seed: str = "0") -> None:
     """Pin ``PYTHONHASHSEED`` for reproducibility, re-exec'ing once to apply it.
 
     Hash randomisation (fixed at interpreter start) varies set/frozenset order
-    over agent-id strings per worker, flipping results for the same task. It can
-    only be disabled before start, so set the env var and re-exec. A user-set
-    value (other than ``"random"``) is respected; no-op once pinned.
+    over agent-id strings, flipping same-task results; it can only be disabled
+    pre-start, so set the env var and re-exec. A user value other than
+    ``"random"`` is respected.
     """
     current = os.environ.get("PYTHONHASHSEED")
     if current is not None and current != "random":
@@ -350,13 +350,9 @@ async def _run_simulation(
     net = factory()
     _apply_scenario(net, task, logger)
 
-    # Scale the per-solve cap to grid size. A numerically hard-infeasible solve
-    # grinds the *whole* cap; on a ~40-node grid (simbench_lv_small) repeated
-    # such solves at the flat 300s ceiling summed to 18*300s = task_timeout, so
-    # the task timed out with no useful signal. Healthy solve time scales with
-    # node count, so cap ~1s/node — unchanged (300s) on the large grids, but
-    # ~40-50s on the small ones, keeping the full sim under the task budget even
-    # if every step is infeasible. Floor 30s (async-preempt granularity).
+    # Scale per-solve cap to ~1s/node: on a ~40-node grid the flat 300s ceiling
+    # let 18 infeasible solves sum to the full task_timeout with no signal. Large
+    # grids stay 300s; small ones drop to ~40s. Floor 30s (async-preempt granularity).
     n_nodes = sum(1 for _ in net.nodes)
     scaled_cap = max(30.0, min(per_solve_cap, float(n_nodes)))
     if scaled_cap < per_solve_cap:
@@ -390,11 +386,9 @@ async def _run_simulation(
     net._scare_priorities = priorities
 
     scenario = task.scenario or {}
-    # Per-experiment horizon override (scenario key, alongside physics_time_scale
-    # / physics_interval_s): a longer sim accrues MORE receding-physics steps at
-    # the SAME 24-min dt and the SAME per-step agent budget. Stretching physical
-    # time via physics_time_scale instead would desync agent message delays
-    # (sim-clock) from the physics dt, so horizon length is a duration knob only.
+    # Per-experiment horizon override: a longer sim accrues more receding-physics
+    # steps at the same dt/agent budget. Not physics_time_scale, which would
+    # desync sim-clock message delays from the physics dt — a duration knob only.
     sim_duration_s = float(
         scenario.get("simulation_duration_s") or plan.simulation_duration_s
     )
@@ -580,12 +574,10 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
             counts,
         )
 
-    # Heat McCormick linearisation: mandatory for islanding (the gurobipy
-    # backend cannot ingest the fully nonlinear DHS balance), opt-in via
-    # ``heat_mccormick`` for other kinds so a paired A/B arm can run the
-    # identical heat physics — without it the clean-vs-microgrid delta
-    # confounds islanding with the relaxation. Shared helper keeps live and
-    # oracle physics identical.
+    # Heat McCormick linearisation: mandatory for islanding (the gurobipy backend
+    # can't ingest nonlinear DHS balance), else opt-in via ``heat_mccormick`` so a
+    # paired A/B arm runs identical heat physics (else clean-vs-microgrid confounds
+    # islanding with the relaxation).
     if kind == "microgrid" or scenario.get("heat_mccormick"):
         apply_oracle_heat_linearisation(net)
         logger.info("Applied McCormick heat linearisation (oracle settings)")
@@ -647,12 +639,11 @@ def _config_from_task(task: TaskSpec):
             enable_cp_admm=False,
         )
     elif task.variant == "component_level":
-        # One community per connected component per sector — global L1, no
-        # hierarchy. CPs join bridged communities and reconcile via
-        # MultiCommunityCPRole (EMA + deadband + cooldown). multihop_constraint
-        # MUST stay off: the partition collapses each sector into one group, so
-        # forwarding fans out O(N^2) and OOM-kills the worker; direct neighbours
-        # already give the global picture.
+        # One community per connected component per sector (global L1, no hierarchy);
+        # CPs join bridged communities, reconciling via MultiCommunityCPRole (EMA +
+        # deadband + cooldown). multihop_constraint MUST stay off: the partition
+        # collapses each sector into one group, so forwarding fans out O(N^2) and
+        # OOM-kills the worker; direct neighbours already give the global picture.
         base = RestorationConfiguration(
             enable_holonic=False,
             enable_cp_admm=False,
@@ -909,9 +900,9 @@ def _failing_fatal_claims(
     ]
 
 
-# Every artifact run_task / the oracle / the metrics writers can produce.
-# Scrubbed at task start so a re-run that fails early can't leave stale
-# outputs from a previous run for the aggregator to join.
+# Artifacts run_task / the oracle / the metrics writers scrub at task start so a
+# re-run that fails early can't leave stale outputs for the aggregator to join.
+# NOTE: incomplete — network_changes.csv (written above) is produced but not listed here.
 _TASK_ARTIFACTS = (
     "status.json",
     "exception.json",

@@ -513,13 +513,9 @@ class CPPriorityAdmmRole(Role):
         reachable_nodes = self._reachable_node_set()
         if not self._am_gossip_initiator(reachable_nodes):
             return
-        # Don't supersede our own in-flight cascade: starting a new round here
-        # calls _begin_round, which cancels the running cascade before it can
-        # commit. Summaries / the watchdog re-trigger faster than a round
-        # completes, so without this guard every cascade is cancelled and the CP
-        # converter actuator never fires. Let the active round finish (it
-        # self-terminates at round_timeout_s and commits); the next dirty tick
-        # opens a fresh round on the updated state.
+        # Skip if a cascade is in flight: a new round's _begin_round cancels the running
+        # (uncommitted) cascade, and re-triggers outpace round completion, so without this
+        # guard apply_regulate never fires. Let it self-terminate at round_timeout_s.
         if self._gossip_participant.is_round_active():
             return
         demands = self._build_demands(reachable_nodes)
@@ -529,15 +525,9 @@ class CPPriorityAdmmRole(Role):
             self._reachable_peer_cp_ids(reachable_nodes) | {self.cp_id}
         )
         self._gossip_round_id += 1
-        # Timeouts in SIM-seconds (carrier clock). They MUST be small relative
-        # to the task sim duration (~10s) and the rebalance cadence: the cascade
-        # only commits (fires apply_regulate) when a round completes, either by
-        # converging or by hitting round_timeout_s. The previous 30s round /1s
-        # iter never completed within a 10s sim, so the CP converter actuator
-        # never fired and the electricity slack over-drew. 2.0s/0.2s lets every
-        # round commit-on-timeout within the sim (the partially-solved factor
-        # still curtails effectively); paired with the in-flight guard above so
-        # rounds aren't perpetually cancelled before committing.
+        # SIM-second timeouts (carrier clock): a round commits (apply_regulate) on convergence
+        # or round_timeout_s. 30s round/1s iter never completed in the ~10s sim -> CP converter
+        # never fired, elec slack over-drew; 2.0s/0.2s commits-on-timeout (partial still curtails).
         start = create_gossip_cascade_start(
             round_id=self._gossip_round_id,
             participants=participants,

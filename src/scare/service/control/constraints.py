@@ -122,11 +122,11 @@ _CURTAIL_PROGRESS_TOL: float = 0.01
 _QV_MAX_CONSECUTIVE_DEFERS: int = 6
 _QV_DEFER_PROGRESS_TOL: float = 1e-3
 
-# The auction never fires on ``loading_percent``: its node-blind bidding can't
-# relieve a branch (the line-relief path owns it; downstream relief re-enables
-# it with a targeted bidder set). ``t_k`` is skipped only while the heat
-# frontier controller is enabled to own it — see ``_auction_skips_var``. The
-# auction still fires on ``vm_pu`` / ``pressure_pu`` where local load is the lever.
+# The auction never fires on ``loading_percent`` (node-blind bidding can't
+# relieve a branch; the line-relief path owns it, re-enabling it only with a
+# targeted bidder set) and skips ``t_k`` only while the heat frontier owns it
+# (see ``_auction_skips_var``). It still fires on ``vm_pu`` / ``pressure_pu``
+# where local load is the lever.
 
 # Targeting (``enable_curtail_auction_targeting``): proximity to the violated
 # origin scales willingness within these bounds (within-tier tiebreaker, from
@@ -161,14 +161,11 @@ _LINE_RELIEF_MIN_REDUCIBLE: float = 5e-4
 # Released only on genuine headroom, not the relief's own settle point.
 _LINE_RELIEF_RELEASE_MARGIN: float = 15.0
 
-# Congestion-price controller (``enable_line_congestion_price``). Integral gain
-# on the normalized loading overshoot ((val-hi)/100) per poll: moderate so the
-# price climbs to the export-clearing level over a few polls instead of slamming
-# PV to 0 in one shot. Restore step decays the price each headroom poll so PV
-# ramps back to serve local load. Headroom margin (loading-% points below the
-# limit) gates the decay — inside the band the last ceiling is held (a stalled
-# monitor must not release curtailment and re-overload). Price is capped below 1
-# so a downstream generator is never pinned fully to 0 by a single branch.
+# Congestion-price AIMD (``enable_line_congestion_price``): GAIN integrates the
+# price up on normalized loading overshoot ((val-hi)/100); RESTORE_STEP decays it
+# each headroom poll so PV ramps back. HEADROOM_MARGIN gates the decay (hold the
+# last ceiling inside the band so a stalled monitor can't release curtailment and
+# re-overload). PRICE_MAX < 1 keeps a downstream gen off a hard 0.
 _LINE_CONGESTION_GAIN: float = 0.35
 _LINE_CONGESTION_RESTORE_STEP: float = 0.05
 _LINE_CONGESTION_HEADROOM_MARGIN: float = 8.0
@@ -269,7 +266,7 @@ class GridConstraintMonitor(Role):
 
         # Dedup of forwarded state: (origin, variable) -> (best_hops, t, util).
         # Forward incoming only on better hops; re-broadcast own only on value
-        # change or freshness elapse. Never cleared per-cycle (re-floods the group).
+        # change / freshness. Never cleared per-cycle (would re-flood the group).
         self._state_forwarded: dict[tuple[str, str], tuple[int, float, float]] = {}
         # Per-variable (t, util) of this agent's last own broadcast.
         self._last_local_broadcast: dict[str, tuple[float, float]] = {}
@@ -440,12 +437,10 @@ class GridConstraintMonitor(Role):
             and var == "loading_percent"
             and bool(self._downstream_load_addrs)
         )
-        # Export-driven (reverse-flow) overload: shedding downstream load
-        # INCREASES net export and worsens it, so every load-shed relief path
-        # is suppressed and downstream generation is curtailed instead.
-        # Debounced over consecutive polls, and owned only while curtailable
-        # downstream generators exist — otherwise the ordinary relief chain
-        # stays in charge rather than suppressing everything.
+        # Export (reverse-flow) overload: shedding downstream load raises net
+        # export and worsens it, so all load-shed paths are suppressed and
+        # downstream generation is curtailed instead. Debounced over polls, and
+        # owned only while curtailable downstream generators exist.
         is_export = (
             self.branch_id is not None
             and var == "loading_percent"
@@ -461,14 +456,10 @@ class GridConstraintMonitor(Role):
             and self._export_streak[var] >= _EXPORT_DEBOUNCE_POLLS
             and bool(self._downstream_generator_aids())
         )
-        # Load-shed suppression for an export overload. Legacy: only once the
-        # debounced ``export_overload`` is confirmed — but then the waterfall
-        # sheds downstream load on the first poll or two before generation
-        # curtail (the correct lever) engages, and that shed doesn't revert once
-        # the line clears. Under generation-priority curtailment, stop shedding
-        # the MOMENT an overload looks export-driven with curtailable downstream
-        # generation; the gen-curtail actuation below stays debounced so a single
-        # transient reverse sample can't latch a non-reverting curtail.
+        # Legacy debounce sheds 1-2 polls of downstream load pre-gen-curtail and
+        # never reverts; so under gen-priority/congestion-price suppress load-shed
+        # the moment an overload looks export-driven with curtailable downstream
+        # gens (pre-debounce), while gen-curtail below stays debounced.
         if self.enable_generation_priority_curtailment or self.enable_line_congestion_price:
             suppress_load_shed = is_export and bool(self._downstream_generator_aids())
         else:
@@ -578,7 +569,11 @@ class GridConstraintMonitor(Role):
         # Cache gate: skip the pass when no value moved and no violation is
         # active. An active violation must keep firing until it clears, else
         # downstream balance roles never see the "clear" transition.
-        if not self._violation_emitted and self._last_polled_values:
+        if (
+            not self._violation_emitted
+            and self._last_polled_values
+            and not self._needs_per_poll_tick()
+        ):
             unchanged = all(
                 math.isfinite(v)
                 and var in self._last_polled_values
@@ -607,14 +602,10 @@ class GridConstraintMonitor(Role):
         self._update_sensitivity(obs)
 
         for var, val in values.items():
-            # Skip readings the solver hasn't populated or that signal a
-            # de-energised junction: isolated heat nodes report t_k=0 / NaN
-            # post-failure, a gas region cut off from its source collapses to
-            # pressure_pu~0 (or saturates the relaxed-Weymouth box at ~sqrt(3)),
-            # and an electricity node cut off from its slack collapses to
-            # vm_pu~0 (see DEENERGISED_*). None is an actionable breach (no
-            # curtailment lever re-energises a source-isolated region); genuine
-            # out-of-bound readings sit well inside the gap, so they still fire.
+            # Skip de-energised readings (heat t_k<=0/NaN, gas pressure<=low or
+            # >=high relaxed-Weymouth box saturating at ~sqrt(3), elec vm_pu<=floor;
+            # see DEENERGISED_*): no curtail lever re-energises them; genuine
+            # out-of-bound values sit inside the gap and still fire.
             if (
                 not math.isfinite(val)
                 or (var == "t_k" and val <= 0.0)
@@ -632,10 +623,10 @@ class GridConstraintMonitor(Role):
             lo, hi = bounds.get(var, (float("-inf"), float("inf")))
             util = constraint_utilization(val, lo, hi)
 
-            # Every poll: feed the line-relief hand-off its loading headroom and
-            # keep any live restore-ramp lock fresh, so the bounded hand-back can
-            # proceed once the line clears without the lock ageing out (which
-            # would let L2 slam the load to full and re-overload the line).
+            # Feed the line-relief hand-off its headroom and re-stamp any live
+            # restore-ramp lock. The cache gate can short-circuit this poll, so
+            # lock liveness isn't guaranteed (an aged-out lock lets L2 slam the
+            # load to full and re-overload the line).
             self._maintain_line_relief_handoff(var, val, hi)
             if self.enable_line_congestion_price:
                 self._maintain_congestion_price(obs, var, val, hi)
@@ -858,6 +849,18 @@ class GridConstraintMonitor(Role):
             and bool(self._downstream_load_addrs)
         )
 
+    def _needs_per_poll_tick(self) -> bool:
+        """Branches whose per-poll maintenance must run even when values are
+        stable and no violation is active: the line-relief lever (keep a live
+        restore-ramp lock fresh in the cleared region) and an active congestion
+        price (keep decaying it back to 1.0). Skipping these is the limit-cycle
+        the cache gate would otherwise cause."""
+        return self._is_line_relief_branch() or (
+            self.enable_line_congestion_price
+            and self.branch_id is not None
+            and self._line_congestion_price > 0.0
+        )
+
     def _hold_downstream_line_locks(self, var: str, val: float, hi: float) -> None:
         """Keep the L2-clawback line locks fresh while the line is over (or in
         the hysteresis band), so L2 can't re-serve a just-relieved load. No-op
@@ -894,8 +897,10 @@ class GridConstraintMonitor(Role):
         self, obs: dict, var: str, val: float, hi: float
     ) -> None:
         """Soft congestion-price controller for an export (reverse-flow) branch
-        overload. Runs EVERY poll (not just on breach) so the price can decay and
-        the generation ceiling recover once the line clears.
+        overload. Runs on every poll that survives the ``_monitor`` cache gate,
+        so the price can decay and the generation ceiling recover once the line
+        clears — but a settled, in-bounds branch short-circuits the gate and
+        freezes the price.
 
         AIMD-style: integrate the price up on overshoot while the flow is export
         with curtailable downstream gens; decay it on genuine loading headroom;
@@ -1183,14 +1188,11 @@ class GridConstraintMonitor(Role):
         if span <= 0:
             return
 
-        # Excess-injection violation: over-voltage is relieved ONLY by cutting
-        # generation. Bid generators, exclude loads — shedding load on a
-        # PV-surplus feeder raises voltage and needlessly drops served demand.
-        # The Q(U)/auction coordination substitutes reactive for the ACTIVE
-        # over-voltage shed it defers; that shed must target generation (its
-        # premise), so it implies generation-priority even if the standalone
-        # flag is off — otherwise the coordinated path sheds loads, which raises
-        # voltage on an export feeder (wrong direction).
+        # Over-voltage is relieved only by cutting generation, so bid gens and
+        # exclude loads (shedding load on a PV-surplus feeder raises voltage).
+        # Q(U)/auction coordination substitutes reactive for the active shed it
+        # defers, so it must also target generation — hence it implies
+        # injection_relief even when the standalone gen-priority flag is off.
         injection_relief = (
             (
                 self.enable_generation_priority_curtailment

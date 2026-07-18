@@ -63,8 +63,9 @@ from experiment.scenarios import (
 
 logger = logging.getLogger(__name__)
 
-# Partition count for the oracle's McCormick-DHS heat linearisation —
-# matches the value the grid factory uses when DHS is enabled there.
+# Partition count for the oracle/shared ``apply_oracle_heat_linearisation``
+# helper; the factory leaves DHS nonlinear, and the live-net path (runner.py)
+# shares this exact helper so the two cannot drift.
 _ORACLE_MCCORMICK_PARTITIONS = 16
 
 
@@ -107,49 +108,27 @@ def _apply_failures(monee_net: Any, failures: list[Any]) -> None:
                 )
 
 
-# Bounded near-strict priority ladder for the oracle LP objective. The oracle
-# minimises ``sum(weight_load * (1 - regulation))``, so per MW a higher tier is
-# preferred to a lower one whenever ``w(tier)`` is strictly decreasing — the
-# ordering is strict AT THE MARGIN for any decreasing ladder, independent of
-# demand sizes. This mirrors SCARE's own objective (tier-1 hard-locked, tiers 2-4
-# steep ``1e8/1e4/1``; base/util.tier_priority_weight) so the optimality gap
-# measures solver quality, not a policy mismatch — NOT the PWSF metric's moderate
-# 8:4:2:1, which would make the oracle trade tier-1 away and inflate the gap.
-#
-# Two solver-resolution constraints apply. (1) Aux floor: monee's
-# ``auto_priority_floor`` lifts the shed weights off the max objective
-# coefficient, so a tier whose weight sits far below the max is swamped below
-# the aux terms. That is exactly why the legacy ``1e12/1e8/1e4/1`` ladder
-# behaved priority-BLIND — tiers 3/4 were 1e8-1e12x below tier 1, the LP tied
-# them, and the oracle shed serveable tier-1 load under forced shedding. A span
-# of 1e6 (adjacent ratio 100) keeps every tier above the aux floor. (2) MIP
-# TERMINATION: the aux-floor analysis says nothing about the branch-and-bound
-# gap. With forced-shed objective terms at ~1e9·MW, a relative MIPGap of 1e-3
-# (monee's default) exceeds the entire tier-3/4 objective contribution, so
-# their dispatch inside the gap is arbitrary (~64k tier inversions measured;
-# reproducibly eliminated at MIPGap=1e-8). ``_ORACLE_GUROBI_PARAMS`` below
-# tightens the gap so no tier decision fits inside the termination tolerance.
-# Validated by a forced-shedding oracle solve
-# (see tests/eval/test_oracle_priority.py).
+# Near-strict priority ladder mirroring SCARE's objective (tiers 2-4 steep
+# 1e8/1e4/1), NOT PWSF's 8:4:2:1 which would trade tier-1 away and inflate the
+# gap. Strict at the margin for any decreasing weights, size-independent. Span
+# 1e6/ratio-100 keeps every tier above monee's auto_priority_floor (legacy
+# 1e12/1e8/1e4/1 was priority-BLIND there). Also needs MIPGap<=1e-8 (default
+# 1e-3 hid ~64k tier inversions). Validated in tests/eval/test_oracle_priority.py.
 _ORACLE_TIER_WEIGHT: dict[int, float] = {1: 1e6, 2: 1e4, 3: 1e2, 4: 1.0}
 
-# MIPGapAbs = half the objective cost of fully shedding a conservative
-# minimum-size (1e-3 MW) load at the cheapest tier
-# (0.5 · WEIGHT_DEMAND · tier-4 weight · 1e-3 MW = 0.5), so no tier decision
-# can hide inside the absolute termination gap; MIPGap covers the relative
-# criterion. TimeLimit matches monee's default.
+# MIPGapAbs = half the objective cost of shedding a 1e-3 MW tier-4 load
+# (= 0.5·WEIGHT_DEMAND·tier4·1e-3 = 0.5 at WEIGHT_DEMAND=1e3), so no tier
+# decision fits inside the absolute gap; MIPGap covers the relative side.
+# TimeLimit matches monee's default.
 _ORACLE_MIN_LOAD_MW = 1e-3
 
 
 def _oracle_threads() -> int:
-    """Match Gurobi's thread count to the actual core allocation.
+    """Match Gurobi Threads to the slurm cgroup allocation.
 
-    Under slurm the task is cgroup-limited to ``cpus-per-task`` cores, but
-    Gurobi's default (Threads=0) spawns workers for every core it DETECTS on
-    the node — ~32 B&B threads contending for one allotted core: scheduler
-    thrash, higher memory (per-thread node pools vs the 16G cap), and far
-    less effective search per wall-second. Off-slurm defaults to 1, the
-    setting every solver preset here was validated at.
+    Default Threads=0 spawns one worker per DETECTED core (~32) while the task
+    gets only cpus-per-task — scheduler thrash and per-thread node pools vs the
+    16G cap. Off-slurm = 1 (the setting every preset was validated at).
     """
     try:
         return max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", "1")))
@@ -164,14 +143,11 @@ _ORACLE_GUROBI_PARAMS: dict[str, float] = {
     "Threads": _oracle_threads(),
 }
 
-# Grids/scenarios whose oracle MIQCQP stalls at the TimeLimit with weak or no
-# incumbents (eval_full_v2: reconfig gap median ~1.0 with 27/105 sol_count=0;
-# mvlv gap ~0.98 — the "oracle" was far off the optimum, so SCARE "beat" it).
-# Longer budget only; measured on the reproduced sol_count=0 reconfig task
-# (seed 200000002, Threads=1): MIPFocus=1/NoRelHeurTime made the BOUND
-# collapse (gap 0.81-0.90) while the failed-sector tie restriction
-# (_restrict_ties_to_failed_sectors) + baseline warm start close the gap to
-# 6e-4 at the stock search settings — so no focus/heuristic overrides here.
+# reconfig/mvlv MIQCQP stalls at TimeLimit (eval_full_v2: reconfig 27/105
+# sol_count=0 gap ~1, mvlv gap ~0.98) so "oracle" fell below optimum and SCARE
+# "beat" it. Fix is longer budget only: on seed 200000002 (Threads=1)
+# MIPFocus=1/NoRelHeurTime collapsed the BOUND (gap 0.81-0.90) while
+# tie-restriction + baseline warm start reach 6e-4 at stock search settings.
 _ORACLE_HARD_PRESET: dict[str, float] = {
     "TimeLimit": 900,
 }
@@ -244,14 +220,12 @@ class _OracleGurobiSolver(GurobipySolver):
 
 
 def _make_vm_bounds_hook(bounds_vm: tuple[float, float]):
-    """Bound the electricity voltage Var the solver actually optimises.
+    """Box the voltage Var the solver actually optimises.
 
-    monee's ``bounds_vm`` boxes only the ``vm_pu`` attribute, which under the
-    MISOCP electricity formulation is a reporting Intermediate at solve time —
-    the real Var is ``vm_pu_squared`` (box (0, 2.25)) — so the voltage envelope
-    was a no-op there. Mirrors monee's ``_make_pressure_bounds_hook``
-    (``pressure_squared_pu``); ``vm_pu`` is still bounded when it IS a Var
-    (non-MISOCP formulations).
+    Under MISOCP that is ``vm_pu_squared`` (native box 0..2.25, here set to
+    lo^2, hi^2), while ``vm_pu`` is a reporting Intermediate there so monee's
+    ``bounds_vm`` no-ops. Also box ``vm_pu`` when it IS a Var (non-MISOCP).
+    Mirrors ``_make_pressure_bounds_hook``.
     """
     lo, hi = bounds_vm
 
@@ -286,14 +260,11 @@ def _weight_for_load_factory(
     no priorities are supplied, so monee uses its flat-weight behaviour.
     Out-of-range tiers clamp onto [1, 4].
 
-    The tier is STAMPED onto each load model as ``_scare_oracle_tier`` and the
-    closure resolves it via ``getattr``, NOT an ``id(model)`` map. monee's solver
-    deep-copies the network before building the objective
-    (``solver/core.py``: ``input_network.copy()``), so the objective sees COPIED
-    models whose ``id`` differs from the originals; an id-keyed map misses every
-    one, silently returns ``None`` for all loads, and renders the oracle
-    priority-BLIND (verified: reversing the ladder left the dispatch unchanged).
-    A model attribute survives the copy, so the weight resolves on the copy too.
+    Tier is stamped as the attribute ``_scare_oracle_tier`` and resolved via
+    ``getattr``, NOT an ``id(model)`` map: monee deep-copies the net at solve time
+    (``solver/core.py`` ``input_network.copy()``), so an id-keyed map misses every
+    copied model and renders the oracle priority-BLIND (verified: reversing the
+    ladder didn't change dispatch). Attributes survive the copy.
     """
     if not priorities:
         return None
@@ -494,15 +465,11 @@ def _build_min_shed_problem(
     """Apply the oracle formulations to *monee_net* (in place) and build the
     min-load-shedding problem both the one-shot and the temporal oracle solve.
     """
-    # Linearise the district-heating temperature physics for the oracle solve
-    # only. The factory leaves DHS in its full nonlinear form; with the binary
-    # ``on_off`` decision var on reconfiguration-grid backup branches, the
-    # nonlinear heat balance lifts to degree 4, which Pyomo's LP/QCP writer
-    # cannot serialise. McCormick-DHS replaces the balance with a piecewise
-    # linear envelope (on_off then enters only linear terms), letting the oracle
-    # solve with backup lines intact, comparable to SCARE. Applied here, not in
-    # the factory, so only the oracle LP is affected; the net is oracle-dedicated
-    # so the in-place swap is safe.
+    # Linearise DHS for the oracle only: the factory leaves it nonlinear, but
+    # with the binary ``on_off`` on reconfig backup branches the heat balance
+    # lifts to degree 4, which Pyomo's LP/QCP writer can't serialise.
+    # McCormick-DHS keeps on_off in linear terms so backup lines stay intact.
+    # Safe in-place — the net is oracle-dedicated.
     apply_oracle_heat_linearisation(monee_net)
     monee_net.apply_formulation(
         GAS_NONCONVEX_MIQCQP_FORMULATION
@@ -524,13 +491,10 @@ def _build_min_shed_problem(
     ext_grid_gas_bounds = (
         (-budgets["gas"], +budgets["gas"]) if budgets["gas"] is not None else (-10, 10)
     )
-    # Heat-side ExtHydrGrid is left unbounded by ``apply_slack_budget`` (heating
-    # loop mass flow is constrained by HE physics, not policy). Size the
-    # envelope from the grid's heat-side throughput: the Sink mass flows are
-    # non-regulatable (shedding only zeroes HeatLoad q, never Sink flow), so
-    # the slack MUST be able to carry their sum — a fixed default silently
-    # turns the oracle infeasible on grids above LV scale (the MVLV grid
-    # carries ~179 kg/s against the old ±10 default; LV ~5).
+    # Heat slack is left unbounded by ``apply_slack_budget``; size it from
+    # throughput because Sink mass flows are non-regulatable (shed only zeroes
+    # HeatLoad q, never Sink flow) so the slack must carry their sum — a fixed
+    # ±10 goes infeasible above LV (MVLV ~179 kg/s vs LV ~5).
     heat_envelope_kgs = max(10.0, 2.0 * _heat_throughput_kgs(monee_net))
     ext_grid_heat_bounds = (
         (-budgets["heat"], +budgets["heat"])
@@ -557,12 +521,10 @@ def _build_min_shed_problem(
     # t_k = (313.15, 403.15) via monee's water-grid t_ref = 356 K -> t_pu.
     bounds_vm_pu = (0.95, 1.05)
     bounds_pressure_pu = (0.85, 1.25)
-    # Give the oracle the SAME regulator-setpoint lever the MAS now has: let each
-    # gas slack outlet pressure be an optimizable decision var within the band,
-    # not a single fixed pin. Without this the oracle is a LOOSER bound — SCARE's
-    # GasPressureRegulator could raise its setpoint to hold nodes in band where a
-    # fixed-setpoint oracle would have to shed. Gas-only (the heat-side
-    # ExtHydrGrid is governed by t_k, not pressure).
+    # Let each gas slack outlet pressure be an optimizable var within the band,
+    # matching SCARE's GasPressureRegulator lever — a fixed setpoint would make
+    # the oracle a LOOSER bound (SCARE could raise setpoint to hold nodes an
+    # oracle must shed). Gas-only (heat-side is governed by t_k).
     for child in monee_net.childs:
         m = child.model
         if not isinstance(m, ExtHydrGrid):
@@ -608,15 +570,11 @@ def _restrict_ties_to_failed_sectors(monee_net: Any, failures: list[Any]) -> Non
     branch failure; pin ties in unaffected sectors open (the pre-failure
     radial operating point).
 
-    With all 15 tie binaries free, fractional ``on_off`` in the relaxation
-    fictitiously bridges the whole network (root bound collapses to gap ~1)
-    and the ties' bilinear heat/Weymouth terms defeat every rounding
-    heuristic — 27/105 reconfig oracle solves in eval_full_v2 timed out with
-    NO incumbent. Ties in a sector without a failure are not a
-    reconfiguration DOF (nothing to reroute around), so pinning them shrinks
-    the binary coupling without weakening the oracle as a comparator. No-op
-    when no failed sector is identifiable (e.g. pure generator failures):
-    every tie then stays free.
+    All 15 ties free → fractional ``on_off`` fictitiously bridges the net (root
+    gap ~1) and bilinear heat/Weymouth terms defeat rounding (27/105 reconfig
+    solves timed out, no incumbent). A tie in a non-failed sector is not a
+    reconfiguration DOF, so pinning it doesn't weaken the oracle. No-op when no
+    failed sector is identifiable.
     """
     from monee.model.branch import GasPipe, GenericPowerBranch, WaterPipe
 
@@ -665,16 +623,11 @@ def _stamp_warm_start(
     Gurobi's MIP start (``inject_gurobi_vars_attr`` turns ``Var.value`` into
     ``Var.Start``; monee's promotion skips attrs that are already Vars).
 
-    Without this, promotion resets every regulation to 1 and every backup
-    ``on_off`` to 1 — a serve-everything start that is infeasible under tight
-    slack budgets, so Gurobi gets no usable start at all (27 reconfig oracle
-    tasks in eval_full_v2 timed out with sol_count=0). Seeds instead:
-    - child regulation from the PRE-failure incumbent (feasible modulo the
-      failed branches; start-completion repairs the rest),
-    - backup ties open (the radial pre-failure operating point).
-
-    Bounds/integrality mirror the promotion exactly (``REGULATION_ATTR`` /
-    ``controllable_backup_lines``), so the problem itself is unchanged.
+    Promotion otherwise resets every regulation and backup ``on_off`` to 1
+    (serve-everything) — infeasible under tight slack budgets, so Gurobi gets no
+    usable start (27 reconfig tasks in eval_full_v2 timed out sol_count=0). Seed
+    child regulation from the pre-failure incumbent and backup ties open.
+    Bounds/integrality mirror the promotion, so the problem is unchanged.
     """
     def _is_gas_grid(g: Any) -> bool:
         grids = g if isinstance(g, list) else [g]
@@ -684,13 +637,10 @@ def _stamp_warm_start(
         )
 
     if regulations:
-        # Positive allow-list mirroring monee's promotion classes exactly
-        # (problem/core.py controllable_demands/generators). gurobipy injects
-        # EVERY Var attr regardless of promotion, so stamping any child the
-        # problem would not promote (GridForming* on microgrid nets, shunts,
-        # storages) would add a free regulation Var — and node balances
-        # multiply child flow by regulation, turning child-linear balances
-        # bilinear where the child's flow is itself a Var.
+        # Allow-list mirrors monee's promotion classes: gurobipy injects EVERY
+        # Var attr regardless of promotion, so stamping a non-promoted child
+        # (GridForming on microgrid nets, shunts, storages) adds a free
+        # regulation Var that turns child-linear node balances bilinear.
         allowed = (PowerLoad, HeatLoad, PowerGenerator, HeatGenerator, Source, Sink)
         for child in monee_net.childs:
             model = child.model
@@ -1041,14 +991,11 @@ def compute_baseline_served(
                 float(slack_budget_pct),
                 hard_cap_carriers=tuple(hard_cap) if hard_cap else None,
             )
-    # No-failure baseline: the backup tie-lines are normally-open and there is
-    # nothing to reroute around, so fix them open for THIS solve and clear the
-    # ``backup`` flag so ``controllable_backup_lines`` does not promote ``on_off``
-    # to a binary. Keeping them controllable turned the reconfig baseline into a
-    # 15-integer nonconvex MIQCQP that gurobi could not find a feasible point for
-    # within the per-solve cap (baseline_available=False for every reconfig run);
-    # the radial pre-failure operating point — tie-lines open — is also the
-    # physically correct reference. The post-failure oracle and SCARE keep them.
+    # Baseline has no failure to reroute around, so fix ties open and clear
+    # backup — else controllable_backup_lines promotes on_off into a 15-integer
+    # nonconvex MIQCQP with no feasible point found (baseline_available=False for
+    # every reconfig run). Radial-open is the correct reference; the post-failure
+    # oracle and SCARE keep them.
     for branch in fresh.branches:
         if getattr(branch.model, "backup", False):
             branch.model.backup = False

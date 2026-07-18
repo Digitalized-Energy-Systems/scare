@@ -207,13 +207,24 @@ class TestStaleObsCounter:
         events = [e for e in _drain_events() if e.kind == "regulate_on_stale_obs"]
         assert events == []
 
-    def test_event_fires_when_obs_frozen(self):
+    def test_event_fires_when_same_aid_regulates_on_frozen_obs(self):
         b = _FakeBehavior()
         apply_regulate(b, "a1", 0.4, sector="e", reason="r", timestamp=1.0)
-        # No update to _net_results — second regulate is on stale state.
-        apply_regulate(b, "a2", 0.4, sector="e", reason="r", timestamp=2.0)
+        # No _net_results update — a SECOND regulate on the SAME aid is stale.
+        # Distinct factor clears the same-value dedup, not the stale check.
+        apply_regulate(b, "a1", 0.5, sector="e", reason="r", timestamp=2.0)
         events = [e for e in _drain_events() if e.kind == "regulate_on_stale_obs"]
         assert len(events) == 1
+
+    def test_no_event_for_distinct_aids_on_frozen_obs(self):
+        # Batched multi-agent dispatch between two solves: each agent's first
+        # write on the snapshot is fresh, so no stale event (the detector is
+        # keyed per-aid; a write on a1 does not make a2's obs stale).
+        b = _FakeBehavior()
+        apply_regulate(b, "a1", 0.4, sector="e", reason="r", timestamp=1.0)
+        apply_regulate(b, "a2", 0.4, sector="e", reason="r", timestamp=2.0)
+        events = [e for e in _drain_events() if e.kind == "regulate_on_stale_obs"]
+        assert events == []
 
 
 # ---------------------------------------------------------------------------

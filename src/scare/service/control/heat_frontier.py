@@ -37,11 +37,9 @@ class HeatFrontierController:
     # stale sensitivity; the P term settles at the frontier as dT/dP learns).
     GAIN: float = 0.5
     MAX_STEP: float = 0.15
-    # Waterfall targeting floor: a peer is a meaningful shed target only above
-    # this absolute draw (MW) or this share of the deferring load's own needed
-    # relief. Kilowatt remnants can't warm a node — and because the peer shed
-    # is multiplicative (never reaches zero), an existence-based guard on them
-    # deadlocked the deferring load's own shed forever (eval_full_v2 just_heat).
+    # Waterfall shed target must exceed this absolute MW or this share of needed
+    # relief. Peer sheds are multiplicative (never reach zero), so an existence
+    # guard on kilowatt remnants deadlocked the own shed (eval_full_v2 just_heat).
     WATERFALL_TARGET_MIN_MW: float = 1e-3
     WATERFALL_TARGET_NEED_SHARE: float = 0.1
     # Defer the own shed only while lower-priority reducible covers this share

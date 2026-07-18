@@ -64,8 +64,10 @@ class NegotiationRecord:
     """One step in a gossip negotiation's lifecycle.
 
     ``event`` is the lifecycle position (started / skipped_balanced /
-    skipped_singleton / finished / timed_out / cancelled / abandoned). Each
-    negotiation yields one ``started`` plus exactly one terminal record.
+    skipped_singleton / finished / stalled / timed_out / cancelled /
+    abandoned). ``skipped_balanced`` and ``skipped_singleton`` emit a single
+    record with no preceding ``started``; only negotiations that reach
+    ``started`` also emit exactly one terminal record.
     """
 
     t: float

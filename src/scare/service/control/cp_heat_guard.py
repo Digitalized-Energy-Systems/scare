@@ -1,14 +1,8 @@
 """Outlet-temperature guard for heat-producing coupling points.
 
-A heat-producing CP (P2H / G2H / CHP) injects ``q_mw_heat`` into its outlet
-junction as pure energy; on a low-flow junction the resulting temperature rise
-``ΔT = Q / (ṁ·c_p)`` drives ``t_k`` far past the operating ceiling. Nothing in
-the stack pushes back: the L3 kernel sizes CP regulation off ``demand −
-delivered`` (delivered is measured at load setpoints, which injection can never
-raise), the heat frontier owns only the LOW side of the band, the curtailment
-auction skips ``t_k`` (and shedding heat *loads* on a hot junction removes
-cooling draw — wrong direction), and CP models are BORN at ``regulation=1.0``,
-so even a run with zero L3 commits injects at rated power.
+A heat-producing CP (P2H/G2H/CHP) injects ``q_mw_heat``; on low flow ``ΔT = Q / (ṁ·c_p)`` drives ``t_k`` past the ceiling.
+Nothing else pushes back: the L3 kernel sizes off ``demand − delivered`` (injection can't raise delivered), the frontier owns only the LOW side,
+the auction skips ``t_k``, and CPs are BORN at ``regulation=1.0`` (inject at rated even with zero L3 commits).
 
 This role is the missing high-side controller. Per heat-producing CP it polls
 the outlet junction's ``t_k`` and maintains a regulation CEILING via AIMD:

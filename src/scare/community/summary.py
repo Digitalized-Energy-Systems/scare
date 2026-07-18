@@ -181,15 +181,14 @@ class HolonSummaryRole(Role):
         self.enable_heat_cp_supply = bool(enable_heat_cp_supply)
         self.heat_refresh_s = float(heat_refresh_s)
         self.cp_budget_nominal = bool(cp_budget_nominal)
-        # Credit coalition-pool generators at delivered |sp| (not rated |cap|)
-        # so a curtailed generator can't fund the pool at nameplate; also gates
-        # cross-sector coalitions on the CP transfer being actuatable (see
-        # enable_coalition_delivered_supply).
+        # Credit pool generators at delivered |sp| not rated |cap| (a curtailed
+        # gen can't fund at nameplate); also gates cross-sector coalitions on the
+        # CP transfer being actuatable.
         self.coalition_delivered_supply = bool(coalition_delivered_supply)
         # Whether a CPCommitment consumer exists (legacy EnergyConverterRole L3).
-        # Under the default priority-ADMM L3 it does not, so a cross-sector
-        # coalition's promised CP transfer never actuates — don't raise
-        # own-sector fractions on it (they'd be funded by the slack instead).
+        # Default priority-ADMM L3 has none, so a promised CP transfer never
+        # actuates — don't raise own-sector fractions on it (they'd be
+        # slack-funded, the child-118 overdraw).
         self.cp_commitment_actuatable = bool(cp_commitment_actuatable)
         # Slow safety-net cadence re-running publish + check + re-assert
         # even when idle; the dominant trigger is event-driven (see setup).
@@ -411,14 +410,9 @@ class HolonSummaryRole(Role):
                     eff = lookup_slack_eff_budget(self.behavior, aid)
                     v = float(eff) if eff is not None else abs(cap)
                     supply_total += v
-                    # The CP input cap must NOT see the wound-down eff
-                    # budget: the integral feedback exists to make L1/L2
-                    # shed native load toward B, but with it a converter
-                    # (Ση<1) has zero input headroom and its converged
-                    # optimum is r=0 — starving the one actuator that can
-                    # relieve the over-draw. The CP kernel's cascade
-                    # arbitrates native serving vs CP input inside the
-                    # same B, so give it the nominal operator budget.
+                    # CP input cap uses nominal, not wound-down eff budget: a
+                    # floor gives a converter (Ση<1) zero headroom → r=0, starving
+                    # the over-draw actuator (CP kernel splits native-vs-CP, one B).
                     if self.cp_budget_nominal:
                         slack_budget_total += abs(slack_meta.cap)
                     else:
@@ -517,11 +511,8 @@ class HolonSummaryRole(Role):
         return publishers[0] == str(self.context.aid)
 
     def _check_invariants(self) -> None:
-        """Aggregate peer summaries by tier, detect inversions, and
-        (on the elected initiator) open a coalition.
-
-        Gated on initiator election to yield one event + one coalition
-        per inversion cohort, not N.
+        """Aggregate peer summaries by tier, detect inversions, and (on the
+        elected initiator only) open one coalition per inversion cohort, not N.
         """
         if topology_characteristic(self, tid="groups") != "leader":
             return
@@ -1424,12 +1415,10 @@ class HolonSummaryRole(Role):
         await self._dispatch_active_coalition(active)
 
     async def _dispatch_active_coalition(self, active: _ActiveCoalition) -> None:
-        """Send the constraint as a StartBalanceNegotiation to every
-        accepting member, plus self.
-
-        Tier-monotonic clamp mirrors the component-allocation path: a coalition
-        fraction map dispatched directly must not serve a lower-priority tier
-        above a higher one.
+        """Send the constraint as a StartBalanceNegotiation to every accepting
+        member plus self, tier-monotonic-clamped (mirrors the
+        component-allocation path) so a coalition map can't serve a
+        lower-priority tier above a higher one.
         """
         service_fraction_by_sector_priority = {
             active.sector.value: clamp_tier_monotonic(

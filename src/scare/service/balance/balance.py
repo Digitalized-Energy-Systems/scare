@@ -89,36 +89,20 @@ _THRESHOLD_ABS_FLOOR: float = 1e-6
 # target. Feeds the now-disabled heat MW-balance path.
 _HEAT_CLEAR_FRACTION: float = 0.6
 
-# Heat L2 supply probe: share of the unserved heat gap offered on top of the
-# delivered total each flex cycle (see ``_handle_ask_flex``). Geometric climb
-# to the feasibility frontier; the frontier controller trims overreach.
-# 0.2 is the A/B-validated value (ab_heat_priority_v2). It converges slowly
-# for the ~6 effective rebalance rounds of a 30 s task (tier-4 settles below
-# its feasible level on well-supplied grids, costing heat PWSF) — 0.3-0.5 is
-# the knob to try, but the 0.4 probe A/B was confounded by concurrent CP-fix
-# tree changes and needs a clean campaign.
+# Share of the unserved heat gap offered on top of delivered each flex cycle
+# (``_handle_ask_flex``); geometric climb to the frontier, controller trims
+# overreach. 0.2 is A/B-validated (ab_heat_priority_v2) but converges slowly over
+# ~6 rebalance rounds per 30 s task (tier-4 under-settles) — 0.3-0.5 is the knob,
+# though the 0.4 A/B was confounded by concurrent CP-fix tree changes.
 _HEAT_L2_PROBE_SHARE: float = 0.2
 
-# Grid-former supply probe (served-vs-slack-compliance trade-off knob).
-#
-# A promoted island reference is a free-Var source: the holon realises its
-# capacity only by allocating load, which the physics then makes it produce.
-# Crediting only its DELIVERED injection (share=0) is slack-safe but ratchets
-# DOWN (loads shed -> less drawn -> less produced -> credited less -> more shed),
-# leaving former-fed serving modest. Crediting ``delivered + share*(rating -
-# delivered)`` lets the holon offer the former's headroom as load; the free-Var
-# former then produces to meet it, recovering served.
-#
-# But a positive share OVER-credits where the former shares an island with a
-# budgeted slack: the offered load routes partly through the slack (the
-# feasibility solve has no cost bias toward the former, unlike the oracle's
-# hard-slack-constrained LP), and the resulting L2 priority floor blocks the
-# SlackBudgetMonitor from shedding it back. Measured on the recoverable_islanding
-# repro (simbench_lv, seed 100000023): share 0.0 -> PWSF 0.42, gas slack PASS;
-# 0.5 -> 0.66, gas slack FAIL (110% over); rating -> 0.77, FAIL (151%). Default 0
-# keeps the gas slack compliant; raise it to trade slack-budget compliance for
-# served recovery. Analogue of ``_HEAT_L2_PROBE_SHARE`` (heat has no slack budget
-# to breach, so it can run a positive share by default).
+# Credit ``delivered + share*(rating-delivered)`` so the free-Var former produces
+# to meet offered load; a positive share over-credits when it shares an island with
+# a budgeted slack (offered load routes through the slack and the L2 floor blocks
+# re-shed). recoverable_islanding seed 100000023: share 0.0 -> PWSF 0.42, gas slack
+# PASS; 0.5 -> 0.66, FAIL (110% over); rating -> 0.77, FAIL (151%). Default 0 keeps
+# the gas slack compliant. Analogue of ``_HEAT_L2_PROBE_SHARE`` (heat has no slack
+# budget).
 _GRID_FORMER_SUPPLY_PROBE_SHARE: float = 0.0
 
 _MAX_HOPS = 100
@@ -245,16 +229,16 @@ class _GossipState:
     counter: int
     current_delta: float
     starting_setpoint: float
-    # Feasible-δ box anchored to the *starting* setpoint. NOT recomputed per
-    # step: the agent's own regulate flips the LP's reported sp, flipping the
-    # box sign and driving a full-shed/full-load oscillation. Anchoring keeps δ
-    # a true cumulative change and the box constant.
+    # Feasible-δ box anchored to the *starting* setpoint, NOT recomputed per step:
+    # the agent's own regulate flips the LP's reported sp, flipping the box sign
+    # into a full-shed/full-load oscillation. Anchoring keeps δ cumulative and the
+    # box constant.
     dmin_starting: float = 0.0
     dmax_starting: float = 0.0
-    # Per-agent contribution ledger merged by keeping the highest-counter entry
-    # (avoids cyclic double-counting). Value: (delta, counter, priority, saturated).
-    # saturated entries are excluded from the equal-share denominator so
-    # per-visit contraction doesn't collapse as the boundary set grows.
+    # Ledger (delta, counter, priority, saturated); merge keeps the highest-counter
+    # entry to avoid cyclic double-counting. Saturated entries are excluded from the
+    # equal-share denominator so contraction doesn't collapse as the boundary set
+    # grows.
     memory: dict[str, tuple[float, int, int, bool]] = field(default_factory=dict)
     # True only for the originator; peers built from a received message set
     # False. Originator records terminal diary events once per nid, preserving
@@ -308,10 +292,9 @@ class EnergyBalanceNegotiator(Role):
         # built). Upward reactive triggers then go to the leader's own L2 and
         # the component-peer mesh, not the arbitrary ``holons`` chunk topology.
         self._component_scope = bool(component_scope)
-        # Monotonic counter for DETERMINISTIC negotiation IDs. The id feeds
-        # hash-based gossip routing; a uuid4 id (os.urandom, immune to seeding)
-        # made routing vary run-to-run. ``aid/seq`` is unique and reproducible.
-        # See project_restoration_sim_nonreproducible.
+        # Monotonic counter for DETERMINISTIC negotiation ids feeding hash-based
+        # routing; a uuid4 id (os.urandom, immune to seeding) made routing vary
+        # run-to-run; aid/seq is unique + reproducible. See project_restoration_sim_nonreproducible.
         self._neg_seq = 0
         self.priority = priority
         self.impact_weight = impact_weight
@@ -380,8 +363,9 @@ class EnergyBalanceNegotiator(Role):
         self._last_regulate_factor: float = 0.0
         self._clpu_ramp_per_s: float = self.convergence_rate
 
-        # Neighbour liveness: str(addr) -> last inbound timestamp. Seeded on
-        # first contact so unresponsive nodes age out rather than ghost-alive.
+        # Liveness is decided by the TrustLedger (``_trust.is_live``);
+        # ``_neighbour_last_seen``/``_heartbeat_max_age_s`` are leftover write-only
+        # state and no aging-out is driven from them.
         self._neighbour_last_seen: dict[str, float] = {}
         poll = ts.get("poll_period_s", 1.0)
         self._heartbeat_max_age_s: float = poll * _HEARTBEAT_MAX_AGE_MULTIPLE
@@ -591,9 +575,10 @@ class EnergyBalanceNegotiator(Role):
         self._trust.on_message_received(key, now)
 
     def _touch_neighbours(self, addrs: list) -> None:
-        """Seed the heartbeat clock for just-contacted neighbours.
+        """Seed ``_neighbour_last_seen`` for just-contacted neighbours.
 
-        Grants a grace period before an unresponsive node ages out.
+        The trust ledger's optimistic initial score provides the grace period;
+        this seeding has no effect on any liveness decision.
         """
         now = self.context.current_timestamp
         for addr in addrs:
@@ -911,12 +896,10 @@ class EnergyBalanceNegotiator(Role):
                         (aid, float(cap), float(sp), sec, int(prio))
                     )
             elif cap < 0:
-                # Generators that answered this trigger round are proven live:
-                # credit delivered |sp| plus rampable headroom, else a cold
-                # start (sp≈0) freezes the pool at slack-only and zeroes tiers
-                # 2-4 forever. Non-responders keep delivered-only |sp| so
-                # unreachable capacity can't declare tier-1 "feasible". Slacks
-                # keep the budgeted rating.
+                # Live (responded) gens credit delivered |sp| + rampable headroom,
+                # else a cold start (sp≈0) freezes the pool at slack-only and zeroes
+                # tiers 2-4; non-responders keep delivered-only so unreachable
+                # capacity can't declare tier-1 feasible; slacks keep budgeted rating.
                 if lookup_slack(self.behavior, aid) is not None:
                     pool += abs(float(cap))
                 else:
@@ -1754,22 +1737,12 @@ class EnergyBalanceNegotiator(Role):
             if sp > 0 and available > 0:
                 total_shedded += available
 
-        # Heat L2 reconnect: heat has no bounded slack pool (the unbounded
-        # ExtHydrGrid never registers a rating), so the gen-only ledger reads
-        # supply=0 for gen-less groups — and the allocation's no-supply branch
-        # would shed every tier. Report heat DELIVERED TO LOADS instead: that
-        # total is the pool the per-tier waterfall can reallocate. Replaces
-        # (not max) the gen ledger — an in-group CHP's injection is the same
-        # MW the consuming groups' loads already report, and the component
-        # merge sums supplies across leaders.
-        #
-        # Plus an upward PROBE: delivered alone ratchets DOWN — the fractions
-        # it produces cap the loads, so delivered can never rise above the
-        # (transient) level it was sampled at, and L2-shed tiers stay shed
-        # forever. Offering a share of the unserved gap each cycle lets the
-        # estimate climb to the true feasibility frontier (physics delivers
-        # the probe ⇒ next sample is higher; it doesn't ⇒ the frontier sheds
-        # the overreach back with a restorable curtail-lock).
+        # Heat has no bounded slack pool, so the gen-only ledger reads supply=0 and
+        # the allocation would shed every tier; report heat DELIVERED TO LOADS
+        # instead (replaces, not max — the component merge sums it across leaders).
+        # Plus an upward probe: delivered alone ratchets DOWN (produced fractions cap
+        # the loads), so offer a share of the gap each cycle to climb to the true
+        # frontier.
         if self.enable_heat_l2_dispatch:
             sec_heat = Sector.HEAT.value
             delivered = sum(served_by_sector_priority.get(sec_heat, {}).values())
@@ -1872,13 +1845,11 @@ class EnergyBalanceNegotiator(Role):
         # fractions applied per local-load-tier.
         service_frac = getattr(message, "service_fraction_by_sector_priority", None)
         if service_frac:
-            # Coordination overhaul: when the allocation is UNCHANGED and a
-            # gossip this agent originated is in flight, re-assert the per-load
-            # priority floor but do NOT abandon the gossip — let it converge.
-            # This cuts the dominant "yielding to L2" abandonment without staling
-            # the floor (every current member, incl. newly-relevant loads, is
-            # re-floored). Safe under the upward change-detection: any real
-            # change moves a setpoint → triggers a fresh, changed dispatch.
+            # Unchanged allocation + own in-flight originator gossip: re-assert the
+            # per-load floor but do NOT abandon the gossip — cuts the dominant
+            # "yielding to L2" abandonment without staling the floor. Safe under
+            # upward change-detection (any real change moves a setpoint → fresh
+            # changed dispatch).
             if (
                 self.enable_change_only_dispatch
                 and self._gossip is not None
@@ -2017,12 +1988,11 @@ class EnergyBalanceNegotiator(Role):
                         for sec, tm in service_fraction.items()
                     },
                 )
-                # S1: close the L2->L1->L2 cascade. ``apply_regulate`` emits
-                # nothing, so nudge the local HolonicCommunityRole to rebalance.
-                # Do NOT emit NFE here: its placeholder sp would mis-trigger
-                # stability and reset the leader's factor to 0. Only reached
-                # when at least one setpoint actually changed (``applied`` gate)
-                # so a no-op re-dispatch can't spin the cascade.
+                # S1: close the L2->L1->L2 cascade by nudging the local
+                # HolonicCommunityRole (apply_regulate emits nothing). Do NOT emit
+                # NFE here — its placeholder sp mis-triggers stability and resets the
+                # leader factor to 0. The ``applied`` gate keeps a no-op re-dispatch
+                # from spinning the cascade.
                 holon_role = self.context.get_role(HolonicCommunityRole)
                 if holon_role is not None:
                     try:
@@ -2347,15 +2317,11 @@ class EnergyBalanceNegotiator(Role):
 
         factor = max(0.0, min(1.0, abs(new_setpoint / cap)))
 
-        # A generator the auction holds down for a live over-voltage (fresh
-        # curtail-lock) must not be re-ramped by this direct-act path — it
-        # bypasses ``apply_regulate``'s interlock and the gossip anchor
-        # predates the curtail. CLAMP to the held level rather than defer:
-        # the actuated-ledger writeback below then records the true (held)
-        # contribution and marks this member saturated, so the dual
-        # reallocates the shortfall. A deferral (returning None) skips the
-        # writeback and leaves the requested delta on the books as phantom
-        # gen supply — A/B-validated worse (loads shed against paper supply).
+        # Gen held down by a live curtail-lock: CLAMP to the held level (not
+        # defer/None) so the writeback records the true held contribution and marks
+        # it saturated, letting the dual reallocate. Deferring leaves the requested
+        # delta as phantom gen supply — A/B-validated worse (loads shed against paper
+        # supply).
         if cap < 0 and has_gen_curtail_lock(
             self.behavior, self.context.aid, self.context.current_timestamp
         ):

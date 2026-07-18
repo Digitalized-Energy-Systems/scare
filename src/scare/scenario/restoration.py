@@ -44,7 +44,6 @@ from monee.model.child import (
 )
 from monee.model.extension import GridFormingGenerator, GridFormingSource
 
-from scare.base.channel import SectorImbalanceBeacon
 from scare.base.config import RestorationConfiguration
 from scare.base.model import (
     DEENERGISED_PRESSURE_HIGH_PU,
@@ -232,14 +231,12 @@ def _maybe_register_slack(behavior: Any, aid: str, child: Any) -> None:
 
 
 def _maybe_register_grid_former(behavior: Any, aid: str, child: Any) -> None:
-    """Register a promoted island reference's rated capacity.
+    """Record a promoted island reference's rated capacity (Var bound magnitude).
 
-    A ``GridForming*`` unit's balancing var (``p_mw`` / ``mass_flow_kgs``) is a
-    free ``Var`` whose sign flips as it produces vs absorbs the island residual;
-    the rating is that Var's bound magnitude. Recording it lets the holon credit
-    the former as a fixed supply source rather than misreading a positive free
-    value as load demand. Only microgrid/islanding scenarios promote formers, so
-    this is inert elsewhere.
+    A ``GridForming*`` unit's balancing Var flips sign as it produces vs absorbs
+    the island residual; recording its bound magnitude lets the holon credit it as
+    fixed supply, not misread the free Var as load. Only islanding promotes formers,
+    so this is inert elsewhere.
     """
     m = child.model
     if isinstance(m, GridFormingGenerator):
@@ -510,17 +507,11 @@ async def start_restoration_simulation(
 
 
 async def _settle_end_of_sim(world: SimulationWorld) -> None:
-    """Let controllers react to the true post-flush power-flow before the
-    end-of-sim snapshot.
-
-    The final ``flush_energy_flow()`` (in the runner) reveals the converged
-    voltages/pressures, which may differ from the throttled solve the
-    controllers last observed — leaving the constraints snapshot recording an
-    excursion no agent reacted to (the end-of-sim observation desync). This
-    alternates an immediate flush with a short discrete-step chunk so the
-    controllers observe the revealed state and act, breaking early once a flush
-    leaves the env clean (no pending acts to re-solve). Gated OFF by default —
-    it perturbs every task's final state and needs aggregate validation.
+    """Alternate an immediate flush with a short discrete-step so controllers
+    observe the post-flush converged voltages/pressures (which the throttled
+    solve hid) and react before the end-of-sim snapshot; break once a flush
+    leaves the env clean. Fixes the end-of-sim observation desync. Gated OFF by
+    default (perturbs every task's final state; needs aggregate validation).
     """
     behavior: RestorationEnvironmentBehavior = world.environment.behavior
     config = getattr(behavior, "_scare_config", None)
@@ -1184,8 +1175,24 @@ def _node_priority_weighted_demand(
 def _line_home_endpoint(branch: Any, monee_net: Any, priorities: dict[str, int]) -> Any:
     """PowerLine home endpoint: lower priority-weighted demand wins,
     ties break to the smaller node id.
+
+    A childless junction is avoided: the monitor attaches (and gets its home
+    leader) only via a home-node child in some community, so homing to a
+    child-less endpoint would leave home_leader_addr=None and endpoint relief
+    a silent no-op. Prefer the child-bearing endpoint when exactly one has children.
     """
+
+    def _has_children(nid: Any) -> bool:
+        try:
+            node = monee_net.node_by_id(nid)
+        except Exception:
+            return False
+        return bool(getattr(node, "child_ids", []) or [])
+
     a, b = branch.id[0], branch.id[1]
+    has_a, has_b = _has_children(a), _has_children(b)
+    if has_a != has_b:
+        return a if has_a else b
     pwd_a = _node_priority_weighted_demand(a, monee_net, priorities)
     pwd_b = _node_priority_weighted_demand(b, monee_net, priorities)
     if pwd_a < pwd_b:
@@ -1675,11 +1682,6 @@ def _build_topologies(
                     )
                 )
 
-            # Periodic SectorImbalanceUpdate so L3 (CP ADMM) can trigger on
-            # local imbalance without waiting for an L1 event.
-            if config.enable_cp_admm:
-                leader.add_role(SectorImbalanceBeacon(behavior, sector))
-
             # L2.5 cross-holon priority-inversion detector + coalition
             # formation, publishing per-tier served/demand on the mesh.
             if config.enable_holon_summary:
@@ -1728,12 +1730,10 @@ def _build_topologies(
                     )
                 )
 
-    # Holons topology (L2): chunk same-sector leaders into ``max_holon_size``
-    # cliques (one initiator each); collect coalition unions per holon.
-    # Legacy holon/sector scope only — component scope elects a coordinator per
-    # connected component (via the holon_summary mesh below) and never reads the
-    # clique topology, so building it would be dead work + a misleading per-holon
-    # diagnostic over arbitrary lex chunks.
+    # Holons topology (L2): chunk same-sector leaders into cliques; collect
+    # coalition unions per holon. Legacy holon/sector scope only — component
+    # scope elects a per-component coordinator via the holon_summary mesh below
+    # and never reads the clique topology, so building it would be dead work.
     holon_members_by_sector: dict[str, dict[int, list[str]]] = {
         s.value: {} for s in _SECTORS
     }
@@ -1770,12 +1770,10 @@ def _build_topologies(
                     holon_members_by_sector[sector.value][holon_idx] = holon_child_aids
 
     # L2.5 holon-summary mesh: per-sector full clique of leaders broadcasting
-    # ``HolonSummary`` (surfaces cross-holon inversions for cross-chunk ADMM).
-    # Built whenever holonic dispatch is on — NOT gated on enable_holon_summary:
-    # the mesh doubles as the election substrate for the per-component L2 ADMM
-    # coordinator (holonic._resolve_sector_peer_addrs) and the LeaderEmerged
-    # re-registration broadcast (repartition.py). The summary/coalition ROLES
-    # stay gated on enable_holon_summary above.
+    # ``HolonSummary``. Built whenever holonic is on — NOT gated on
+    # enable_holon_summary: this mesh is also the election substrate for the
+    # per-component L2 ADMM coordinator and the LeaderEmerged re-registration
+    # broadcast; only the summary/coalition ROLES stay gated.
     if config.enable_holonic:
         # CP agents bridging each sector join too under the L3 priority-ADMM
         # cutover (CPPriorityAdmmRole reads supply/demand from HolonSummary).
@@ -1785,12 +1783,10 @@ def _build_topologies(
                 agent = world.agents.get(aid_)
                 if agent is None:
                     continue
-                # Normally a CP joins only its bridged sectors' summary meshes.
-                # Under demand_union it joins ALL sector meshes so any CP (e.g. a
-                # P2G elected gossip initiator, which bridges electricity+gas)
-                # physically receives heat HolonSummary and can fold heat demand
-                # into the broadcast round. CPs are passive mesh members (no
-                # HolonSummaryRole), so extra membership only adds delivery.
+                # Under demand_union a CP joins ALL sector meshes (not just its
+                # bridged ones) so e.g. a P2G gossip initiator physically receives
+                # heat HolonSummary and can fold heat demand into its round. CPs
+                # are passive members, so extra membership only adds delivery.
                 join_secs = (
                     list(cp_agents_by_sector)
                     if config.enable_cp_demand_union
@@ -1929,10 +1925,9 @@ def _build_topologies(
     def _on_branch_failed(bid: tuple) -> None:
         mirror.mark_broken(tuple(bid))
         _mark_grid_edge_broken(grid_topo, bid)
-        # Topology just changed: the cached energy-flow is now wrong, but the
-        # cooldown would let agents react to stale pre-failure voltages.  Force
-        # one immediate recompute so the first post-failure control action sees
-        # the true state (one solve per failure; see enable_recompute_on_failure).
+        # Force one immediate recompute so the first post-failure action sees
+        # true state instead of stale pre-failure voltages the cooldown would
+        # otherwise serve (one solve per failure; see enable_recompute_on_failure).
         if getattr(config, "enable_recompute_on_failure", False):
             _flush = getattr(behavior, "flush_energy_flow", None)
             if callable(_flush):
@@ -2279,14 +2274,11 @@ def _register_recordings(
         lambda agent: float((behavior.observe(agent.aid) or {}).get("regulation", 0.0)),
     )
 
-    # Constraint metrics: avg is the mean; min/max surface the violating
-    # extremes the average hides. De-energised readings are dropped so the
-    # series match the compliance gate: a gas region cut off from its
-    # ExtHydrGrid collapses to pressure_pu~0 OR saturates monee's
-    # pressure_squared_pu Var at its upper bound (pressure_pu~sqrt(3)~1.732),
-    # and an isolated heat junction reads t_k~0. All are solver-bound artefacts,
-    # not real extremes (see ``constraint_violations_final`` and the
-    # DEENERGISED_PRESSURE_* constants).
+    # De-energised readings are dropped to match the compliance gate: gas cut
+    # off from ExtHydrGrid collapses to pressure_pu~0 or saturates the
+    # pressure_squared_pu Var at its upper bound (pressure_pu~sqrt(3)~1.732);
+    # isolated heat junctions read t_k~0. All are solver-bound artefacts (see
+    # the DEENERGISED_PRESSURE_* constants).
     def _constraint_values(child_aids: list[str], key: str) -> list[float]:
         vals: list[float] = []
         for aid in child_aids:
@@ -2435,21 +2427,22 @@ def _register_recordings(
             lambda aids=aids: _tier_served(aids),
         )
 
-    # --- Net-results freshness tracking ---
-    # An infeasible recompute reuses the old ``_net_results`` (frozen metrics);
-    # ``id()`` drifts on each accepted solve, so record the last-change time.
-    _freshness_state = {
-        "id": id(behavior._net_results) if behavior._net_results is not None else None,
+    # Infeasible recompute reuses the old ``_net_results`` (frozen metrics);
+    # ``id()`` drifts only on an accepted solve, so record the last-change time.
+    # Hold the last-seen results object and compare by identity, not id(): a
+    # GC'd results object's address can be reused, aliasing a genuinely new
+    # solve as "unchanged" and freezing the freshness timestamp. Retaining the
+    # object (the same one behavior._net_results already holds) blocks reuse.
+    _freshness_state: dict[str, Any] = {
+        "obj": behavior._net_results,
         "t": float(world.clock.time),
     }
 
     def _last_feasible_solve_t() -> float:
         nr = getattr(behavior, "_net_results", None)
-        if nr is not None:
-            cur = id(nr)
-            if cur != _freshness_state["id"]:
-                _freshness_state["id"] = cur
-                _freshness_state["t"] = float(world.clock.time)
+        if nr is not None and nr is not _freshness_state["obj"]:
+            _freshness_state["obj"] = nr
+            _freshness_state["t"] = float(world.clock.time)
         return _freshness_state["t"]
 
     record_world(world, "last_feasible_solve_t", _last_feasible_solve_t)

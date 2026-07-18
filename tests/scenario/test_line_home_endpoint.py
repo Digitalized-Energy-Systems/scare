@@ -111,9 +111,11 @@ class TestLineHomeEndpoint:
         home = _line_home_endpoint(branch, net, priorities)
         assert home == 3
 
-    def test_one_side_empty_one_side_loaded(self):
-        # Empty side has pwd=0 < the loaded side → home is the empty
-        # endpoint (degenerate "nothing to shed" case).
+    def test_childless_side_is_avoided(self):
+        # A childless junction can't host the branch monitor (attachment needs a
+        # home-node child in a community), so home to the LOADED endpoint even
+        # though its pwd is higher — else home_leader_addr stays None and the
+        # endpoint-relief lever silently no-ops.
         net = _mk_net(
             {
                 9: [],
@@ -123,7 +125,7 @@ class TestLineHomeEndpoint:
         priorities = {"child-1000": 1}
         branch = SimpleNamespace(id=(9, 10))
         home = _line_home_endpoint(branch, net, priorities)
-        assert home == 9
+        assert home == 10
 
     def test_quantity_outweighs_tier(self):
         # Five tier-5 loads (5 × 32 = 160 weight units per MW) on

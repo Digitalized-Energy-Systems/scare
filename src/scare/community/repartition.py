@@ -125,96 +125,112 @@ class DynamicRepartitionRole(Role):
             )
             return
 
-        # Orphan sub-community: lex-smallest aid leads.
+        # Orphans can span several mutually-disconnected islands; one promoted
+        # leader would be unreachable from the others. Partition orphans by
+        # connected component (BFS over live branches) and elect a lex-smallest
+        # leader PER island so every orphan addresses a leader it can reach.
         orphaned_aids.sort()
-        new_leader_aid = orphaned_aids[0]
-        new_leader_addr = self._member_addr.get(new_leader_aid)
-        if new_leader_addr is None:
-            logger.warning(
-                "[%s] repartition: orphan leader %s has no recorded addr, abort",
-                self.context.aid,
-                new_leader_aid,
-            )
-            return
-        new_community_id = uuid4()
-        orphan_addrs = [self._member_addr[aid] for aid in orphaned_aids]
-
-        record_event(
-            t=self.context.current_timestamp,
-            kind="community_repartitioned",
-            aid=self.context.aid,
-            sector=self.sector.value,
-            detail=(
-                f"orphans={len(orphaned_aids)} new_leader={new_leader_aid} "
-                f"remaining={len(live_members) - len(orphaned_aids)}"
-            ),
-        )
-        logger.info(
-            "[%s] repartition: %d/%d members orphaned (new_leader=%s, sector=%s)",
-            self.context.aid,
-            len(orphaned_aids),
-            len(live_members),
-            new_leader_aid,
-            self.sector.value,
-        )
-
-        # Notify each orphan, concurrently for prompt convergence.
-        assignment = RepartitionAssignment(
-            community_id=new_community_id,
-            new_leader_addr=new_leader_addr,
-            orphan_addrs=orphan_addrs,
-        )
-        await asyncio.gather(
-            *[
-                self.context.send_message(assignment, receiver_addr=addr)
-                for addr in orphan_addrs
+        orphan_node = {aid: live_members[aid] for aid in orphaned_aids}
+        assigned: set[str] = set()
+        for seed in orphaned_aids:
+            if seed in assigned:
+                continue
+            reach = _bfs_reachable(orphan_node[seed], self._live_branches.values())
+            comp = [
+                aid
+                for aid in orphaned_aids
+                if aid not in assigned and orphan_node[aid] in reach
             ]
-        )
+            if seed not in comp:
+                comp.append(seed)
+            assigned.update(comp)
 
-        # Drop orphans from the surviving community's neighbour list.
+            new_leader_aid = comp[0]
+            new_leader_addr = self._member_addr.get(new_leader_aid)
+            if new_leader_addr is None:
+                logger.warning(
+                    "[%s] repartition: island leader %s has no recorded addr, skip",
+                    self.context.aid,
+                    new_leader_aid,
+                )
+                continue
+            new_community_id = uuid4()
+            orphan_addrs = [self._member_addr[aid] for aid in comp]
+
+            record_event(
+                t=self.context.current_timestamp,
+                kind="community_repartitioned",
+                aid=self.context.aid,
+                sector=self.sector.value,
+                detail=(
+                    f"orphans={len(comp)} new_leader={new_leader_aid} "
+                    f"remaining={len(live_members) - len(orphaned_aids)}"
+                ),
+            )
+            logger.info(
+                "[%s] repartition: island of %d orphans (new_leader=%s, sector=%s)",
+                self.context.aid,
+                len(comp),
+                new_leader_aid,
+                self.sector.value,
+            )
+
+            # Notify each orphan in this island, concurrently for prompt convergence.
+            assignment = RepartitionAssignment(
+                community_id=new_community_id,
+                new_leader_addr=new_leader_addr,
+                orphan_addrs=orphan_addrs,
+            )
+            await asyncio.gather(
+                *[
+                    self.context.send_message(assignment, receiver_addr=addr)
+                    for addr in orphan_addrs
+                ]
+            )
+
+            # Broadcast ``LeaderEmerged`` on the ``holon_summary_<sector>`` mesh so
+            # L2 registers the promoted island leader; otherwise its
+            # ``ComponentAdmmReport`` is dropped and SlackBudgetMonitor can't escalate.
+            new_leader_node_id = self._member_node_id.get(new_leader_aid)
+            if new_leader_node_id is not None:
+                announcement = LeaderEmerged(
+                    leader_aid=new_leader_aid,
+                    leader_addr=new_leader_addr,
+                    node_id=new_leader_node_id,
+                    sector=self.sector,
+                )
+                try:
+                    summary_peers = list(
+                        topology_neighbors(
+                            self,
+                            tid=f"holon_summary_{self.sector.value}",
+                        )
+                    )
+                except Exception:
+                    summary_peers = []
+                for peer_addr in summary_peers:
+                    try:
+                        await self.context.send_message(
+                            announcement,
+                            receiver_addr=peer_addr,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "[%s] leader-emerged broadcast to %s failed: %s",
+                            self.context.aid,
+                            peer_addr,
+                            exc,
+                        )
+
+        # Drop all orphans from the surviving community's neighbour list, once.
         own = self.context.get_or_create_model(CommunityAssignment)
         own.neighbors = [
             addr
             for aid, addr in self._member_addr.items()
-            if aid not in self._already_orphaned and aid not in orphaned_aids
+            if aid not in self._already_orphaned and aid not in assigned
         ]
         self.context.update(own)
-        self._already_orphaned.update(orphaned_aids)
-
-        # Broadcast ``LeaderEmerged`` on the ``holon_summary_<sector>`` mesh so
-        # L2 roles register the promoted orphan leader; otherwise its
-        # ``ComponentAdmmReport`` is dropped and SlackBudgetMonitor can't
-        # escalate. Sent from this role since it is already on the mesh.
-        new_leader_node_id = self._member_node_id.get(new_leader_aid)
-        if new_leader_node_id is not None:
-            announcement = LeaderEmerged(
-                leader_aid=new_leader_aid,
-                leader_addr=new_leader_addr,
-                node_id=new_leader_node_id,
-                sector=self.sector,
-            )
-            try:
-                summary_peers = list(
-                    topology_neighbors(
-                        self,
-                        tid=f"holon_summary_{self.sector.value}",
-                    )
-                )
-            except Exception:
-                summary_peers = []
-            for peer_addr in summary_peers:
-                try:
-                    await self.context.send_message(
-                        announcement,
-                        receiver_addr=peer_addr,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "[%s] leader-emerged broadcast to %s failed: %s",
-                        self.context.aid,
-                        peer_addr,
-                        exc,
-                    )
+        self._already_orphaned.update(assigned)
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +297,9 @@ class RepartitionHandlerRole(Role):
             # No local subscribers — downstream reads the model directly.
             pass
 
-        # Repoint co-located ``SlackBudgetMonitor.home_leader_addr``: its cached
-        # original leader goes stale on reassignment. ``get_role`` (RoleContext
-        # has no ``.roles`` attribute); import kept local to avoid a module-level
-        # community→service dependency.
+        # Repoint ``SlackBudgetMonitor.home_leader_addr`` (cached leader goes stale
+        # on reassignment). Local import avoids a module-level community→service
+        # dependency; ``get_role`` since RoleContext has no ``.roles`` attribute.
         from scare.service.control.slack_budget import SlackBudgetMonitor
 
         monitor = self.context.get_role(SlackBudgetMonitor)

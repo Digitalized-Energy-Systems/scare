@@ -26,19 +26,13 @@ def install_perturbation(
     if packet_loss_pct <= 0 and latency_jitter_ms <= 0:
         return
 
-    # Both paths (pure loss and jitter) go through the seeded subclass below:
-    # mango's stock SimpleCommunicationSimulation draws loss from the global
-    # RNG, making the loss pattern depend on send order / prior stream
-    # consumption — reruns of the same task would drop different messages.
+    # Both loss and jitter route through the seeded subclass below: mango's stock
+    # SimpleCommunicationSimulation draws loss from the global RNG, so the drop pattern
+    # depends on send order / prior stream consumption (reruns drop different messages).
 
-    # Latency jitter (optional loss). Two correctness requirements:
-    # 1. Quantize the delay to a grid: mango re-solves a MISOCP at each distinct
-    #    delivery timestamp, so a continuous delay would explode N co-sent
-    #    messages into O(N) solver-heavy steps. The grid bounds that to ~16.
-    # 2. Deterministic per package: seed the RNG from package identity so
-    #    delay/loss are independent of send order and prior RNG-stream
-    #    consumption (a rerun of the same task perturbs the same messages).
-    #    Trade-off: messages sharing (sender, receiver, sent_time) share fate.
+    # Grid-quantize the delay: mango re-solves a MISOCP per distinct delivery timestamp,
+    # so continuous delay explodes N co-sent messages into O(N) solves (grid caps ~16 buckets).
+    # Seed RNG from package identity so delay/loss are deterministic across reruns and independent of send order; messages sharing (sender, receiver, sent_time) share fate.
     sigma_s = latency_jitter_ms / 1000.0
     loss_frac = max(0.0, packet_loss_pct / 100.0) if packet_loss_pct > 0 else 0.0
     # Quantum: ±2σ over ~16 buckets, but never finer than the base delay.

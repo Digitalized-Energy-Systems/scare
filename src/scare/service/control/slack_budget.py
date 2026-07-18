@@ -57,14 +57,9 @@ _MONITOR_DELTA_TOL: float = 1e-4
 # 0.3 damps the one-cycle draw-tracking lag; aggressive gains overshoot.
 _FEEDBACK_GAIN: float = 0.3
 
-# Feedback target margin (fraction of B). The feedback drives the draw toward
-# ``B·(1−margin)`` instead of ``B``, so the settle band ``[target−tol·B,
-# target+tol·B]`` tops out at exactly B — a real ``tol`` margin below the
-# compliance claim's ``B·(1+tol)`` threshold. Without it the old target B put
-# the band's upper edge at ``B·(1+tol)``, coincident with the claim line, so a
-# draw settling at the band edge failed the peak-graded claim by a hair
-# (eval_full_v2: gas steady_peak/threshold median 1.024). Sized == tol so the
-# lower edge stays at ``B·(1−2·tol)``, comfortably above zero.
+# Feedback target margin (fraction of B). Targets ``B·(1−margin)`` so the settle band ``[target±tol·B]``
+# tops out at B, tol below the claim's ``B·(1+tol)``; old target B put the band edge on the claim line,
+# failing the peak-graded claim (eval_full_v2 gas median 1.024). Sized == tol keeps the lower edge above zero.
 _FEEDBACK_TARGET_MARGIN: float = 0.05
 
 

@@ -4,9 +4,17 @@ Called once at the end of a run (from the runner), produces:
 
 - ``result.json``    extended schema with outcomes, diary summary, events
 - ``served.csv``     per-(sector, tier) demand / served / fraction
+- ``served_by_load.csv``   per-load detail
+- ``constraints_final.csv``   end-of-sim hard-bound readings
+- ``slack_meta.json``  per-slack-child budget + LP envelope
+- ``trajectories.csv``   per-aid regulate factor over time
 - ``diary.csv``      one row per ``NegotiationRecord``
 - ``events.csv``     one row per ``EventRecord``
 - ``messages.csv``   one row per recorded message (t, type, sender, recipient; off by default)
+
+The per-task artefacts consumed by ``claims.py`` are ``served_by_load.csv``,
+``constraints_final.csv`` and ``slack_meta.json`` (``trajectories.csv`` is a
+plot/report artefact, not read by the claims checker).
 
 The schema is the source of truth for the aggregator and the claims
 checker; both read these artefacts back without going near the in-process
@@ -58,10 +66,9 @@ def compose_result(
     served = served_breakdown(monee_net, behavior, priorities=priorities)
     restoration = restoration_breakdown(served, baseline_served)
     integral = constraint_violation_integral(world)
-    # End-of-sim per-node/per-branch feasibility against the oracle's envelope.
-    # The during-run integral only sees per-sector averages, so out-of-bounds
-    # individuals can integrate near-zero; the ``constraint_compliance`` claim
-    # gates on this so PWSF stays comparable across variants and the oracle.
+    # End-of-sim per-node/branch feasibility; the during-run integral only sees
+    # per-sector averages, so out-of-bounds individuals integrate near-zero.
+    # constraint_compliance gates on this snapshot to keep PWSF comparable to the oracle.
     constraints_final = constraint_violations_final(monee_net)
     t_stable = time_to_stabilise_s(world)
 
@@ -266,10 +273,10 @@ def write_slack_meta(path: Path, monee_net: Any) -> None:
           ...
         }
 
-    Budget is stamped on the model by ``apply_slack_budget``; LP-envelope is the
-    absolute Var bound after that widened it (typically 10x budget).  Both are
-    ``null`` for intentionally unbudgeted slacks (heat-side ``ExtHydrGrid``),
-    and the plot skips the overlay for that sector.
+    Budget is stamped by ``apply_slack_budget``; ``lp_envelope`` is the absolute
+    Var bound after it widened (typically ~10x budget).  Both ``null`` for
+    intentionally-unbudgeted slacks (heat-side ``ExtHydrGrid``); the plot skips
+    that sector.
     """
 
     meta: dict[str, dict[str, Any]] = {}

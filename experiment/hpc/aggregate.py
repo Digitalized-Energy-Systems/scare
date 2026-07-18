@@ -340,17 +340,14 @@ _PAIR_KEYS = ("grid", "scenario", "seed")
 def _paired_delta(
     base: pd.DataFrame, row: pd.DataFrame, col: str, population: str
 ) -> tuple[float, float, int] | None:
-    """Per-seed paired mean-difference of ``col`` (row − baseline) and its 95%
-    CI. Seeds are shared across ablation rows (plan.py derives seed from
-    (experiment, grid, run) only), so pairing on (grid, scenario, seed) removes
-    the between-seed scenario-difficulty variance that dominates the marginal
-    CIs — a far less conservative effect screen than comparing two independent
-    means. ``None`` if fewer than 2 shared, non-NaN pairs survive.
+    """Per-seed paired mean-difference of ``col`` (row − baseline) with 95% CI.
 
-    A ``__passed`` compliance flag is paired over all runs (a compliant-only
-    pass-rate is degenerate); other metrics honour ``population``, so a seed
-    compliant in one row but not the other drops from the pairing — hence the
-    paired n can be below the per-group n and is reported separately.
+    plan.py derives seed from (experiment, grid, run) only, so ablation rows share
+    the failure draw; pairing on (grid, scenario, seed) removes the between-seed
+    difficulty variance that dominates the marginal CIs. ``None`` if <2 shared
+    non-NaN pairs. ``__passed`` flags pair over all runs (compliant-only is
+    degenerate); other metrics honour ``population``, so paired n can be below the
+    per-group n and is reported separately.
     """
     pop = "all" if col.endswith("__passed") else population
     b = base if pop == "all" else base[compliant_mask(base)]
@@ -417,6 +414,13 @@ def _format_justification_sections(
             axis, baseline_key = "variant", "scare"
         else:
             continue
+        # Ablation/sweep buckets and the paired `default` baseline must not pool
+        # other-variant rows (e.g. oracle): pin to the SCARE variant, as the
+        # legacy ablation path does (variant IS the axis on the variant branch).
+        if axis in ("ablation", "sweep") and "variant" in g_exp.columns:
+            g_exp = g_exp[g_exp["variant"] == "scare"]
+            if g_exp.empty:
+                continue
         has_default = bool((g_exp[axis] == baseline_key).any())
         base = g_exp[g_exp[axis] == baseline_key] if has_default else None
         base_stats = (
@@ -508,26 +512,14 @@ def _format_justification_sections(
 
 
 def _compliant_split(g: pd.DataFrame) -> tuple[pd.Series, float, int, int]:
-    """Split a group of task rows into its compliance-conditional view.
+    """Split a group into ``(pwsf_compliant, compliance_rate, n_compliant, n_total)``.
 
-    Returns ``(pwsf_compliant, compliance_rate, n_compliant, n_total)``:
-
-    * ``pwsf_compliant`` — the ``priority_weighted_fraction`` series
-      restricted to tasks that passed *every* compliance claim (slack
-      budget AND constraint feasibility); the series the headline mean
-      should be computed over.
-    * ``compliance_rate`` — fraction of tasks (with a defined PWSF) that
-      passed compliance, in ``[0, 1]``. ``nan`` when no compliance column
-      is present so the caller can suppress the column instead of
-      reporting a fictional 100%.
-    * ``n_compliant`` / ``n_total`` — counts for the table.
-
-    A variant can inflate PWSF two ways the oracle cannot: draw the slack
-    past the operator-allowed envelope, or leave the grid out of bounds
-    (crediting load served through an overloaded line or at an infeasible
-    voltage / temperature). Both make the served value non-comparable to
-    the constraint-respecting oracle, so the PWSF mean is restricted to
-    runs honouring both, with the joint rate reported as a paired metric.
+    ``pwsf_compliant`` is PWSF restricted to tasks passing every compliance claim
+    (slack budget AND feasibility); ``rate`` is ``nan`` when no compliance column
+    exists so the caller suppresses it rather than reporting a fake 100%. Gating
+    is required because a variant can inflate PWSF two ways the oracle cannot —
+    overdrawing slack or crediting load delivered out of bounds — making the mean
+    non-comparable to the constraint-respecting oracle otherwise.
     """
     full = (
         g[_PRIMARY_OUTCOME].dropna()
