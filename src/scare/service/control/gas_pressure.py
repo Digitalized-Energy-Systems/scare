@@ -27,15 +27,14 @@ from typing import TYPE_CHECKING, Any
 from mango import Role
 
 from scare.base.model import (
-    DEENERGISED_PRESSURE_HIGH_PU,
-    DEENERGISED_PRESSURE_PU,
     SECTOR_CONSTRAINTS,
     SECTOR_TIMESCALE,
     ConstraintStateMessage,
     Sector,
+    is_energised_reading,
 )
 from scare.base.runtime.diagnostics import record_event
-from scare.base.util import lookup_slack_pressure, set_slack_pressure
+from scare.base.util import lookup_slack_pressure, safe_observe, set_slack_pressure
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -123,18 +122,17 @@ class GasPressureRegulator(Role):
         self._reports[key] = (float(val), float(self.context.current_timestamp))
 
     def _safe_observe(self) -> dict[str, Any] | None:
-        try:
-            obs = self.behavior.observe(self.context.aid)
-        except Exception:  # noqa: BLE001
-            return None
-        return obs or None
+        return safe_observe(
+            self.behavior, self.context.aid, exc=Exception, empty_to_none=True
+        )
 
     @staticmethod
     def _is_energised_pressure(val: float) -> bool:
-        """True for a real junction pressure; drops both de-energised artifacts:
-        source-isolated ~0, and a zero-flow/P2G junction saturating monee's
-        relaxed-Weymouth box at ~sqrt(3) (acting on that high one once walked the whole profile to the floor chasing phantom over-pressure)."""
-        return DEENERGISED_PRESSURE_PU < val < DEENERGISED_PRESSURE_HIGH_PU
+        """True for a real junction pressure; drops both de-energised artefacts
+        (source-isolated ~0 and the ~sqrt(3) relaxed-Weymouth box saturation that
+        once walked the profile to the floor chasing phantom over-pressure).
+        See ``is_energised_reading``."""
+        return is_energised_reading("pressure_pu", val)
 
     def _fed_pressures(self, own_p: float | None, now: float) -> list[float]:
         """Energised pressures over the fed subtree: fresh mesh reports plus the

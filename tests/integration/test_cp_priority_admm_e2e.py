@@ -27,7 +27,8 @@ from mango_energy_environments import fetch_example_net
 
 from scare.base.config import RestorationConfiguration
 from scare.base.runtime import diagnostics
-from scare.base.util import create_failures, obs_capacity, obs_sector
+from scare.base.util import obs_capacity, obs_sector
+from scare.scenario.failure_sampling import create_failures
 from scare.scenario.restoration import (
     create_restoration_scenario_world,
     start_restoration_simulation,
@@ -115,8 +116,8 @@ def _regulate_writes_per_cp(cp_aids: set[str]) -> dict[str, list[float]]:
     """Pull every ``regulate`` action recorded by ``record_regulate``
     that targets a CP's aid; returns aid → list[(t, factor, reason)]."""
     out: dict[str, list[tuple[float, float, str]]] = {aid: [] for aid in cp_aids}
-    # diagnostics._log is the deque of ActionRecords from record_regulate.
-    for r in diagnostics._log:  # noqa: SLF001 — test introspection
+    # _RECORDER._log is the deque of ActionRecords from record_regulate.
+    for r in diagnostics._RECORDER._log:  # noqa: SLF001 — test introspection
         if r.kind != "regulate":
             continue
         if r.aid not in cp_aids:

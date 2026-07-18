@@ -10,11 +10,14 @@ Shared by the per-holon and component-coordinator paths. Side-effect-free.
 
 from __future__ import annotations
 
-from scare.base.model import AvailableFlexAnswer
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from scare.base.channel import SectorTierFlexLike
 
 
 def aggregate_holon_flex(
-    answers: list[AvailableFlexAnswer],
+    answers: list[SectorTierFlexLike],
 ) -> tuple[
     dict[str, float],
     dict[str, dict[int, float]],

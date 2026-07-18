@@ -15,6 +15,7 @@ from mango.express.topology import (
 )
 from monee.model.child import ExtHydrGrid, ExtPowerGrid
 
+from scare.base.addressing import is_child_aid
 from scare.base.model import (
     SECTOR_CONSTRAINTS,
     SECTOR_TIMESCALE,
@@ -48,8 +49,6 @@ from scare.base.util import (
     l2_effective_floor,
     last_actuated_factor,
     line_congestion_ceiling,
-    lookup_grid_former_rating,
-    set_l2_priority_floor,
     lookup_slack,
     lookup_slack_eff_budget,
     note_actuated_factor,
@@ -58,6 +57,7 @@ from scare.base.util import (
     obs_priority,
     obs_sector,
     obs_setpoint,
+    set_l2_priority_floor,
 )
 from scare.community.holonic import HolonicCommunityRole
 from scare.service.balance.gossip_math import (
@@ -69,6 +69,7 @@ from scare.service.balance.gossip_math import (
     qp_priority_weight,
     step_size,
 )
+from scare.service.balance.grid_former import GridFormerPolicy
 from scare.service.balance.trust import TrustLedger, TrustParams, hash_weighted_choice
 
 if TYPE_CHECKING:
@@ -155,7 +156,7 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
     Suppresses regulation writes on slacks: ``regulation < 1`` clamps the LP's
     slack envelope and the next solve goes infeasible. Covers bounded and unbounded.
     """
-    if not aid.startswith("child-"):
+    if not is_child_aid(aid):
         return False
     try:
         cid = int(aid[len("child-") :])
@@ -287,6 +288,9 @@ class EnergyBalanceNegotiator(Role):
     ) -> None:
         super().__init__()
         self.behavior = behavior
+        self._grid_former_policy = GridFormerPolicy(
+            behavior, probe_share=_GRID_FORMER_SUPPLY_PROBE_SHARE
+        )
         self.sector = sector
         # True when L2 runs per connected component (holon cliques are not
         # built). Upward reactive triggers then go to the leader's own L2 and
@@ -881,8 +885,8 @@ class EnergyBalanceNegotiator(Role):
             # its supply (delivered + headroom probe) to the pool and skip the
             # load/gen bins (its free var otherwise reads as sign-flipping
             # load/ratcheting supply).
-            if self._is_grid_former(aid):
-                pool += self._grid_former_supply_credit(
+            if self._grid_former_policy.is_former(aid):
+                pool += self._grid_former_policy.supply_credit(
                     aid, obs_setpoint(obs, behavior=self.behavior, aid=aid)
                 )
                 continue
@@ -1684,10 +1688,10 @@ class EnergyBalanceNegotiator(Role):
             # its supply (delivered + headroom probe) and skip the
             # flex/balance/demand accounting (its sign-flipping free var
             # otherwise reads as phantom demand).
-            if self._is_grid_former(aid):
+            if self._grid_former_policy.is_former(aid):
                 supply_by_sector[sec_key] = supply_by_sector.get(
                     sec_key, 0.0
-                ) + self._grid_former_supply_credit(aid, sp)
+                ) + self._grid_former_policy.supply_credit(aid, sp)
                 continue
             flex_by_sector[sec_key] = flex_by_sector.get(sec_key, 0.0) + available
             balance_by_sector[sec_key] = balance_by_sector.get(sec_key, 0.0) + sp
@@ -1916,7 +1920,7 @@ class EnergyBalanceNegotiator(Role):
                 obs = self.behavior.observe(aid) or {}
                 # A promoted island reference is a generator, never a load: skip
                 # it so a positive free p_mw/mass_flow can't be shed as demand.
-                if self._is_grid_former(aid):
+                if self._grid_former_policy.is_former(aid):
                     continue
                 cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
                 if cap <= 0:  # generator/slack source
@@ -2247,38 +2251,7 @@ class EnergyBalanceNegotiator(Role):
         ExtGrid slack — pinned δ-box + no actuation — so the MAS balances load
         AROUND the fixed reference instead of fighting the actuator guard.
         """
-        return self._is_grid_former(self.context.aid)
-
-    def _is_grid_former(self, aid: str) -> bool:
-        """True iff *aid* is a promoted island reference and the guard is on.
-
-        A ``GridForming*`` unit's free p_mw/mass_flow flips ``obs_capacity``'s
-        sign, so the holon reads it as phantom load demand when it absorbs the
-        island residual (starving real loads) and never as the supply it is. The
-        holon must classify it as a generator regardless of that sign; callers
-        credit its DELIVERED injection ``max(0, -sp)`` as supply (the codebase's
-        delivered-not-rated convention, so it can't disarm slack enforcement)."""
-        if not getattr(
-            getattr(self.behavior, "_scare_config", None),
-            "enable_grid_former_curtail_guard",
-            False,
-        ):
-            return False
-        return lookup_grid_former_rating(self.behavior, aid) is not None
-
-    def _grid_former_supply_credit(self, aid: str, sp: float) -> float:
-        """Supply to credit a grid-former: ``delivered + share*(rating -
-        delivered)`` (see ``_GRID_FORMER_SUPPLY_PROBE_SHARE``). ``delivered =
-        max(0, -sp)`` is its current injection; the probe offers a slice of its
-        unused headroom so the holon can allocate load the free-Var former then
-        produces to meet, instead of ratcheting down on delivered alone."""
-        delivered = max(0.0, -float(sp))
-        rating = lookup_grid_former_rating(self.behavior, aid)
-        if rating is None:
-            return delivered
-        return delivered + _GRID_FORMER_SUPPLY_PROBE_SHARE * max(
-            0.0, float(rating) - delivered
-        )
+        return self._grid_former_policy.is_former(self.context.aid)
 
     def _apply_setpoint(self, new_setpoint: float) -> float | None:
         """Actuate ``new_setpoint`` (after clamp + floors); return the applied

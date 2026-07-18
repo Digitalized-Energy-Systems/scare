@@ -33,7 +33,7 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.runtime.diagnostics import record_event
-from scare.base.util import set_slack_eff_budget
+from scare.base.util import safe_observe, set_slack_eff_budget
 
 if TYPE_CHECKING:
     from mango import AgentAddress
@@ -114,13 +114,9 @@ class SlackBudgetMonitor(Role):
         self.context.schedule_periodic_task(self._monitor, delay=poll)
 
     def _safe_observe(self) -> dict[str, Any] | None:
-        try:
-            obs = self.behavior.observe(self.context.aid)
-        except Exception:  # noqa: BLE001
-            return None
-        if not obs:
-            return None
-        return obs
+        return safe_observe(
+            self.behavior, self.context.aid, exc=Exception, empty_to_none=True
+        )
 
     def _try_emit_event(self, event: Any) -> None:
         try:

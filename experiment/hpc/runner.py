@@ -81,7 +81,7 @@ from scare.base.runtime.infeasibility_capture import (
 )
 from scare.base.runtime.solver_guard import install_solver_time_limit
 from scare.base.runtime.trace import SimTimeLogFilter
-from scare.base.util import create_failures
+from scare.scenario.failure_sampling import create_failures
 from scare.scenario.restoration import (
     _flush_pending_negotiations,
     create_restoration_scenario_world,

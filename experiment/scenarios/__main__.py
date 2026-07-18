@@ -10,11 +10,12 @@ import random
 
 from experiment.scenarios.grids import GRIDS
 from scare.base.runtime.diagnostics import (
+    arm,
     install_solver_failure_dump,
     negotiation_summary,
 )
-from scare.base.util import create_failures
 from scare.base.viz.visu import visualize_results
+from scare.scenario.failure_sampling import create_failures
 from scare.scenario.restoration import (
     create_restoration_scenario_world,
     start_restoration_simulation,
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 install_solver_failure_dump()
+arm()  # install_solver_failure_dump no longer arms as a side effect
 
 SIMULATION_DURATION_S = 5.0
 FAILURE_DELAY_S = 2.0

@@ -19,14 +19,14 @@ from scare.base.util import (
 
 def _drain_events():
     """Snapshot the diagnostics event log and clear it for the next test."""
-    events = list(_diag._event_log)
-    _diag._event_log.clear()
+    events = list(_diag._RECORDER._event_log)
+    _diag._RECORDER._event_log.clear()
     return events
 
 
 def _disarm():
-    _diag._armed = False
-    _diag._event_log.clear()
+    _diag._RECORDER._armed = False
+    _diag._RECORDER._event_log.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -44,18 +44,23 @@ from monee.model.child import (
 )
 from monee.model.extension import GridFormingGenerator, GridFormingSource
 
+from scare.base.addressing import child_aid, is_child_aid, node_aid
 from scare.base.config import RestorationConfiguration
 from scare.base.model import (
-    DEENERGISED_PRESSURE_HIGH_PU,
-    DEENERGISED_PRESSURE_PU,
-    DEENERGISED_VM_PU,
     ConstraintViolation,
     ReconfigurationCompletedEvent,
     Sector,
     SystemStrategy,
+    is_energised_reading,
 )
 from scare.base.optimization.admm import (
     ScareDistributedOptimizationRole as DistributedOptimizationRole,
+)
+from scare.base.optimization.admm_factories import (
+    create_chp_admm_flex_actor,
+    create_g2p_admm_flex_actor,
+    create_p2g_admm_flex_actor,
+    create_p2h_admm_flex_actor,
 )
 from scare.base.runtime import diagnostics as _diag
 from scare.base.runtime.comms import install_perturbation
@@ -69,10 +74,7 @@ from scare.base.topology.community import (
 )
 from scare.base.topology.topology_mirror import mirror_from_monee
 from scare.base.util import (
-    create_chp_admm_flex_actor,
-    create_g2p_admm_flex_actor,
-    create_p2g_admm_flex_actor,
-    create_p2h_admm_flex_actor,
+    first_role,
     get_by_branch_id,
     kgps_to_mw,
     lookup_slack,
@@ -84,6 +86,7 @@ from scare.base.util import (
     register_priority,
     register_sector,
     register_slack,
+    role_index,
     sector_from_grid,
     set_directional_constraint_cap,
 )
@@ -177,11 +180,11 @@ def _heat_component_by_node(monee_net: Any) -> dict[Any, int]:
 
 
 def _node_aid(node_id: Any) -> str:
-    return f"node-{node_id}"
+    return node_aid(node_id)
 
 
 def _child_aid(child_id: Any) -> str:
-    return f"child-{child_id}"
+    return child_aid(child_id)
 
 
 def _model_type_name(branch) -> str:
@@ -1165,7 +1168,7 @@ def _node_priority_weighted_demand(
         cap = obs_capacity(obs)
         if cap <= 0:
             continue
-        aid = f"child-{cid}"
+        aid = child_aid(cid)
         tier = priorities.get(aid, 1)
         weight = 2.0 ** max(0, P - tier)
         total += weight * cap
@@ -1227,7 +1230,7 @@ def _branch_downstream_load_addrs(monee_net: Any, world: Any) -> dict[str, list[
             continue
         if cap <= 0:  # generators/non-loads can't be shed
             continue
-        ag = world.agents.get(f"child-{child.id}")
+        ag = world.agents.get(child_aid(child.id))
         if ag is not None:
             node_loads[child.node_id].append(ag.addr)
 
@@ -1365,7 +1368,7 @@ def _build_topologies(
                         except Exception:
                             continue
                         home_child_aids = {
-                            f"child-{cid}"
+                            child_aid(cid)
                             for cid in getattr(home_node, "child_ids", []) or []
                         }
                         if home_child_aids & member_aids:
@@ -1385,7 +1388,7 @@ def _build_topologies(
                 # Child aids in this coalition (branch agents skipped — no
                 # ``regulation`` key); index = position within the sector.
                 child_member_aids = [
-                    m.aid for m in members if m.aid.startswith("child-")
+                    m.aid for m in members if is_child_aid(m.aid)
                 ]
                 coalition_idx = len(coalition_members_by_sector[sector.value])
                 coalition_members_by_sector[sector.value][coalition_idx] = (
@@ -1509,7 +1512,7 @@ def _build_topologies(
     # Per-leader maps for the dynamic re-partition role (node ids, member
     # addresses, branch adjacency). Recomputed here, not threaded through.
     aid_to_node_id: dict[str, Any] = {
-        f"child-{c.id}": c.node_id for c in monee_net.childs
+        child_aid(c.id): c.node_id for c in monee_net.childs
     }
     aid_to_addr: dict[str, Any] = {
         aid: agent.addr for aid, agent in world.agents.items()
@@ -1555,7 +1558,7 @@ def _build_topologies(
             cp_type = _detect_cp_type_for_node(node, monee_net)
             if cp_type is None:
                 continue
-            aid = f"node-{node.id}"
+            aid = node_aid(node.id)
             agent = world.agents.get(aid)
             if agent is None:
                 continue
@@ -1761,7 +1764,7 @@ def _build_topologies(
                             aid = getattr(member, "aid", None)
                             if (
                                 aid
-                                and aid.startswith("child-")
+                                and is_child_aid(aid)
                                 and aid not in seen_aids
                             ):
                                 seen_aids.add(aid)
@@ -1838,18 +1841,21 @@ def _build_topologies(
         for sector in _SECTORS:
             connect_topologies(cps_topo, groups_topo, sector.value)
 
+    # One EnergyConverterRole index reused by both CP passes below. Sound because
+    # pass-1 only adds DynamicConnectorRole (a different type), so the
+    # first-EnergyConverterRole per agent is stable between the passes.
+    cp_role_index = (
+        role_index(world.agents.values(), EnergyConverterRole)
+        if config.enable_cp_admm
+        else {}
+    )
+
     # L3 dynamic CP-connector filter, built after the CP topology so it can
     # walk the populated EnergyConverterRole agents. Purely additive.
     if config.enable_cp_admm and config.enable_dynamic_cp_topology:
-        for agent in world.agents.values():
-            cp_role = None
-            for role in getattr(agent, "roles", []):
-                if isinstance(role, EnergyConverterRole):
-                    cp_role = role
-                    break
-            if cp_role is None:
-                continue
-            cp_node_id = aid_to_node_id.get(agent.aid)
+        for aid, cp_role in cp_role_index.items():
+            agent = world.agents[aid]
+            cp_node_id = aid_to_node_id.get(aid)
             if cp_node_id is None:
                 # Branch-hosted CP: use the first endpoint (reachability is
                 # symmetric, so either gives the same classes).
@@ -1871,15 +1877,8 @@ def _build_topologies(
     # Wire multi-sector L3 state on every CP role under ``enable_cp_admm``
     # (coord election + dispatch are core); before this it's legacy per-CP.
     if config.enable_cp_admm:
-        for agent in world.agents.values():
-            cp_role = None
-            for role in getattr(agent, "roles", []):
-                if isinstance(role, EnergyConverterRole):
-                    cp_role = role
-                    break
-            if cp_role is None:
-                continue
-            meta = cp_meta_by_aid.get(agent.aid)
+        for aid, cp_role in cp_role_index.items():
+            meta = cp_meta_by_aid.get(aid)
             if meta is None:
                 continue
             cp_role.wire_multi_sector_l3(
@@ -1898,11 +1897,7 @@ def _build_topologies(
             aid_: meta["node_id"] for aid_, meta in cp_meta_by_aid.items()
         }
         for agent in world.agents.values():
-            cp_role = None
-            for role in getattr(agent, "roles", []):
-                if isinstance(role, CPPriorityAdmmRole):
-                    cp_role = role
-                    break
+            cp_role = first_role(agent, CPPriorityAdmmRole)
             if cp_role is None:
                 continue
             meta = cp_meta_by_aid.get(agent.aid)
@@ -2274,11 +2269,8 @@ def _register_recordings(
         lambda agent: float((behavior.observe(agent.aid) or {}).get("regulation", 0.0)),
     )
 
-    # De-energised readings are dropped to match the compliance gate: gas cut
-    # off from ExtHydrGrid collapses to pressure_pu~0 or saturates the
-    # pressure_squared_pu Var at its upper bound (pressure_pu~sqrt(3)~1.732);
-    # isolated heat junctions read t_k~0. All are solver-bound artefacts (see
-    # the DEENERGISED_PRESSURE_* constants).
+    # De-energised readings are dropped to match the compliance gate (isolated
+    # gas ~0 or ~sqrt(3), heat t_k~0). See ``is_energised_reading``.
     def _constraint_values(child_aids: list[str], key: str) -> list[float]:
         vals: list[float] = []
         for aid in child_aids:
@@ -2286,13 +2278,8 @@ def _register_recordings(
             if not (obs and key in obs):
                 continue
             v = float(obs[key])
-            if key == "pressure_pu" and (
-                v <= DEENERGISED_PRESSURE_PU or v >= DEENERGISED_PRESSURE_HIGH_PU
-            ):
-                continue
-            if key == "t_k" and v <= 0.0:
-                continue
-            if key == "vm_pu" and v <= DEENERGISED_VM_PU:
+            # Drop de-energised readings; a non-finite value is kept (as before).
+            if math.isfinite(v) and not is_energised_reading(key, v):
                 continue
             vals.append(v)
         return vals

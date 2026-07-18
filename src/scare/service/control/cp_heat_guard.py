@@ -23,14 +23,13 @@ state within a few polls regardless of the local flow regime.
 from __future__ import annotations
 
 import logging
-import math
 from typing import TYPE_CHECKING, Any
 
 from mango import Role
 
-from scare.base.model import SECTOR_CONSTRAINTS, Sector
+from scare.base.model import SECTOR_CONSTRAINTS, Sector, is_energised_reading
 from scare.base.runtime.diagnostics import record_event
-from scare.base.util import apply_regulate, publish_cp_heat_ceiling
+from scare.base.util import apply_regulate, publish_cp_heat_ceiling, safe_observe
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -100,28 +99,19 @@ class CPHeatOutletGuard(Role):
         self.context.schedule_periodic_task(self._control, delay=_GUARD_PERIOD_S)
 
     def _safe_observe(self, aid: str) -> dict[str, Any] | None:
-        try:
-            obs = self.behavior.observe(aid)
-        except Exception:  # noqa: BLE001
-            return None
-        return obs or None
+        return safe_observe(self.behavior, aid, exc=Exception, empty_to_none=True)
 
     def _outlet_t_k(self) -> float | None:
-        """Outlet junction temperature, or None when unavailable or the
-        junction is de-energised (isolated junctions read t_k ~0 — an
-        artifact, not an operating state; same convention as the constraint
-        monitor and the eval scan)."""
+        """Outlet junction temperature, or None when unavailable or the junction
+        is de-energised (isolated junctions read t_k ~0 — an artefact, not an
+        operating state). See ``is_energised_reading``."""
         obs = self._safe_observe(self.outlet_aid)
         if obs is None:
             return None
         t = obs.get("t_k")
-        try:
-            t = float(t)
-        except (TypeError, ValueError):
+        if not is_energised_reading("t_k", t):
             return None
-        if not math.isfinite(t) or t <= 0.0:
-            return None
-        return t
+        return float(t)
 
     async def _control(self) -> None:
         now = float(self.context.current_timestamp)

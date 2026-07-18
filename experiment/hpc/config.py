@@ -121,6 +121,17 @@ class ExperimentSpec:
         )
 
 
+# Runtime defaults — the single source shared by CampaignConfig and RuntimePlan
+# (they carried the same literals three times). fatal_claims is a TUPLE here;
+# CampaignConfig wraps it as a list to keep its list type across asdict()/to_json.
+_SIMULATION_DURATION_S = 30.0
+_TASK_TIMEOUT_S = 1500.0
+_FAILURE_DELAY_S_MAX = 2.0
+_WRITE_TIMESERIES = True
+_WRITE_TRAJECTORIES = True
+FATAL_CLAIMS_DEFAULT: tuple[str, ...] = ("priority_invariant", "monotonic_progress")
+
+
 @dataclass
 class CampaignConfig:
     name: str
@@ -128,19 +139,19 @@ class CampaignConfig:
     experiments: list[ExperimentSpec] = field(default_factory=list)
     out_root: str = "experiment/_runs"
     base_seed: int = 0
-    simulation_duration_s: float = 30.0
-    task_timeout_s: float = 1500.0
-    failure_delay_s_max: float = 2.0
-    write_timeseries: bool = True
+    simulation_duration_s: float = _SIMULATION_DURATION_S
+    task_timeout_s: float = _TASK_TIMEOUT_S
+    failure_delay_s_max: float = _FAILURE_DELAY_S_MAX
+    write_timeseries: bool = _WRITE_TIMESERIES
     # Per-aid regulation trajectories — sparse event-driven series.
     # Default ON because the validity plots read them; disable for
     # high-task-count campaigns where the few MB/task is material.
-    write_trajectories: bool = True
+    write_trajectories: bool = _WRITE_TRAJECTORIES
     timestamp_dir: bool = True
     # Claims that flip task status to ``claims_failed`` when they fail;
     # round-tripped into the resolved config.json for RuntimePlan.
     fatal_claims: list[str] = field(
-        default_factory=lambda: ["priority_invariant", "monotonic_progress"]
+        default_factory=lambda: list(FATAL_CLAIMS_DEFAULT)
     )
     notes: str = ""
     defaults: GridDefaults = field(default_factory=GridDefaults)
@@ -231,32 +242,36 @@ class RuntimePlan:
     """Subset of the config needed inside the runner — kept narrow so the
     runner doesn't depend on slurm/grid metadata."""
 
-    simulation_duration_s: float = 30.0
-    task_timeout_s: float = 1500.0
-    failure_delay_s_max: float = 2.0
-    write_timeseries: bool = True
+    simulation_duration_s: float = _SIMULATION_DURATION_S
+    task_timeout_s: float = _TASK_TIMEOUT_S
+    failure_delay_s_max: float = _FAILURE_DELAY_S_MAX
+    write_timeseries: bool = _WRITE_TIMESERIES
     # Per-aid regulation trajectories — sparse event-driven series.
     # Default ON because the validity plots read them; disable for
     # high-task-count campaigns where the few MB/task is material.
-    write_trajectories: bool = True
+    write_trajectories: bool = _WRITE_TRAJECTORIES
     # Claims that flip task status to ``claims_failed`` when they fail.
     # Default set covers the invariants we cannot silently violate
     # without invalidating the headline numbers.
-    fatal_claims: tuple[str, ...] = ("priority_invariant", "monotonic_progress")
+    fatal_claims: tuple[str, ...] = FATAL_CLAIMS_DEFAULT
 
     @classmethod
     def from_config_json(cls, path: Path) -> RuntimePlan:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         fatal = data.get("fatal_claims")
         return cls(
-            simulation_duration_s=float(data.get("simulation_duration_s", 30.0)),
-            task_timeout_s=float(data.get("task_timeout_s", 1500.0)),
-            failure_delay_s_max=float(data.get("failure_delay_s_max", 2.0)),
-            write_timeseries=bool(data.get("write_timeseries", True)),
-            write_trajectories=bool(data.get("write_trajectories", True)),
-            fatal_claims=tuple(fatal)
-            if fatal is not None
-            else ("priority_invariant", "monotonic_progress"),
+            simulation_duration_s=float(
+                data.get("simulation_duration_s", _SIMULATION_DURATION_S)
+            ),
+            task_timeout_s=float(data.get("task_timeout_s", _TASK_TIMEOUT_S)),
+            failure_delay_s_max=float(
+                data.get("failure_delay_s_max", _FAILURE_DELAY_S_MAX)
+            ),
+            write_timeseries=bool(data.get("write_timeseries", _WRITE_TIMESERIES)),
+            write_trajectories=bool(
+                data.get("write_trajectories", _WRITE_TRAJECTORIES)
+            ),
+            fatal_claims=tuple(fatal) if fatal is not None else FATAL_CLAIMS_DEFAULT,
         )
 
 

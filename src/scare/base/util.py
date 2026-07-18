@@ -9,6 +9,7 @@ import numpy as np
 from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink
 from monee.model.extension import GridFormingGenerator, GridFormingSource
 
+from scare.base.addressing import branch_aid, is_child_aid
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.runtime.diagnostics import record_event, record_regulate
 
@@ -131,6 +132,48 @@ def _get_behavior_store(behavior: Any, attr: str, factory=dict) -> Any:
         store = factory()
         setattr(behavior, attr, store)
     return store
+
+
+def safe_observe(
+    behavior: Any,
+    aid: str,
+    *,
+    exc: type[BaseException] | tuple[type[BaseException], ...] = (
+        AttributeError,
+        KeyError,
+    ),
+    empty_to_none: bool = False,
+) -> dict | None:
+    """One guarded ``behavior.observe(aid)``. Swallows only *exc* (returning
+    None); anything outside *exc* propagates. With ``empty_to_none`` a falsy obs
+    also returns None. Each caller passes its own exception breadth so the
+    per-site swallow semantics are preserved."""
+    try:
+        obs = behavior.observe(aid)
+    except exc:
+        return None
+    if empty_to_none and not obs:
+        return None
+    return obs
+
+
+def first_role(agent: Any, role_type: type) -> Any:
+    """First role of *role_type* on *agent* (side-effect-free read), or None."""
+    for role in getattr(agent, "roles", []):
+        if isinstance(role, role_type):
+            return role
+    return None
+
+
+def role_index(agents: Any, role_type: type) -> dict[str, Any]:
+    """``aid -> first role of role_type`` over *agents* that have one, in
+    iteration order."""
+    idx: dict[str, Any] = {}
+    for agent in agents:
+        role = first_role(agent, role_type)
+        if role is not None:
+            idx[agent.aid] = role
+    return idx
 
 
 def _sector_store(behavior: Any) -> dict[str, Sector]:
@@ -724,7 +767,7 @@ def _is_slack_class_child(behavior: Any, aid: str) -> bool:
     writes must skip slacks. Class-based not registry-based: the unbounded
     heat-side ExtHydrGrid never registers yet is structurally a slack.
     """
-    if not aid.startswith("child-"):
+    if not is_child_aid(aid):
         return False
     try:
         cid = int(aid[len("child-") :])
@@ -747,7 +790,7 @@ def is_grid_former_child(behavior: Any, aid: str) -> bool:
     the ``enable_grid_former_curtail_guard`` write path forces such writes to
     full so the reference stays up.
     """
-    if not aid.startswith("child-"):
+    if not is_child_aid(aid):
         return False
     try:
         cid = int(aid[len("child-") :])
@@ -771,7 +814,7 @@ def _is_heat_side_mass_flow_sink(behavior: Any, aid: str) -> bool:
     so thermal curtailment must go through the HeatLoad instead. Gas-sector
     Sinks model real consumption and stay curtailable.
     """
-    if not aid.startswith("child-"):
+    if not is_child_aid(aid):
         return False
     try:
         cid = int(aid[len("child-") :])
@@ -1168,9 +1211,7 @@ def obs_sector(
 
 
 def create_branch_aid(branch_id: tuple) -> str:
-    a, b = branch_id[0], branch_id[1]
-    hi, lo = (a, b) if a > b else (b, a)
-    return f"branch-{hi}-{lo}"
+    return branch_aid(branch_id)
 
 
 def get_by_branch_id(centrality: dict, branch_id: tuple) -> float:
@@ -1180,21 +1221,8 @@ def get_by_branch_id(centrality: dict, branch_id: tuple) -> float:
     return centrality.get(rev, 0.0)
 
 
-# Re-export for backwards compatibility with callers importing it here.
-from scare.scenario.failure_sampling import create_failures  # noqa: E402,F401
-
-
 def efficiency_vector(eta_el: float, eta_heat: float, eta_gas: float) -> np.ndarray:
     return np.array([eta_el, eta_heat, eta_gas], dtype=float)
-
-
-# Re-export for backwards compatibility with callers importing them here.
-from scare.base.optimization.admm_factories import (  # noqa: E402,F401
-    create_chp_admm_flex_actor,
-    create_g2p_admm_flex_actor,
-    create_p2g_admm_flex_actor,
-    create_p2h_admm_flex_actor,
-)
 
 
 def sector_color(sector: Sector) -> str:
@@ -1516,17 +1544,22 @@ def clamp_to_constraints(
     return setpoint
 
 
-# Direction-aware constraint capping (see constraint_allowed_fraction). Set per
-# build from ``RestorationConfiguration.enable_directional_constraint_cap``.
-# Module-global (not threaded through every caller) because it is a physics
-# invariant, not a per-actor policy; each task rebuilds and re-sets it.
-_DIRECTIONAL_CONSTRAINT_CAP: bool = True
+# Direction-aware constraint capping (see constraint_allowed_fraction). Single
+# WRITER (set once per build from RestorationConfiguration): a named holder, not
+# a bare global read inside constraint math. SCARE re-sets it per task at build
+# time and never threads within a process, so no lock is needed; full per-call
+# threading through the 7 call sites is deferred to the util split (item 7).
+class _DirectionalCapState:
+    def __init__(self) -> None:
+        self.enabled = True
+
+
+_CAP_STATE = _DirectionalCapState()
 
 
 def set_directional_constraint_cap(enabled: bool) -> None:
     """Toggle the direction-aware serving cap in :func:`constraint_allowed_fraction`."""
-    global _DIRECTIONAL_CONSTRAINT_CAP
-    _DIRECTIONAL_CONSTRAINT_CAP = bool(enabled)
+    _CAP_STATE.enabled = bool(enabled)
 
 
 def constraint_allowed_fraction(
@@ -1567,7 +1600,7 @@ def constraint_allowed_fraction(
         val = float(obs[var])
         if not math.isfinite(val):
             continue
-        if _DIRECTIONAL_CONSTRAINT_CAP:
+        if _CAP_STATE.enabled:
             half = (hi - lo) / 2.0
             if half <= 0.0:
                 continue

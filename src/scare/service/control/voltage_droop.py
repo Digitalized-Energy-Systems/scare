@@ -14,7 +14,7 @@ from mango import Role
 
 from scare.base.model import SECTOR_TIMESCALE, Sector
 from scare.base.runtime.diagnostics import record_event
-from scare.base.util import _QV_RELIEF_TTL_S, publish_qv_relief
+from scare.base.util import _QV_RELIEF_TTL_S, publish_qv_relief, safe_observe
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -176,10 +176,7 @@ class ReactivePowerDroopRole(Role):
     async def _step(self) -> None:
         if not self.behavior.has_action(self.context.aid, "set_q"):
             return
-        try:
-            obs = self.behavior.observe(self.context.aid) or {}
-        except AttributeError:
-            return
+        obs = safe_observe(self.behavior, self.context.aid, exc=AttributeError) or {}
         v = obs.get("vm_pu")
         if v is None:
             return

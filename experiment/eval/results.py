@@ -32,6 +32,7 @@ from typing import Any
 
 from monee.model.child import ExtHydrGrid, ExtPowerGrid
 
+from experiment.eval.claims import diary_invariant_holds
 from experiment.eval.metrics import (
     constraint_rows,
     constraint_violation_integral,
@@ -89,7 +90,7 @@ def compose_result(
 
     # Per-reason regulate counts.
     regulates_by_reason: Counter[str] = Counter()
-    for rec in diagnostics._log:  # type: ignore[attr-defined]
+    for rec in diagnostics.action_log():
         if rec.kind == "regulate":
             regulates_by_reason[rec.reason] += 1
 
@@ -133,12 +134,7 @@ def compose_result(
 
 
 def _diary_invariant_holds(summary: dict[str, int]) -> bool:
-    started = int(summary.get("started", 0))
-    terminals = sum(
-        int(summary.get(k, 0))
-        for k in ("finished", "timed_out", "cancelled", "abandoned", "stalled")
-    )
-    return started == terminals
+    return diary_invariant_holds(summary)
 
 
 # Artefact writers

@@ -70,6 +70,17 @@ def evaluate_task(task_dir: Path) -> dict[str, Any]:
 
 # Diary invariant
 
+# One negotiation lifecycle yields `started` == the sum of these terminals.
+DIARY_TERMINAL_EVENTS = ("finished", "timed_out", "cancelled", "abandoned", "stalled")
+
+
+def diary_invariant_holds(counts: dict[str, int]) -> bool:
+    """True iff every started negotiation reached exactly one terminal event
+    (``started == Σ DIARY_TERMINAL_EVENTS``)."""
+    started = int(counts.get("started", 0))
+    terminals = sum(int(counts.get(k, 0)) for k in DIARY_TERMINAL_EVENTS)
+    return started == terminals
+
 
 def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
     if not diary_path.exists():
@@ -80,10 +91,7 @@ def _check_diary_invariant(diary_path: Path) -> dict[str, Any]:
         ev = r.get("event", "")
         counts[ev] = counts.get(ev, 0) + 1
     started = counts.get("started", 0)
-    terminals = sum(
-        counts.get(k, 0)
-        for k in ("finished", "timed_out", "cancelled", "abandoned", "stalled")
-    )
+    terminals = sum(counts.get(k, 0) for k in DIARY_TERMINAL_EVENTS)
     return {
         "passed": started == terminals,
         "detail": {"started": started, "terminals": terminals, "counts": counts},

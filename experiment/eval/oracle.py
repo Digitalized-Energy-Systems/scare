@@ -29,7 +29,10 @@ from monee.model.child import (
     Source,
 )
 from monee.model.core import Var
-from monee.model.formulation import make_heat_convex_milp_formulation, GAS_NONCONVEX_MIQCQP_FORMULATION
+from monee.model.formulation import (
+    GAS_NONCONVEX_MIQCQP_FORMULATION,
+    make_heat_convex_milp_formulation,
+)
 from monee.model.node import Bus
 from monee.problem import (
     WEIGHT_DEMAND,
@@ -902,10 +905,37 @@ def run_temporal_oracle(
     }
 
 
-_BASELINE_CACHE: dict[str, dict[str, Any]] = {}
-# Same keys as _BASELINE_CACHE: the baseline incumbent's per-child regulation,
-# kept for warm-starting the post-failure oracle solve.
-_BASELINE_REGS_CACHE: dict[str, dict[str, float]] = {}
+class BaselineCache:
+    """Per-(grid, scenario, priorities) baseline served + incumbent regulations,
+    persisted ACROSS a worker's tasks (a hit avoids re-solving the pre-failure
+    baseline). Preserves the deepcopy-on-write/read contract so a returned served
+    map can be mutated without poisoning the cache. ``clear()`` exists but is not
+    called by default — semantics unchanged from the module-dict version."""
+
+    def __init__(self) -> None:
+        self._served: dict[str, dict[str, Any]] = {}
+        self._regs: dict[str, dict[str, float]] = {}
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        cached = self._served.get(key)
+        return None if cached is None else copy.deepcopy(cached)
+
+    def put(
+        self, key: str, served: dict[str, Any], regs: dict[str, float] | None
+    ) -> None:
+        self._served[key] = copy.deepcopy(served)
+        if regs:
+            self._regs[key] = dict(regs)
+
+    def get_regs(self, key: str) -> dict[str, float] | None:
+        return self._regs.get(key)
+
+    def clear(self) -> None:
+        self._served.clear()
+        self._regs.clear()
+
+
+_BASELINE = BaselineCache()
 
 
 def _baseline_cache_key(
@@ -941,9 +971,9 @@ def compute_baseline_served(
     a deep copy so callers can mutate freely.
     """
     cache_key = _baseline_cache_key(grid_name, scenario, priorities)
-    cached = _BASELINE_CACHE.get(cache_key)
+    cached = _BASELINE.get(cache_key)
     if cached is not None:
-        return copy.deepcopy(cached)
+        return cached
 
     if grid_name not in GRIDS:
         raise SystemExit(f"Unknown grid {grid_name!r}")
@@ -1010,12 +1040,9 @@ def compute_baseline_served(
             f"{out.get('failure_reason')}"
         )
     served = out["served"]
-    _BASELINE_CACHE[cache_key] = copy.deepcopy(served)
-    # Side-cache the incumbent's per-child regulation for the post-failure
-    # oracle's MIP warm start (see baseline_regulations / _stamp_warm_start).
-    regs = out.get("regulations")
-    if regs:
-        _BASELINE_REGS_CACHE[cache_key] = dict(regs)
+    # Side-caches served + the incumbent's per-child regulation for the
+    # post-failure oracle's MIP warm start (see baseline_regulations).
+    _BASELINE.put(cache_key, served, out.get("regulations"))
     return served
 
 
@@ -1027,9 +1054,36 @@ def baseline_regulations(
 ) -> dict[str, float] | None:
     """Per-child regulation of the cached pre-failure baseline incumbent, or
     ``None`` when :func:`compute_baseline_served` has not run for this key."""
-    return _BASELINE_REGS_CACHE.get(
-        _baseline_cache_key(grid_name, scenario, priorities)
-    )
+    return _BASELINE.get_regs(_baseline_cache_key(grid_name, scenario, priorities))
+
+
+def _compose_outcomes(served: dict[str, Any]) -> dict[str, Any]:
+    """The served->outcomes core both compose_oracle_result branches share."""
+    return {
+        "priority_weighted_demand": served["priority_weighted_demand"],
+        "priority_weighted_served": served["priority_weighted_served"],
+        "priority_weighted_fraction": served["priority_weighted_fraction"],
+        "priority_weighted_fraction_by_sector": served.get(
+            "priority_weighted_fraction_by_sector", {}
+        ),
+        "served_by_sector": served["by_sector"],
+        "served_by_tier": served["by_tier"],
+        "served_by_tier_sector": served["by_tier_sector"],
+        "n_loads": served["n_loads"],
+        "n_loads_served_zero": served["n_loads_served_zero"],
+    }
+
+
+def _oracle_claims(
+    slack: Any, constraint: Any, *, heat_priority: Any = None
+) -> dict[str, Any]:
+    """Oracle claims envelope. No priority-invariant claim (the oracle has no
+    MAS dispatch to invariant-check); heat_priority is the non-gating oracle-
+    relative diagnostic, present only on the success path."""
+    claims = {"slack_budget_compliance": slack, "constraint_compliance": constraint}
+    if heat_priority is not None:
+        claims["heat_priority"] = heat_priority
+    return claims
 
 
 def compose_oracle_result(
@@ -1112,17 +1166,7 @@ def compose_oracle_result(
             "completed": False,
             "sim_time_final": 0.0,
             "outcomes": {
-                "priority_weighted_demand": served["priority_weighted_demand"],
-                "priority_weighted_served": served["priority_weighted_served"],
-                "priority_weighted_fraction": served["priority_weighted_fraction"],
-                "priority_weighted_fraction_by_sector": served.get(
-                    "priority_weighted_fraction_by_sector", {}
-                ),
-                "served_by_sector": served["by_sector"],
-                "served_by_tier": served["by_tier"],
-                "served_by_tier_sector": served["by_tier_sector"],
-                "n_loads": served["n_loads"],
-                "n_loads_served_zero": served["n_loads_served_zero"],
+                **_compose_outcomes(served),
                 "constraint_violation_integral": integral,
                 "constraint_violations_final": {},
                 "time_to_stabilise_s": 0.0,
@@ -1140,10 +1184,7 @@ def compose_oracle_result(
                     else {}
                 ),
             },
-            "claims": {
-                "slack_budget_compliance": failed_claim,
-                "constraint_compliance": failed_claim,
-            },
+            "claims": _oracle_claims(failed_claim, failed_claim),
             "diary": {"invariant_holds": True},
             "events": {},
             "messages": {},
@@ -1239,18 +1280,8 @@ def compose_oracle_result(
         "completed": True,
         "sim_time_final": 0.0,  # one-shot — no sim trajectory
         "outcomes": {
+            **_compose_outcomes(served),
             **extension_outcomes,
-            "priority_weighted_demand": served["priority_weighted_demand"],
-            "priority_weighted_served": served["priority_weighted_served"],
-            "priority_weighted_fraction": served["priority_weighted_fraction"],
-            "priority_weighted_fraction_by_sector": served.get(
-                "priority_weighted_fraction_by_sector", {}
-            ),
-            "served_by_sector": served["by_sector"],
-            "served_by_tier": served["by_tier"],
-            "served_by_tier_sector": served["by_tier_sector"],
-            "n_loads": served["n_loads"],
-            "n_loads_served_zero": served["n_loads_served_zero"],
             "n_net_nodes": len(getattr(solved_net, "nodes", []) or []),
             "constraint_violation_integral": integral,
             "constraint_violations_final": constraints_final,
@@ -1266,16 +1297,9 @@ def compose_oracle_result(
             "oracle_solve_optimal": solver_stats.get("solve_optimal"),
             "slack_budget_summary": slack_summary,
         },
-        "claims": {
-            # No priority-invariant claim: the oracle has no MAS-side dispatch
-            # to invariant-check. Other variants populate it via evaluate_task.
-            "slack_budget_compliance": slack_claim,
-            "constraint_compliance": constraint_claim,
-            # Oracle-relative heat-priority diagnostic (non-gating): the
-            # achievable feasible-subset tier ordering the LP attains, the
-            # reference SCARE's controllable heat gap is measured against.
-            "heat_priority": heat_priority_claim,
-        },
+        "claims": _oracle_claims(
+            slack_claim, constraint_claim, heat_priority=heat_priority_claim
+        ),
         "diary": {"invariant_holds": True},  # vacuous
         "events": {},
         "messages": {},

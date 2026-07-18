@@ -12,10 +12,8 @@ from mango import sender_addr as mango_sender_addr
 from mango.express.topology import topology_neighbors
 from monee.model.child import ExtPowerGrid
 
+from scare.base.addressing import child_aid
 from scare.base.model import (
-    DEENERGISED_PRESSURE_HIGH_PU,
-    DEENERGISED_PRESSURE_PU,
-    DEENERGISED_VM_PU,
     PROACTIVE_WARNING_FRACTION,
     SECTOR_CONSTRAINTS,
     SECTOR_TIMESCALE,
@@ -30,6 +28,7 @@ from scare.base.model import (
     ResponseEnergyMessage,
     Sector,
     StartBalanceNegotiation,
+    is_energised_reading,
 )
 from scare.base.runtime.diagnostics import record_event
 from scare.base.util import (
@@ -48,6 +47,7 @@ from scare.base.util import (
     publish_node_voltage,
     qv_relief_avail,
     refresh_line_curtail_lock,
+    safe_observe,
     sector_from_grid,
 )
 from scare.service.balance.trust import TrustLedger, TrustParams
@@ -399,10 +399,7 @@ class GridConstraintMonitor(Role):
 
     def _safe_observe(self) -> dict | None:
         """``observe()`` result, or ``None`` when the LP hasn't solved yet."""
-        try:
-            return self.behavior.observe(self.context.aid)
-        except (AttributeError, KeyError):
-            return None
+        return safe_observe(self.behavior, self.context.aid)
 
     def _try_emit_event(self, event) -> None:
         """Emit a local event, swallowing the ``KeyError`` when no role subscribes."""
@@ -602,22 +599,10 @@ class GridConstraintMonitor(Role):
         self._update_sensitivity(obs)
 
         for var, val in values.items():
-            # Skip de-energised readings (heat t_k<=0/NaN, gas pressure<=low or
-            # >=high relaxed-Weymouth box saturating at ~sqrt(3), elec vm_pu<=floor;
-            # see DEENERGISED_*): no curtail lever re-energises them; genuine
-            # out-of-bound values sit inside the gap and still fire.
-            if (
-                not math.isfinite(val)
-                or (var == "t_k" and val <= 0.0)
-                or (
-                    var == "pressure_pu"
-                    and (
-                        val <= DEENERGISED_PRESSURE_PU
-                        or val >= DEENERGISED_PRESSURE_HIGH_PU
-                    )
-                )
-                or (var == "vm_pu" and val <= DEENERGISED_VM_PU)
-            ):
+            # Skip de-energised / non-finite readings (see is_energised_reading):
+            # no curtail lever re-energises them; genuine out-of-bound values sit
+            # inside the band and still fire.
+            if not is_energised_reading(var, val):
                 continue
 
             lo, hi = bounds.get(var, (float("-inf"), float("inf")))
@@ -1078,7 +1063,7 @@ class GridConstraintMonitor(Role):
                 continue
             if cap >= 0:
                 continue
-            aid = f"child-{child.id}"
+            aid = child_aid(child.id)
             if self.behavior.has_action(aid, "regulate"):
                 gens.append(aid)
         self._downstream_gen_aids = gens

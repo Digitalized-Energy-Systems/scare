@@ -96,7 +96,7 @@ def test_spread_exceeds_band_saturates_and_flags():
         sp = lookup_slack_pressure(beh, reg.context.aid)
         assert sp is None or sp == pytest.approx(1.25)
     finally:
-        diagnostics._armed = False
+        diagnostics._RECORDER._armed = False
 
 
 def test_in_band_relaxes_toward_nominal():
@@ -167,4 +167,4 @@ def test_overpressure_trap_not_blamed_on_shedding():
         assert traps, "over-pressure trap event expected"
         assert "not relievable by shedding" in traps[-1].detail
     finally:
-        diagnostics._armed = False
+        diagnostics._RECORDER._armed = False

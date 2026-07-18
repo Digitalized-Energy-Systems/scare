@@ -33,11 +33,9 @@ from monee.model.multi import (
 from monee.solver.core import find_ignored_nodes
 
 from scare.base.model import (
-    DEENERGISED_PRESSURE_HIGH_PU,
-    DEENERGISED_PRESSURE_PU,
-    DEENERGISED_VM_PU,
     SECTOR_CONSTRAINTS,
     Sector,
+    is_energised_reading,
 )
 from scare.base.util import (
     constraint_allowed_fraction,
@@ -815,16 +813,10 @@ def _is_deenergised_avg(var: str, val: float) -> bool:
     violation — without this a fully de-energised run (avg_vm_pu~0.05) integrates
     to a huge spurious value while the final scan reports zero violations.
     """
-    if var == "vm_pu":
-        return val <= DEENERGISED_VM_PU
-    if var == "pressure_pu":
-        # Low floor = region cut off from supply; high saturation (~sqrt(3))
-        # = solver bound on an isolated region. Both are artefacts, not a real
-        # average over-/under-pressure (matches the plot/model de-energised masks).
-        return val <= DEENERGISED_PRESSURE_PU or val >= DEENERGISED_PRESSURE_HIGH_PU
-    if var == "t_k":
-        return val <= 0.0
-    return False
+    # De-energised = a FINITE reading outside is_energised_reading's band. The
+    # finite prefix preserves the original: a non-finite avg (nan) is KEPT, not
+    # scored as a black-out violation.
+    return math.isfinite(val) and not is_energised_reading(var, val)
 
 
 def constraint_violation_integral(world: Any) -> dict[str, float]:
@@ -1094,7 +1086,7 @@ def _branch_loading_current_percent(branch: Any, monee_net: Any) -> float | None
             base_kv = float(getattr(node_model, "base_kv", None))
         except (TypeError, ValueError):
             continue
-        if vm is None or not math.isfinite(vm) or vm <= DEENERGISED_VM_PU:
+        if not is_energised_reading("vm_pu", vm):  # rejects None/non-finite/<=floor
             continue
         if not (base_kv > 0.0):
             continue
@@ -1219,24 +1211,9 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
             if val is None or not math.isfinite(val):
                 continue
             # Solver-unpopulated / de-energised junctions are not real breaches
-            # (the live monitor skips them the same way): an isolated heat
-            # junction reports t_k~0, a gas region cut off from its ExtHydrGrid
-            # collapses to pressure_pu~0 (or saturates at the relaxed-Weymouth
-            # solver bound ~sqrt(3) — same artefact, high side), and an
-            # electricity node cut off from its slack collapses to vm_pu~0. See
-            # DEENERGISED_* for why a small floor (not 0) is needed and why
-            # genuine out-of-bound readings still gate.
-            if (
-                (var == "t_k" and val <= 0.0)
-                or (
-                    var == "pressure_pu"
-                    and (
-                        val <= DEENERGISED_PRESSURE_PU
-                        or val >= DEENERGISED_PRESSURE_HIGH_PU
-                    )
-                )
-                or (var == "vm_pu" and val <= DEENERGISED_VM_PU)
-            ):
+            # (the live monitor skips them the same way; see is_energised_reading).
+            # val is already finite (guarded above).
+            if not is_energised_reading(var, val):
                 continue
             rows.append(_violation_row("node", node.id, sec, var, val, lo, hi))
 

@@ -186,6 +186,20 @@ class EnergyConverterRole(Role):
     def _multi_sector_l3_enabled(self) -> bool:
         return self._component.enabled()
 
+    def _is_cps_cluster_leader(self) -> bool:
+        """Raw cps-cluster-leader test. Gates the leader-ONLY sites (L2.5
+        envelope, legacy per-CP trigger), which must stay leader-scoped even
+        under L3 or a non-leader CP would race the L3 path."""
+        return topology_characteristic(self, tid="cps") == "leader"
+
+    def _acts_as_cp_leader(self) -> bool:
+        """This CP should run coordination logic: cluster leader OR the L3 wiring
+        is live (leader test first, so ``_component.enabled()`` is only read when
+        not leader — same short-circuit as the original ``char != 'leader' and
+        not L3`` gates). Gates the full-form sites (holon-alloc, negotiation-
+        finished, cp-allocation)."""
+        return self._is_cps_cluster_leader() or self._multi_sector_l3_enabled()
+
     def _cp_peers_in_component(self) -> dict[str, dict[str, Any]]:
         return self._component.cp_peers(self.context.aid)
 
@@ -295,8 +309,7 @@ class EnergyConverterRole(Role):
             message.publisher,
             char,
         )
-        # Cps-leader gate (legacy mode only); L3 uses _is_l3_coordinator instead.
-        if char != "leader" and not self._multi_sector_l3_enabled():
+        if not self._acts_as_cp_leader():
             return
         # Echo guard: skip an allocation our own CP setpoint caused.
         if (
@@ -343,7 +356,7 @@ class EnergyConverterRole(Role):
         """
         if message.cp_id and message.cp_id != str(self.context.aid):
             return
-        if topology_characteristic(self, tid="cps") != "leader":
+        if not self._is_cps_cluster_leader():
             return
         # Translate sector-value keys to Sector enums; unknown strings dropped.
         flows: dict[Sector, float] = {}
@@ -414,10 +427,9 @@ class EnergyConverterRole(Role):
             message.new_setpoint,
             char,
         )
-        # Cps-leader gate (legacy mode only); in L3 the coordinator is the
-        # lex-smallest component aid, often not the cluster leader, and must
-        # still wake on gossip convergence (trigger_multi_sector_l3 re-gates).
-        if char != "leader" and not self._multi_sector_l3_enabled():
+        # Non-leader coordinators must still wake on gossip convergence in L3;
+        # trigger_multi_sector_l3 re-gates on the actual coordinator.
+        if not self._acts_as_cp_leader():
             return
         if self._active:
             return
@@ -456,7 +468,7 @@ class EnergyConverterRole(Role):
         return kept
 
     async def trigger_cp_negotiation(self) -> None:
-        if topology_characteristic(self, tid="cps") != "leader":
+        if not self._is_cps_cluster_leader():
             return
         if self._active:
             return
@@ -886,11 +898,9 @@ class EnergyConverterRole(Role):
         """Apply an L3-coord setpoint via _apply_result so it shares the legacy
         per-CP path. Idempotent: apply_regulate dedups same-value writes.
         """
-        # CPAllocation is per-CP addressed (subscribe filter on cp_aid); in L3
-        # every CP applies its own setpoint, so gate on the cluster leader only
-        # in legacy mode (mirrors _handle_holon_allocation).
-        char = topology_characteristic(self, tid="cps")
-        if char != "leader" and not self._multi_sector_l3_enabled():
+        # CPAllocation is per-CP addressed (subscribe filter on cp_aid): in L3
+        # every CP applies its own setpoint, so this is the full-form gate.
+        if not self._acts_as_cp_leader():
             return
         flows_mw = dict(message.sector_flows_mw)
         # Translate to the flat [el, heat, gas] vector; missing sectors stay 0.

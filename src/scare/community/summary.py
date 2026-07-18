@@ -92,19 +92,29 @@ class _ActiveCoalition:
     ttl_s: float
 
 
-def _xs_registry(
-    behavior: RestorationEnvironmentBehavior,
-) -> dict[Sector, dict[str, HolonSummary]]:
-    """Per-behavior shared registry of latest HolonSummary by sector.
+class CrossSectorChannel:
+    """Typed publish/read facade over the per-behavior cross-sector HolonSummary
+    bus (``behavior._scare_xs_summaries``). Today single-process and lazy-init;
+    the one seam a distributed transport would reimplement."""
 
-    Lazy-init, single-process; a distributed deployment needs a real
-    cross-sector publish path.
-    """
-    store = getattr(behavior, "_scare_xs_summaries", None)
-    if store is None:
-        store = {}
-        behavior._scare_xs_summaries = store
-    return store
+    def __init__(self, store: dict[Sector, dict[str, HolonSummary]]) -> None:
+        self._store = store
+
+    @classmethod
+    def for_behavior(
+        cls, behavior: RestorationEnvironmentBehavior
+    ) -> "CrossSectorChannel":
+        store = getattr(behavior, "_scare_xs_summaries", None)
+        if store is None:
+            store = {}
+            behavior._scare_xs_summaries = store
+        return cls(store)
+
+    def publish(self, sector: Sector, key: str, summary: HolonSummary) -> None:
+        self._store.setdefault(sector, {})[key] = summary
+
+    def read(self, sector: Sector) -> dict[str, HolonSummary]:
+        return self._store.get(sector, {})
 
 
 @dataclass
@@ -466,11 +476,11 @@ class HolonSummaryRole(Role):
         # Record our own summary too — the invariant check treats self
         # as just another publisher.
         self._peer_summaries[str(self.context.aid)] = summary
-        # Cross-sector visibility: mirror into a shared per-sector registry
-        # other-sector roles read. Single-process only; no cross-host path.
-        _xs_registry(self.behavior).setdefault(self.sector, {})[
-            str(self.context.aid)
-        ] = summary
+        # Cross-sector visibility: mirror into the shared per-sector channel
+        # other-sector roles read.
+        CrossSectorChannel.for_behavior(self.behavior).publish(
+            self.sector, str(self.context.aid), summary
+        )
         for addr in peers:
             await self.context.send_message(summary, receiver_addr=addr)
 
@@ -487,7 +497,9 @@ class HolonSummaryRole(Role):
         self._peer_summaries[key] = message
         # Full address for sending coalition messages back to this peer.
         self._peer_addrs[key] = sender
-        _xs_registry(self.behavior).setdefault(message.sector, {})[key] = message
+        CrossSectorChannel.for_behavior(self.behavior).publish(
+            message.sector, key, message
+        )
         # Peer view shifted — re-run detection now, not next watchdog.
         if topology_characteristic(self, tid="groups") == "leader":
             self._check_invariants()
@@ -606,10 +618,10 @@ class HolonSummaryRole(Role):
         """
         if not self._cp_meta:
             return
-        registry = _xs_registry(self.behavior)
+        channel = CrossSectorChannel.for_behavior(self.behavior)
         own_sec = self.sector
         own_aid = str(self.context.aid)
-        own_summaries = registry.get(own_sec, {})
+        own_summaries = channel.read(own_sec)
         if not own_summaries:
             return
         now = float(self.context.current_timestamp)
@@ -623,7 +635,7 @@ class HolonSummaryRole(Role):
             for peer_sec in sectors_bridged:
                 if peer_sec == own_sec:
                     continue
-                peer_summaries = registry.get(peer_sec, {})
+                peer_summaries = channel.read(peer_sec)
                 if not peer_summaries:
                     continue
                 pair = self._find_inversion_pair(own_summaries, peer_summaries)
@@ -761,9 +773,9 @@ class HolonSummaryRole(Role):
         if eta <= 0.0 or cp_cap_out <= 0.0:
             return  # CP can't push this direction
 
-        registry = _xs_registry(self.behavior)
-        own_summaries = registry.get(own_sec, {})
-        peer_summaries = registry.get(peer_sec, {})
+        channel = CrossSectorChannel.for_behavior(self.behavior)
+        own_summaries = channel.read(own_sec)
+        peer_summaries = channel.read(peer_sec)
 
         own_dem, own_ser = self._aggregate_tier(own_summaries)
         peer_dem, peer_ser = self._aggregate_tier(peer_summaries)

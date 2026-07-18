@@ -31,7 +31,7 @@ from scare.base.channel import (
 )
 from scare.base.model import Sector, StartBalanceNegotiation
 from scare.community.coalition_store import CoalitionConstraintStore
-from scare.community.summary import HolonSummaryRole, _xs_registry
+from scare.community.summary import CrossSectorChannel, HolonSummaryRole
 
 # ---------------------------------------------------------------------------
 # Fake mango context: records outbound messages, carries an aid + sim
@@ -137,23 +137,27 @@ def _inject_inversion(behavior: Any) -> None:
     """Populate the shared registry: electricity tier-1 at 30 % served,
     heat tier-5 at 100 % — the inversion the coalition should fix.
     """
-    registry = _xs_registry(behavior)
-    registry[Sector.ELECTRICITY] = {
-        "leader-el-1": _make_summary(
+    channel = CrossSectorChannel.for_behavior(behavior)
+    channel.publish(
+        Sector.ELECTRICITY,
+        "leader-el-1",
+        _make_summary(
             "leader-el-1",
             Sector.ELECTRICITY,
             demand_by_tier={1: 2.0},
             served_by_tier={1: 0.6},  # 30 % served
         ),
-    }
-    registry[Sector.HEAT] = {
-        "leader-heat-1": _make_summary(
+    )
+    channel.publish(
+        Sector.HEAT,
+        "leader-heat-1",
+        _make_summary(
             "leader-heat-1",
             Sector.HEAT,
             demand_by_tier={5: 1.0},
             served_by_tier={5: 1.0},  # 100 % served
         ),
-    }
+    )
 
 
 def _p2h_meta(cp_addr: _Addr) -> dict[str, dict[str, Any]]:

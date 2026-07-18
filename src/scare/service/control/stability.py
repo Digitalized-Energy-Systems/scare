@@ -16,6 +16,7 @@ from scare.base.util import (
     lookup_slack,
     obs_capacity,
     obs_setpoint,
+    safe_observe,
 )
 
 if TYPE_CHECKING:
@@ -43,10 +44,7 @@ class NodeObserver(Role):
     async def _observe(self) -> None:
         if self.context.current_timestamp > self.control_until_s:
             return
-        try:
-            obs = self.behavior.observe(self.context.aid)
-        except (AttributeError, KeyError):
-            return
+        obs = safe_observe(self.behavior, self.context.aid)
         if obs:
             logger.debug("[%s] obs=%s", self.context.aid, obs)
 
@@ -106,10 +104,7 @@ class GenerationController(Role):
         defers it while the auction holds the generator down. No-op for
         loads/slacks and for generators already at (or constrained below) full.
         """
-        try:
-            obs = self.behavior.observe(self.context.aid)
-        except (AttributeError, KeyError):
-            return
+        obs = safe_observe(self.behavior, self.context.aid)
         if not obs:
             return
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
@@ -192,10 +187,7 @@ class GenerationController(Role):
     ) -> None:
         if event.sector != self.sector:
             return
-        try:
-            obs = self.behavior.observe(self.context.aid)
-        except (AttributeError, KeyError):
-            return
+        obs = safe_observe(self.behavior, self.context.aid)
         if not obs:
             return
         cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)

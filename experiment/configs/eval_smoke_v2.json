@@ -1,0 +1,286 @@
+{
+  "$comment": [
+    "eval_smoke_v2 — minimized, high-coverage subset of eval_full_v2.json for a",
+    "LOCAL SCARE smoke campaign (max 2 workers). Goal: exercise every major code",
+    "path with as few tasks as possible, NOT statistical power.",
+    "  - n_seeds=1 everywhere (no distributional claims; sim has uuid4 nondet).",
+    "  - Grids: LV size ladder (small/medium/large) + reconfig + all 3 CP variants.",
+    "    DROPPED simbench_mvlv (778 nodes, ~7min+/task incl. oracle) — MV+LV scaling",
+    "    is only partially covered; re-add for a full run.",
+    "  - Variants: all 4 (scare/single_level/component_level/oracle) on the LV",
+    "    headline + scaling + cross-sector + reconfig; scare-only elsewhere.",
+    "  - Scenario kinds covered: clean, concentrated, line_stress, pv_peak,",
+    "    cold_day, microgrid. Failure types: default/poisson, generator, branch,",
+    "    mixed, concentrated, island.",
+    "  - Ablation/sweep matrices collapsed to a smoke subset that just proves the",
+    "    toggle plumbing + robustness path run (NOT per-lever attribution).",
+    "  - Extensions: 2 islanding tasks + 1 temporal task (6h horizon, heaviest).",
+    "task_timeout_s=1800 covers the temporal 6h task; sim_duration 30s otherwise."
+  ],
+  "name": "eval_smoke_v2",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 1,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "$comment": "Headline — all 4 variants on the LV benchmark, healthy clean restoration.",
+      "name": "functional_core",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare", "single_level", "component_level", "oracle"],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Grid-size ladder (small/medium/large) with the oracle gap.",
+      "name": "scaling",
+      "grids": ["simbench_lv_small", "simbench_lv_medium", "simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare", "oracle"],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Cross-sector CP-ADMM path — dependent grid, generator failures, tight slack.",
+      "name": "cross_sector",
+      "grids": ["simbench_lv_cp_heavy_dependent"],
+      "n_seeds": 1,
+      "variants": ["scare", "component_level", "oracle"],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ]
+    },
+    {
+      "$comment": "Remaining CP grid variants — scare only.",
+      "name": "cp_flexibility",
+      "grids": ["simbench_lv_cp_heavy", "simbench_lv_cp_dependent"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Feeder reconfiguration (FLISR) — reconfig grid, branch failures.",
+      "name": "reconfiguration",
+      "grids": ["simbench_lv_reconfig"],
+      "n_seeds": 1,
+      "variants": ["scare", "oracle"],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "branch",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Line-loading / curtailment pipeline — overload after a branch redirect.",
+      "name": "line_stress",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "scenarios": [
+        {
+          "kind": "line_stress",
+          "load_scale": 1.8,
+          "ampacity_scale": 0.5,
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Voltage support (Q-V droop) — pv_peak on the small grid that over-volts.",
+      "name": "voltage",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ]
+    },
+    {
+      "$comment": "Heat sector — cold_day deficit on cp_heavy.",
+      "name": "heat",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Mixed-carrier failures — exercises the mixed contingency population + gas.",
+      "name": "mixed_failures",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Comms robustness smoke — one packet-loss + one latency-jitter point.",
+      "name": "robustness",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "sweeps": [
+        { "comms_packet_loss_pct": 20.0 },
+        { "comms_latency_jitter_ms": 200.0 }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Ablation-plumbing smoke on the concentrated-5 deficit: baseline + three core toggles (holonic / QP-gossip / line-loading). {} row doubles as the holonic-redistribution baseline.",
+      "name": "ablation_smoke",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_holonic": false },
+        { "enable_qp_gossip": false },
+        { "enable_line_loading_constraint": false }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Islanding extension — paired microgrid vs clean control on identical island cuts.",
+      "name": "extension_islanding",
+      "grids": ["simbench_lv"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "scenarios": [
+        {
+          "kind": "microgrid",
+          "failure_type": "island",
+          "n_failures": 5,
+          "carriers": ["electricity", "water", "gas"],
+          "promote_all_generators": true,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "heat_mccormick": true,
+          "failure_type": "island",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ]
+    },
+    {
+      "$comment": "Temporal extension (heaviest) — single 6h-horizon task with gas linepack + thermal LTC and periodic-only physics solving.",
+      "name": "extension_temporal",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 1,
+      "variants": ["scare"],
+      "ablations": [
+        {
+          "energy_flow_cooldown_s_override": 1000000.0,
+          "energy_flow_max_acts": 0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "generator_carriers": ["heat", "gas"],
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15,
+          "simulation_duration_s": 21600.0,
+          "physics_time_scale": 1.0,
+          "physics_interval_s": 10.0,
+          "sector_timescale": {
+            "electricity": { "poll_period_s": 30.0, "decision_delay_s": 5.0 },
+            "gas": { "poll_period_s": 120.0, "decision_delay_s": 30.0 },
+            "heat": { "poll_period_s": 600.0, "decision_delay_s": 120.0 }
+          },
+          "linepack": true,
+          "ltc": true
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "02:00:00",
+    "mem": "4G",
+    "cpus": 1,
+    "max_concurrent": 64,
+    "aggregate": true
+  }
+}

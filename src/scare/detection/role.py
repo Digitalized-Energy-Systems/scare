@@ -8,6 +8,7 @@ from mango import sender_addr as mango_sender_addr
 from mango.express.topology import topology_neighbors
 from mango_energy_environments import BranchFailureEvent
 
+from scare.base.addressing import addr_aid, node_id_from_aid
 from scare.base.model import FailureNotice, LineFailure, Sector
 from scare.base.runtime.diagnostics import record_event
 
@@ -218,13 +219,7 @@ def _normalise_branch_id(branch_id: tuple) -> tuple:
 
 
 def _node_id_from_addr(addr: Any) -> Any:
-    aid = getattr(addr, "aid", str(addr))
-    if not aid.startswith("node-"):
-        return None
-    try:
-        return int(aid.split("-", 1)[1])
-    except ValueError:
-        return None
+    return node_id_from_aid(addr_aid(addr))
 
 
 def _sector_from_str(s: str) -> Sector | None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
@@ -61,6 +62,32 @@ DEENERGISED_PRESSURE_HIGH_PU: float = 1.70
 # floor, so a 0.5 threshold drops only the collapsed reading while real
 # under-voltage (e.g. 0.9 vs the 0.95 floor) still gates.
 DEENERGISED_VM_PU: float = 0.5
+
+
+def is_energised_reading(variable: str, value: Any) -> bool:
+    """Single source of truth: does *value* read a real energised state for
+    *variable*, or a de-energisation / solver-bound artefact? Consulted by every
+    actuator and every grader so they cannot disagree by copy-drift.
+
+    Bands: ``vm_pu`` > DEENERGISED_VM_PU; DEENERGISED_PRESSURE_PU < ``pressure_pu``
+    < DEENERGISED_PRESSURE_HIGH_PU; ``t_k`` > 0. A variable with no artefact (e.g.
+    ``loading_percent``) is always energised. None / non-numeric / non-finite is
+    NOT energised — the ``float()`` guard rejects None before ``math.isfinite``.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(v):
+        return False
+    if variable == "vm_pu":
+        return v > DEENERGISED_VM_PU
+    if variable == "pressure_pu":
+        return DEENERGISED_PRESSURE_PU < v < DEENERGISED_PRESSURE_HIGH_PU
+    if variable == "t_k":
+        return v > 0.0
+    return True
+
 
 # Fraction of feasible range at which an agent warns neighbours it nears a limit.
 PROACTIVE_WARNING_FRACTION: float = 0.85

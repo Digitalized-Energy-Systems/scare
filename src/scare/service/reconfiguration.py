@@ -7,6 +7,7 @@ from uuid import uuid4
 from mango import Role, State
 from mango.express.topology import topology_neighbors
 
+from scare.base.addressing import addr_aid, branch_aid_from_addrs
 from scare.base.model import (
     GridPathMessage,
     GridPathResult,
@@ -442,20 +443,11 @@ def should_close_tie(switch_state: int | None) -> bool:
 
 
 def _addr_aid(addr: Any) -> str:
-    return getattr(addr, "aid", str(addr))
+    return addr_aid(addr)
 
 
 def _branch_aid_from_addrs(addr_a: Any, addr_b: Any) -> str:
-    def _extract_id(addr: Any) -> int:
-        aid = addr.aid if hasattr(addr, "aid") else str(addr)
-        try:
-            return int(aid.split("-")[-1])
-        except ValueError:
-            return 0
-
-    a, b = _extract_id(addr_a), _extract_id(addr_b)
-    hi, lo = (a, b) if a > b else (b, a)
-    return f"branch-{hi}-{lo}"
+    return branch_aid_from_addrs(addr_a, addr_b)
 
 
 class GridTieSwitchOperator(Role):

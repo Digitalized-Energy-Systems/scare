@@ -11,7 +11,7 @@ import mango_energy_environments.environments.restoration.multi_energy_monee as 
 import pytest
 from mango_energy_environments import fetch_example_net
 
-from scare.base.util import create_failures
+from scare.scenario.failure_sampling import create_failures
 from scare.scenario.restoration import (
     create_restoration_scenario_world,
     start_restoration_simulation,

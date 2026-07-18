@@ -28,7 +28,7 @@ from mango_energy_environments import fetch_example_net
 
 from scare.base.config import RestorationConfiguration
 from scare.base.runtime import diagnostics
-from scare.base.util import create_failures
+from scare.scenario.failure_sampling import create_failures
 from scare.scenario.restoration import (
     create_restoration_scenario_world,
     start_restoration_simulation,

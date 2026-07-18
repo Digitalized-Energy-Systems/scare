@@ -10,13 +10,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
-
+from typing import Any, Protocol
 
 from scare.base.model import Sector
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +32,27 @@ class Decision:
     version: int
     caused_by: dict[str, int] = field(default_factory=dict)
     timestamp_s: float = 0.0
+
+
+@dataclass
+class SectorTierFlex:
+    """The per-(sector, tier) flex quad shared by the flex/summary/coalition/
+    component payloads. Composed into the Decision subclasses so the shape is
+    declared once; ``holon_flex.aggregate_holon_flex`` ingests exactly these."""
+
+    supply_by_sector: dict[str, float] = field(default_factory=dict)
+    demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+
+
+class SectorTierFlexLike(Protocol):
+    """Structural type of anything the supply-priority ADMM can ingest — the four
+    flex-quad DTOs (AvailableFlexAnswer + the three Decision subclasses) satisfy
+    it, replacing the manual 'same dict shape' docstring invariant."""
+
+    supply_by_sector: dict[str, float]
+    demand_by_sector_priority: dict[str, dict[int, float]]
+    served_by_sector_priority: dict[str, dict[int, float]]
 
 
 @dataclass
@@ -69,7 +86,7 @@ class CPSetpoint(Decision):
 
 
 @dataclass
-class HolonSummary(Decision):
+class HolonSummary(SectorTierFlex, Decision):
     """Post-rebalance per-tier served/demand summary for one leader's community.
 
     Published periodically on the sector-wide ``holon_summary_<sector>`` mesh;
@@ -82,12 +99,8 @@ class HolonSummary(Decision):
     sector: Sector = Sector.ELECTRICITY
     per_tier_served_mw: dict[int, float] = field(default_factory=dict)
     per_tier_demand_mw: dict[int, float] = field(default_factory=dict)
-    # Mirrors the ``CoalitionAcceptance`` slice so an L2 leader runs
-    # ``allocate_supply_priority`` on the peer view without a flex round-trip;
-    # the shared dict shape lets the kernel ingest both payloads via one path.
-    supply_by_sector: dict[str, float] = field(default_factory=dict)
-    demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
-    served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    # supply_by_sector / demand_by_sector_priority / served_by_sector_priority
+    # come from the SectorTierFlex mixin (the shared ADMM-ingest slice).
     # Per-sector slack-only operator budget (Σ slack members' eff_budget), split
     # from ``supply_by_sector`` so L3 CP-ADMM caps a CP's input-sector draw at
     # the slack budget rather than the aggregate generator pool.
@@ -116,7 +129,7 @@ class CoalitionInvitation(Decision):
 
 
 @dataclass
-class CoalitionAcceptance(Decision):
+class CoalitionAcceptance(SectorTierFlex, Decision):
     """Reply from an invited leader carrying its scoped flex slice.
 
     The initiator runs coalition ADMM on the aggregate of acceptances plus its
@@ -131,9 +144,7 @@ class CoalitionAcceptance(Decision):
     coalition_id: str = ""
     sector: Sector = Sector.ELECTRICITY
     accepted: bool = True
-    supply_by_sector: dict[str, float] = field(default_factory=dict)
-    demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
-    served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    # supply/demand/served-by-sector come from the SectorTierFlex mixin.
     home_node_id: Any = None
     demand_nodes_by_tier: dict[int, dict[Any, float]] = field(default_factory=dict)
     # Non-empty only for CP members.
@@ -181,7 +192,7 @@ class CoalitionConstraint(Decision):
 
 
 @dataclass
-class ComponentAdmmReport(Decision):
+class ComponentAdmmReport(SectorTierFlex, Decision):
     """A group leader's flex report for the per-(sector, active-component) L2 ADMM.
 
     Sent by every leader to the component coordinator (lex-smallest aid among
@@ -196,9 +207,7 @@ class ComponentAdmmReport(Decision):
     round_id: str = ""
     sector: Sector = Sector.ELECTRICITY
     leader_aid: str = ""
-    supply_by_sector: dict[str, float] = field(default_factory=dict)
-    demand_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
-    served_by_sector_priority: dict[str, dict[int, float]] = field(default_factory=dict)
+    # supply/demand/served-by-sector come from the SectorTierFlex mixin.
     # Implicit ACK: echoes the last applied ``ComponentAllocation.version`` so the
     # coordinator detects missed dispatches and re-sends. ``-1`` = none yet.
     last_applied_allocation_version: int = -1
