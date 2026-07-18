@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
 
 from mango import Role, State
 from mango.express.topology import topology_neighbors
@@ -17,7 +16,7 @@ from scare.base.model import (
     StartBalanceNegotiation,
 )
 from scare.base.runtime.diagnostics import record_event, record_switch
-from scare.base.util import _get_behavior_store, obs_constraint_values
+from scare.base.util import _get_behavior_store, async_dispatch, obs_constraint_values
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -44,17 +43,15 @@ class GridReconfigurator(Role):
         # forward once. Ranking: track lowest max_loading, re-forward if better.
         self._forwarded_searches: set[str] = set()
         self._forwarded_loading: dict[str, float] = {}
+        # Monotonic counter backing reproducible search ids -- see base.util.ids.
+        self._search_seq = 0
         self.enable_ranking = enable_ranking
         self.window_s = window_s
         # search_id → candidates buffered until window close.
         self._search_results: dict[str, list[GridPathResult]] = {}
 
     def setup(self) -> None:
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         self.context.subscribe_message(
             self,
@@ -102,7 +99,8 @@ class GridReconfigurator(Role):
             )
             return
 
-        search_id = str(uuid4())
+        self._search_seq += 1
+        search_id = f"{self.context.aid}/{self._search_seq}"
         # Mark in-flight so ``_handle_path_result`` accepts its result.
         self._pending_searches[search_id] = True
         if self.enable_ranking:
@@ -455,12 +453,10 @@ class GridTieSwitchOperator(Role):
         self,
         behavior: RestorationEnvironmentBehavior,
         branch_id: tuple,
-        centrality: float = 0.0,
     ) -> None:
         super().__init__()
         self.behavior = behavior
         self.branch_id = branch_id
-        self.centrality = centrality
 
     def setup(self) -> None:
         pass

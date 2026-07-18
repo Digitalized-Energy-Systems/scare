@@ -208,7 +208,7 @@ def _apply_theme(
     width: int = _FIG_WIDTH,
     font_bump: int = 0,
     legend_top: bool = False,
-    no_legend: bool = False
+    no_legend: bool = False,
 ) -> go.Figure:
     """Apply the shared figure theme. ``font_bump`` adds the same delta
     (pt) to every text element, for figures shown as large panels.
@@ -222,9 +222,7 @@ def _apply_theme(
         width=width,
     )
     if no_legend:
-        fig.update_layout(
-            margin=dict(r=50)
-        )
+        fig.update_layout(margin=dict(r=50))
     # ``update_layout`` only styles axis #1 (``xaxis``/``yaxis``); on a
     # make_subplots figure every other panel's axes keep plotly defaults, so
     # tick marks and gridlines render inconsistently from panel to panel.
@@ -722,11 +720,7 @@ def variant_comparison_bar(
             )
         )
 
-
-    fig.update_layout(barmode="group", 
-                      bargap=0.32, 
-                      bargroupgap=0.12
-    )
+    fig.update_layout(barmode="group", bargap=0.32, bargroupgap=0.12)
     fig.update_xaxes(
         range=[0, 1.05], title="priority-weighted served fraction", tickformat=".2f"
     )
@@ -856,15 +850,15 @@ _COMPLIANCE_CATS: list[tuple[str, str, str, str]] = [
 
 def _compliance_category(df: pd.DataFrame) -> pd.Series:
     """Per-row compliance category over ``_COMPLIANCE_CATS`` keys."""
-    slack_ok = (
-        df["claims__slack_budget_compliance__passed"].fillna(False).astype(bool)
-    )
+    slack_ok = df["claims__slack_budget_compliance__passed"].fillna(False).astype(bool)
     cc_ok = df["claims__constraint_compliance__passed"].fillna(False).astype(bool)
 
     def nv(v: str) -> pd.Series:
         c = f"claims__constraint_compliance__detail__by_variable__{v}__n_violations"
-        return (df[c].fillna(0) > 0) if c in df.columns else pd.Series(
-            False, index=df.index
+        return (
+            (df[c].fillna(0) > 0)
+            if c in df.columns
+            else pd.Series(False, index=df.index)
         )
 
     reasons = {
@@ -975,9 +969,7 @@ def variant_pwsf_compliance_bar(
         for vi, variant in enumerate(variants):
             fracs: list[float] = []
             for gkey, _ in present:
-                sub = work[
-                    (work[group_col] == gkey) & (work["variant"] == variant)
-                ]
+                sub = work[(work[group_col] == gkey) & (work["variant"] == variant)]
                 fracs.append((sub["_cat"] == key).mean() if len(sub) else float("nan"))
             fig.add_trace(
                 go.Bar(
@@ -1090,8 +1082,7 @@ def stress_class_variant_bar(
         for exp, label in present:
             vals = (
                 compliant[
-                    (compliant["experiment"] == exp)
-                    & (compliant["variant"] == variant)
+                    (compliant["experiment"] == exp) & (compliant["variant"] == variant)
                 ][metric_col]
                 .dropna()
                 .tolist()
@@ -1487,7 +1478,9 @@ def robustness_curve(
             mode="lines+markers",
             line=dict(color=_VARIANT_COLOR["scare"], width=_DATA_LINE_WIDTH),
             marker=dict(
-                size=_MARKER_SIZE, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
+                size=_MARKER_SIZE,
+                color=_VARIANT_COLOR["scare"],
+                line=dict(color="white", width=1),
             ),
             customdata=[
                 f"x={xv}<br>mean PWSF (compliant): {m:.4f}<br>95% CI: {_ci_label(c)}<br>"
@@ -1513,7 +1506,9 @@ def robustness_curve(
                 y=(share.values * 100).tolist(),
                 mode="lines+markers",
                 name="compliant runs",
-                line=dict(color=_VARIANT_COLOR["oracle"], width=_DATA_LINE_WIDTH, dash="dot"),
+                line=dict(
+                    color=_VARIANT_COLOR["oracle"], width=_DATA_LINE_WIDTH, dash="dot"
+                ),
                 marker=dict(
                     size=_MARKER_SIZE,
                     color=_VARIANT_COLOR["oracle"],
@@ -1629,7 +1624,9 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
             mode="lines+markers",
             line=dict(color=_VARIANT_COLOR["scare"], width=_DATA_LINE_WIDTH),
             marker=dict(
-                size=_MARKER_SIZE, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
+                size=_MARKER_SIZE,
+                color=_VARIANT_COLOR["scare"],
+                line=dict(color="white", width=1),
             ),
             customdata=[
                 f"failures: {xv}<br>mean PWSF (compliant): {m:.4f}<br>"
@@ -1773,7 +1770,9 @@ def sweep_curve_dual(
             name="served (compliant)",
             line=dict(color=_VARIANT_COLOR["scare"], width=_DATA_LINE_WIDTH),
             marker=dict(
-                size=_MARKER_SIZE, color=_VARIANT_COLOR["scare"], line=dict(color="white", width=1)
+                size=_MARKER_SIZE,
+                color=_VARIANT_COLOR["scare"],
+                line=dict(color="white", width=1),
             ),
             hovertemplate=f"{sweep_param}: %{{x}}<br>served (compliant): %{{y:.4f}}<extra></extra>",
         ),
@@ -1791,7 +1790,9 @@ def sweep_curve_dual(
                 y=share.values.tolist(),
                 mode="lines+markers",
                 name="compliant share",
-                line=dict(color=_VARIANT_COLOR["oracle"], width=_DATA_LINE_WIDTH, dash="dot"),
+                line=dict(
+                    color=_VARIANT_COLOR["oracle"], width=_DATA_LINE_WIDTH, dash="dot"
+                ),
                 marker=dict(
                     size=_MARKER_SIZE,
                     color=_VARIANT_COLOR["oracle"],
@@ -1811,7 +1812,11 @@ def sweep_curve_dual(
                 y=wall.values,
                 mode="lines+markers",
                 name="wallclock (s)",
-                line=dict(color=_VARIANT_COLOR["single_level"], width=_DATA_LINE_WIDTH, dash="dot"),
+                line=dict(
+                    color=_VARIANT_COLOR["single_level"],
+                    width=_DATA_LINE_WIDTH,
+                    dash="dot",
+                ),
                 marker=dict(
                     size=_MARKER_SIZE,
                     color=_VARIANT_COLOR["single_level"],
@@ -2085,8 +2090,8 @@ def restoration_vs_baseline_bar(
         agg_spec["raw_ratio"] = (raw_col, "mean")
     if pwsf_col in sub.columns:
         agg_spec["pwsf_ratio"] = (pwsf_col, "mean")
-    grouped = sub.groupby("grid").agg(**agg_spec).sort_values(
-        "baseline_mw", ascending=False
+    grouped = (
+        sub.groupby("grid").agg(**agg_spec).sort_values("baseline_mw", ascending=False)
     )
     grids = grouped.index.tolist()
     grids_lbl = _grids_display(grids)
@@ -2369,7 +2374,9 @@ def restoration_loss_split_by_tier_bar(
     )
     # Tier 1 (most critical) on top.
     fig.update_yaxes(title="priority tier (1 = most critical)", autorange="reversed")
-    height = int(_hbar_height(len(tier_labels)) * 0.7)  # -30%: compact next to the taller vertical panels
+    height = int(
+        _hbar_height(len(tier_labels)) * 0.7
+    )  # -30%: compact next to the taller vertical panels
     return _save(
         _apply_theme(
             fig, title=title, height=height, width=_BAR_FIG_WIDTH, legend_top=True
@@ -2541,8 +2548,8 @@ def absolute_load_lost_bar(
     }
     if has_base:
         agg_spec["baseline_mw"] = (base_col, "mean")
-    grouped = sub.groupby("grid").agg(**agg_spec).sort_values(
-        "dropped_mw", ascending=False
+    grouped = (
+        sub.groupby("grid").agg(**agg_spec).sort_values("dropped_mw", ascending=False)
     )
 
     if has_base:
@@ -2628,9 +2635,7 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
     # behaviour). Dividing by each variant's task count gives the mean number of
     # negotiations of each outcome PER TASK, which is comparable.
     n_tasks = df.groupby("variant").size()
-    by_variant = (
-        df.groupby("variant")[[c[0] for c in cols]].sum().div(n_tasks, axis=0)
-    )
+    by_variant = df.groupby("variant")[[c[0] for c in cols]].sum().div(n_tasks, axis=0)
     if by_variant.empty:
         return _save(_empty_fig("no diary data", title), out_path)
 
@@ -2710,8 +2715,7 @@ def time_to_stabilise_box(
             name=alias_variant(str(v)),
             color=_variant_color(str(v)),
             hovertemplate=(
-                f"<b>{alias_variant(str(v))}</b><br>"
-                "time: %{y:.2f} s<extra></extra>"
+                f"<b>{alias_variant(str(v))}</b><br>time: %{{y:.2f}} s<extra></extra>"
             ),
         )
     fig.update_yaxes(
@@ -2720,7 +2724,9 @@ def time_to_stabilise_box(
     fig.update_xaxes(title="variant")
     fig.update_layout(showlegend=False, boxgap=0.45, boxgroupgap=0.2)
     return _save(
-        _apply_theme(fig, title=title, height=380, width=_box_fig_width(n_boxes), no_legend=True),
+        _apply_theme(
+            fig, title=title, height=380, width=_box_fig_width(n_boxes), no_legend=True
+        ),
         out_path,
     )
 
@@ -2915,8 +2921,7 @@ def cp_influence_bar(
     out_path: Path,
     *,
     title: str = (
-        "Coupling-point optimization — activity and restored load "
-        "(all runs, by grid)"
+        "Coupling-point optimization — activity and restored load (all runs, by grid)"
     ),
 ) -> Path:
     """Two panels, shared grid axis, pooled over every completed run.
@@ -3098,8 +3103,7 @@ def cp_influence_bar(
         if use_mw:
             for c, mw_key in carrier_stack:
                 xs = [
-                    _nz(bd_means.get(mw_key, {}).get((grid, variant)))
-                    for grid in grids
+                    _nz(bd_means.get(mw_key, {}).get((grid, variant))) for grid in grids
                 ]
                 fig.add_trace(
                     go.Bar(
@@ -3111,12 +3115,8 @@ def cp_influence_bar(
                         x=xs,
                         orientation="h",
                         marker=_bar_marker(
-                            _hex_to_rgba(
-                                _variant_color(variant), carrier_alpha[c]
-                            ),
-                            pattern_shape=_SECTOR_PATTERN.get(
-                                carrier_sector[c], ""
-                            ),
+                            _hex_to_rgba(_variant_color(variant), carrier_alpha[c]),
+                            pattern_shape=_SECTOR_PATTERN.get(carrier_sector[c], ""),
                         ),
                         hovertemplate="%{customdata}<extra></extra>",
                         customdata=carrier_hover[c],
@@ -3172,8 +3172,7 @@ def cp_influence_bar(
                     s_mean = pwsf_mean.get((grid, variant))
                     if o_mean is not None and s_mean is not None:
                         deltas += (
-                            f"Δ vs {alias_variant(other)}: "
-                            f"{s_mean - o_mean:+.4f}<br>"
+                            f"Δ vs {alias_variant(other)}: {s_mean - o_mean:+.4f}<br>"
                         )
                 if deltas:
                     deltas = (
@@ -3318,9 +3317,7 @@ def restoration_by_sector_bar(
                 y=grids_lbl,
                 x=grouped[col].values,
                 orientation="h",
-                marker=_bar_marker(
-                    color, pattern_shape=_SECTOR_PATTERN.get(sec, "")
-                ),
+                marker=_bar_marker(color, pattern_shape=_SECTOR_PATTERN.get(sec, "")),
                 hovertemplate=(
                     f"<b>{sec}</b><br>grid: %{{y}}<br>ratio: %{{x:.3f}}<extra></extra>"
                 ),
@@ -3334,7 +3331,9 @@ def restoration_by_sector_bar(
         tickformat=".2f",
     )
     fig.update_yaxes(title="grid")
-    height = int(_hbar_height(len(grids), len(sectors)) * 0.7)  # -30%: compact next to the taller vertical panels
+    height = int(
+        _hbar_height(len(grids), len(sectors)) * 0.7
+    )  # -30%: compact next to the taller vertical panels
     return _save(
         _apply_theme(
             fig, title=title, height=height, width=_BAR_FIG_WIDTH, legend_top=True
@@ -3429,9 +3428,9 @@ def _mask_deenergised(avg_col: str, vals: np.ndarray | None) -> np.ndarray | Non
 
     out = np.asarray(vals, dtype=float).copy()
     if avg_col.endswith("pressure_pu"):
-        out[(out <= DEENERGISED_PRESSURE_PU) | (out >= DEENERGISED_PRESSURE_HIGH_PU)] = (
-            np.nan
-        )
+        out[
+            (out <= DEENERGISED_PRESSURE_PU) | (out >= DEENERGISED_PRESSURE_HIGH_PU)
+        ] = np.nan
     elif avg_col.endswith("t_k"):
         out[out <= 0.0] = np.nan
     elif avg_col.endswith("vm_pu"):
@@ -3913,7 +3912,8 @@ def constraint_violation_integral_bar(
                 "(static LP, no time series) — absence ≠ zero violations"
             ),
             font=dict(
-                family=_FONT_FAMILY, size=_ANNOTATION_FONT_SIZE - 2,
+                family=_FONT_FAMILY,
+                size=_ANNOTATION_FONT_SIZE - 2,
                 color=_MUTED_COLOR,
             ),
         )
@@ -4135,7 +4135,12 @@ def _group_balance_lines(
 
     fig.update_xaxes(title=x_title, row=len(sectors), col=1)
     height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
-    return _save(_apply_theme(fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path)
+    return _save(
+        _apply_theme(
+            fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP
+        ),
+        out_path,
+    )
 
 
 def slack_trajectory(
@@ -4277,7 +4282,12 @@ def slack_trajectory(
 
     fig.update_xaxes(title=x_title, row=len(sectors), col=1)
     height = max(_FIG_HEIGHT, 170 * len(sectors) + 80)
-    return _save(_apply_theme(fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path)
+    return _save(
+        _apply_theme(
+            fig, title=title, height=height, legend_top=True, font_bump=_TRAJ_FONT_BUMP
+        ),
+        out_path,
+    )
 
 
 def gas_slack_pressure_trajectory(
@@ -4301,9 +4311,7 @@ def gas_slack_pressure_trajectory(
         c for c in timeseries.columns if c.startswith("slack_pressure__gas__")
     )
     if not cols:
-        return _save(
-            _empty_fig("no slack_pressure__gas__* columns", title), out_path
-        )
+        return _save(_empty_fig("no slack_pressure__gas__* columns", title), out_path)
 
     x, x_title, x_scale = _time_axis(timeseries["time_s"].values)
     x_hover = x_title.split("(")[-1].rstrip(")")
@@ -4473,7 +4481,14 @@ def regulation_per_child_lines(
     fig.update_xaxes(title=x_title)
     fig.update_yaxes(title="regulation factor", range=[-0.05, 1.5], tickformat=".2f")
     return _save(
-        _apply_theme(fig, title=title + subtitle, height=380, legend_top=True, font_bump=_TRAJ_FONT_BUMP), out_path
+        _apply_theme(
+            fig,
+            title=title + subtitle,
+            height=380,
+            legend_top=True,
+            font_bump=_TRAJ_FONT_BUMP,
+        ),
+        out_path,
     )
 
 
@@ -4897,8 +4912,7 @@ def _extension_ab_bar(
 
     multi_grid = pivot.index.get_level_values("grid").nunique() > 1
     x = [
-        f"{alias_grid(g)} · s{s}" if multi_grid else f"seed {s}"
-        for g, s in pivot.index
+        f"{alias_grid(g)} · s{s}" if multi_grid else f"seed {s}" for g, s in pivot.index
     ]
     delta = pivot["B"] - pivot["A"]
 
@@ -4952,8 +4966,7 @@ def _extension_ab_bar(
                         line=dict(width=1.2, color="white"),
                     ),
                     hovertemplate=(
-                        f"<b>{name}</b><br>%{{x}}<br>PWSF: %{{y:.4f}}"
-                        "<extra></extra>"
+                        f"<b>{name}</b><br>%{{x}}<br>PWSF: %{{y:.4f}}<extra></extra>"
                     ),
                 )
             )
@@ -4972,10 +4985,7 @@ def _extension_ab_bar(
         bordercolor="#CCCCCC",
         borderwidth=0.6,
         borderpad=5,
-        text=(
-            f"<b>mean Δ (B−A)</b> {mean_delta:+.4f}  ·  "
-            f"<b>n</b>={len(pivot)} pairs"
-        ),
+        text=(f"<b>mean Δ (B−A)</b> {mean_delta:+.4f}  ·  <b>n</b>={len(pivot)} pairs"),
         font=dict(family=_FONT_FAMILY, size=_ANNOTATION_FONT_SIZE, color=_AXIS_COLOR),
     )
     fig.update_layout(barmode="group", bargap=0.3, bargroupgap=0.1)
@@ -5057,9 +5067,11 @@ def extension_islanding_events(
     )
     # Unit from the widest span across tasks so every trace shares one axis.
     _tmax = max(
-        (float(ts["time_s"].astype(float).max())
-         for _, ts in tasks
-         if not ts.empty and "time_s" in ts.columns),
+        (
+            float(ts["time_s"].astype(float).max())
+            for _, ts in tasks
+            if not ts.empty and "time_s" in ts.columns
+        ),
         default=0.0,
     )
     _, x_title, x_scale = _time_axis(np.array([_tmax]))
@@ -5242,8 +5254,7 @@ def extension_temporal_thermal_inertia(
     out_path: Path,
     *,
     title: str = (
-        "Thermal inertia — junction temperature, no-LTC baseline vs LTC "
-        "(same seed)"
+        "Thermal inertia — junction temperature, no-LTC baseline vs LTC (same seed)"
     ),
 ) -> Path:
     """The temporal experiment's defining property: without thermal
@@ -5423,6 +5434,8 @@ def extension_islanding_recovery(
     fig.update_yaxes(title="mean served fraction", range=[0, 1.05], tickformat=".2f")
     fig.update_xaxes(title="sector")
     return _save(
-        _apply_theme(fig, title=title, height=520, width=_BAR_FIG_WIDTH, legend_top=True),
+        _apply_theme(
+            fig, title=title, height=520, width=_BAR_FIG_WIDTH, legend_top=True
+        ),
         out_path,
     )

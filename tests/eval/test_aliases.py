@@ -62,9 +62,7 @@ class TestAblationAlias:
         )
 
     def test_parameter_renders_as_assignment(self):
-        assert (
-            alias_ablation("holon_admm_scope=sector") == "holon-ADMM scope = sector"
-        )
+        assert alias_ablation("holon_admm_scope=sector") == "holon-ADMM scope = sector"
 
     def test_unknown_flag_uses_heuristic(self):
         assert alias_ablation("enable_cp_qp_thing=False") == "no CP QP thing"
@@ -75,10 +73,7 @@ class TestSweepAlias:
         assert alias_sweep("default") == "default"
 
     def test_value_rendered(self):
-        assert (
-            alias_sweep("slack_target_fraction=0.5")
-            == "slack target fraction = 0.5"
-        )
+        assert alias_sweep("slack_target_fraction=0.5") == "slack target fraction = 0.5"
 
 
 class TestScenarioAlias:
@@ -87,10 +82,11 @@ class TestScenarioAlias:
         assert alias_scenario(None) == "default"
 
     def test_clean_with_failures(self):
-        key = "kind=clean;max_failures=3;priority_assignment=skewed;slack_budget_pct=0.45"
+        key = (
+            "kind=clean;max_failures=3;priority_assignment=skewed;slack_budget_pct=0.45"
+        )
         assert (
-            alias_scenario(key)
-            == "random failures ×3 · skewed priorities · slack 45%"
+            alias_scenario(key) == "random failures ×3 · skewed priorities · slack 45%"
         )
 
     def test_concentrated(self):
@@ -120,6 +116,8 @@ class TestScenarioAlias:
 
     def test_dict_input(self):
         assert (
-            alias_scenario({"kind": "clean", "failure_type": "generator", "max_failures": 3})
+            alias_scenario(
+                {"kind": "clean", "failure_type": "generator", "max_failures": 3}
+            )
             == "generator outage ×3"
         )

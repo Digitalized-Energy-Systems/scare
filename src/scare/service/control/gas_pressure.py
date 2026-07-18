@@ -84,9 +84,7 @@ class GasPressureRegulator(Role):
         self.sector = sector
         self.gain = float(gain)
         self.nominal = float(nominal_pu)
-        lo, hi = SECTOR_CONSTRAINTS.get(sector, {}).get(
-            "pressure_pu", (0.85, 1.25)
-        )
+        lo, hi = SECTOR_CONSTRAINTS.get(sector, {}).get("pressure_pu", (0.85, 1.25))
         self._lo = float(lo)
         self._hi = float(hi)
         self._relax_margin = _RELAX_MARGIN_FRAC * (self._hi - self._lo)

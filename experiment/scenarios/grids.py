@@ -9,7 +9,10 @@ import monee.express as mx
 import simbench
 from monee.io.from_pandapower import from_pandapower_net
 from monee.model.child import ExtPowerGrid
-from monee.model.formulation import EL_MISOCP_FORMULATION,GAS_NONCONVEX_MIQCQP_FORMULATION
+from monee.model.formulation import (
+    EL_MISOCP_FORMULATION,
+    GAS_NONCONVEX_MIQCQP_FORMULATION,
+)
 from monee.model.grid import STANDARD_ATMOSPHERE_PA
 from monee.network import generate_supply_return_mes_based_on_power_net
 

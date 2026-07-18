@@ -52,9 +52,7 @@ class HeatFrontierController:
     WATERFALL_DEFER_POLLS: int = 5
     WATERFALL_DEFER_IMPROVE_K: float = 0.5
 
-    def __init__(
-        self, *, peer_freshness_s: float, component_id: Any = None
-    ) -> None:
+    def __init__(self, *, peer_freshness_s: float, component_id: Any = None) -> None:
         self._peer_freshness_s = peer_freshness_s
         # Static water-subnetwork id of the own node; peers advertising a
         # different component can't warm this node and are never waterfall

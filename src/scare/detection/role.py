@@ -11,6 +11,7 @@ from mango_energy_environments import BranchFailureEvent
 from scare.base.addressing import addr_aid, node_id_from_aid
 from scare.base.model import FailureNotice, LineFailure, Sector
 from scare.base.runtime.diagnostics import record_event
+from scare.base.util import async_dispatch
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -62,11 +63,7 @@ class ProblemDetector(Role):
         self._delivered: set[tuple] = set()
 
     def setup(self) -> None:
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         self.context.subscribe_message(
             self,

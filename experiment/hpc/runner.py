@@ -101,13 +101,6 @@ EXIT_ERROR = 1
 EXIT_TIMEOUT = 2
 
 
-
-
-
-
-
-
-
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed % (2**32))
@@ -174,12 +167,6 @@ def _serialize_failures(failures: list[Any]) -> list[dict[str, Any]]:
             rec["custom_id"] = str(custom_id)
         out.append(rec)
     return out
-
-
-
-
-
-
 
 
 async def _run_simulation(
@@ -325,8 +312,9 @@ def _run_oracle(
         task.grid, scenario=scenario, priorities=priorities
     )
     if warm_regs:
-        logger.info("Oracle: warm-starting from baseline incumbent (%d regs)",
-                    len(warm_regs))
+        logger.info(
+            "Oracle: warm-starting from baseline incumbent (%d regs)", len(warm_regs)
+        )
     started = _time.monotonic()
     payload = compose_oracle_result(
         monee_net=net,
@@ -571,8 +559,6 @@ def _compute_baseline(task: TaskSpec, logger: logging.Logger) -> dict[str, Any] 
         return None
 
 
-
-
 def _write_oracle_outputs(
     out_dir: Path,
     plan: RuntimePlan,
@@ -597,8 +583,6 @@ def _write_oracle_outputs(
     )
     write_slack_meta(out_dir / "slack_meta.json", net)
     return oracle_metrics
-
-
 
 
 def _write_simulation_outputs(

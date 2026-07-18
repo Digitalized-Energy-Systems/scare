@@ -440,7 +440,11 @@ def _format_justification_sections(
         rows: list[list[str]] = []
         for key, gk in g_exp.groupby(axis):
             rate = compliance_rate(gk)
-            row = [str(key), str(len(gk)), "—" if rate is None else f"{rate * 100:.0f}%"]
+            row = [
+                str(key),
+                str(len(gk)),
+                "—" if rate is None else f"{rate * 100:.0f}%",
+            ]
             sig: dict[str, bool] = {}
             for m in metrics:
                 st = _metric_stats(gk, m, population)
@@ -568,9 +572,11 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
     rows: list[list[str]] = []
     for grid, g in ok_vc.groupby("grid"):
         gc = g[compliant_mask(g) & g[_PRIMARY_OUTCOME].notna()]
-        orc = gc[gc["variant"] == "oracle"].drop_duplicates(key).set_index(key)[
-            _PRIMARY_OUTCOME
-        ]
+        orc = (
+            gc[gc["variant"] == "oracle"]
+            .drop_duplicates(key)
+            .set_index(key)[_PRIMARY_OUTCOME]
+        )
         if orc.empty:
             continue
         for variant, gv in gc.groupby("variant"):
@@ -781,14 +787,22 @@ def _format_eval_sections(
             # Pin each grid's ``default`` row first within its grid block;
             # alias to display names only after the raw-key sort.
             rows.sort(
-                key=lambda r: (r[0], r[1] != "default", r[1])
-                if multi_grid
-                else (r[0] != "default", r[0])
+                key=lambda r: (
+                    (r[0], r[1] != "default", r[1])
+                    if multi_grid
+                    else (r[0] != "default", r[0])
+                )
             )
             key_idx = 1 if multi_grid else 0
             for r in rows:
                 r[key_idx] = alias_ablation(r[key_idx])
-            header = ["ablation", "n_compliant/n_total", "compliance", "mean PWSF", "Δ vs full system"]
+            header = [
+                "ablation",
+                "n_compliant/n_total",
+                "compliance",
+                "mean PWSF",
+                "Δ vs full system",
+            ]
             if multi_grid:
                 header = ["grid"] + header
             parts.append("")

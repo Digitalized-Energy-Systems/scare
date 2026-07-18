@@ -35,8 +35,8 @@ class TestObsSector:
     def test_electricity_p_mw_capacity(self):
         assert obs_sector({"p_mw_capacity": 10.0}) == Sector.ELECTRICITY
 
-    def test_heat_q_w_set(self):
-        assert obs_sector({"q_w_set": 1000.0}) == Sector.HEAT
+    def test_heat_q_mw_set(self):
+        assert obs_sector({"q_mw_set": 1.0}) == Sector.HEAT
 
     def test_heat_q_mvar(self):
         assert obs_sector({"q_mvar": 1.0}) == Sector.HEAT
@@ -59,8 +59,8 @@ class TestObsCapacity:
     def test_p_mw(self):
         assert obs_capacity({"p_mw": -5.0}) == -5.0
 
-    def test_q_w_set(self):
-        assert obs_capacity({"q_w_set": 1000.0}) == 1000.0
+    def test_q_mw_set(self):
+        assert obs_capacity({"q_mw_set": 1.0}) == 1.0
 
     def test_mass_flow(self):
         assert obs_capacity({"mass_flow_kgs": 0.3}) == 0.3
@@ -221,9 +221,7 @@ class TestObsConstraintValues:
         assert result == {"t_k": 370.0}
 
     def test_loading_direct_key_is_percent(self):
-        result = obs_constraint_values(
-            {"loading_percent": 87.5}, Sector.ELECTRICITY
-        )
+        result = obs_constraint_values({"loading_percent": 87.5}, Sector.ELECTRICITY)
         assert result == {"loading_percent": 87.5}
 
     def test_loading_line_from_side_fraction(self):

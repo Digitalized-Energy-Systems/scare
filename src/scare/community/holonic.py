@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import numpy as np
 from distributed_resource_optimization import (
@@ -60,9 +60,11 @@ from scare.base.runtime.diagnostics import record_event
 from scare.base.runtime.trace import optimization
 from scare.base.topology.topology_mirror import LivePeerFilter
 from scare.base.util import (
+    async_dispatch,
     clamp_tier_monotonic,
     compute_priority_weighted_shares,
 )
+from scare.base.util.ids import deterministic_uuid
 from scare.community.deliverability import per_actor_deliverable_caps
 from scare.community.holon_flex import (
     aggregate_holon_flex,
@@ -139,7 +141,6 @@ class HolonicCommunityRole(Role):
         my_node_id: Any = None,
         leader_node_ids: dict[str, Any] | None = None,
         topology_mirror: Any = None,
-        cp_node_ids: set[Any] | None = None,
     ) -> None:
         super().__init__()
         self.sector = sector
@@ -178,9 +179,6 @@ class HolonicCommunityRole(Role):
         self._my_node_id = my_node_id
         self._leader_node_ids: dict[str, Any] = dict(leader_node_ids or {})
         self._topology_mirror = topology_mirror
-        # Node ids hosting a CP agent; the per-component path uses this to
-        # detect a CP in the leader's multi-sector component. Empty ⇒ none.
-        self._cp_node_ids: set[Any] = set(cp_node_ids or set())
         # ``rebalance_period_s``: slow drift heartbeat (timeseries changes with
         # no NegotiationFinishedEvent). ``rebalance_min_gap_s``: fuse letting one
         # member-gossip round resolve before the next ADMM cycle.
@@ -198,6 +196,8 @@ class HolonicCommunityRole(Role):
         # holon_id -> {sender_key: (addr, accept_or_None)}. Address kept to
         # build the resolved member list without a topology re-lookup.
         self._pending_proposals: dict[UUID, dict[str, tuple[Any, bool | None]]] = {}
+        # Monotonic counter backing reproducible holon ids -- see base.util.ids.
+        self._holon_seq = 0
         # Collected member flex answers; ``_flex_answer_senders`` holds the
         # sender per answer to route the allocation back as override target.
         self._flex_answers: list[AvailableFlexAnswer] = []
@@ -257,6 +257,10 @@ class HolonicCommunityRole(Role):
         self._last_applied_allocation_version: int = -1
         self._last_applied_allocation_publisher: str | None = None
 
+    def request_rebalance(self) -> None:
+        """Public: ask this leader to re-run its L2 round (throttled)."""
+        self._maybe_schedule_rebalance()
+
     def setup(self) -> None:
         # Formation is event-driven; this slow watchdog covers a leader that
         # missed every trigger.
@@ -272,11 +276,7 @@ class HolonicCommunityRole(Role):
                 self._heat_periodic_rebalance, delay=self.heat_rebalance_period_s
             )
 
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         self.context.subscribe_message(
             self,
@@ -538,7 +538,8 @@ class HolonicCommunityRole(Role):
             return
 
         candidates = neighbours[: self.max_holon_size - 1]
-        holon_id = uuid4()
+        self._holon_seq += 1
+        holon_id = deterministic_uuid(self.context.aid, self._holon_seq)
         self._pending_proposals[holon_id] = {str(a): (a, None) for a in candidates}
 
         req = HolonicJoinRequest(
@@ -571,7 +572,11 @@ class HolonicCommunityRole(Role):
         reply = HolonicJoinAnswer(
             holon_id=message.holon_id,
             accept=accept,
-            community_id=community.community_id or uuid4(),
+            # Fallback for an unregistered community. Stable per agent: a fresh
+            # id per reply would make the same community answer under a
+            # different identity each round.
+            community_id=community.community_id
+            or deterministic_uuid(self.context.aid, "community"),
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
@@ -1514,29 +1519,6 @@ class HolonicCommunityRole(Role):
             return None
         return min(peers.keys())
 
-    def _multi_sector_l3_active(self) -> bool:
-        """True iff this leader sits in a multi-sector component with a CP
-        agent (so an L3 coordinator owns the decision and L2 defers).
-
-        Traverses the joint subgraph via ``reachable_from(allow_cp_bridges=True)``
-        and intersects with known CP nodes; empty ⇒ L2 runs locally.
-        """
-        if not self._cp_node_ids:
-            return False
-        mirror = self._topology_mirror
-        my_node = self._my_node_id
-        if mirror is None or my_node is None:
-            return False
-        try:
-            reachable = mirror.reachable_from(
-                my_node,
-                sector=None,
-                allow_cp_bridges=True,
-            )
-        except Exception:
-            return False
-        return any(n in reachable for n in self._cp_node_ids)
-
     async def _run_component_scoped_admm(self) -> None:
         """Component-scoped variant of ``_run_supply_priority_admm``.
 
@@ -1646,9 +1628,9 @@ class HolonicCommunityRole(Role):
         # latency/loss a reordered older report must not overwrite a fresher
         # one (the buffer is last-arrival-wins otherwise).
         prior = self._component_report_buffer.get(message.leader_aid)
-        if prior is not None and int(
-            getattr(message, "version", 0)
-        ) <= int(getattr(prior[1], "version", -1)):
+        if prior is not None and int(getattr(message, "version", 0)) <= int(
+            getattr(prior[1], "version", -1)
+        ):
             return
         self._component_report_buffer[message.leader_aid] = (message.round_id, message)
         # Packet-loss recovery: if the sender's echoed version trails our latest

@@ -20,7 +20,9 @@ _SENS_MIN, _SENS_MAX = 0.25, 4.0
 _PROX_MIN, _PROX_MAX = 0.25, 4.0
 
 
-def _willingness(tier, cap, reducible, *, sens=0.01, sens_ref=0.01, injection_relief=False):
+def _willingness(
+    tier, cap, reducible, *, sens=0.01, sens_ref=0.01, injection_relief=False
+):
     return curtail_willingness(
         priority_tier=tier,
         capacity=cap,

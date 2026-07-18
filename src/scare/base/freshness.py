@@ -16,7 +16,8 @@ window without folding it into construction.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 
 class FreshnessStore:
@@ -25,7 +26,7 @@ class FreshnessStore:
         self.ttl = ttl
 
     @classmethod
-    def on(cls, behavior: Any, attr: str, ttl: float) -> "FreshnessStore":
+    def on(cls, behavior: Any, attr: str, ttl: float) -> FreshnessStore:
         """Bind to the per-behavior store at ``attr`` (same lifetime as the sim
         world), sharing the underlying dict across all wrappers for that attr."""
         from scare.base.util import _get_behavior_store

@@ -66,9 +66,7 @@ def _build_heat_group(behavior, *, heat_l2_dispatch):
 
 
 def _regulates(behavior, aid):
-    return [
-        c for c in behavior.action_log if c[0] == aid and c[1] == "regulate"
-    ]
+    return [c for c in behavior.action_log if c[0] == aid and c[1] == "regulate"]
 
 
 @pytest.mark.asyncio

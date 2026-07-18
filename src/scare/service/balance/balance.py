@@ -42,6 +42,7 @@ from scare.base.runtime.diagnostics import (
 )
 from scare.base.util import (
     apply_regulate,
+    async_dispatch,
     clamp_to_constraints,
     constraint_allowed_fraction,
     constraint_utilization,
@@ -412,7 +413,9 @@ class SetpointActuator:
         delta back to the gossip ledger.
         """
         obs = self._role.behavior.observe(self._role.context.aid) or {}
-        cap = obs_capacity(obs, behavior=self._role.behavior, aid=self._role.context.aid)
+        cap = obs_capacity(
+            obs, behavior=self._role.behavior, aid=self._role.context.aid
+        )
         if cap == 0.0:
             return None
         # Tier-1 hard-lock guard: the pre-step already set tier-1 loads and the
@@ -448,7 +451,9 @@ class SetpointActuator:
         # delta as phantom gen supply — A/B-validated worse (loads shed against paper
         # supply).
         if cap < 0 and has_gen_curtail_lock(
-            self._role.behavior, self._role.context.aid, self._role.context.current_timestamp
+            self._role.behavior,
+            self._role.context.aid,
+            self._role.context.current_timestamp,
         ):
             held = last_actuated_factor(self._role.behavior, self._role.context.aid)
             if held is not None and factor > held + 1e-6:
@@ -463,7 +468,11 @@ class SetpointActuator:
 
         # No-regret floor applies only during restoration (target > 0); shedding
         # (target < 0) legitimately reduces factor.
-        target = self._role._sess.gossip.target if self._role._sess.gossip is not None else 0.0
+        target = (
+            self._role._sess.gossip.target
+            if self._role._sess.gossip is not None
+            else 0.0
+        )
         is_restoration = target > 0
         if self._role.priority > 0 and is_restoration:
             self._role._listener.check_violation_cleared()
@@ -483,7 +492,11 @@ class SetpointActuator:
         # allowed)`` just to zero its own imbalance. Tiers 2/3/4 only.
         if self._role.enable_l2_priority_floor:
             floor = l2_effective_floor(
-                self._role.behavior, self._role.context.aid, obs, self._role.sector, self._role.priority
+                self._role.behavior,
+                self._role.context.aid,
+                obs,
+                self._role.sector,
+                self._role.priority,
             )
             if floor is not None and factor < floor:
                 factor = floor
@@ -581,7 +594,9 @@ class SetpointActuator:
         if deficit <= 0:
             return
         obs = self._role.behavior.observe(self._role.context.aid) or {}
-        cap = obs_capacity(obs, behavior=self._role.behavior, aid=self._role.context.aid)
+        cap = obs_capacity(
+            obs, behavior=self._role.behavior, aid=self._role.context.aid
+        )
         if cap >= 0:
             return  # not a generator
         # Curtail-vs-ramp interlock is enforced in ``apply_regulate``: a write
@@ -618,14 +633,34 @@ class ConstraintSignalListener:
 
     def __init__(self, role: EnergyBalanceNegotiator) -> None:
         self._role = role
-        self._proactive_util: dict[str, float] = {}
+        # variable -> (utilization, timestamp recorded)
+        self._proactive_util: dict[str, tuple[float, float]] = {}
 
     def record_warning(self, event: ConstraintWarning) -> None:
         # Record proximity-to-bound util so the gossip step can throttle. Other
         # sectors ignored (coupling handled at holon/CP level).
         if event.sector != self._role.sector:
             return
-        self._proactive_util[event.variable] = float(event.utilization)
+        self._proactive_util[event.variable] = (
+            float(event.utilization),
+            self._role.context.current_timestamp,
+        )
+
+    def _live_proactive_utils(self) -> list[float]:
+        """Recorded utilizations, dropping expired ones.
+
+        ConstraintWarning fires only above the warning threshold and nothing is
+        emitted on recovery, so without an age-out the worst entry throttles
+        this agent for the rest of the run.
+        """
+        ttl = self._role.proactive_util_ttl_s
+        if ttl <= 0.0:
+            return [u for u, _ in self._proactive_util.values()]
+        now = self._role.context.current_timestamp
+        for var, (_, t) in list(self._proactive_util.items()):
+            if now - t > ttl:
+                del self._proactive_util[var]
+        return [u for u, _ in self._proactive_util.values()]
 
     def check_violation_cleared(self) -> None:
         """Clear the violation flag if the monitor reports local feasibility again."""
@@ -655,9 +690,9 @@ class ConstraintSignalListener:
         neigh_util = self.worst_neighbour_utilization()
         if neigh_util > 0.0:
             scale = min(scale, max(0.0, 1.0 - neigh_util))
-        if self._proactive_util:
-            worst_proactive = max(self._proactive_util.values())
-            scale = min(scale, max(0.0, 1.0 - worst_proactive))
+        live_proactive = self._live_proactive_utils()
+        if live_proactive:
+            scale = min(scale, max(0.0, 1.0 - max(live_proactive)))
         return scale
 
     def find_constraint_monitor(self):
@@ -755,9 +790,7 @@ class TriggerCoordinator:
 
         # Tier-1 hard pre-step: lift tier-1 to regulation=1 if the pool
         # covers it, else pro-rata distribute and shed tiers 2/3/4.
-        residual_target, skip_gossip = self._pre_apply_tier1_hard(
-            total_sp, responders
-        )
+        residual_target, skip_gossip = self._pre_apply_tier1_hard(total_sp, responders)
         if skip_gossip:
             # Residual below threshold.
             self._role._sess.active = False
@@ -766,14 +799,18 @@ class TriggerCoordinator:
 
     async def handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
         obs = self._role.behavior.observe(self._role.context.aid) or {}
-        cap = obs_capacity(obs, behavior=self._role.behavior, aid=self._role.context.aid)
+        cap = obs_capacity(
+            obs, behavior=self._role.behavior, aid=self._role.context.aid
+        )
         sp = self._reported_setpoint(obs)
         reply = ResponseEnergyMessage(
             negotiation_id=message.negotiation_id,
             setpoint=sp,
             available=cap - sp,  # headroom, not total cap
         )
-        await self._role.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
+        await self._role.context.send_message(
+            reply, receiver_addr=mango_sender_addr(meta)
+        )
 
     def _reported_setpoint(self, obs: dict) -> float:
         """Setpoint contribution to the group's negotiation target.
@@ -869,9 +906,7 @@ class TriggerCoordinator:
                 if int(prio) == 1:
                     tier1_records.append((aid, float(cap), float(sp), sec))
                 else:
-                    non_tier1_loads.append(
-                        (aid, float(cap), float(sp), sec, int(prio))
-                    )
+                    non_tier1_loads.append((aid, float(cap), float(sp), sec, int(prio)))
             elif cap < 0:
                 # Live (responded) gens credit delivered |sp| + rampable headroom,
                 # else a cold start (sp≈0) freezes the pool at slack-only and zeroes
@@ -985,7 +1020,6 @@ class TriggerCoordinator:
     # ------------------------------------------------------------------
 
 
-
 class L2DispatchHandler:
     """L2/L3 directive handling: apply the holon's per-tier service fractions
     (dispatch-only; ramp generators / refresh the priority floor) and yield any
@@ -1022,12 +1056,8 @@ class L2DispatchHandler:
         if self._role.sector == Sector.HEAT:
             if not self._role.enable_heat_l2_dispatch:
                 return
-            service_frac = getattr(
-                message, "service_fraction_by_sector_priority", None
-            )
-            if not service_frac or not self._heat_fractions_meaningful(
-                service_frac
-            ):
+            service_frac = getattr(message, "service_fraction_by_sector_priority", None)
+            if not service_frac or not self._heat_fractions_meaningful(service_frac):
                 return
             if (
                 self._role.enable_change_only_dispatch
@@ -1081,9 +1111,13 @@ class L2DispatchHandler:
             self._role._sess.last_dispatched_service_fraction = None
             self._yield_to_l2_authority("override_target")
             self._role._sess.active = True
-            self._role.context.schedule_instant_task(self._role._start_gossip(float(override)))
+            self._role.context.schedule_instant_task(
+                self._role._start_gossip(float(override))
+            )
             return
-        self._role.context.schedule_instant_task(self._role._trigger.trigger_balance_negotiation())
+        self._role.context.schedule_instant_task(
+            self._role._trigger.trigger_balance_negotiation()
+        )
 
     async def _dispatch_service_fractions(
         self, service_fraction: dict[str, dict[int, float]]
@@ -1170,9 +1204,7 @@ class L2DispatchHandler:
             # enforcement realizes the holon-assumed supply rather than shedding
             # to the un-ramped generation level.
             if self._role.enable_l2_generator_ramp and gen_members:
-                applied += self._ramp_member_generators(
-                    gen_members, served_by_sector
-                )
+                applied += self._ramp_member_generators(gen_members, served_by_sector)
 
             if applied:
                 logger.info(
@@ -1193,7 +1225,7 @@ class L2DispatchHandler:
                 holon_role = self._role.context.get_role(HolonicCommunityRole)
                 if holon_role is not None:
                     try:
-                        holon_role._maybe_schedule_rebalance()
+                        holon_role.request_rebalance()
                     except Exception as exc:  # noqa: BLE001
                         logger.debug(
                             "[%s] dispatch L2 re-fire skipped: %s",
@@ -1235,9 +1267,7 @@ class L2DispatchHandler:
             deficit = served - current_gen
             if deficit <= 1e-6:
                 continue
-            headrooms = [
-                (aid, cap, sp, abs(cap) - abs(sp)) for aid, cap, sp in gens
-            ]
+            headrooms = [(aid, cap, sp, abs(cap) - abs(sp)) for aid, cap, sp in gens]
             total_headroom = sum(h for *_, h in headrooms if h > 1e-9)
             if total_headroom <= 1e-9:
                 continue
@@ -1271,9 +1301,7 @@ class L2DispatchHandler:
             return False
         return any(v > 0.0 for v in tiers.values())
 
-    def _service_fraction_unchanged(
-        self, new: dict[str, dict[int, float]]
-    ) -> bool:
+    def _service_fraction_unchanged(self, new: dict[str, dict[int, float]]) -> bool:
         """True when *new* matches the last dispatched service fraction within
         ``_UPWARD_NOTIFY_TOL`` (same sectors, same tiers, values within tol)."""
         prev = self._role._sess.last_dispatched_service_fraction
@@ -1354,7 +1382,9 @@ class L2DispatchHandler:
                     for aid in aids:
                         obs = self._role.behavior.observe(aid) or {}
                         caps.append(
-                            abs(obs_capacity(obs, behavior=self._role.behavior, aid=aid))
+                            abs(
+                                obs_capacity(obs, behavior=self._role.behavior, aid=aid)
+                            )
                         )
                     total_cap = sum(caps) or 1.0
                     # Positive tgt = serve more; negative = shed.
@@ -1362,7 +1392,9 @@ class L2DispatchHandler:
                         share = cap / total_cap
                         delta_sp = tgt * share
                         obs = self._role.behavior.observe(aid) or {}
-                        sp_curr = obs_setpoint(obs, behavior=self._role.behavior, aid=aid)
+                        sp_curr = obs_setpoint(
+                            obs, behavior=self._role.behavior, aid=aid
+                        )
                         new_sp = sp_curr + delta_sp
                         if cap == 0.0:
                             continue
@@ -1401,7 +1433,6 @@ class L2DispatchHandler:
             self._role._sess.active = False
 
 
-
 class GossipEngine:
     """Gossip/ADMM negotiation engine: primal-dual token gossip, stall
     detection, terminal-diary bookkeeping, and finish/writeback. Operates on the
@@ -1419,7 +1450,6 @@ class GossipEngine:
     # ------------------------------------------------------------------
     # Neighbour liveness / heartbeat
     # ------------------------------------------------------------------
-
 
     def _update_gap_window_and_check_stall(
         self, open_gap: float, target: float
@@ -1495,7 +1525,6 @@ class GossipEngine:
             _THRESHOLD_CAPACITY_FRACTION * self._role._sess.group_capacity_abs,
         )
 
-
     async def _start_gossip(self, target: float) -> None:
         # MW balance deactivated for heat; also guards the holon override_target
         # path that calls here directly.
@@ -1539,7 +1568,9 @@ class GossipEngine:
         self_key = str(self._role.context.addr)
 
         obs = self._role.behavior.observe(self._role.context.aid) or {}
-        starting_sp = obs_setpoint(obs, behavior=self._role.behavior, aid=self._role.context.aid)
+        starting_sp = obs_setpoint(
+            obs, behavior=self._role.behavior, aid=self._role.context.aid
+        )
         # Anchor the QP δ-box to the starting state (see _GossipState);
         # per-step recompute causes a self-driven sign-flip oscillation.
         dmin_start, dmax_start = obs_min_max(
@@ -1598,7 +1629,9 @@ class GossipEngine:
                     detail=f"residual={target:.4f} (singleton)",
                 )
                 self._role.context.emit_event(
-                    LocalGenerationApproval(sector=self._role.sector, residual_deficit=target)
+                    LocalGenerationApproval(
+                        sector=self._role.sector, residual_deficit=target
+                    )
                 )
                 self._role._actuator.try_self_dispatch(target)
             self._role._sess.active = False
@@ -1653,7 +1686,10 @@ class GossipEngine:
         )
 
     async def _gossip_timeout(self, negotiation_id: str) -> None:
-        if self._role._sess.gossip is not None and self._role._sess.gossip.negotiation_id == negotiation_id:
+        if (
+            self._role._sess.gossip is not None
+            and self._role._sess.gossip.negotiation_id == negotiation_id
+        ):
             logger.warning(
                 "[%s] gossip %s timed out — forcing finish",
                 self._role.context.aid,
@@ -1685,7 +1721,10 @@ class GossipEngine:
 
         self_key = str(self._role.context.addr)
 
-        if self._role._sess.gossip is None or self._role._sess.gossip.negotiation_id != nid:
+        if (
+            self._role._sess.gossip is None
+            or self._role._sess.gossip.negotiation_id != nid
+        ):
             # A different nid arriving over our in-flight gossip: record an
             # ``abandoned`` terminal for the old nid before overwriting state
             # (preserves started == Σ terminals).
@@ -1740,25 +1779,35 @@ class GossipEngine:
             )
             # Merge ledger keeping newest-counter entries; Byzantine-clip each
             # delta to a multiple of |target|.
-            cap_byz = _BYZANTINE_DELTA_CAP_MULTIPLE * max(abs(self._role._sess.gossip.target), 1.0)
-            ledger_merge(self._role._sess.gossip.memory, message.memory, byzantine_cap=cap_byz)
+            cap_byz = _BYZANTINE_DELTA_CAP_MULTIPLE * max(
+                abs(self._role._sess.gossip.target), 1.0
+            )
+            ledger_merge(
+                self._role._sess.gossip.memory, message.memory, byzantine_cap=cap_byz
+            )
 
         target = self._role._sess.gossip.target
         obs = self._role.behavior.observe(self._role.context.aid) or {}
-        cap = obs_capacity(obs, behavior=self._role.behavior, aid=self._role.context.aid)
+        cap = obs_capacity(
+            obs, behavior=self._role.behavior, aid=self._role.context.aid
+        )
         # Gossip-anchored δ-box, not a fresh ``obs_min_max`` (which flips after
         # the agent's own regulate and drives a bang-bang oscillation).
         dmin = self._role._sess.gossip.dmin_starting
         dmax = self._role._sess.gossip.dmax_starting
 
-        prev_own = self._role._sess.gossip.memory.get(self_key, (0.0, 0, self._role.priority, False))[0]
+        prev_own = self._role._sess.gossip.memory.get(
+            self_key, (0.0, 0, self._role.priority, False)
+        )[0]
         total_delta = self._gossip_total_delta()
         open_gap = target - total_delta
 
         participation_scale = self._role._listener.compute_participation_scale(obs)
 
         active_count = max(1, len(self._role._sess.gossip.memory))
-        n_free = max(1, sum(1 for v in self._role._sess.gossip.memory.values() if not v[3]))
+        n_free = max(
+            1, sum(1 for v in self._role._sess.gossip.memory.values() if not v[3])
+        )
 
         if self._role.enable_qp_gossip:
             # P6: primal-dual QP closed-form update. δ_i = clamp(a_i · λ, dmin,
@@ -1815,7 +1864,9 @@ class GossipEngine:
             )
             self._role._sess.gossip.dual_lambda += (
                 step_size(
-                    self._role.convergence_rate, counter, step_decay_k0=self._role.step_decay_k0
+                    self._role.convergence_rate,
+                    counter,
+                    step_decay_k0=self._role.step_decay_k0,
                 )
                 * residual
                 / sum_a_est
@@ -1827,7 +1878,9 @@ class GossipEngine:
                 (open_gap / n_free)
                 * self._role.impact_weight
                 * step_size(
-                    self._role.convergence_rate, counter, step_decay_k0=self._role.step_decay_k0
+                    self._role.convergence_rate,
+                    counter,
+                    step_decay_k0=self._role.step_decay_k0,
                 )
                 * participation_scale
             )
@@ -1883,7 +1936,10 @@ class GossipEngine:
             await self._finish_negotiation_stalled()
             return
 
-        if abs(open_gap) <= self._role.termination_tolerance or counter >= self._role.max_hops:
+        if (
+            abs(open_gap) <= self._role.termination_tolerance
+            or counter >= self._role.max_hops
+        ):
             await self._finish_negotiation()
         elif neighbours:
             next_addr = self._role._next_hop(neighbours, nid, counter)
@@ -1908,7 +1964,9 @@ class GossipEngine:
             if self._role._sess.gossip
             else obs_setpoint(self._role.behavior.observe(self._role.context.aid) or {})
         )
-        delta = self._role._sess.gossip.current_delta if self._role._sess.gossip else 0.0
+        delta = (
+            self._role._sess.gossip.current_delta if self._role._sess.gossip else 0.0
+        )
         new_sp = starting_sp + delta
         # Coordination overhaul: only propagate this finish UPWARD (to the holon
         # ADMM at L2 and CP at L3, plus the local-leader L2 self-trigger) when
@@ -2011,7 +2069,9 @@ class GossipEngine:
         # CP re-triggers); neighbours re-derive their own sp. ``negotiation_id``
         # lets members with matching gossip state (incl. a blocked originator)
         # release it instead of timing out.
-        finished_nid = self._role._sess.gossip.negotiation_id if self._role._sess.gossip else ""
+        finished_nid = (
+            self._role._sess.gossip.negotiation_id if self._role._sess.gossip else ""
+        )
         neighbours = self._role._gossip_neighbours()
         finished_msg = NegotiationFinishedEvent(
             new_setpoint=new_sp, sector=self._role.sector, negotiation_id=finished_nid
@@ -2035,7 +2095,9 @@ class GossipEngine:
                 except KeyError:
                     holon_peers = []
                 for addr in holon_peers:
-                    await self._role.context.send_message(finished_msg, receiver_addr=addr)
+                    await self._role.context.send_message(
+                        finished_msg, receiver_addr=addr
+                    )
 
             # Leader also notifies CP connectors (both scopes)
             if topology_characteristic(self._role, tid="groups") == "leader":
@@ -2048,7 +2110,9 @@ class GossipEngine:
                         new_sp,
                     )
                 for addr in cp_connectors:
-                    await self._role.context.send_message(finished_msg, receiver_addr=addr)
+                    await self._role.context.send_message(
+                        finished_msg, receiver_addr=addr
+                    )
 
         self._role._sess.gossip = None
         # ``_active`` is owned by the trigger phase while ``_trigger_nid`` is
@@ -2106,9 +2170,15 @@ class GossipEngine:
             if self._role._sess.gossip
             else obs_setpoint(self._role.behavior.observe(self._role.context.aid) or {})
         )
-        delta = self._role._sess.gossip.current_delta if self._role._sess.gossip else 0.0
+        delta = (
+            self._role._sess.gossip.current_delta if self._role._sess.gossip else 0.0
+        )
         nid = getattr(message, "negotiation_id", "")
-        if nid and self._role._sess.gossip is not None and self._role._sess.gossip.negotiation_id == nid:
+        if (
+            nid
+            and self._role._sess.gossip is not None
+            and self._role._sess.gossip.negotiation_id == nid
+        ):
             if self._role._sess.gossip.is_originator:
                 total_delta = self._gossip_total_delta()
                 record_negotiation(
@@ -2135,7 +2205,6 @@ class GossipEngine:
     # ------------------------------------------------------------------
     # Flex reporting
     # ------------------------------------------------------------------
-
 
     def _close_inflight_originator(
         self, event: str, log_reason: str | None = None
@@ -2168,7 +2237,6 @@ class GossipEngine:
             )
 
 
-
 class EnergyBalanceNegotiator(Role):
     """Gossip-based energy balance negotiation.
 
@@ -2189,6 +2257,7 @@ class EnergyBalanceNegotiator(Role):
         impact_weight: float = 1.0,
         termination_tolerance: float = 1e-5,
         constraint_aware: bool = True,
+        proactive_util_ttl_s: float = 0.0,
         enable_monotonic_floor: bool = True,
         enable_clpu_ramp: bool = True,
         max_hops: int = _MAX_HOPS,
@@ -2219,6 +2288,7 @@ class EnergyBalanceNegotiator(Role):
         self.impact_weight = impact_weight
         self.termination_tolerance = termination_tolerance
         self.constraint_aware = constraint_aware
+        self.proactive_util_ttl_s = proactive_util_ttl_s
         self.enable_monotonic_floor = enable_monotonic_floor
         self.enable_clpu_ramp = enable_clpu_ramp
         # L2 priority-floor: clamp gossip sheds up to the component ADMM's
@@ -2293,12 +2363,7 @@ class EnergyBalanceNegotiator(Role):
 
         # Mango dispatches synchronously; wrap async handlers to self-schedule
         # (tracked by termination detection) and stamp the sender's heartbeat.
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self._record_sender(meta)
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self, on_receive=self._record_sender)
 
         self.context.subscribe_message(
             self,
@@ -2451,6 +2516,11 @@ class EnergyBalanceNegotiator(Role):
     ) -> None:
         await self._dispatch.handle_start_balance(message, meta)
 
+    async def trigger_balance_negotiation(self) -> None:
+        # Public: the scenario's failure-event handlers schedule this on the
+        # role itself, not on _trigger.
+        await self._trigger.trigger_balance_negotiation()
+
     async def _start_gossip(self, target: float) -> None:
         await self._engine._start_gossip(target)
 
@@ -2525,12 +2595,13 @@ class EnergyBalanceNegotiator(Role):
         if event.sector != self.sector:
             return
         if topology_characteristic(self, tid="groups") == "leader":
-            self.context.schedule_instant_task(self._trigger.trigger_balance_negotiation())
+            self.context.schedule_instant_task(
+                self._trigger.trigger_balance_negotiation()
+            )
 
     # ------------------------------------------------------------------
     # Setpoint application with monotonic progress guarantee
     # ------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
@@ -2568,6 +2639,7 @@ def create_energy_balance_role(
     *,
     priority: int | None = None,
     constraint_aware: bool = True,
+    proactive_util_ttl_s: float = 0.0,
     enable_monotonic_floor: bool = True,
     enable_clpu_ramp: bool = True,
     termination_tolerance: float = 1e-5,
@@ -2588,6 +2660,7 @@ def create_energy_balance_role(
         sector=sector,
         priority=priority,
         constraint_aware=constraint_aware,
+        proactive_util_ttl_s=proactive_util_ttl_s,
         enable_monotonic_floor=enable_monotonic_floor,
         enable_clpu_ramp=enable_clpu_ramp,
         termination_tolerance=termination_tolerance,

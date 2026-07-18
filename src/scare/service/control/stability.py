@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 from mango import Role
 
+from scare.base.config import cfg_value
 from scare.base.model import SECTOR_TIMESCALE, NegotiationFinishedEvent, Sector
 from scare.base.util import (
     _last_regulate_store,
@@ -23,30 +24,6 @@ if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
 
 logger = logging.getLogger(__name__)
-
-
-class NodeObserver(Role):
-    def __init__(
-        self,
-        behavior: RestorationEnvironmentBehavior,
-        *,
-        control_until_s: float = 30.0,
-        poll_period_s: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.behavior = behavior
-        self.control_until_s = control_until_s
-        self.poll_period_s = poll_period_s
-
-    def setup(self) -> None:
-        self.context.schedule_periodic_task(self._observe, delay=self.poll_period_s)
-
-    async def _observe(self) -> None:
-        if self.context.current_timestamp > self.control_until_s:
-            return
-        obs = safe_observe(self.behavior, self.context.aid)
-        if obs:
-            logger.debug("[%s] obs=%s", self.context.aid, obs)
 
 
 class GenerationController(Role):
@@ -116,7 +93,9 @@ class GenerationController(Role):
         if has_gen_curtail_lock(self.behavior, self.context.aid, now):
             return  # over-voltage auction owns it — don't ramp into a violation
         rated = abs(cap)
-        cur_factor = abs(obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid))
+        cur_factor = abs(
+            obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
+        )
         cur_factor = cur_factor / rated if rated > 0 else 1.0
         # Local-physics cap: don't ramp into a local over-voltage / overload.
         allowed = constraint_allowed_fraction(obs, self.sector, tier=0)
@@ -174,13 +153,10 @@ class GenerationController(Role):
             self._ext_factor_seen = store_factor
             self._ext_change_t = now
         store_t = _last_regulate_t_store(self.behavior).get(aid)
-        last_write_t = max(
-            self._ext_change_t, store_t if store_t is not None else -1e9
-        )
+        last_write_t = max(self._ext_change_t, store_t if store_t is not None else -1e9)
         return (
-            (now - last_write_t) < self._RAMP_RESPECT_DISPATCH_S
-            and store_factor < target - self._RAMP_TOL
-        )
+            now - last_write_t
+        ) < self._RAMP_RESPECT_DISPATCH_S and store_factor < target - self._RAMP_TOL
 
     def _on_negotiation_finished(
         self, event: NegotiationFinishedEvent, _src: Any
@@ -212,8 +188,8 @@ class GenerationController(Role):
 
         # Same safety nets as ``_apply_setpoint`` so this path can't jump.
         cfg = getattr(self.behavior, "_scare_config", None)
-        enable_floor = getattr(cfg, "enable_monotonic_floor", True)
-        enable_ramp = getattr(cfg, "enable_clpu_ramp", True)
+        enable_floor = cfg_value(cfg, "enable_monotonic_floor")
+        enable_ramp = cfg_value(cfg, "enable_clpu_ramp")
 
         now = self.context.current_timestamp
         # CLPU ramp: bound ramp-up to ``convergence_rate``/s; decreases

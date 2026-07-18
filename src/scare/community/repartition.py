@@ -13,7 +13,6 @@ import asyncio
 import logging
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
 
 from mango import Role
 from mango.express.topology import topology_characteristic, topology_neighbors
@@ -26,6 +25,8 @@ from scare.base.model import (
     Sector,
 )
 from scare.base.runtime.diagnostics import record_event
+from scare.base.util import async_dispatch
+from scare.base.util.ids import deterministic_uuid
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -73,6 +74,8 @@ class DynamicRepartitionRole(Role):
         # Members already orphaned: don't re-orphan (no longer authoritative).
         self._already_orphaned: set[str] = set()
         self._reassess_pending: bool = False
+        # Monotonic counter backing reproducible community ids -- see base.util.ids.
+        self._repartition_seq = 0
 
     def setup(self) -> None:
         # The global ``BranchFailureEvent`` dispatches to on_branch_failure.
@@ -154,7 +157,10 @@ class DynamicRepartitionRole(Role):
                     new_leader_aid,
                 )
                 continue
-            new_community_id = uuid4()
+            self._repartition_seq += 1
+            new_community_id = deterministic_uuid(
+                self.context.aid, self._repartition_seq
+            )
             orphan_addrs = [self._member_addr[aid] for aid in comp]
 
             record_event(
@@ -246,11 +252,7 @@ class RepartitionHandlerRole(Role):
     """
 
     def setup(self) -> None:
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         self.context.subscribe_message(
             self,

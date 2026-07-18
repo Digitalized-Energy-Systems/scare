@@ -194,6 +194,15 @@ class RestorationConfiguration:
     # participation_scale = 1 always.
     enable_constraint_aware_gossip: bool = True
 
+    # Age-out (s) for the proactive-utilization entries feeding that throttle.
+    # ConstraintWarning fires only at util >= PROACTIVE_WARNING_FRACTION (0.85)
+    # and the recovery path emits nothing, so an entry -- always in [0.85, 1.0]
+    # -- otherwise pins the agent's participation_scale <= 0.15 for the rest of
+    # the run. 0.0 keeps that latching behaviour (the pre-fix default); a
+    # positive value expires stale entries on read. Opt-in: clearing the latch
+    # changes gossip participation and therefore campaign numbers.
+    proactive_util_ttl_s: float = 0.0
+
     # Multi-hop ConstraintStateMessage forwarding. False: only direct neighbours
     # see local utilization.
     enable_multihop_constraint: bool = True
@@ -589,3 +598,17 @@ class RestorationConfiguration:
 def default_config() -> RestorationConfiguration:
     """Return a fresh baseline config; names baseline intent at call sites."""
     return RestorationConfiguration()
+
+
+_DECLARED_DEFAULTS = RestorationConfiguration()
+
+
+def cfg_value(cfg: object, name: str):
+    """Read ``name`` off ``cfg``, falling back to this file's declared default.
+
+    Call sites that spelled their own literal fallback drifted whenever a
+    default changed here, so an unconfigured code path silently ran a different
+    configuration than production. Resolving through the dataclass makes that
+    impossible.
+    """
+    return getattr(cfg, name, getattr(_DECLARED_DEFAULTS, name))

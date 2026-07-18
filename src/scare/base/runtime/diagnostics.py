@@ -117,7 +117,12 @@ class DiagnosticsRecorder:
             return
         self._log.append(
             ActionRecord(
-                t=t, kind="regulate", aid=aid, sector=sector, value=factor, reason=reason
+                t=t,
+                kind="regulate",
+                aid=aid,
+                sector=sector,
+                value=factor,
+                reason=reason,
             )
         )
         if self._trajectory_armed:
@@ -130,7 +135,12 @@ class DiagnosticsRecorder:
             return
         self._log.append(
             ActionRecord(
-                t=t, kind="switch", aid=aid, sector="", value=float("nan"), reason=reason
+                t=t,
+                kind="switch",
+                aid=aid,
+                sector="",
+                value=float("nan"),
+                reason=reason,
             )
         )
         # Mirror into the event ledger so the aggregator counts tie-switch closes.

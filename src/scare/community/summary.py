@@ -40,6 +40,7 @@ from scare.base.channel import (
 from scare.base.model import NegotiationFinishedEvent, Sector, StartBalanceNegotiation
 from scare.base.runtime.diagnostics import record_event
 from scare.base.util import (
+    async_dispatch,
     clamp_tier_monotonic,
     lookup_slack,
     lookup_slack_eff_budget,
@@ -103,7 +104,7 @@ class CrossSectorChannel:
     @classmethod
     def for_behavior(
         cls, behavior: RestorationEnvironmentBehavior
-    ) -> "CrossSectorChannel":
+    ) -> CrossSectorChannel:
         store = getattr(behavior, "_scare_xs_summaries", None)
         if store is None:
             store = {}
@@ -261,11 +262,7 @@ class HolonSummaryRole(Role):
             self._topology_tid,
         )
 
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         # Subscribe to summaries from same-sector peers.
         self.context.subscribe_message(

@@ -144,7 +144,9 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
     sub = _completed_sims(campaign.by_experiment("variant_comparison"))
     if sub.empty:
         return []
-    grids_present = [g for g in _VC_GRID_ORDER if g in set(sub["grid"].dropna().unique())]
+    grids_present = [
+        g for g in _VC_GRID_ORDER if g in set(sub["grid"].dropna().unique())
+    ]
     vc_groups = [(g, alias_grid(g)) for g in grids_present]
     return [
         str(
@@ -226,7 +228,11 @@ def _ablation_experiments(campaign: CampaignData) -> list[str]:
     """Every experiment whose name marks it as an ablation matrix. The
     eval_full campaign splits the matrix by theme (``ablation_core``,
     ``ablation_voltage``, …) rather than a single ``ablation`` experiment."""
-    return [e for e in campaign.experiments() if e == "ablation" or e.startswith("ablation_")]
+    return [
+        e
+        for e in campaign.experiments()
+        if e == "ablation" or e.startswith("ablation_")
+    ]
 
 
 def _ablation(
@@ -250,9 +256,7 @@ def _ablation(
             sub = sub[sub["variant"] == "scare"]
         if sub.empty:
             continue
-        grids = (
-            sorted(sub["grid"].dropna().unique()) if "grid" in sub.columns else []
-        )
+        grids = sorted(sub["grid"].dropna().unique()) if "grid" in sub.columns else []
         figs: list[str] = []
         if len(grids) > 1:
             for grid in grids:
@@ -316,11 +320,7 @@ def _cascading(campaign: CampaignData, out_dir: Path) -> list[str]:
     if sub.empty:
         return []
     return [
-        str(
-            plots.cascading_curve(
-                _completed_sims(sub), out_dir / "n_failures.png"
-            )
-        ),
+        str(plots.cascading_curve(_completed_sims(sub), out_dir / "n_failures.png")),
     ]
 
 
@@ -435,9 +435,7 @@ def _extensions(campaign: CampaignData, out_dir: Path) -> list[str]:
 
     tmp = _completed_sims(campaign.by_experiment("extension_temporal"))
     if not tmp.empty:
-        figs.append(
-            str(plots.extension_temporal_ab(tmp, out_dir / "temporal_ab.png"))
-        )
+        figs.append(str(plots.extension_temporal_ab(tmp, out_dir / "temporal_ab.png")))
         # Pair the off and on arm of each seed (scare) for the inertia /
         # ride-through overlays: same seed shares the failure draw.
         scare = tmp[tmp["variant"] == "scare"]
@@ -476,7 +474,9 @@ def _extensions(campaign: CampaignData, out_dir: Path) -> list[str]:
             task = campaign.task(int(row["task_id"]))
             tasks.append((f"seed {task.seed}", task.timeseries, task.scenario))
         oracle_series = []
-        for _, row in b_arm[b_arm["variant"] == "oracle"].sort_values("seed").iterrows():
+        for _, row in (
+            b_arm[b_arm["variant"] == "oracle"].sort_values("seed").iterrows()
+        ):
             task = campaign.task(int(row["task_id"]))
             series = (
                 (task.result.get("outcomes") or {}).get("oracle_temporal") or {}
@@ -501,11 +501,7 @@ def _claims(campaign: CampaignData, out_dir: Path) -> list[str]:
     if df.empty:
         return []
     return [
-        str(
-            plots.claims_pass_rate(
-                _completed_sims(df), out_dir / "claims_overall.png"
-            )
-        )
+        str(plots.claims_pass_rate(_completed_sims(df), out_dir / "claims_overall.png"))
     ]
 
 
@@ -634,9 +630,7 @@ def _validity(campaign: CampaignData, out_dir: Path) -> list[str]:
             plots.gas_slack_pressure_trajectory(
                 rep.timeseries,
                 out_dir / "gas_slack_pressure_trajectory.png",
-                title=(
-                    f"Gas ext-grid regulator — task {rep.task_id} ({rep.grid})"
-                ),
+                title=(f"Gas ext-grid regulator — task {rep.task_id} ({rep.grid})"),
                 failure_t=failure_t,
             )
         )
@@ -1066,7 +1060,13 @@ def _table_claims(campaign: CampaignData) -> str:
     # exempt from several claims (shown as "—", not counted as passing).
     header = "| claim | " + " | ".join(alias_variant(v) for v in variants) + " |"
     sep = "|---|" + "|".join(["---"] * len(variants)) + "|"
-    lines = ["", "## Claims compliance (pass rate by variant, graded rows)", "", header, sep]
+    lines = [
+        "",
+        "## Claims compliance (pass rate by variant, graded rows)",
+        "",
+        header,
+        sep,
+    ]
     for col in cols:
         claim = col[len("claims__") : -len("__passed")]
         cells = []

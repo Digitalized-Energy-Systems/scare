@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import math
-import uuid
 from typing import TYPE_CHECKING, Any
 
 from mango import Role
@@ -34,6 +33,7 @@ from scare.base.runtime.diagnostics import record_event
 from scare.base.util import (
     LINE_CONGESTION_REASON,
     apply_regulate,
+    async_dispatch,
     constraint_utilization,
     feeder_max_voltage,
     has_heat_curtail_lock,
@@ -274,6 +274,8 @@ class GridConstraintMonitor(Role):
         # Loads downstream of this branch (the only ones whose curtailment
         # reduces its flow); populated post-build for electricity branch monitors.
         self._downstream_load_addrs: list[Any] = list(downstream_load_addrs or [])
+        # NOTE: also settable post-build via ``set_downstream_loads`` -- the
+        # addresses do not exist yet at construction time.
         self.enable_multihop_constraint = enable_multihop_constraint
         self.enable_heat_frontier = enable_heat_frontier
         # Heat priority-waterfall gate: a cold load defers its own shed while
@@ -336,6 +338,8 @@ class GridConstraintMonitor(Role):
 
         # Auctioneer-side state: auction_id -> {"bids", "total", ...}.
         self._open_auctions: dict[str, dict[str, Any]] = {}
+        # Monotonic counter backing reproducible auction ids -- see base.util.ids.
+        self._auction_seq = 0
         # Per-variable in-flight guard (variable -> deadline): prevents stacking
         # auctions while letting curtailment iterate round-by-round.
         self._curtail_inflight: dict[str, float] = {}
@@ -364,6 +368,10 @@ class GridConstraintMonitor(Role):
         # requests a deferring cold load sends to lower-priority peers.
         self._waterfall_request_cooldown: dict[str, float] = {}
 
+    def set_downstream_loads(self, addrs: list[Any]) -> None:
+        """Set the loads downstream of this branch, once addresses resolve."""
+        self._downstream_load_addrs = list(addrs)
+
     def setup(self) -> None:
         poll = SECTOR_TIMESCALE.get(self.sector, {}).get("poll_period_s", 1.0)
         self.context.schedule_periodic_task(self._monitor, delay=poll)
@@ -375,11 +383,7 @@ class GridConstraintMonitor(Role):
                 delay=min(poll, _HEAT_FRONTIER_PERIOD_S),
             )
 
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         self.context.subscribe_message(
             self,
@@ -495,7 +499,10 @@ class GridConstraintMonitor(Role):
         # never reverts; so under gen-priority/congestion-price suppress load-shed
         # the moment an overload looks export-driven with curtailable downstream
         # gens (pre-debounce), while gen-curtail below stays debounced.
-        if self.enable_generation_priority_curtailment or self.enable_line_congestion_price:
+        if (
+            self.enable_generation_priority_curtailment
+            or self.enable_line_congestion_price
+        ):
             suppress_load_shed = is_export and bool(self._downstream_generator_aids())
         else:
             suppress_load_shed = export_overload
@@ -949,8 +956,7 @@ class GridConstraintMonitor(Role):
             if is_export:
                 self._line_congestion_price = min(
                     _LINE_CONGESTION_PRICE_MAX,
-                    self._line_congestion_price
-                    + _LINE_CONGESTION_GAIN * overshoot,
+                    self._line_congestion_price + _LINE_CONGESTION_GAIN * overshoot,
                 )
             elif val <= hi - _LINE_CONGESTION_HEADROOM_MARGIN:
                 self._line_congestion_price = max(
@@ -1386,7 +1392,8 @@ class GridConstraintMonitor(Role):
             self._curtail_inflight.pop(variable, None)
             return
 
-        auction_id = str(uuid.uuid4())
+        self._auction_seq += 1
+        auction_id = f"{self.context.aid}/{self._auction_seq}"
         self._open_auctions[auction_id] = {
             "bids": {},
             "total": total_amount,

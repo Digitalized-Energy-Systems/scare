@@ -403,9 +403,7 @@ class TestCrossSectorActuatabilityGate:
         if hasattr(role.context, "_pending"):
             asyncio.run(role.context._pending)
 
-        cp_msgs = [
-            m for m in role.context.sent if isinstance(m.payload, CPCommitment)
-        ]
+        cp_msgs = [m for m in role.context.sent if isinstance(m.payload, CPCommitment)]
         assert cp_msgs == []
         assert not role._active_xs_coalitions
         assert not store.has_active_cp_envelope("p2h-1", now=100.0)
@@ -426,7 +424,5 @@ class TestCrossSectorActuatabilityGate:
         role._check_cross_sector_invariants()
         if hasattr(role.context, "_pending"):
             asyncio.run(role.context._pending)
-        cp_msgs = [
-            m for m in role.context.sent if isinstance(m.payload, CPCommitment)
-        ]
+        cp_msgs = [m for m in role.context.sent if isinstance(m.payload, CPCommitment)]
         assert len(cp_msgs) == 1

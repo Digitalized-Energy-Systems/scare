@@ -42,6 +42,7 @@ from scare.base.runtime.trace import optimization
 from scare.base.topology.topology_mirror import LivePeerFilter
 from scare.base.util import (
     apply_regulate,
+    async_dispatch,
     clamp_to_constraints,
     kgps_to_mw,
     mw_to_kgps,
@@ -95,7 +96,10 @@ _FLEX_ROUND_TIMEOUT_S: float = 2.0
 
 
 async def _reply_ask_energy(
-    behavior: RestorationEnvironmentBehavior, context: Any, message: AskEnergyMessage, meta: dict
+    behavior: RestorationEnvironmentBehavior,
+    context: Any,
+    message: AskEnergyMessage,
+    meta: dict,
 ) -> None:
     """Reply to an AskEnergyMessage with the CP's current sector setpoint.
 
@@ -228,6 +232,8 @@ class EnergyConverterRole(Role):
         # Sibling DynamicConnectorRole gating reachable group leaders.
         # None => static topology: every connector is admitted.
         self._live_connector_filter = live_connector_filter
+        # NOTE: also settable post-build via ``set_connector_filter`` -- the
+        # sibling DynamicConnectorRole is created after this role.
         # Per-(in,out) sector efficiency advertised when joining a coalition.
         # Empty => no coupling advertised (coalition path skips this CP).
         self._coupling_ratios: dict[tuple[str, str], float] = (
@@ -326,12 +332,12 @@ class EnergyConverterRole(Role):
     def _is_l3_coordinator(self) -> bool:
         return self._component.is_coordinator(self.context.aid)
 
-    def setup(self) -> None:
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
+    def set_connector_filter(self, live_connector_filter: Any) -> None:
+        """Attach the sibling DynamicConnectorRole after both roles exist."""
+        self._live_connector_filter = live_connector_filter
 
-            return _sync
+    def setup(self) -> None:
+        _wrap = async_dispatch(self)
 
         logger.debug(
             "[%s] EnergyConverterRole setup: sectors=%s",
@@ -700,8 +706,10 @@ class EnergyConverterRole(Role):
                     [self.flex_actor], coordinator, start_msg
                 )
             result = self._clamp_to_envelope(list(self.flex_actor.x))
-            # The actuator must run before emit_event: with no subscriber,
-            # emit_event raises KeyError that would discard the result.
+            # Actuate before emitting: emit_event dispatches synchronously, so a
+            # raising subscriber would otherwise discard the result. (It no
+            # longer raises on *no* subscriber -- mango's emit_event defaults to
+            # strict=False -- but the guard below still covers raising handlers.)
             applied_factor = self._actuator.apply(
                 self.context.aid, result, self.context.current_timestamp
             )
@@ -723,7 +731,9 @@ class EnergyConverterRole(Role):
                 timestamp_s=float(self.context.current_timestamp),
                 cp_id=str(self.context.aid),
                 sector_flows_mw=sector_flows,
-                regulation_factor=1.0 if applied_factor is None else float(applied_factor),
+                regulation_factor=1.0
+                if applied_factor is None
+                else float(applied_factor),
             )
             record_event(
                 t=float(self.context.current_timestamp),
@@ -1031,11 +1041,7 @@ class MultiCommunityCPRole(Role):
         self._last_commit_t: float = -1e9
 
     def setup(self) -> None:
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         # Minimal flex-query reply so a leader treating this CP as a connector
         # doesn't stall. available=0: no spare flex, only the conversion knob.

@@ -10,7 +10,6 @@ import random
 from typing import Any
 
 import networkx as nx
-
 from mango_energy_environments import Failure
 from monee.model.child import ExtPowerGrid, HeatGenerator, PowerGenerator, Source
 from monee.model.extension import GridFormingGenerator, GridFormingSource
@@ -34,7 +33,7 @@ def create_failures(
     num_failures: int = 1,
     delay_s_max: float = 5.0,
     generator_share: float = 0.5,
-    generator_carriers: "tuple[str, ...] | list[str] | set[str] | None" = None,
+    generator_carriers: tuple[str, ...] | list[str] | set[str] | None = None,
 ) -> list[Failure]:
     """Sample ``num_failures`` events. ``failure_type``: branch | generator | mixed
     (``generator_share`` = gen fraction) | concentrated (cluster near a load-rich node) |
@@ -117,7 +116,9 @@ def _sample_island_failures(
             continue
         graph.remove_edge(u, v)
         comp_u = nx.node_connected_component(graph, u)
-        island = comp_u if not (comp_u & roots) else nx.node_connected_component(graph, v)
+        island = (
+            comp_u if not (comp_u & roots) else nx.node_connected_component(graph, v)
+        )
         graph.add_edge(u, v)
         if island & roots:  # cut did not disconnect from the slack (in a loop)
             continue
@@ -234,7 +235,7 @@ def _sample_generator_failures(
     num_failures: int,
     delay_s_max: float,
     *,
-    carriers: "frozenset[str] | None" = None,
+    carriers: frozenset[str] | None = None,
 ) -> list[Failure]:
     """Sample generator-class components; branch CPs via ``branch_ids``,
     childs/compounds via ``Failure.custom``. ``carriers`` (if given) keeps only

@@ -30,7 +30,7 @@ from mango import sender_addr as mango_sender_addr
 
 from scare.base.channel import CPSummary, HolonSummary, MonotonicVersion
 from scare.base.model import Sector
-from scare.base.util import apply_regulate, kgps_to_mw
+from scare.base.util import apply_regulate, async_dispatch, kgps_to_mw
 from scare.service.coupling.cp_priority_admm import (
     CPSpec,
     SectorDemand,
@@ -173,11 +173,7 @@ class CPPriorityAdmmRole(Role):
     # ------------------------------------------------------------------
 
     def setup(self) -> None:
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         # Inbound from L2. Normally only summaries on sectors we bridge; under
         # demand_union take every sector so the round demand set can include

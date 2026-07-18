@@ -1,5 +1,3 @@
-import time
-
 from monee import run_energy_flow
 
 from experiment.scenarios import GRIDS

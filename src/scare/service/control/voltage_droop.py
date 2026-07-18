@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from mango import Role
 
+from scare.base.config import cfg_value
 from scare.base.model import SECTOR_TIMESCALE, Sector
 from scare.base.runtime.diagnostics import record_event
 from scare.base.util import _QV_RELIEF_TTL_S, publish_qv_relief, safe_observe
@@ -46,7 +47,7 @@ def _vvw_enabled(behavior) -> bool:
 
     Read from the behavior-attached config; defaults False when absent."""
     cfg = getattr(behavior, "_scare_config", None)
-    return bool(getattr(cfg, "enable_vvw_coordination", False))
+    return bool(cfg_value(cfg, "enable_vvw_coordination"))
 
 
 def _qv_coordination_enabled(behavior) -> bool:
@@ -55,7 +56,7 @@ def _qv_coordination_enabled(behavior) -> bool:
     When on, the droop publishes its remaining reactive relief so the auction
     sheds active power only for the residual."""
     cfg = getattr(behavior, "_scare_config", None)
-    return bool(getattr(cfg, "enable_qv_auction_coordination", False))
+    return bool(cfg_value(cfg, "enable_qv_auction_coordination"))
 
 
 # dV/dQ prior: cold-start placeholder, two guards so it never decides a shed:

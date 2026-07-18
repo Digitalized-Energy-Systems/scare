@@ -119,8 +119,7 @@ async def sim_stall_watchdog(
     max_stuck_dumped: int = 12,
     logger: logging.Logger | None = None,
 ) -> None:
-    """Real-time watchdog that logs *why* the sim clock is frozen.
-    """
+    """Real-time watchdog that logs *why* the sim clock is frozen."""
     log = logger or _stall_logger
     last_t: float | None = None
     static_s = 0.0

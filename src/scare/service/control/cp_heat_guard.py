@@ -89,9 +89,7 @@ class CPHeatOutletGuard(Role):
         super().__init__()
         self.behavior = behavior
         self.outlet_aid = str(outlet_aid)
-        _lo, hi = SECTOR_CONSTRAINTS.get(Sector.HEAT, {}).get(
-            "t_k", (313.15, 403.15)
-        )
+        _lo, hi = SECTOR_CONSTRAINTS.get(Sector.HEAT, {}).get("t_k", (313.15, 403.15))
         self._hi = float(hi)
         self._ceiling: float = 1.0
 
@@ -150,8 +148,7 @@ class CPHeatOutletGuard(Role):
                 aid=str(self.context.aid),
                 sector="cp",
                 detail=(
-                    f"t_k={t:.2f} hi={self._hi:.2f} "
-                    f"ceiling {prev:.4f}->{ceiling:.4f}"
+                    f"t_k={t:.2f} hi={self._hi:.2f} ceiling {prev:.4f}->{ceiling:.4f}"
                 ),
             )
 

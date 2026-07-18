@@ -54,9 +54,7 @@ def diff_normalized(path_a: str | Path, path_b: str | Path) -> list[str]:
     """Unified diff of two files after id-normalization; empty list == parity."""
     a = normalize_file(path_a).splitlines(keepends=True)
     b = normalize_file(path_b).splitlines(keepends=True)
-    return list(
-        difflib.unified_diff(a, b, fromfile=str(path_a), tofile=str(path_b))
-    )
+    return list(difflib.unified_diff(a, b, fromfile=str(path_a), tofile=str(path_b)))
 
 
 def main() -> int:
@@ -70,7 +68,9 @@ def main() -> int:
         print("PARITY: identical after id-normalization")
         return 0
     print("".join(diff), end="")
-    print(f"\nPARITY FAIL: {sum(1 for d in diff if d[:1] in '+-' and d[:3] not in ('+++', '---'))} changed lines")
+    print(
+        f"\nPARITY FAIL: {sum(1 for d in diff if d[:1] in '+-' and d[:3] not in ('+++', '---'))} changed lines"
+    )
     return 1
 
 

@@ -6,13 +6,17 @@ from __future__ import annotations
 import dataclasses as dc
 
 from scare.base.channel import (
-    ComponentAdmmReport,
     CoalitionAcceptance,
+    ComponentAdmmReport,
     HolonSummary,
     SectorTierFlex,
 )
 
-FLEX_QUAD = {"supply_by_sector", "demand_by_sector_priority", "served_by_sector_priority"}
+FLEX_QUAD = {
+    "supply_by_sector",
+    "demand_by_sector_priority",
+    "served_by_sector_priority",
+}
 
 
 def test_mixin_is_the_single_source():

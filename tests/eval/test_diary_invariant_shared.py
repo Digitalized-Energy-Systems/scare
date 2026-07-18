@@ -8,7 +8,11 @@ from experiment.eval.results import _diary_invariant_holds
 
 def test_terminal_events_constant():
     assert DIARY_TERMINAL_EVENTS == (
-        "finished", "timed_out", "cancelled", "abandoned", "stalled",
+        "finished",
+        "timed_out",
+        "cancelled",
+        "abandoned",
+        "stalled",
     )
 
 

@@ -112,9 +112,7 @@ def test_target_floor_scales_with_needed_relief():
     c.note_peer_state("small", 0.0, 4, 0.004)
     c.note_peer_state("big", 0.0, 4, 0.006)
     # needed 0.05 -> floor max(1e-3, 0.005) = 0.005: only "big" qualifies.
-    assert c.waterfall_request_targets(1, 0.0, needed_mw=0.05) == [
-        ("big", 4, 0.006)
-    ]
+    assert c.waterfall_request_targets(1, 0.0, needed_mw=0.05) == [("big", 4, 0.006)]
     # No need context -> absolute floor only: both qualify, biggest first.
     assert c.waterfall_request_targets(1, 0.0) == [
         ("big", 4, 0.006),
@@ -202,9 +200,7 @@ async def test_waterfall_multi_target_requests_up_to_cap():
         await step_simulation(world, step_size_s=1.0)
 
     shed_peers = {
-        a[0]
-        for a in behavior.action_log
-        if a[1] == "regulate" and a[0] != "agent-0"
+        a[0] for a in behavior.action_log if a[1] == "regulate" and a[0] != "agent-0"
     }
     assert len(shed_peers) == GridConstraintMonitor._HEAT_WATERFALL_MAX_TARGETS
     own = [a for a in behavior.action_log if a[0] == "agent-0" and a[1] == "regulate"]

@@ -127,7 +127,7 @@ _DEFAULT_SECTOR_TIMESCALE: dict[Sector, dict[str, float]] = {
 
 
 def set_sector_timescale(
-    overrides: "dict[str, dict[str, float]] | None" = None,
+    overrides: dict[str, dict[str, float]] | None = None,
 ) -> None:
     """Reset the per-sector agent time-scales to their defaults, then apply
     *overrides* IN PLACE (so services that imported ``SECTOR_TIMESCALE`` see the
@@ -216,11 +216,6 @@ class LeaderEmerged:
     leader_addr: Any
     node_id: Any
     sector: Sector
-
-
-@dataclass
-class ResultService:
-    aid_to_result: dict[str, list[Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -432,18 +427,6 @@ class NegotiationResult:
 class BalanceProblem:
     sector: Sector
     imbalance: float
-
-
-@dataclass
-class CHSJoinRequest:
-    group_id: UUID
-    group_size: int
-
-
-@dataclass
-class CHSJoinRequestAnswer:
-    group_id: UUID
-    accept: bool
 
 
 # --- Grid constraint violation / warning events ---

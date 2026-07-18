@@ -14,6 +14,7 @@ from scare.base.model import (
     NegotiationResult,
     Sector,
 )
+from scare.base.util import async_dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,7 @@ class Community(Role):
         self._collected: dict[str, list[NegotiationResult]] = {}
 
     def setup(self) -> None:
-        def _wrap(coro_fn):
-            def _sync(msg, meta):
-                self.context.schedule_instant_task(coro_fn(msg, meta))
-
-            return _sync
+        _wrap = async_dispatch(self)
 
         self.context.subscribe_message(
             self,

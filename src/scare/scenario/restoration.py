@@ -4,7 +4,6 @@ import asyncio
 import logging
 import math
 from typing import Any
-from uuid import uuid4
 
 from distributed_resource_optimization import (
     create_sharing_target_distance_admm_coordinator,
@@ -25,7 +24,6 @@ from mango_energy_environments import (
     Failure,
     RestorationEnvironmentBehavior,
     create_restoration_world,
-    edge_centrality,
     schedule_failure,
     topology_based_on_grid,
     topology_based_on_grid_groups,
@@ -75,7 +73,6 @@ from scare.base.topology.community import (
 from scare.base.topology.topology_mirror import mirror_from_monee
 from scare.base.util import (
     first_role,
-    get_by_branch_id,
     kgps_to_mw,
     lookup_slack,
     lookup_slack_pressure,
@@ -90,6 +87,7 @@ from scare.base.util import (
     sector_from_grid,
     set_directional_constraint_cap,
 )
+from scare.base.util.ids import deterministic_uuid
 from scare.community.coalition_store import CoalitionConstraintStore
 from scare.community.dynamic_holon import DynamicHolonRole
 from scare.community.holonic import HolonicCommunityRole
@@ -250,7 +248,11 @@ def _maybe_register_grid_former(behavior: Any, aid: str, child: Any) -> None:
         return
     if var is None:
         return
-    mags = [abs(float(b)) for b in (getattr(var, "min", None), getattr(var, "max", None)) if b is not None]
+    mags = [
+        abs(float(b))
+        for b in (getattr(var, "min", None), getattr(var, "max", None))
+        if b is not None
+    ]
     if mags:
         register_grid_former_rating(behavior, aid, max(mags))
 
@@ -780,7 +782,6 @@ def _populate_branches(
     behavior: RestorationEnvironmentBehavior,
     priorities: dict[str, int],
     config: RestorationConfiguration,
-    centrality: dict,
 ) -> None:
     for branch in monee_net.branches:
         aid = create_branch_aid(branch.id)
@@ -820,8 +821,7 @@ def _populate_branches(
                 _attach_multi_community_cp_role(roles, behavior, "p2h", config)
 
         elif hasattr(branch.model, "on_off"):
-            cent = get_by_branch_id(centrality, branch.id)
-            roles.append(GridTieSwitchOperator(behavior, branch.id, centrality=cent))
+            roles.append(GridTieSwitchOperator(behavior, branch.id))
 
         # Heat-outlet guard on heat-producing branch CPs: P2H/G2H inject
         # q_mw_heat at the to-node. Independent of the CP-coordination elif
@@ -873,7 +873,6 @@ def _populate_world(
     priorities: dict[str, int],
     config: RestorationConfiguration,
 ) -> None:
-    centrality = edge_centrality(monee_net)
     branch_sector_by_id, neighbour_sector_by_node = _build_branch_sector_tables(
         monee_net
     )
@@ -882,7 +881,7 @@ def _populate_world(
     _populate_nodes(
         world, monee_net, behavior, priorities, config, neighbour_sector_by_node
     )
-    _populate_branches(world, monee_net, behavior, priorities, config, centrality)
+    _populate_branches(world, monee_net, behavior, priorities, config)
 
 
 def _heat_outlet_aid_for_node(node: Any, monee_net: Any) -> str | None:
@@ -903,9 +902,7 @@ def _heat_outlet_aid_for_node(node: Any, monee_net: Any) -> str | None:
                 return _node_aid(child.node_id)
         return None
     own = _model_type_name(node)
-    if any(
-        s in own for s in ("chpcontrol", "powertoheatcontrol", "gastoheatcontrol")
-    ):
+    if any(s in own for s in ("chpcontrol", "powertoheatcontrol", "gastoheatcontrol")):
         return _node_aid(node.id)
     return None
 
@@ -941,6 +938,7 @@ def _make_balance_role(
         obs,
         priority=priority,
         constraint_aware=config.enable_constraint_aware_gossip,
+        proactive_util_ttl_s=config.proactive_util_ttl_s,
         enable_monotonic_floor=config.enable_monotonic_floor,
         enable_clpu_ramp=config.enable_clpu_ramp,
         termination_tolerance=config.gossip_termination_tolerance,
@@ -1384,12 +1382,12 @@ def _build_topologies(
                 leader = members[0]
                 leader_to_members[leader] = list(members)
                 groups_topo.set_characteristic(node_id, leader, "leader")
-                community_id = uuid4()
+                # Build-time id: no agent context here, so derive from the
+                # coalition's own identity rather than a counter.
+                community_id = deterministic_uuid(sector.value, node_id, leader.aid)
                 # Child aids in this coalition (branch agents skipped — no
                 # ``regulation`` key); index = position within the sector.
-                child_member_aids = [
-                    m.aid for m in members if is_child_aid(m.aid)
-                ]
+                child_member_aids = [m.aid for m in members if is_child_aid(m.aid)]
                 coalition_idx = len(coalition_members_by_sector[sector.value])
                 coalition_members_by_sector[sector.value][coalition_idx] = (
                     child_member_aids
@@ -1469,7 +1467,7 @@ def _build_topologies(
                     isinstance(role, GridConstraintMonitor)
                     and role.branch_id is not None
                 ):
-                    role._downstream_load_addrs = list(addrs)
+                    role.set_downstream_loads(addrs)
                     attached += 1
                     n_loads += len(addrs)
         logger.info(
@@ -1589,18 +1587,6 @@ def _build_topologies(
                 "node_id": branch.id[0],
             }
 
-    # All CP host node ids (HolonicCommunityRole uses them to decide
-    # whether to defer L2 to L3); branch CPs register both endpoints.
-    cp_node_ids: set[Any] = set()
-    if config.enable_cp_admm or config.enable_cp_priority_admm:
-        for node in monee_net.nodes:
-            if _detect_cp_type_for_node(node, monee_net) is not None:
-                cp_node_ids.add(node.id)
-        for branch in monee_net.branches:
-            if _is_cp_branch(branch):
-                cp_node_ids.add(branch.id[0])
-                cp_node_ids.add(branch.id[1])
-
     # Per-sector leader address book for the cross-sector coalition initiator.
     peer_leader_addrs: dict[Sector, dict[str, Any]] = {
         sec: {ldr.aid: ldr.addr for ldr in leaders}
@@ -1658,7 +1644,6 @@ def _build_topologies(
                         my_node_id=leader_node,
                         leader_node_ids=sector_leader_node_ids.get(sector, {}),
                         topology_mirror=mirror,
-                        cp_node_ids=cp_node_ids,
                     )
                 )
             if dyn_holon_role is not None:
@@ -1716,8 +1701,7 @@ def _build_topologies(
                             config.enable_coalition_delivered_supply
                         ),
                         cp_commitment_actuatable=(
-                            config.enable_cp_admm
-                            and not config.enable_cp_priority_admm
+                            config.enable_cp_admm and not config.enable_cp_priority_admm
                         ),
                         my_node_id=aid_to_node_id.get(leader.aid),
                         member_node_ids=summary_member_nodes,
@@ -1762,11 +1746,7 @@ def _build_topologies(
                     for leader in chunk:
                         for member in leader_to_members.get(leader, [leader]):
                             aid = getattr(member, "aid", None)
-                            if (
-                                aid
-                                and is_child_aid(aid)
-                                and aid not in seen_aids
-                            ):
+                            if aid and is_child_aid(aid) and aid not in seen_aids:
                                 seen_aids.add(aid)
                                 holon_child_aids.append(aid)
                     holon_idx = len(holon_members_by_sector[sector.value])
@@ -1872,7 +1852,7 @@ def _build_topologies(
                 mirror,
             )
             agent.add_role(dyn_conn)
-            cp_role._live_connector_filter = dyn_conn
+            cp_role.set_connector_filter(dyn_conn)
 
     # Wire multi-sector L3 state on every CP role under ``enable_cp_admm``
     # (coord election + dispatch are core); before this it's legacy per-CP.
@@ -2237,8 +2217,7 @@ def _register_recordings(
         for c in monee_net.childs
         if isinstance(c.model, (PowerLoad, HeatLoad))
         or (
-            isinstance(c.model, Sink)
-            and not _is_heat_side_mass_flow_sink(c, monee_net)
+            isinstance(c.model, Sink) and not _is_heat_side_mass_flow_sink(c, monee_net)
         )
     }
     sector_aids = {
@@ -2452,9 +2431,7 @@ def _register_recordings(
                 return 0.0
             total = 0.0
             for branch in net.branches:
-                lp = dict(getattr(branch.model, "values", {}) or {}).get(
-                    "linepack_kg"
-                )
+                lp = dict(getattr(branch.model, "values", {}) or {}).get("linepack_kg")
                 try:
                     total += float(lp)
                 except (TypeError, ValueError):

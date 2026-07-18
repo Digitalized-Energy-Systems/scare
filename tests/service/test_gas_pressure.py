@@ -7,7 +7,7 @@ import pytest
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.runtime import diagnostics
 from scare.base.util import lookup_slack_pressure
-from scare.service.control.gas_pressure import _DEADBAND_PU, GasPressureRegulator
+from scare.service.control.gas_pressure import GasPressureRegulator
 
 LO, HI = SECTOR_CONSTRAINTS[Sector.GAS]["pressure_pu"]
 
@@ -161,7 +161,8 @@ def test_overpressure_trap_not_blamed_on_shedding():
         reg, beh = _make(own_p=1.30, reports={"n1": 1.30, "n2": 0.85})
         _run(reg)
         traps = [
-            e for e in diagnostics.event_log()
+            e
+            for e in diagnostics.event_log()
             if e.kind == "gas_pressure_overpressure_trap"
         ]
         assert traps, "over-pressure trap event expected"

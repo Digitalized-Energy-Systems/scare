@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import random
 from typing import Any
 
+import numpy as np
 import pytest
+
+# Failure sampling draws from the process-global RNG (see
+# scare.scenario.failure_sampling), so an unseeded test gets a different failure
+# scenario every run -- different branches cut, different delays. Eval campaigns
+# seed via experiment.hpc.runner._seed_everything; the suite had no equivalent,
+# which made outcomes that depend on the sampled scenario flap run-to-run.
+_TEST_SEED = 0
+
+
+@pytest.fixture(autouse=True)
+def _seed_rngs():
+    random.seed(_TEST_SEED)
+    np.random.seed(_TEST_SEED)
+
 
 # ---------------------------------------------------------------------------
 # MockBehavior — stubs RestorationEnvironmentBehavior
@@ -46,11 +62,6 @@ class MockBehavior:
         pass
 
 
-@pytest.fixture()
-def mock_behavior() -> MockBehavior:
-    return MockBehavior()
-
-
 # ---------------------------------------------------------------------------
 # Observation dict factories
 # ---------------------------------------------------------------------------
@@ -76,32 +87,3 @@ def make_electricity_load(
         "vm_pu": vm_pu,
         "priority": priority,
     }
-
-
-def make_gas_obs(
-    mass_flow: float = 0.5,
-    regulation: float = 0.5,
-    pressure_pu: float = 1.0,
-) -> dict:
-    return {
-        "mass_flow_kgs": mass_flow,
-        "regulation": regulation,
-        "pressure_pu": pressure_pu,
-    }
-
-
-def make_heat_obs(
-    q_w_set: float = 1000.0,
-    regulation: float = 0.5,
-    t_k: float = 363.15,
-) -> dict:
-    return {"q_w_set": q_w_set, "regulation": regulation, "t_k": t_k}
-
-
-def make_heat_mass_flow_obs(
-    mass_flow: float = 0.3,
-    regulation: float = 0.5,
-    t_k: float = 363.15,
-) -> dict:
-    """Heat junction that carries mass_flow_kgs (disambiguated from gas by t_k)."""
-    return {"mass_flow_kgs": mass_flow, "regulation": regulation, "t_k": t_k}

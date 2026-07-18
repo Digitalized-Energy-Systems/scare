@@ -150,9 +150,7 @@ class CampaignConfig:
     timestamp_dir: bool = True
     # Claims that flip task status to ``claims_failed`` when they fail;
     # round-tripped into the resolved config.json for RuntimePlan.
-    fatal_claims: list[str] = field(
-        default_factory=lambda: list(FATAL_CLAIMS_DEFAULT)
-    )
+    fatal_claims: list[str] = field(default_factory=lambda: list(FATAL_CLAIMS_DEFAULT))
     notes: str = ""
     defaults: GridDefaults = field(default_factory=GridDefaults)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)

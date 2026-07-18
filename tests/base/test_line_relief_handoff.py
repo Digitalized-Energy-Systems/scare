@@ -42,8 +42,12 @@ def _behavior(**cfg_overrides):
 def _shed_and_lock(b, t=1.0, factor=0.4):
     """Auction sheds the load and takes the line-relief lock."""
     applied = apply_regulate(
-        b, AID, factor, sector=Sector.ELECTRICITY,
-        reason=CURTAIL_AUCTION_REASON, timestamp=t,
+        b,
+        AID,
+        factor,
+        sector=Sector.ELECTRICITY,
+        reason=CURTAIL_AUCTION_REASON,
+        timestamp=t,
     )
     assert applied
     assert last_actuated_factor(b, AID) == factor

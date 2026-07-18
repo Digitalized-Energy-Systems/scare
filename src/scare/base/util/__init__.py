@@ -11,7 +11,7 @@ from monee.model.extension import GridFormingGenerator, GridFormingSource
 
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.runtime.diagnostics import record_event, record_regulate
-from scare.base.util.addressing import create_branch_aid, get_by_branch_id
+from scare.base.util.addressing import create_branch_aid
 from scare.base.util.blackboard import (
     _COOLDOWN_BYPASS_TIER_THRESHOLD,
     _CP_HEAT_CEILING_TTL_S,
@@ -147,6 +147,28 @@ def safe_observe(
     if empty_to_none and not obs:
         return None
     return obs
+
+
+def async_dispatch(role: Any, *, on_receive: Any = None) -> Any:
+    """Return the ``coro_fn -> sync callback`` wrapper a role's ``setup`` needs.
+
+    ``context.subscribe_message`` takes a sync callback, so every role hand-rolled
+    the same closure. Scheduling the coroutine (rather than awaiting it) is what
+    keeps handler work on mango's simulation clock instead of a side track.
+
+    ``on_receive`` runs on the raw meta before dispatch, for roles that record
+    the sender.
+    """
+
+    def _wrap(coro_fn: Any) -> Any:
+        def _sync(msg: Any, meta: Any) -> None:
+            if on_receive is not None:
+                on_receive(meta)
+            role.context.schedule_instant_task(coro_fn(msg, meta))
+
+        return _sync
+
+    return _wrap
 
 
 def first_role(agent: Any, role_type: type) -> Any:

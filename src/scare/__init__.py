@@ -14,7 +14,6 @@ from scare.base.model import (
     HolonicAssignment,
     LocalGenerationRequest,
     NegotiationFinishedEvent,
-    ResultService,
     Sector,
     SystemStrategy,
 )
@@ -29,7 +28,6 @@ __all__ = [
     "EnergyData",
     "NegotiationFinishedEvent",
     "CommunityAssignment",
-    "ResultService",
     "ConstraintViolation",
     "ConstraintWarning",
     "HolonicAssignment",

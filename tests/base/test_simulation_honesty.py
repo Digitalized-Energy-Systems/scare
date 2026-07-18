@@ -110,9 +110,46 @@ _FORBIDDEN = re.compile(
 _TIME_FORBIDDEN = re.compile(r"\b(time\.(?:time|monotonic|perf_counter)|loop\.time)\(")
 
 
+# Sanctioned exceptions, as {relative path: {token: exact expected count}}.
+# Escaping the simulation clock is the *point* of these call sites. The counts
+# are exact, so a NEW bypass in an already-listed file still fails the guard.
+_SANCTIONED_BYPASS = {
+    # Hang watchdog. It must be invisible to mango's settle detection and tick
+    # on real time -- a clock-driven watchdog cannot fire when the clock is what
+    # froze, which is the failure mode it exists to catch.
+    "scenario/restoration.py": {"asyncio.ensure_future": 1},
+}
+_SANCTIONED_WALLCLOCK = {
+    # Profiling instrumentation: measuring real elapsed time is its purpose.
+    "base/runtime/trace.py": {"time.monotonic(": 3},
+}
+
+
 def _iter_scare_sources() -> list[Path]:
     root = Path(__file__).resolve().parents[2] / "src" / "scare"
     return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+
+
+def _relative(path: Path) -> str:
+    root = Path(__file__).resolve().parents[2] / "src" / "scare"
+    return path.resolve().relative_to(root).as_posix()
+
+
+def _drop_sanctioned(offenders: list[tuple[str, str, str]], allowed: dict) -> list[str]:
+    """Filter (relpath, token, rendered) offenders against the allowlist.
+
+    Occurrences beyond the sanctioned count are kept, so adding a new bypass to
+    a listed file still trips the guard.
+    """
+    seen: dict[tuple[str, str], int] = {}
+    kept: list[str] = []
+    for rel, token, rendered in offenders:
+        budget = allowed.get(rel, {}).get(token, 0)
+        n = seen.get((rel, token), 0) + 1
+        seen[(rel, token)] = n
+        if n > budget:
+            kept.append(rendered)
+    return kept
 
 
 def _strip_comments_and_strings(src: str) -> str:
@@ -132,7 +169,7 @@ def test_no_bare_create_task_in_scare_source():
     mango's scheduler.  Use ``self.context.schedule_instant_task(...)``
     instead.
     """
-    offenders: list[str] = []
+    found: list[tuple[str, str, str]] = []
     for path in _iter_scare_sources():
         text = _strip_comments_and_strings(path.read_text(encoding="utf-8"))
         for match in _FORBIDDEN.finditer(text):
@@ -143,7 +180,10 @@ def test_no_bare_create_task_in_scare_source():
                 )
                 + 1
             )
-            offenders.append(f"{path}:{line}: {match.group(0)}")
+            found.append(
+                (_relative(path), match.group(0), f"{path}:{line}: {match.group(0)}")
+            )
+    offenders = _drop_sanctioned(found, _SANCTIONED_BYPASS)
 
     assert not offenders, (
         "Found scheduler-bypassing calls in src/scare. Replace with "
@@ -157,12 +197,15 @@ def test_no_wallclock_time_in_scare_source():
     discrete-step simulation.  Use ``self.context.current_timestamp``
     or ``world.clock.time``.
     """
-    offenders: list[str] = []
+    found: list[tuple[str, str, str]] = []
     for path in _iter_scare_sources():
         text = _strip_comments_and_strings(path.read_text(encoding="utf-8"))
         for match in _TIME_FORBIDDEN.finditer(text):
             line_no = text.count("\n", 0, match.start()) + 1
-            offenders.append(f"{path}:{line_no}: {match.group(0)}")
+            found.append(
+                (_relative(path), match.group(0), f"{path}:{line_no}: {match.group(0)}")
+            )
+    offenders = _drop_sanctioned(found, _SANCTIONED_WALLCLOCK)
 
     assert not offenders, (
         "Found wall-clock time probes in src/scare. Use "

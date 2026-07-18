@@ -159,7 +159,7 @@ _ORACLE_HARD_GRIDS = frozenset({"simbench_lv_reconfig", "simbench_mvlv"})
 
 def oracle_solver_for_task(
     grid: str, scenario: dict[str, Any] | None = None
-) -> "_OracleGurobiSolver":
+) -> _OracleGurobiSolver:
     """Solver with per-grid termination params; extended budget for grids (or
     microgrid/islanding scenarios) whose MIQCQP cannot converge inside the
     default 300 s."""
@@ -474,9 +474,7 @@ def _build_min_shed_problem(
     # McCormick-DHS keeps on_off in linear terms so backup lines stay intact.
     # Safe in-place — the net is oracle-dedicated.
     apply_oracle_heat_linearisation(monee_net)
-    monee_net.apply_formulation(
-        GAS_NONCONVEX_MIQCQP_FORMULATION
-    )
+    monee_net.apply_formulation(GAS_NONCONVEX_MIQCQP_FORMULATION)
     # Enforce the operator slack budget on the LP itself via
     # ``create_min_load_shedding_problem``'s native ``ext_grid_*_bounds`` (no
     # Var.min/max mutation). The factory keeps the LP envelope at 10x budget for
@@ -619,9 +617,7 @@ def _restrict_ties_to_failed_sectors(monee_net: Any, failures: list[Any]) -> Non
             m.on_off = 0
 
 
-def _stamp_warm_start(
-    monee_net: Any, regulations: dict[str, float] | None
-) -> None:
+def _stamp_warm_start(monee_net: Any, regulations: dict[str, float] | None) -> None:
     """Pre-promote decision attributes to Vars whose initial value seeds
     Gurobi's MIP start (``inject_gurobi_vars_attr`` turns ``Var.value`` into
     ``Var.Start``; monee's promotion skips attrs that are already Vars).
@@ -632,6 +628,7 @@ def _stamp_warm_start(
     child regulation from the pre-failure incumbent and backup ties open.
     Bounds/integrality mirror the promotion, so the problem is unchanged.
     """
+
     def _is_gas_grid(g: Any) -> bool:
         grids = g if isinstance(g, list) else [g]
         return any(
@@ -1036,8 +1033,7 @@ def compute_baseline_served(
         # Raise (uncached) so the runner's baseline-failure path handles it;
         # a cached NaN baseline would poison every task sharing the key.
         raise RuntimeError(
-            f"baseline LP failed for grid {grid_name!r}: "
-            f"{out.get('failure_reason')}"
+            f"baseline LP failed for grid {grid_name!r}: {out.get('failure_reason')}"
         )
     served = out["served"]
     # Side-caches served + the incumbent's per-child regulation for the
@@ -1119,7 +1115,9 @@ def compose_oracle_result(
     if temporal_requested and interval_ok and simulation_duration_s:
         time_scale = float(scenario.get("physics_time_scale", 1.0))
         dt_h = float(physics_interval_s) * time_scale / 3600.0
-        n_steps = max(1, round(float(simulation_duration_s) / float(physics_interval_s)))
+        n_steps = max(
+            1, round(float(simulation_duration_s) / float(physics_interval_s))
+        )
         out = run_temporal_oracle(
             monee_net,
             failures,
@@ -1178,11 +1176,7 @@ def compose_oracle_result(
                 "oracle_solver_stats": solver_stats,
                 "oracle_solve_optimal": False,
                 "slack_budget_summary": {},
-                **(
-                    {"oracle_temporal": out["temporal"]}
-                    if "temporal" in out
-                    else {}
-                ),
+                **({"oracle_temporal": out["temporal"]} if "temporal" in out else {}),
             },
             "claims": _oracle_claims(failed_claim, failed_claim),
             "diary": {"invariant_holds": True},
@@ -1211,9 +1205,7 @@ def compose_oracle_result(
         # Per-node constraint readings off the oracle's solved net, so the
         # voltage/pressure comparison vs SCARE is non-vacuous (oracle tasks
         # previously emitted no constraints_final.csv).
-        write_constraints_final_csv(
-            Path(out_dir) / "constraints_final.csv", solved_net
-        )
+        write_constraints_final_csv(Path(out_dir) / "constraints_final.csv", solved_net)
 
     # Oracle-relative heat-priority diagnostic (non-gating). Computed in-memory
     # off ``load_rows`` so the oracle carries the same claim key the MAS variants

@@ -13,6 +13,7 @@ from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink
 from monee.model.extension import GridFormingGenerator, GridFormingSource
 
 from scare.base.addressing import is_child_aid
+from scare.base.config import cfg_value
 from scare.base.model import Sector
 from scare.base.runtime.diagnostics import record_event, record_regulate
 from scare.base.util.constraints import constraint_allowed_fraction
@@ -224,9 +225,7 @@ def publish_line_congestion_price(
         store[key] = (float(price), float(now))
 
 
-def line_congestion_ceiling(
-    behavior: Any, aid: str, now: float, ttl: float
-) -> float:
+def line_congestion_ceiling(behavior: Any, aid: str, now: float, ttl: float) -> float:
     """Generation ceiling (max regulation factor) for *aid* = ``1 - Σ fresh
     branch prices``, clamped to ``[0, 1]``. Returns 1.0 (no cap) when no fresh
     price is published."""
@@ -608,9 +607,7 @@ def apply_regulate(
             else:
                 _lock[str(aid)] = factor
         elif reason in L2_ALLOCATION_REASONS and str(aid) in _lock:
-            _current = _last_regulate_store(behavior).get(
-                str(aid), _lock[str(aid)]
-            )
+            _current = _last_regulate_store(behavior).get(str(aid), _lock[str(aid)])
             if factor > float(_current) + tolerance:
                 # A restore: recovery of a temperature shed belongs to the
                 # frontier (restores when the region is warm) — L2 must not
@@ -633,8 +630,8 @@ def apply_regulate(
     # While the line-relief auction holds a load down for an overloaded line,
     # L2 must DEFER else it re-serves the just-shed load and the line never
     # clears. Freshness-lifted. Gated on the downstream-relief flag.
-    if _sector_e is Sector.ELECTRICITY and getattr(
-        _cfg, "enable_branch_downstream_relief", False
+    if _sector_e is Sector.ELECTRICITY and cfg_value(
+        _cfg, "enable_branch_downstream_relief"
     ):
         _lline = _line_curtail_lock_store(behavior)
         if reason == CURTAIL_AUCTION_REASON:
@@ -689,8 +686,8 @@ def apply_regulate(
     # node violation (PV over-voltage), the local-gen RESTORE paths must DEFER
     # rather than ramp straight back to 1.0, else the auction/restore pair
     # limit-cycles and over-voltage never clears. Freshness-lifted.
-    if _sector_e is Sector.ELECTRICITY and getattr(
-        _cfg, "enable_curtail_ramp_interlock", False
+    if _sector_e is Sector.ELECTRICITY and cfg_value(
+        _cfg, "enable_curtail_ramp_interlock"
     ):
         _lgen = _gen_curtail_lock_store(behavior)
         if reason == CURTAIL_AUCTION_REASON:
@@ -742,7 +739,7 @@ def apply_regulate(
     # undo it. Record the floor on L2 writes; clamp L1 reactive sheds UP to it.
     # tier-1-immune ``constraint_allowed_fraction`` re-asserts the tier-1
     # hard-lock. Generators (tier <= 0) excluded.
-    if getattr(_cfg, "enable_l2_priority_floor", False):
+    if cfg_value(_cfg, "enable_l2_priority_floor"):
         if reason in L2_ALLOCATION_REASONS:
             # Cap the holon allocation by the constraint-allowed fraction: the
             # MW-based ADMM is blind to per-node physics and would otherwise

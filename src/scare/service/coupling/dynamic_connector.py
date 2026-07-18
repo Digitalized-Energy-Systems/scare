@@ -118,8 +118,7 @@ class DynamicConnectorRole(Role):
             ),
         )
         logger.info(
-            "[%s] CP connector reassess: dropped %d, readmitted %d "
-            "(total_dropped=%d)",
+            "[%s] CP connector reassess: dropped %d, readmitted %d (total_dropped=%d)",
             self.context.aid,
             len(newly_unreachable),
             len(readmitted),

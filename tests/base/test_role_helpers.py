@@ -32,7 +32,11 @@ def test_first_role_tolerates_missing_roles_attr():
 
 
 def test_role_index_maps_aid_to_first_role_in_order():
-    a1, a2, a3 = _agent("a1", RoleA()), _agent("a2", RoleB()), _agent("a3", RoleA(), RoleB())
+    a1, a2, a3 = (
+        _agent("a1", RoleA()),
+        _agent("a2", RoleB()),
+        _agent("a3", RoleA(), RoleB()),
+    )
     idx = role_index([a1, a2, a3], RoleA)
     assert list(idx) == ["a1", "a3"]  # a2 has no RoleA; insertion order preserved
     assert all(isinstance(r, RoleA) for r in idx.values())

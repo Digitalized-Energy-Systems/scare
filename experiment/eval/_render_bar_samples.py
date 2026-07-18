@@ -267,38 +267,158 @@ for i in range(24):
 trajectories = pd.DataFrame(traj)
 
 jobs = [
-    ("variant_comparison", lambda: plots.variant_comparison_bar(df, OUT / "variant_comparison")),
+    (
+        "variant_comparison",
+        lambda: plots.variant_comparison_bar(df, OUT / "variant_comparison"),
+    ),
     ("ablation_impact", lambda: plots.ablation_impact_bar(df, OUT / "ablation_impact")),
     ("served_by_tier", lambda: plots.served_by_tier(served, OUT / "served_by_tier")),
     ("claims_pass_rate", lambda: plots.claims_pass_rate(df, OUT / "claims_pass_rate")),
-    ("restoration_vs_baseline", lambda: plots.restoration_vs_baseline_bar(df, OUT / "restoration_vs_baseline")),
-    ("restoration_by_tier", lambda: plots.restoration_by_tier_bar(df, OUT / "restoration_by_tier")),
-    ("restoration_loss_split_by_tier", lambda: plots.restoration_loss_split_by_tier_bar(df, OUT / "restoration_loss_split_by_tier")),
-    ("agent_only_ratio_by_tier", lambda: plots.agent_only_ratio_by_tier_bar(df, OUT / "agent_only_ratio_by_tier")),
-    ("restoration_ratio_by_variant", lambda: plots.restoration_ratio_by_variant_bar(df, OUT / "restoration_ratio_by_variant")),
-    ("absolute_load_lost", lambda: plots.absolute_load_lost_bar(df, OUT / "absolute_load_lost")),
+    (
+        "restoration_vs_baseline",
+        lambda: plots.restoration_vs_baseline_bar(df, OUT / "restoration_vs_baseline"),
+    ),
+    (
+        "restoration_by_tier",
+        lambda: plots.restoration_by_tier_bar(df, OUT / "restoration_by_tier"),
+    ),
+    (
+        "restoration_loss_split_by_tier",
+        lambda: plots.restoration_loss_split_by_tier_bar(
+            df, OUT / "restoration_loss_split_by_tier"
+        ),
+    ),
+    (
+        "agent_only_ratio_by_tier",
+        lambda: plots.agent_only_ratio_by_tier_bar(
+            df, OUT / "agent_only_ratio_by_tier"
+        ),
+    ),
+    (
+        "restoration_ratio_by_variant",
+        lambda: plots.restoration_ratio_by_variant_bar(
+            df, OUT / "restoration_ratio_by_variant"
+        ),
+    ),
+    (
+        "absolute_load_lost",
+        lambda: plots.absolute_load_lost_bar(df, OUT / "absolute_load_lost"),
+    ),
     ("diary_outcomes", lambda: plots.diary_outcomes_bar(df, OUT / "diary_outcomes")),
     ("solver_health", lambda: plots.solver_health_bar(df, OUT / "solver_health")),
-    ("regulates_by_reason", lambda: plots.regulates_by_reason_bar(df, OUT / "regulates_by_reason")),
-    ("restoration_by_sector", lambda: plots.restoration_by_sector_bar(df, OUT / "restoration_by_sector")),
-    ("constraint_violation_integral", lambda: plots.constraint_violation_integral_bar(df, OUT / "constraint_violation_integral")),
-    ("constraint_violations_by_variable", lambda: plots.constraint_violations_by_variable_bar(df, OUT / "constraint_violations_by_variable")),
+    (
+        "regulates_by_reason",
+        lambda: plots.regulates_by_reason_bar(df, OUT / "regulates_by_reason"),
+    ),
+    (
+        "restoration_by_sector",
+        lambda: plots.restoration_by_sector_bar(df, OUT / "restoration_by_sector"),
+    ),
+    (
+        "constraint_violation_integral",
+        lambda: plots.constraint_violation_integral_bar(
+            df, OUT / "constraint_violation_integral"
+        ),
+    ),
+    (
+        "constraint_violations_by_variable",
+        lambda: plots.constraint_violations_by_variable_bar(
+            df, OUT / "constraint_violations_by_variable"
+        ),
+    ),
     # --- non-bar plot types ---
-    ("optimality_gap_scatter", lambda: plots.optimality_gap_scatter(df, OUT / "optimality_gap_scatter")),
-    ("optimality_gap_box", lambda: plots.optimality_gap_box(df, OUT / "optimality_gap_box")),
-    ("robustness_curve", lambda: plots.robustness_curve(df, OUT / "robustness_curve", sweep_param="slack_budget", x_label="slack budget (p.u.)", title="Robustness vs slack budget")),
+    (
+        "optimality_gap_scatter",
+        lambda: plots.optimality_gap_scatter(df, OUT / "optimality_gap_scatter"),
+    ),
+    (
+        "optimality_gap_box",
+        lambda: plots.optimality_gap_box(df, OUT / "optimality_gap_box"),
+    ),
+    (
+        "robustness_curve",
+        lambda: plots.robustness_curve(
+            df,
+            OUT / "robustness_curve",
+            sweep_param="slack_budget",
+            x_label="slack budget (p.u.)",
+            title="Robustness vs slack budget",
+        ),
+    ),
     ("cascading_curve", lambda: plots.cascading_curve(df, OUT / "cascading_curve")),
-    ("sweep_curve_dual", lambda: plots.sweep_curve_dual(df, OUT / "sweep_curve_dual", sweep_param="slack_budget", x_label="slack budget (p.u.)", title="Served + wallclock vs slack budget")),
-    ("time_to_stabilise_box", lambda: plots.time_to_stabilise_box(df, OUT / "time_to_stabilise_box")),
-    ("restoration_trajectory", lambda: plots.restoration_trajectory(timeseries, events, OUT / "restoration_trajectory", failure_t=FAIL_T)),
-    ("system_balance_trajectory", lambda: plots.system_balance_trajectory(timeseries, events, OUT / "system_balance_trajectory", failure_t=FAIL_T)),
-    ("constraint_envelope_trajectory", lambda: plots.constraint_envelope_trajectory(timeseries, events, OUT / "constraint_envelope_trajectory", failure_t=FAIL_T, solver_failures=0)),
-    ("slack_trajectory", lambda: plots.slack_trajectory(timeseries, OUT / "slack_trajectory", failure_t=FAIL_T, slack_meta=slack_meta)),
-    ("gas_slack_pressure_trajectory", lambda: plots.gas_slack_pressure_trajectory(timeseries, OUT / "gas_slack_pressure_trajectory", failure_t=FAIL_T)),
-    ("coalition_balance_lines", lambda: plots.coalition_balance_lines(timeseries, OUT / "coalition_balance_lines")),
-    ("holon_balance_lines", lambda: plots.holon_balance_lines(timeseries, OUT / "holon_balance_lines")),
-    ("regulation_per_child_lines", lambda: plots.regulation_per_child_lines(trajectories, OUT / "regulation_per_child_lines")),
-    ("system_state_overview", lambda: plots.system_state_overview(timeseries, events, OUT / "system_state_overview", failure_t=FAIL_T)),
+    (
+        "sweep_curve_dual",
+        lambda: plots.sweep_curve_dual(
+            df,
+            OUT / "sweep_curve_dual",
+            sweep_param="slack_budget",
+            x_label="slack budget (p.u.)",
+            title="Served + wallclock vs slack budget",
+        ),
+    ),
+    (
+        "time_to_stabilise_box",
+        lambda: plots.time_to_stabilise_box(df, OUT / "time_to_stabilise_box"),
+    ),
+    (
+        "restoration_trajectory",
+        lambda: plots.restoration_trajectory(
+            timeseries, events, OUT / "restoration_trajectory", failure_t=FAIL_T
+        ),
+    ),
+    (
+        "system_balance_trajectory",
+        lambda: plots.system_balance_trajectory(
+            timeseries, events, OUT / "system_balance_trajectory", failure_t=FAIL_T
+        ),
+    ),
+    (
+        "constraint_envelope_trajectory",
+        lambda: plots.constraint_envelope_trajectory(
+            timeseries,
+            events,
+            OUT / "constraint_envelope_trajectory",
+            failure_t=FAIL_T,
+            solver_failures=0,
+        ),
+    ),
+    (
+        "slack_trajectory",
+        lambda: plots.slack_trajectory(
+            timeseries,
+            OUT / "slack_trajectory",
+            failure_t=FAIL_T,
+            slack_meta=slack_meta,
+        ),
+    ),
+    (
+        "gas_slack_pressure_trajectory",
+        lambda: plots.gas_slack_pressure_trajectory(
+            timeseries, OUT / "gas_slack_pressure_trajectory", failure_t=FAIL_T
+        ),
+    ),
+    (
+        "coalition_balance_lines",
+        lambda: plots.coalition_balance_lines(
+            timeseries, OUT / "coalition_balance_lines"
+        ),
+    ),
+    (
+        "holon_balance_lines",
+        lambda: plots.holon_balance_lines(timeseries, OUT / "holon_balance_lines"),
+    ),
+    (
+        "regulation_per_child_lines",
+        lambda: plots.regulation_per_child_lines(
+            trajectories, OUT / "regulation_per_child_lines"
+        ),
+    ),
+    (
+        "system_state_overview",
+        lambda: plots.system_state_overview(
+            timeseries, events, OUT / "system_state_overview", failure_t=FAIL_T
+        ),
+    ),
 ]
 
 for name, fn in jobs:

@@ -8,9 +8,9 @@ real monee grid with an injected breach.
 
 from __future__ import annotations
 
-import pytest
-
 import math
+
+import pytest
 
 from experiment.eval.metrics import (
     _bound_overshoot,
@@ -143,9 +143,7 @@ class TestScanOnRealGrid:
         node.model.pressure_pu = 0.0
 
         rows = constraint_rows(net)
-        assert all(
-            r["id"] != node.id or r["variable"] != "pressure_pu" for r in rows
-        )
+        assert all(r["id"] != node.id or r["variable"] != "pressure_pu" for r in rows)
 
     def test_genuine_under_pressure_still_gates(self):
         # A junction that is pressurised but below the 0.85 floor is a real

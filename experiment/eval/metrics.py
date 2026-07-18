@@ -78,9 +78,7 @@ def _disconnected_node_ids(monee_net: Any) -> set[int]:
     """
     try:
         return set(
-            find_ignored_nodes(
-                monee_net, getattr(monee_net, "islanding_config", None)
-            )
+            find_ignored_nodes(monee_net, getattr(monee_net, "islanding_config", None))
         )
     except Exception:
         return set()
@@ -276,7 +274,9 @@ def _is_gas_consumer_sink(child: Any, monee_net: Any) -> bool:
     if not isinstance(child.model, Sink):
         return False
     try:
-        grid_name = str(getattr(monee_net.node_by_id(child.node_id).grid, "name", "")).lower()
+        grid_name = str(
+            getattr(monee_net.node_by_id(child.node_id).grid, "name", "")
+        ).lower()
     except Exception:  # noqa: BLE001
         return False
     return "gas" in grid_name
@@ -971,13 +971,21 @@ def _cp_output(model: Any, gas_hhv: float) -> tuple[float, float, float]:
         return (0.0, heat, 0.0)
     if isinstance(model, PowerToHeatControlNode):
         # el_mw here is the electricity CONSUMPTION setpoint; only heat is output.
-        return (0.0, _cp_param(model, "efficiency") * abs(_cp_param(model, "el_mw")) * reg, 0.0)
+        return (
+            0.0,
+            _cp_param(model, "efficiency") * abs(_cp_param(model, "el_mw")) * reg,
+            0.0,
+        )
     if isinstance(model, (PowerToHeatHG, GasToHeatHG)):
         return (0.0, abs(_cp_param(model, "heat_energy_mw")) * reg, 0.0)
     if isinstance(model, GasToPower):
         return (abs(_cp_param(model, "el_mw")) * reg, 0.0, 0.0)
     if isinstance(model, PowerToGas):
-        return (0.0, 0.0, abs(_cp_param(model, "gas_mass_flow_kgs")) * k * gas_hhv * reg)
+        return (
+            0.0,
+            0.0,
+            abs(_cp_param(model, "gas_mass_flow_kgs")) * k * gas_hhv * reg,
+        )
     return (0.0, 0.0, 0.0)
 
 

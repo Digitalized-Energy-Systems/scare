@@ -264,10 +264,14 @@ def test_cp_actuator_returns_none_without_applicable_sector(monkeypatch):
 
     calls: list = []
     monkeypatch.setattr(cp_mod, "apply_regulate", lambda *a, **k: calls.append(a))
-    assert cp_mod.CpActuator(_FakeBehavior({})).apply("cp1", [1.0, 2.0, 3.0], 0.0) is None
+    assert (
+        cp_mod.CpActuator(_FakeBehavior({})).apply("cp1", [1.0, 2.0, 3.0], 0.0) is None
+    )
     # zero cap -> that sector is skipped too.
     assert (
-        cp_mod.CpActuator(_FakeBehavior({"el_mw": 0.0})).apply("cp1", [1.0, 0.0, 0.0], 0.0)
+        cp_mod.CpActuator(_FakeBehavior({"el_mw": 0.0})).apply(
+            "cp1", [1.0, 0.0, 0.0], 0.0
+        )
         is None
     )
     assert calls == []
@@ -280,7 +284,9 @@ def test_cp_actuator_does_not_touch_cp_version(monkeypatch):
 
     monkeypatch.setattr(cp_mod, "apply_regulate", lambda *a, **k: None)
     role = cp_mod.EnergyConverterRole(
-        _FakeBehavior({"el_mw": 10.0}), flex_actor=object(), sectors=[Sector.ELECTRICITY]
+        _FakeBehavior({"el_mw": 10.0}),
+        flex_actor=object(),
+        sectors=[Sector.ELECTRICITY],
     )
     assert role._cp_version.current == 0
     role._actuator.apply("cp1", [5.0, 0.0, 0.0], timestamp=1.0)
