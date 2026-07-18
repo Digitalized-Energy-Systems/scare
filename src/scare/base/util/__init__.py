@@ -12,11 +12,14 @@ from monee.model.extension import GridFormingGenerator, GridFormingSource
 from scare.base.addressing import branch_aid, is_child_aid
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.runtime.diagnostics import record_event, record_regulate
-
-# Natural gas HHV. MW/(kg/s) factor is 3.6*HHV, not HHV itself.
-# Must match the fluid of the simulated grids: all benchmark nets are built
-# with gas_type="lgas" (monee model/grid.py), not hgas (15.3).
-HHV: float = 11.79011  # kWh/kg (lgas)
+from scare.base.util.units import (
+    HHV,
+    efficiency_vector,
+    kgps_to_mw,
+    mw_to_kgps,
+    sector_color,
+    sector_from_grid,
+)
 
 _CAPACITY_KEYS = (
     "p_mw",
@@ -29,14 +32,6 @@ _CAPACITY_KEYS = (
     "p_mw_capacity",
     "mass_flow_capacity_kgs",
 )
-
-
-def mw_to_kgps(value: float) -> float:
-    return value / (3.6 * HHV)
-
-
-def kgps_to_mw(value: float) -> float:
-    return value * 3.6 * HHV
 
 
 def obs_capacity(
@@ -104,24 +99,6 @@ def obs_min_max(
         return (cap - sp, -sp)
     else:
         return (-sp, cap - sp)
-
-
-def sector_from_grid(grid: Any) -> Sector | None:
-    """Resolve a Sector from a monee grid object via its .name attribute.
-
-    Returns None for multi-grid nodes (e.g. CHPControlNode) which straddle
-    sectors and must be resolved by context.
-    """
-    if grid is None or isinstance(grid, (list, tuple)):
-        return None
-    name = str(getattr(grid, "name", "")).lower()
-    if "power" in name:
-        return Sector.ELECTRICITY
-    if "gas" in name:
-        return Sector.GAS
-    if "water" in name or "heat" in name:
-        return Sector.HEAT
-    return None
 
 
 def _get_behavior_store(behavior: Any, attr: str, factory=dict) -> Any:
@@ -1219,16 +1196,6 @@ def get_by_branch_id(centrality: dict, branch_id: tuple) -> float:
         return centrality[branch_id]
     rev = (branch_id[1], branch_id[0]) + branch_id[2:]
     return centrality.get(rev, 0.0)
-
-
-def efficiency_vector(eta_el: float, eta_heat: float, eta_gas: float) -> np.ndarray:
-    return np.array([eta_el, eta_heat, eta_gas], dtype=float)
-
-
-def sector_color(sector: Sector) -> str:
-    return {Sector.GAS: "green", Sector.HEAT: "red", Sector.ELECTRICITY: "orange"}[
-        sector
-    ]
 
 
 # ---------------------------------------------------------------------------
