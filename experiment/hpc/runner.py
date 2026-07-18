@@ -16,7 +16,6 @@ import asyncio
 import gc
 import json
 import logging
-import math
 import os
 import platform
 import random
@@ -31,8 +30,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
-from mango.simulation.world import WorldRecording
 
 from experiment.eval.claims import evaluate_task
 from experiment.eval.oracle import (
@@ -60,7 +57,20 @@ from experiment.hpc.config import (
     TaskSpec,
     task_dir,
 )
+from experiment.hpc.output import (
+    _dump_diagnostics,
+    _exact_gas_solved_net,
+    _extract_metrics,
+    _failing_fatal_claims,
+    _json_sanitize,
+    _scrub_stale_artifacts,
+    _write_timeseries,
+)
 from experiment.hpc.plan import read_manifest
+from experiment.hpc.runner_logging import (
+    _SOLVER_FAILURE_LOGGERS,
+    _setup_logging,
+)
 from experiment.scenarios import (
     GRIDS,
     apply_cold_day,
@@ -73,14 +83,12 @@ from experiment.scenarios import (
 )
 from scare.base.config import RestorationConfiguration
 from scare.base.model import set_sector_timescale
-from scare.base.runtime import diagnostics
 from scare.base.runtime import diagnostics as _diag
 from scare.base.runtime.infeasibility_capture import (
     arm_infeasibility_capture,
     disarm_infeasibility_capture,
 )
 from scare.base.runtime.solver_guard import install_solver_time_limit
-from scare.base.runtime.trace import SimTimeLogFilter
 from scare.scenario.failure_sampling import create_failures
 from scare.scenario.restoration import (
     _flush_pending_negotiations,
@@ -92,121 +100,12 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_TIMEOUT = 2
 
-LOG_FORMAT = "%(asctime)s t=%(sim_t)8.3f %(levelname)s [%(name)s] %(message)s"
 
 
-class _SolverFailureCounter(logging.Filter):
-    """Count solver-status escalations for per-task health.
-
-    An infeasible solve fires as a monee-ERROR + pyomo-WARNING pair, deduped
-    within ``_DEDUPE_WINDOW_S``; Gurobi/Pyomo env strings are also caught to
-    separate env issues from algorithm bugs.
-    """
-
-    _SOLVER_ERROR_MARKERS: tuple[str, ...] = (
-        "GurobiError",
-        "HostID mismatch",
-        "License",  # Gurobi LicenseError
-    )
-    _DEDUPE_WINDOW_S: float = 1.0  # min spacing between distinct solves
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.count = 0
-        self.infeasible_count = 0
-        self.warning_count = 0
-        self._last_infeasible_t: float = float("-inf")
-
-    def _is_infeasible_msg(self, msg: str) -> bool:
-        # monee.solver.pyo ERROR path.
-        if "infeasible (status=" in msg or "Pyomo solve infeasible" in msg:
-            return True
-        # pyomo.core load_solutions WARNING path (both substrings, one record).
-        if (
-            "Loading a SolverResults object" in msg
-            and "termination condition: infeasible" in msg
-        ):
-            return True
-        # monee.solver.gurobipy (islanding backend) + monee.simulation.stepper
-        # skip-mode absorption — without these, stepper-path failures leave
-        # solver_failures at 0.
-        if "Gurobi solve failed without a usable solution" in msg:
-            return True
-        if "Stepper step" in msg and "failed" in msg:
-            return True
-        return False
-
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
-        if record.levelno < logging.WARNING:
-            return True
-        msg = record.getMessage()
-        if self._is_infeasible_msg(msg):
-            if record.created - self._last_infeasible_t >= self._DEDUPE_WINDOW_S:
-                self.infeasible_count += 1
-                self.count += 1
-            self._last_infeasible_t = record.created
-        elif "returned non-ok status" in msg:
-            self.warning_count += 1
-            self.count += 1
-        elif any(marker in msg for marker in self._SOLVER_ERROR_MARKERS):
-            # Gurobi env/license/host-id errors: still solver failures.
-            self.warning_count += 1
-            self.count += 1
-        return True
 
 
-# Solver-failure emitters the per-task counter attaches to; detached in run_task's
-# finally since run_local reuses worker processes across tasks.
-_SOLVER_FAILURE_LOGGERS: tuple[str, ...] = (
-    "monee.solver.pyo",
-    "pyomo.core",
-    "monee.solver.gurobipy",
-    "monee.simulation.stepper",
-)
 
 
-def _setup_logging(log_path: Path) -> tuple[logging.FileHandler, _SolverFailureCounter]:
-    # Stamp every record with the current sim time (record.sim_t) so the
-    # LOG_FORMAT's t=... field is always populated, including third-party logs.
-    sim_time_filter = SimTimeLogFilter()
-
-    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    handler.addFilter(sim_time_filter)
-
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    # Drop pre-existing handlers to avoid double-logging (e.g. earlier basicConfig).
-    for h in list(root.handlers):
-        root.removeHandler(h)
-    root.addHandler(handler)
-
-    # Keep WARN+ on stderr so Slurm captures show-stoppers per array task.
-    stderr = logging.StreamHandler(sys.stderr)
-    stderr.setLevel(logging.WARNING)
-    stderr.setFormatter(logging.Formatter(LOG_FORMAT))
-    stderr.addFilter(sim_time_filter)
-    root.addHandler(stderr)
-
-    # Suppress third-party DEBUG/INFO chatter (mango alone emits ~60k lines
-    # per 30s sim). At package root so new submodules stay quiet; WARN+ surfaces.
-    for noisy in (
-        "pyomo",
-        "gurobipy",
-        "mango",
-        "mango_energy_environments",
-        "simbench",
-    ):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    counter = _SolverFailureCounter()
-    # Listen on every infeasibility emitter; the counter dedupes pairs (an
-    # absorbed stepper failure fires as gurobipy/pyo ERROR + stepper WARNING
-    # within the dedupe window).
-    for logger_name in _SOLVER_FAILURE_LOGGERS:
-        logging.getLogger(logger_name).addFilter(counter)
-    return handler, counter
 
 
 def _seed_everything(seed: int) -> None:
@@ -277,50 +176,10 @@ def _serialize_failures(failures: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _extract_metrics(world: Any) -> dict[str, Any]:
-    metrics: dict[str, Any] = {}
-    for name, rec in getattr(world, "data_collections", {}).items():
-        if not isinstance(rec, WorldRecording):
-            continue
-        ts = list(rec.timeseries)
-        t = list(rec.time)
-        if not ts:
-            continue
-        arr = np.asarray(ts, dtype=float)
-        metrics[f"{name}__last"] = float(arr[-1])
-        metrics[f"{name}__min"] = float(arr.min())
-        metrics[f"{name}__max"] = float(arr.max())
-        metrics[f"{name}__mean"] = float(arr.mean())
-        metrics[f"{name}__n_samples"] = int(arr.size)
-        if len(t) >= 2:
-            metrics[f"{name}__integral"] = float(
-                np.trapz(arr, np.asarray(t, dtype=float))
-            )
-
-    metrics["messages_total"] = len(getattr(world, "recorded_messages", []) or [])
-    clock = getattr(world, "clock", None)
-    metrics["sim_time_final"] = float(getattr(clock, "time", 0.0))
-    return metrics
 
 
-def _write_timeseries(world: Any, path: Path) -> None:
-    series_map: dict[str, pd.Series] = {}
-    for name, rec in getattr(world, "data_collections", {}).items():
-        if not isinstance(rec, WorldRecording):
-            continue
-        if not rec.timeseries:
-            continue
-        series_map[name] = pd.Series(
-            rec.timeseries, index=pd.Index(rec.time, name="time_s")
-        )
-    if not series_map:
-        return
-    df = pd.concat(series_map, axis=1).sort_index()
-    df.to_csv(path)
 
 
-def _dump_diagnostics(path: Path) -> None:
-    path.write_text(diagnostics.dump_recent() + "\n", encoding="utf-8")
 
 
 async def _run_simulation(
@@ -712,16 +571,6 @@ def _compute_baseline(task: TaskSpec, logger: logging.Logger) -> dict[str, Any] 
         return None
 
 
-def _json_sanitize(obj: Any) -> Any:
-    """NaN/inf floats -> None so result.json is standard JSON (json.dumps
-    otherwise emits bare ``NaN`` tokens strict parsers reject)."""
-    if isinstance(obj, float) and not math.isfinite(obj):
-        return None
-    if isinstance(obj, dict):
-        return {k: _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_sanitize(v) for v in obj]
-    return obj
 
 
 def _write_oracle_outputs(
@@ -750,37 +599,6 @@ def _write_oracle_outputs(
     return oracle_metrics
 
 
-def _exact_gas_solved_net(net: Any, logger: logging.Logger) -> Any:
-    """Re-solve the final network state with exact (nonconvex MIQCQP) gas Weymouth.
-
-    The relaxed Weymouth the live sim uses leaves gas pressure underdetermined
-    at zero-flow (load-shed) junctions: the epigraph ``m² ≤ m_sq`` lets the
-    solver inflate ``m_sq`` and park ``pressure_squared_pu`` at its box maximum,
-    reporting a spurious ``pressure_pu = √3``. The exact formulation (the same
-    ``GAS_NONCONVEX_MIQCQP`` the oracle uses) pins gas pressure so the constraint
-    check reads physical values. Returns the solved result network, or the
-    original ``net`` if the exact solve is unavailable/fails.
-    """
-    try:
-        from monee import run_energy_flow
-        from monee.model.formulation import GAS_NONCONVEX_MIQCQP_FORMULATION
-
-        net.apply_formulation(GAS_NONCONVEX_MIQCQP_FORMULATION)
-        res = run_energy_flow(net, solver="gurobi", exclude_unconnected_nodes=True)
-        result_net = getattr(res, "network", None)
-        if getattr(res, "success", False) and result_net is not None:
-            return result_net
-        logger.warning(
-            "Exact-gas constraint re-solve did not succeed; "
-            "keeping relaxed-Weymouth gas pressures."
-        )
-    except Exception:  # noqa: BLE001 — never let the constraint re-solve abort output
-        logger.warning(
-            "Exact-gas constraint re-solve failed; keeping relaxed-Weymouth "
-            "gas pressures.",
-            exc_info=True,
-        )
-    return net
 
 
 def _write_simulation_outputs(
@@ -882,52 +700,13 @@ def _write_simulation_outputs(
     return claims
 
 
-def _failing_fatal_claims(
-    claims: dict[str, Any] | None, plan: RuntimePlan
-) -> list[str]:
-    """Failed fatal claims — these escalate ``ok`` to ``claims_failed``. The
-    fatal set is overridable per-campaign via ``plan.fatal_claims``.
-    """
-    if not claims:
-        return []
-    fatal_claims = tuple(
-        getattr(plan, "fatal_claims", ("priority_invariant", "monotonic_progress"))
-    )
-    return [
-        name
-        for name in fatal_claims
-        if name in claims and not claims[name].get("passed", True)
-    ]
 
 
 # Artifacts run_task / the oracle / the metrics writers scrub at task start so a
 # re-run that fails early can't leave stale outputs for the aggregator to join.
 # NOTE: incomplete — network_changes.csv (written above) is produced but not listed here.
-_TASK_ARTIFACTS = (
-    "status.json",
-    "exception.json",
-    "result.json",
-    "failures.json",
-    "diagnostics.txt",
-    "infeasibility_snapshot.json",
-    "slack_meta.json",
-    "served.csv",
-    "served_by_load.csv",
-    "constraints_final.csv",
-    "diary.csv",
-    "events.csv",
-    "messages.csv",
-    "timeseries.csv",
-    "trajectories.csv",
-)
 
 
-def _scrub_stale_artifacts(out_dir: Path) -> None:
-    for name in _TASK_ARTIFACTS:
-        try:
-            (out_dir / name).unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
