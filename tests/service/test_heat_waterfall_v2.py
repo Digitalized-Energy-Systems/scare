@@ -194,7 +194,7 @@ async def test_waterfall_multi_target_requests_up_to_cap():
         agent.add_role(m)
 
     async with world:
-        m0._sensitivity = 660.0
+        m0._sens._value = 660.0
         # needed = 0.15 * 0.2 = 0.03 MW; each peer covers 0.5 * 0.01 = 0.005.
         for m in peers:
             _seed_peer(m0, m, tier=4, reducible=0.01)
@@ -224,7 +224,7 @@ async def test_waterfall_escalates_while_self_shedding():
         agent.add_role(m)
 
     async with world:
-        m0._sensitivity = 660.0
+        m0._sens._value = 660.0
         # needed = 0.03 MW; peer holds only 0.002 -> insufficient to defer,
         # but above the 1e-3 targeting floor.
         _seed_peer(m0, m1, tier=4, reducible=0.002)
@@ -254,7 +254,7 @@ async def test_fully_shed_cold_load_still_requests_peers():
         agent.add_role(m)
 
     async with world:
-        m0._sensitivity = 660.0
+        m0._sens._value = 660.0
         _seed_peer(m0, m1, tier=4, reducible=0.05)
         await m0._heat_frontier_control()
         await step_simulation(world, step_size_s=1.0)

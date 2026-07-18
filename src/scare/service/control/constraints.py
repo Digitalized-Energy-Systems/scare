@@ -180,6 +180,46 @@ _LINE_CONGESTION_TTL_S: float = 3.0
 _HEAT_FRONTIER_PERIOD_S: float = 1.0
 
 
+class SensitivityEstimator:
+    """EMA of |dV/dP| for the sector's primary constraint variable, seeded with a
+    sector-typical prior. Behavior/aid for the obs lookups are passed per update."""
+
+    def __init__(self, sector: Sector) -> None:
+        self._sector = sector
+        self._value: float = _SENSITIVITY_DEFAULT.get(sector, 1e-3)
+        self._last_p: float | None = None
+        self._last_v: float | None = None
+
+    @property
+    def value(self) -> float:
+        return self._value
+
+    def update(self, obs: dict, behavior: Any, aid: str) -> None:
+        var = _SECTOR_PRIMARY_VAR.get(self._sector)
+        if var is None or var not in obs:
+            return
+        v = float(obs[var])
+        if not math.isfinite(v):
+            return
+        cap = obs_capacity(obs, behavior=behavior, aid=aid)
+        sp = obs_setpoint(obs, behavior=behavior, aid=aid)
+        # Signed injection (sp negative for generators, cap < 0).
+        p = sp if cap != 0.0 else 0.0
+        if self._last_p is not None and self._last_v is not None:
+            dp = p - self._last_p
+            dv = v - self._last_v
+            min_dp = _SENSITIVITY_MIN_DP.get(self._sector, 1e-6)
+            if abs(dp) >= min_dp and math.isfinite(dv):
+                sample = abs(dv / dp)
+                # Clamp absurd jumps (post-failure snapshots) before the EMA.
+                sample = min(sample, 10.0 * self._value + 1.0)
+                self._value = (
+                    1.0 - _SENSITIVITY_EMA_ALPHA
+                ) * self._value + _SENSITIVITY_EMA_ALPHA * sample
+        self._last_p = p
+        self._last_v = v
+
+
 class GridConstraintMonitor(Role):
     """Checks local grid measurements against sector bounds and takes action:
     warnings, violations + ``BalanceProblem`` on breach, and multi-hop
@@ -292,9 +332,7 @@ class GridConstraintMonitor(Role):
 
         # Local power-flow sensitivity: EMA of |dV/dP| from own (P, V) history,
         # letting the auction bid agents near the violation more aggressively.
-        self._sensitivity: float = _SENSITIVITY_DEFAULT.get(sector, 1e-3)
-        self._last_p: float | None = None
-        self._last_v: float | None = None
+        self._sens = SensitivityEstimator(sector)
 
         # Auctioneer-side state: auction_id -> {"bids", "total", ...}.
         self._open_auctions: dict[str, dict[str, Any]] = {}
@@ -596,7 +634,7 @@ class GridConstraintMonitor(Role):
                     self.behavior, self.context.aid, _vm, self.context.current_timestamp
                 )
 
-        self._update_sensitivity(obs)
+        self._sens.update(obs, self.behavior, self.context.aid)
 
         for var, val in values.items():
             # Skip de-energised / non-finite readings (see is_energised_reading):
@@ -1159,7 +1197,7 @@ class GridConstraintMonitor(Role):
             priority_tier=prio_tier,
             capacity=cap,
             reducible=reducible,
-            sensitivity=self._sensitivity,
+            sensitivity=self._sens.value,
             sensitivity_ref=_SENSITIVITY_DEFAULT.get(self.sector, 1e-3),
             priority_tiers=_PRIORITY_TIERS,
             sens_mult_min=_SENS_MULT_MIN,
@@ -1599,7 +1637,7 @@ class GridConstraintMonitor(Role):
             lo=lo,
             cap=cap,
             cur=cur,
-            sensitivity=self._sensitivity,
+            sensitivity=self._sens.value,
             now=self.context.current_timestamp,
             my_tier=my_tier,
             has_lock=has_heat_curtail_lock(self.behavior, self.context.aid),
@@ -1735,29 +1773,4 @@ class GridConstraintMonitor(Role):
     def local_sensitivity(self) -> float:
         """Latest |dV/dP| estimate for the primary constraint variable; defaults
         to a sector-typical prior until enough samples are collected."""
-        return self._sensitivity
-
-    def _update_sensitivity(self, obs: dict) -> None:
-        var = _SECTOR_PRIMARY_VAR.get(self.sector)
-        if var is None or var not in obs:
-            return
-        v = float(obs[var])
-        if not math.isfinite(v):
-            return
-        cap = obs_capacity(obs, behavior=self.behavior, aid=self.context.aid)
-        sp = obs_setpoint(obs, behavior=self.behavior, aid=self.context.aid)
-        # Signed injection (sp negative for generators, cap < 0).
-        p = sp if cap != 0.0 else 0.0
-        if self._last_p is not None and self._last_v is not None:
-            dp = p - self._last_p
-            dv = v - self._last_v
-            min_dp = _SENSITIVITY_MIN_DP.get(self.sector, 1e-6)
-            if abs(dp) >= min_dp and math.isfinite(dv):
-                sample = abs(dv / dp)
-                # Clamp absurd jumps (post-failure snapshots) before the EMA.
-                sample = min(sample, 10.0 * self._sensitivity + 1.0)
-                self._sensitivity = (
-                    1.0 - _SENSITIVITY_EMA_ALPHA
-                ) * self._sensitivity + _SENSITIVITY_EMA_ALPHA * sample
-        self._last_p = p
-        self._last_v = v
+        return self._sens.value

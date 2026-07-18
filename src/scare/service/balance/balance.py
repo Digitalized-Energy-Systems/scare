@@ -70,7 +70,8 @@ from scare.service.balance.gossip_math import (
     step_size,
 )
 from scare.service.balance.grid_former import GridFormerPolicy
-from scare.service.balance.trust import TrustLedger, TrustParams, hash_weighted_choice
+from scare.service.balance.neighbour_router import NeighbourRouter
+from scare.service.balance.trust import TrustLedger, TrustParams
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -254,6 +255,112 @@ class _GossipState:
     dual_lambda: float = 0.0
 
 
+def _compute_flex_report(
+    *,
+    member_aids: list[str],
+    behavior: Any,
+    grid_former_policy: GridFormerPolicy,
+    role_sector: Sector,
+    now: float,
+    enable_heat_l2_dispatch: bool,
+    round_id: str,
+) -> AvailableFlexAnswer:
+    """Leader-side flex aggregation over group members (read-only): supply/demand
+    pools, per-(sector, tier) splits, unmet demand, and the heat delivered-plus-probe
+    frontier."""
+    total_flex = 0.0
+    total_balance = 0.0
+    total_shedded = 0.0
+    flex_by_sector: dict[str, float] = {}
+    balance_by_sector: dict[str, float] = {}
+    unmet_by_sector: dict[str, float] = {}
+    demand_by_priority: dict[int, float] = {}
+    served_by_priority: dict[int, float] = {}
+    demand_by_sector_priority: dict[str, dict[int, float]] = {}
+    served_by_sector_priority: dict[str, dict[int, float]] = {}
+    supply_by_sector: dict[str, float] = {}
+    for aid in member_aids:
+        obs = behavior.observe(aid) or {}
+        sector = obs_sector(obs, behavior=behavior, aid=aid)
+        if sector is None:
+            continue
+        cap = obs_capacity(obs, behavior=behavior, aid=aid)
+        sp = obs_setpoint(obs, behavior=behavior, aid=aid)
+        available = cap - sp  # headroom
+        sec_key = sector.value
+        # A promoted island reference is a generator, never a load: credit its
+        # supply and skip flex/demand accounting (its sign-flipping free var
+        # otherwise reads as phantom demand).
+        if grid_former_policy.is_former(aid):
+            supply_by_sector[sec_key] = supply_by_sector.get(
+                sec_key, 0.0
+            ) + grid_former_policy.supply_credit(aid, sp)
+            continue
+        flex_by_sector[sec_key] = flex_by_sector.get(sec_key, 0.0) + available
+        balance_by_sector[sec_key] = balance_by_sector.get(sec_key, 0.0) + sp
+        # Route-A supply pool (cap < 0): generators count *delivered* |sp| (curtailed
+        # supply can't inflate the pool); slacks use their budgeted rating.
+        if cap < 0:
+            if lookup_slack(behavior, aid) is not None:
+                eff = lookup_slack_eff_budget(behavior, aid)
+                gen_supply = float(eff) if eff is not None else abs(cap)
+            else:
+                gen_supply = abs(sp)
+            supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + gen_supply
+        # Priority-tier demand aggregation (loads only: cap > 0).
+        if cap > 0:
+            prio = obs_priority(
+                obs, behavior=behavior, aid=aid, record_default_fallback_t=now
+            )
+            demand_by_priority[prio] = demand_by_priority.get(prio, 0.0) + abs(cap)
+            served_by_priority[prio] = served_by_priority.get(prio, 0.0) + abs(sp)
+            demand_by_sector_priority.setdefault(sec_key, {})
+            demand_by_sector_priority[sec_key][prio] = demand_by_sector_priority[
+                sec_key
+            ].get(prio, 0.0) + abs(cap)
+            served_by_sector_priority.setdefault(sec_key, {})
+            served_by_sector_priority[sec_key][prio] = served_by_sector_priority[
+                sec_key
+            ].get(prio, 0.0) + abs(sp)
+            # Unmet (rated cap - actual sp) captures the silent disconnect-loss
+            # case the CP layer would otherwise miss.
+            unmet = abs(cap) - abs(sp)
+            if unmet > 1e-12:
+                unmet_by_sector[sec_key] = unmet_by_sector.get(sec_key, 0.0) + unmet
+        if sector != role_sector:
+            continue
+        total_flex += available
+        total_balance += sp
+        if sp > 0 and available > 0:
+            total_shedded += available
+
+    # Heat has no bounded slack pool, so report delivered-to-loads plus an upward
+    # probe share of the gap (delivered alone ratchets DOWN toward the frontier).
+    if enable_heat_l2_dispatch:
+        sec_heat = Sector.HEAT.value
+        delivered = sum(served_by_sector_priority.get(sec_heat, {}).values())
+        demand = sum(demand_by_sector_priority.get(sec_heat, {}).values())
+        supply_by_sector[sec_heat] = delivered + _HEAT_L2_PROBE_SHARE * max(
+            0.0, demand - delivered
+        )
+
+    return AvailableFlexAnswer(
+        flex=total_flex,
+        balance=total_balance,
+        shedded=total_shedded,
+        sector=role_sector,
+        flex_by_sector=flex_by_sector,
+        balance_by_sector=balance_by_sector,
+        demand_by_priority=demand_by_priority,
+        served_by_priority=served_by_priority,
+        unmet_by_sector=unmet_by_sector,
+        demand_by_sector_priority=demand_by_sector_priority,
+        served_by_sector_priority=served_by_sector_priority,
+        supply_by_sector=supply_by_sector,
+        round_id=round_id,
+    )
+
+
 class EnergyBalanceNegotiator(Role):
     """Gossip-based energy balance negotiation.
 
@@ -367,21 +474,20 @@ class EnergyBalanceNegotiator(Role):
         self._last_regulate_factor: float = 0.0
         self._clpu_ramp_per_s: float = self.convergence_rate
 
-        # Liveness is decided by the TrustLedger (``_trust.is_live``);
-        # ``_neighbour_last_seen``/``_heartbeat_max_age_s`` are leftover write-only
-        # state and no aging-out is driven from them.
-        self._neighbour_last_seen: dict[str, float] = {}
+        # ``_heartbeat_max_age_s`` is leftover write-only state (no aging-out).
         poll = ts.get("poll_period_s", 1.0)
         self._heartbeat_max_age_s: float = poll * _HEARTBEAT_MAX_AGE_MULTIPLE
 
         # B.1: continuous coupling weights K_ij(t) in [0, 1] biasing forwarding
-        # and gating liveness. Decay scales with poll period.
-        self._trust = TrustLedger(
-            TrustParams(
-                decay_rate_per_s=1.0 / max(poll * _HEARTBEAT_MAX_AGE_MULTIPLE, 1.0),
-                recover_rate=0.6,
-                liveness_threshold=0.5,
-                initial=1.0,
+        # and gating liveness (owned by the router). Decay scales with poll period.
+        self._router = NeighbourRouter(
+            TrustLedger(
+                TrustParams(
+                    decay_rate_per_s=1.0 / max(poll * _HEARTBEAT_MAX_AGE_MULTIPLE, 1.0),
+                    recover_rate=0.6,
+                    liveness_threshold=0.5,
+                    initial=1.0,
+                )
             )
         )
 
@@ -572,23 +678,10 @@ class EnergyBalanceNegotiator(Role):
         addr = mango_sender_addr(meta)
         if addr is None:
             return
-        key = str(addr)
-        now = self.context.current_timestamp
-        self._neighbour_last_seen[key] = now
-        # B.1: each received message recovers the K-score.
-        self._trust.on_message_received(key, now)
+        self._router.record_sender(str(addr), self.context.current_timestamp)
 
     def _touch_neighbours(self, addrs: list) -> None:
-        """Seed ``_neighbour_last_seen`` for just-contacted neighbours.
-
-        The trust ledger's optimistic initial score provides the grace period;
-        this seeding has no effect on any liveness decision.
-        """
-        now = self.context.current_timestamp
-        for addr in addrs:
-            key = str(addr)
-            if key not in self._neighbour_last_seen:
-                self._neighbour_last_seen[key] = now
+        self._router.touch(addrs, self.context.current_timestamp)
 
     def _update_gap_window_and_check_stall(
         self, open_gap: float, target: float
@@ -665,15 +758,11 @@ class EnergyBalanceNegotiator(Role):
         )
 
     def _live_neighbours(self) -> list:
-        """Group neighbours whose trust score K_ij exceeds the liveness threshold.
-
-        Unknown neighbours bootstrap optimistically (K = 1.0). Includes every
-        live neighbour (branch agents too) — for the flex-query round. For token
-        routing use ``_gossip_neighbours``.
-        """
-        all_neighbours = topology_neighbors(self, tid="groups")
-        now = self.context.current_timestamp
-        return [a for a in all_neighbours if self._trust.is_live(str(a), now)]
+        """Live group neighbours (branch agents included) for the flex-query
+        round; token routing uses ``_gossip_neighbours``."""
+        return self._router.live(
+            topology_neighbors(self, tid="groups"), self.context.current_timestamp
+        )
 
     def _gossip_neighbours(self) -> list:
         """Live neighbours with a same-sector negotiator (token-processing peers).
@@ -686,21 +775,10 @@ class EnergyBalanceNegotiator(Role):
         capable = store.get(self.sector, set())
         return [a for a in self._live_neighbours() if a.aid in capable]
 
-    def _scored_neighbours(self, neighbours: list) -> list[float]:
-        """Return the K-score for each neighbour in ``neighbours`` order."""
-        now = self.context.current_timestamp
-        return [self._trust.score(str(a), now) for a in neighbours]
-
     def _next_hop(self, neighbours: list, nid: str, counter: int):
-        """B.1: K-weighted deterministic next-hop.
-
-        Picks proportional to trust K_ij; uniform SHA256-modulo when all K equal.
-        Low-K neighbours are routed around.
-        """
-        if not neighbours:
-            return None
-        weights = self._scored_neighbours(neighbours)
-        return hash_weighted_choice(neighbours, weights, f"{nid}:{counter}")
+        return self._router.next_hop(
+            neighbours, nid, counter, self.context.current_timestamp
+        )
 
     # ------------------------------------------------------------------
     # Trigger phase
@@ -1654,120 +1732,19 @@ class EnergyBalanceNegotiator(Role):
     async def _handle_ask_flex(self, message: AskForAvailableFlex, meta: dict) -> None:
         if topology_characteristic(self, tid="groups") != "leader":
             return
-
         member_aids = [self.context.aid] + [
             addr.aid for addr in topology_neighbors(self, tid="groups")
         ]
-
         if message.include_connectors:
             for addr in topology_connectors(self, tid="groups"):
                 member_aids.append(addr.aid)
-
-        total_flex = 0.0
-        total_balance = 0.0
-        total_shedded = 0.0
-        flex_by_sector: dict[str, float] = {}
-        balance_by_sector: dict[str, float] = {}
-        unmet_by_sector: dict[str, float] = {}
-        demand_by_priority: dict[int, float] = {}
-        served_by_priority: dict[int, float] = {}
-        demand_by_sector_priority: dict[str, dict[int, float]] = {}
-        served_by_sector_priority: dict[str, dict[int, float]] = {}
-        supply_by_sector: dict[str, float] = {}
-        for aid in member_aids:
-            obs = self.behavior.observe(aid) or {}
-            sector = obs_sector(obs, behavior=self.behavior, aid=aid)
-            if sector is None:
-                continue
-            cap = obs_capacity(obs, behavior=self.behavior, aid=aid)
-            sp = obs_setpoint(obs, behavior=self.behavior, aid=aid)
-            available = cap - sp  # headroom
-            # Per-sector breakdown for multi-dimensional ADMM.
-            sec_key = sector.value
-            # A promoted island reference is a generator, never a load: credit
-            # its supply (delivered + headroom probe) and skip the
-            # flex/balance/demand accounting (its sign-flipping free var
-            # otherwise reads as phantom demand).
-            if self._grid_former_policy.is_former(aid):
-                supply_by_sector[sec_key] = supply_by_sector.get(
-                    sec_key, 0.0
-                ) + self._grid_former_policy.supply_credit(aid, sp)
-                continue
-            flex_by_sector[sec_key] = flex_by_sector.get(sec_key, 0.0) + available
-            balance_by_sector[sec_key] = balance_by_sector.get(sec_key, 0.0) + sp
-            # Route-A supply pool (generators, cap < 0). Generators count
-            # *delivered* ``|sp|``, not rated ``|cap|``, so curtailed supply
-            # can't inflate the pool. Slacks instead use the budgeted rating.
-            if cap < 0:
-                if lookup_slack(self.behavior, aid) is not None:
-                    # Slack: effective budget if loss-compensation set one
-                    # (targets ``B - losses``), else nominal.
-                    eff = lookup_slack_eff_budget(self.behavior, aid)
-                    gen_supply = float(eff) if eff is not None else abs(cap)
-                else:
-                    gen_supply = abs(sp)  # generator: deliverable, not rated
-                supply_by_sector[sec_key] = (
-                    supply_by_sector.get(sec_key, 0.0) + gen_supply
-                )
-            # Priority-tier demand aggregation (loads only: cap > 0).
-            if cap > 0:
-                prio = obs_priority(
-                    obs,
-                    behavior=self.behavior,
-                    aid=aid,
-                    record_default_fallback_t=self.context.current_timestamp,
-                )
-                demand_by_priority[prio] = demand_by_priority.get(prio, 0.0) + abs(cap)
-                served_by_priority[prio] = served_by_priority.get(prio, 0.0) + abs(sp)
-                # Per-(sector, tier) split for the tier-stratified holon ADMM.
-                demand_by_sector_priority.setdefault(sec_key, {})
-                demand_by_sector_priority[sec_key][prio] = demand_by_sector_priority[
-                    sec_key
-                ].get(prio, 0.0) + abs(cap)
-                served_by_sector_priority.setdefault(sec_key, {})
-                served_by_sector_priority[sec_key][prio] = served_by_sector_priority[
-                    sec_key
-                ].get(prio, 0.0) + abs(sp)
-                # Unmet demand (rated cap - actual sp): captures the silent
-                # disconnect-loss case (regulation=0 on a load with no path to a
-                # grid-former) the CP layer would otherwise miss.
-                unmet = abs(cap) - abs(sp)
-                if unmet > 1e-12:
-                    unmet_by_sector[sec_key] = unmet_by_sector.get(sec_key, 0.0) + unmet
-            if sector != self.sector:
-                continue
-            total_flex += available
-            total_balance += sp
-            if sp > 0 and available > 0:
-                total_shedded += available
-
-        # Heat has no bounded slack pool, so the gen-only ledger reads supply=0 and
-        # the allocation would shed every tier; report heat DELIVERED TO LOADS
-        # instead (replaces, not max — the component merge sums it across leaders).
-        # Plus an upward probe: delivered alone ratchets DOWN (produced fractions cap
-        # the loads), so offer a share of the gap each cycle to climb to the true
-        # frontier.
-        if self.enable_heat_l2_dispatch:
-            sec_heat = Sector.HEAT.value
-            delivered = sum(served_by_sector_priority.get(sec_heat, {}).values())
-            demand = sum(demand_by_sector_priority.get(sec_heat, {}).values())
-            supply_by_sector[sec_heat] = delivered + _HEAT_L2_PROBE_SHARE * max(
-                0.0, demand - delivered
-            )
-
-        reply = AvailableFlexAnswer(
-            flex=total_flex,
-            balance=total_balance,
-            shedded=total_shedded,
-            sector=self.sector,
-            flex_by_sector=flex_by_sector,
-            balance_by_sector=balance_by_sector,
-            demand_by_priority=demand_by_priority,
-            served_by_priority=served_by_priority,
-            unmet_by_sector=unmet_by_sector,
-            demand_by_sector_priority=demand_by_sector_priority,
-            served_by_sector_priority=served_by_sector_priority,
-            supply_by_sector=supply_by_sector,
+        reply = _compute_flex_report(
+            member_aids=member_aids,
+            behavior=self.behavior,
+            grid_former_policy=self._grid_former_policy,
+            role_sector=self.sector,
+            now=self.context.current_timestamp,
+            enable_heat_l2_dispatch=self.enable_heat_l2_dispatch,
             round_id=message.round_id,
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))

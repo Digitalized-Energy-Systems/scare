@@ -194,9 +194,9 @@ async def test_curtail_willingness_sensitivity_is_bounded():
 
     async with world:
         obs = behavior.observe("agent-0")
-        monitor._sensitivity = 1e9  # absurdly high
+        monitor._sens._value = 1e9  # absurdly high
         w_hi = monitor._own_curtail_willingness(obs)
-        monitor._sensitivity = 1e-9  # absurdly low
+        monitor._sens._value = 1e-9  # absurdly low
         w_lo = monitor._own_curtail_willingness(obs)
 
     # Same tier + reducible in both calls, so the ratio is purely the
@@ -222,7 +222,7 @@ async def test_heat_frontier_sheds_to_partial_not_zero():
     agent.add_role(monitor)
 
     async with world:
-        monitor._sensitivity = 660.0  # learned dT/dP (K per MW): frontier ~0.8
+        monitor._sens._value = 660.0  # learned dT/dP (K per MW): frontier ~0.8
         await monitor._heat_frontier_control()
 
     regs = [a for a in behavior.action_log if a[1] == "regulate"]
@@ -249,7 +249,7 @@ async def test_heat_frontier_applies_to_tier1():
     agent.add_role(monitor)
 
     async with world:
-        monitor._sensitivity = 660.0
+        monitor._sens._value = 660.0
         await monitor._heat_frontier_control()
 
     regs = [a for a in behavior.action_log if a[1] == "regulate"]
@@ -272,7 +272,7 @@ async def test_heat_frontier_holds_in_band():
     agent.add_role(monitor)
 
     async with world:
-        monitor._sensitivity = 660.0
+        monitor._sens._value = 660.0
         await monitor._heat_frontier_control()
 
     assert not [a for a in behavior.action_log if a[1] == "regulate"]
@@ -338,7 +338,7 @@ async def test_frontier_defers_shed_when_lower_priority_reducible_in_region():
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)
     async with world:
-        monitor._sensitivity = 660.0
+        monitor._sens._value = 660.0
         now = monitor.context.current_timestamp
         monitor._heat_frontier.note_peer_state("peer-4", now, 4, 0.05)  # tier-4
         await monitor._heat_frontier_control()
@@ -356,7 +356,7 @@ async def test_frontier_sheds_when_only_higher_priority_peers():
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)
     async with world:
-        monitor._sensitivity = 660.0
+        monitor._sens._value = 660.0
         now = monitor.context.current_timestamp
         monitor._heat_frontier.note_peer_state("peer-1", now, 1, 0.05)  # higher prio
         await monitor._heat_frontier_control()
@@ -439,7 +439,7 @@ async def test_waterfall_peer_shed_request_curtails_peer():
     a1.add_role(m1)
 
     async with world:
-        m0._sensitivity = 660.0
+        m0._sens._value = 660.0
         now = m0.context.current_timestamp
         origin = str(m1.context.addr)
         m0._heat_frontier.note_peer_state(origin, now, 4, 0.05)
@@ -512,7 +512,7 @@ async def test_waterfall_peer_shed_request_cooldown():
     a1.add_role(m1)
 
     async with world:
-        m0._sensitivity = 660.0
+        m0._sens._value = 660.0
         now = m0.context.current_timestamp
         origin = str(m1.context.addr)
         m0._heat_frontier.note_peer_state(origin, now, 4, 0.05)
@@ -546,7 +546,7 @@ async def test_frontier_sheds_when_lower_priority_exhausted():
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)
     async with world:
-        monitor._sensitivity = 660.0
+        monitor._sens._value = 660.0
         now = monitor.context.current_timestamp
         monitor._heat_frontier.note_peer_state("peer-4", now, 4, 1e-9)  # ~shed
         await monitor._heat_frontier_control()
@@ -563,7 +563,7 @@ async def test_frontier_stale_peer_aged_out():
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)
     async with world:
-        monitor._sensitivity = 660.0
+        monitor._sens._value = 660.0
         now = monitor.context.current_timestamp
         stale = now - monitor._heat_frontier._peer_freshness_s - 1.0
         monitor._heat_frontier.note_peer_state("peer-4", stale, 4, 0.05)
@@ -581,7 +581,7 @@ async def test_frontier_waterfall_disabled_sheds_tier_blind():
     agent = world.register(RoleAgent(), suggested_aid="agent-0")
     agent.add_role(monitor)
     async with world:
-        monitor._sensitivity = 660.0
+        monitor._sens._value = 660.0
         now = monitor.context.current_timestamp
         monitor._heat_frontier.note_peer_state("peer-4", now, 4, 0.05)
         await monitor._heat_frontier_control()
