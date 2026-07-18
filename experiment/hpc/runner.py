@@ -700,15 +700,6 @@ def _write_simulation_outputs(
     return claims
 
 
-
-
-# Artifacts run_task / the oracle / the metrics writers scrub at task start so a
-# re-run that fails early can't leave stale outputs for the aggregator to join.
-# NOTE: incomplete — network_changes.csv (written above) is produced but not listed here.
-
-
-
-
 def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
     plan = RuntimePlan.from_config_json(campaign_dir / CAMPAIGN_LAYOUT["config"])
     tasks = read_manifest(campaign_dir)

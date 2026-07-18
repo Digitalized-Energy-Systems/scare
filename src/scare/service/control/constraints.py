@@ -609,9 +609,9 @@ class GridConstraintMonitor(Role):
             util = constraint_utilization(val, lo, hi)
 
             # Feed the line-relief hand-off its headroom and re-stamp any live
-            # restore-ramp lock. The cache gate can short-circuit this poll, so
-            # lock liveness isn't guaranteed (an aged-out lock lets L2 slam the
-            # load to full and re-overload the line).
+            # restore-ramp lock. On a line-relief branch _needs_per_poll_tick()
+            # forces per-poll execution, so the cache gate can't short-circuit
+            # here and the lock is re-stamped every poll (liveness guaranteed).
             self._maintain_line_relief_handoff(var, val, hi)
             if self.enable_line_congestion_price:
                 self._maintain_congestion_price(obs, var, val, hi)
@@ -884,8 +884,9 @@ class GridConstraintMonitor(Role):
         """Soft congestion-price controller for an export (reverse-flow) branch
         overload. Runs on every poll that survives the ``_monitor`` cache gate,
         so the price can decay and the generation ceiling recover once the line
-        clears — but a settled, in-bounds branch short-circuits the gate and
-        freezes the price.
+        clears. While the price is >0 the branch always needs a per-poll tick, so
+        the gate never short-circuits an active price; a short-circuit is only
+        possible once the price is already 0 (ceiling fully recovered).
 
         AIMD-style: integrate the price up on overshoot while the flow is export
         with curtailable downstream gens; decay it on genuine loading headroom;

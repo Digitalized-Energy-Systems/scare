@@ -269,7 +269,7 @@ async def allocate_supply_priority(
             "supply=%.4f, demand=%.4f, T_sum=%.4f",
             holon_supply_total,
             total_demand_sum,
-            float(total_T.sum()),
+            float(sc_T.sum()),
         )
         return (
             service_fraction,

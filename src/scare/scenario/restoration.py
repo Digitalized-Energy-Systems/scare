@@ -2278,8 +2278,9 @@ def _register_recordings(
             if not (obs and key in obs):
                 continue
             v = float(obs[key])
-            # Drop de-energised readings; a non-finite value is kept (as before).
-            if math.isfinite(v) and not is_energised_reading(key, v):
+            # Drop de-energised and non-finite readings; both are solver
+            # artefacts that would poison the min/max/avg aggregates.
+            if not is_energised_reading(key, v):
                 continue
             vals.append(v)
         return vals

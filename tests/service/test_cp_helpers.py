@@ -7,6 +7,7 @@ cp_flex.py, and cp_l3.py.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from scare.base.model import AvailableFlexAnswer, Sector
 from scare.service.coupling.cp_envelope import CoalitionEnvelope
@@ -221,3 +222,146 @@ def test_component_view_leader_addrs_filtered_by_reachability():
     )
     out = view.leader_addrs("cp1")
     assert out == {Sector.ELECTRICITY: {"L_near": "addr_near"}}
+
+
+# --------------------------------------------------------------------------- #
+# CpActuator + _reply_ask_energy (extracted from EnergyConverterRole, T1)
+# --------------------------------------------------------------------------- #
+
+
+class _FakeBehavior:
+    def __init__(self, obs):
+        self._obs = obs
+
+    def observe(self, aid):
+        return self._obs
+
+
+def test_cp_actuator_drives_strongest_signal_sector(monkeypatch):
+    from scare.service.coupling import cp as cp_mod
+
+    monkeypatch.setattr(cp_mod, "clamp_to_constraints", lambda v, obs, sector: v)
+    calls: list = []
+    monkeypatch.setattr(
+        cp_mod,
+        "apply_regulate",
+        lambda behavior, aid, factor, **kw: calls.append((aid, factor, kw)),
+    )
+    obs = {"el_mw": 10.0, "heat_mw": 4.0, "gas_mass_flow_kgs": 5.0}
+    act = cp_mod.CpActuator(_FakeBehavior(obs))
+    # result [el=2, heat=3, gas=0]: |weights| 2,3,0 -> heat wins; factor 3/4.
+    factor = act.apply("cp1", [2.0, 3.0, 0.0], timestamp=7.0)
+    assert factor == pytest.approx(0.75)
+    assert len(calls) == 1
+    aid, f, kw = calls[0]
+    assert aid == "cp1"
+    assert f == pytest.approx(0.75)
+    assert kw == {"sector": "cp", "reason": "cp_admm", "timestamp": 7.0}
+
+
+def test_cp_actuator_returns_none_without_applicable_sector(monkeypatch):
+    from scare.service.coupling import cp as cp_mod
+
+    calls: list = []
+    monkeypatch.setattr(cp_mod, "apply_regulate", lambda *a, **k: calls.append(a))
+    assert cp_mod.CpActuator(_FakeBehavior({})).apply("cp1", [1.0, 2.0, 3.0], 0.0) is None
+    # zero cap -> that sector is skipped too.
+    assert (
+        cp_mod.CpActuator(_FakeBehavior({"el_mw": 0.0})).apply("cp1", [1.0, 0.0, 0.0], 0.0)
+        is None
+    )
+    assert calls == []
+
+
+def test_cp_actuator_does_not_touch_cp_version(monkeypatch):
+    # Guards the extraction contract: the actuator has no access to _cp_version,
+    # so it can never advance it (the double-bump the plan review flagged).
+    from scare.service.coupling import cp as cp_mod
+
+    monkeypatch.setattr(cp_mod, "apply_regulate", lambda *a, **k: None)
+    role = cp_mod.EnergyConverterRole(
+        _FakeBehavior({"el_mw": 10.0}), flex_actor=object(), sectors=[Sector.ELECTRICITY]
+    )
+    assert role._cp_version.current == 0
+    role._actuator.apply("cp1", [5.0, 0.0, 0.0], timestamp=1.0)
+    assert role._cp_version.current == 0
+
+
+def test_reply_ask_energy_uses_sector_setpoint():
+    import asyncio
+
+    from scare.base.model import AskEnergyMessage
+    from scare.service.coupling.cp import _reply_ask_energy
+
+    sent: list = []
+
+    class _Ctx:
+        aid = "cp1"
+
+        async def send_message(self, msg, receiver_addr):
+            sent.append((msg, receiver_addr))
+
+    behavior = _FakeBehavior({"el_mw": 8.0, "regulation": 0.5})
+    asyncio.run(
+        _reply_ask_energy(
+            behavior,
+            _Ctx(),
+            AskEnergyMessage(negotiation_id="n1", sector=Sector.ELECTRICITY),
+            meta={"sender_addr": ("leader-addr",), "sender_id": "leader"},
+        )
+    )
+    assert len(sent) == 1
+    reply, _ = sent[0]
+    assert reply.available == 0.0
+    assert reply.setpoint == pytest.approx(4.0)  # 8.0 * 0.5
+
+
+# --------------------------------------------------------------------------- #
+# FlexRound (C8 buffer extracted from EnergyConverterRole)
+# --------------------------------------------------------------------------- #
+
+
+def test_flex_round_open_add_complete_and_drain():
+    from types import SimpleNamespace
+
+    from scare.service.coupling.cp import FlexRound
+
+    fr = FlexRound()
+    rid = fr.open("cp1", 2)
+    assert rid == "cp1-flex-1"
+    assert fr.expected == 2 and fr.answers == [] and fr.round_id == rid
+    # Stale round id is rejected and not buffered.
+    assert fr.add(SimpleNamespace(round_id="other")) is False
+    assert fr.answers == []
+    # First matching answer: incomplete; second: complete.
+    assert fr.add(SimpleNamespace(round_id=rid)) is False
+    assert fr.add(SimpleNamespace(round_id=rid)) is True
+    assert len(fr.answers) == 2
+    drained = fr.drain()
+    assert len(drained) == 2
+    # drain() atomically closes the round.
+    assert fr.expected == 0 and fr.answers == [] and fr.round_id == ""
+
+
+def test_flex_round_rejects_late_answer_after_drain():
+    # The _flex_expected<=0 double-run guard: a late same-round answer arriving
+    # after dispatch must not re-complete the round.
+    from types import SimpleNamespace
+
+    from scare.service.coupling.cp import FlexRound
+
+    fr = FlexRound()
+    rid = fr.open("cp1", 1)
+    assert fr.add(SimpleNamespace(round_id=rid)) is True
+    fr.drain()
+    assert fr.add(SimpleNamespace(round_id=rid)) is False
+
+
+def test_flex_round_counter_monotonic_and_close_empty():
+    from scare.service.coupling.cp import FlexRound
+
+    fr = FlexRound()
+    assert fr.open("cp1", 3) == "cp1-flex-1"
+    assert fr.open("cp1", 1) == "cp1-flex-2"  # counter persists across rounds
+    fr.close_empty()
+    assert fr.expected == 0

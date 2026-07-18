@@ -94,6 +94,122 @@ _PREDICATE_MIN_GAP_S: float = 1.0
 _FLEX_ROUND_TIMEOUT_S: float = 2.0
 
 
+async def _reply_ask_energy(
+    behavior: RestorationEnvironmentBehavior, context: Any, message: AskEnergyMessage, meta: dict
+) -> None:
+    """Reply to an AskEnergyMessage with the CP's current sector setpoint.
+
+    available=0: a CP has no spare flex, only the conversion knob. Shared by
+    both CP roles.
+    """
+    try:
+        obs = behavior.observe(context.aid) or {}
+    except (AttributeError, KeyError):
+        obs = {}
+    key = _ACCESS_KEYS.get(message.sector)
+    if key and key in obs:
+        raw = obs[key]
+        reg = obs.get("regulation", 1.0)
+        try:
+            value = float(raw) * float(reg)
+        except (TypeError, ValueError):
+            value = 0.0
+    else:
+        value = obs_setpoint(obs)
+    if not math.isfinite(value):
+        value = 0.0
+    reply = ResponseEnergyMessage(
+        negotiation_id=message.negotiation_id,
+        setpoint=value,
+        available=0.0,
+    )
+    await context.send_message(reply, receiver_addr=mango_sender_addr(meta))
+
+
+class CpActuator:
+    """Applies a [EL, HEAT, GAS] ADMM result via the CP's single regulation knob,
+    driving the strongest-signal (largest native-MW) sector."""
+
+    def __init__(self, behavior: RestorationEnvironmentBehavior) -> None:
+        self._behavior = behavior
+
+    def apply(self, aid: str, result: list[float], timestamp: float) -> float | None:
+        obs = self._behavior.observe(aid) or {}
+        best_factor: float | None = None
+        best_weight = -1.0
+        for sector, idx in _RESULT_INDEX.items():
+            key = _ACCESS_KEYS[sector]
+            if key not in obs or idx >= len(result):
+                continue
+            value = result[idx]
+            if sector == Sector.GAS:
+                value = mw_to_kgps(value)
+            value = clamp_to_constraints(value, obs, sector)
+            cap = float(obs.get(key, 0.0))
+            if cap == 0.0:
+                continue
+            factor = max(0.0, min(1.0, abs(value / cap)))
+            weight = abs(result[idx])
+            if weight > best_weight:
+                best_weight = weight
+                best_factor = factor
+
+        if best_factor is not None:
+            apply_regulate(
+                self._behavior,
+                aid,
+                best_factor,
+                sector="cp",
+                reason="cp_admm",
+                timestamp=timestamp,
+            )
+        return best_factor
+
+
+class FlexRound:
+    """The CP flex-collection buffer shared by the legacy and L3 ADMM drivers.
+
+    Owns the answer buffer + round identity only; the ``_active``/``_l3_active``
+    locks, driver routing, and deadline scheduling stay on the Role.
+    """
+
+    def __init__(self) -> None:
+        self.answers: list[AvailableFlexAnswer] = []
+        self.expected: int = 0
+        self.round_id: str = ""
+        self._counter: int = 0
+
+    def open(self, aid: str, n_expected: int) -> str:
+        self._counter += 1
+        self.round_id = f"{aid}-flex-{self._counter}"
+        self.answers = []
+        self.expected = n_expected
+        return self.round_id
+
+    def add(self, message: AvailableFlexAnswer) -> bool:
+        """Record a same-round answer; True once the expected set is complete.
+        Rejects late answers after dispatch (expected<=0) and stale round ids."""
+        if self.expected <= 0:
+            return False
+        if (getattr(message, "round_id", "") or "") != self.round_id:
+            return False
+        self.answers.append(message)
+        return len(self.answers) >= self.expected
+
+    def drain(self) -> list[AvailableFlexAnswer]:
+        """Snapshot the answers and close the round (zero expected, clear buffer,
+        blank round id) so a late answer can't seed a second concurrent run."""
+        answers = self.answers[:]
+        self.answers = []
+        self.expected = 0
+        self.round_id = ""
+        return answers
+
+    def close_empty(self) -> None:
+        """Timeout with no answers: zero expected so no run fires."""
+        self.expected = 0
+
+
 class EnergyConverterRole(Role):
     def __init__(
         self,
@@ -107,6 +223,7 @@ class EnergyConverterRole(Role):
         super().__init__()
         self.behavior = behavior
         self.flex_actor = flex_actor
+        self._actuator = CpActuator(behavior)
         self.sectors = sectors
         # Sibling DynamicConnectorRole gating reachable group leaders.
         # None => static topology: every connector is admitted.
@@ -121,12 +238,8 @@ class EnergyConverterRole(Role):
         self._envelope = CoalitionEnvelope()
 
         self._active: bool = False
-        self._flex_answers: list[AvailableFlexAnswer] = []
-        self._flex_expected: int = 0
-        # Current flex-collection round identity: stamped on the ask, matched
-        # against echoing answers, and keyed by the deadline task.
-        self._flex_round_id: str = ""
-        self._flex_round_counter: int = 0
+        # Flex-collection buffer shared by the legacy and L3 ADMM drivers.
+        self._flex = FlexRound()
 
         # Last-observed group setpoint per sector; feeds the fixed-point gate.
         self._last_sector_setpoint: dict[Sector, float] = {}
@@ -146,9 +259,6 @@ class EnergyConverterRole(Role):
         # construction. Unwired => legacy per-CP path (see CPComponentView.enabled).
         self._component = CPComponentView()
 
-        # Dead state: written by _handle_cp_allocation but never read. Wire it
-        # into _apply_result to suppress no-op re-dispatch, or delete both.
-        self._last_l3_setpoint_by_sector: dict[str, float] = {}
         self._l3_round_counter: int = 0
         # True while the L3 collect->solve->dispatch cycle is in flight so reactive
         # triggers coalesce. Distinct from _active (legacy per-CP path).
@@ -269,29 +379,7 @@ class EnergyConverterRole(Role):
         )
 
     async def _handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
-        try:
-            obs = self.behavior.observe(self.context.aid) or {}
-        except (AttributeError, KeyError):
-            obs = {}
-        key = _ACCESS_KEYS.get(message.sector)
-        if key and key in obs:
-            raw = obs[key]
-            reg = obs.get("regulation", 1.0)
-            try:
-                value = float(raw) * float(reg)
-            except (TypeError, ValueError):
-                value = 0.0
-        else:
-            value = obs_setpoint(obs)
-        if not math.isfinite(value):
-            value = 0.0
-        # available=0: a CP has no spare flex, only the conversion knob.
-        reply = ResponseEnergyMessage(
-            negotiation_id=message.negotiation_id,
-            setpoint=value,
-            available=0.0,
-        )
-        await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
+        await _reply_ask_energy(self.behavior, self.context, message, meta)
 
     async def _handle_holon_allocation(
         self, message: HolonAllocation, meta: dict
@@ -498,11 +586,7 @@ class EnergyConverterRole(Role):
         """Arm a flex-collection round: reset the answer buffer, stamp a fresh
         round id, and schedule the deadline that closes it on partial answers
         so one dropped reply can't wedge the CP."""
-        self._flex_round_counter += 1
-        round_id = f"{self.context.aid}-flex-{self._flex_round_counter}"
-        self._flex_round_id = round_id
-        self._flex_answers = []
-        self._flex_expected = n_expected
+        round_id = self._flex.open(str(self.context.aid), n_expected)
         deadline = float(self.context.current_timestamp) + _FLEX_ROUND_TIMEOUT_S
         self.context.schedule_timestamp_task(
             self._close_flex_round(round_id), timestamp=deadline
@@ -512,13 +596,13 @@ class EnergyConverterRole(Role):
     async def _close_flex_round(self, round_id: str) -> None:
         """Deadline task: close a still-open round on whatever answers arrived
         and clear the active flag (nothing arrived => plain unwedge)."""
-        if round_id != self._flex_round_id:
+        if round_id != self._flex.round_id:
             return
         if not (self._active or self._l3_active):
             return
-        if self._flex_expected <= 0:
+        if self._flex.expected <= 0:
             return  # complete set already dispatched to the ADMM driver
-        if len(self._flex_answers) >= self._flex_expected:
+        if len(self._flex.answers) >= self._flex.expected:
             return
         record_event(
             t=float(self.context.current_timestamp),
@@ -526,12 +610,12 @@ class EnergyConverterRole(Role):
             aid=str(self.context.aid),
             sector="cp",
             detail=(
-                f"round={round_id} answers={len(self._flex_answers)}"
-                f"/{self._flex_expected}"
+                f"round={round_id} answers={len(self._flex.answers)}"
+                f"/{self._flex.expected}"
             ),
         )
-        if not self._flex_answers:
-            self._flex_expected = 0
+        if not self._flex.answers:
+            self._flex.close_empty()
             self._active = False
             self._l3_active = False
             return
@@ -548,18 +632,10 @@ class EnergyConverterRole(Role):
         # exclusive by design and both guards below reject re-entry.
         if not self._l3_active and not self._active:
             return
-        # Complete set already dispatched: a late same-round answer arriving
-        # during the ADMM await must not seed a second concurrent run on a
-        # 1-answer aggregate.
-        if self._flex_expected <= 0:
-            return
-        # Strict round identity: both ask paths stamp a non-empty round_id and
-        # the sole responder (balance._handle_ask_flex) always echoes it.
-        answer_round = getattr(message, "round_id", "") or ""
-        if answer_round != self._flex_round_id:
-            return
-        self._flex_answers.append(message)
-        if len(self._flex_answers) < self._flex_expected:
+        # add() rejects a late same-round answer arriving during the ADMM await
+        # (expected<=0, so it can't seed a second concurrent run) and a stale
+        # round id; it returns True only once the expected set is complete.
+        if not self._flex.add(message):
             return
         if self._l3_active:
             await self._run_multi_sector_admm()
@@ -567,10 +643,7 @@ class EnergyConverterRole(Role):
             await self._run_admm()
 
     async def _run_admm(self) -> None:
-        answers = self._flex_answers[:]
-        self._flex_answers = []
-        self._flex_expected = 0
-        self._flex_round_id = ""
+        answers = self._flex.drain()
 
         agg = aggregate_flex_answers(answers)
         imbalance_by_sector = agg.imbalance_by_sector
@@ -627,9 +700,11 @@ class EnergyConverterRole(Role):
                     [self.flex_actor], coordinator, start_msg
                 )
             result = self._clamp_to_envelope(list(self.flex_actor.x))
-            # _apply_result must run before emit_event: with no subscriber,
+            # The actuator must run before emit_event: with no subscriber,
             # emit_event raises KeyError that would discard the result.
-            applied_factor = self._apply_result(result)
+            applied_factor = self._actuator.apply(
+                self.context.aid, result, self.context.current_timestamp
+            )
             try:
                 self.context.emit_event(OptimizationFinishedLocalEvent(result=result))
             except KeyError:
@@ -746,10 +821,7 @@ class EnergyConverterRole(Role):
             self._l3_active = False
 
     async def _run_multi_sector_admm_inner(self) -> None:
-        answers = self._flex_answers[:]
-        self._flex_answers = []
-        self._flex_expected = 0
-        self._flex_round_id = ""
+        answers = self._flex.drain()
         if not answers:
             return
 
@@ -895,7 +967,7 @@ class EnergyConverterRole(Role):
                 await self.context.send_message(wakeup, receiver_addr=addr)
 
     async def _handle_cp_allocation(self, message: CPAllocation, meta: dict) -> None:
-        """Apply an L3-coord setpoint via _apply_result so it shares the legacy
+        """Apply an L3-coord setpoint via the CP actuator so it shares the legacy
         per-CP path. Idempotent: apply_regulate dedups same-value writes.
         """
         # CPAllocation is per-CP addressed (subscribe filter on cp_aid): in L3
@@ -909,10 +981,9 @@ class EnergyConverterRole(Role):
             v = flows_mw.get(sec.value)
             if v is not None:
                 result[idx] = float(v)
-        self._last_l3_setpoint_by_sector = {
-            sec.value: float(result[idx]) for sec, idx in _RESULT_INDEX.items()
-        }
-        applied_factor = self._apply_result(result)
+        applied_factor = self._actuator.apply(
+            self.context.aid, result, self.context.current_timestamp
+        )
         record_event(
             t=float(self.context.current_timestamp),
             kind="cp_setpoint",
@@ -923,40 +994,6 @@ class EnergyConverterRole(Role):
                 f"reg={1.0 if applied_factor is None else float(applied_factor):.3f}"
             ),
         )
-
-    def _apply_result(self, result: list[float]) -> float | None:
-        obs = self.behavior.observe(self.context.aid) or {}
-        # result [0=EL, 1=HEAT, 2=GAS]. One regulation knob: apply the
-        # strongest-signal sector (largest native-MW flow) so it drives the setpoint.
-        best_factor: float | None = None
-        best_weight = -1.0
-        for sector, idx in _RESULT_INDEX.items():
-            key = _ACCESS_KEYS[sector]
-            if key not in obs or idx >= len(result):
-                continue
-            value = result[idx]
-            if sector == Sector.GAS:
-                value = mw_to_kgps(value)
-            value = clamp_to_constraints(value, obs, sector)
-            cap = float(obs.get(key, 0.0))
-            if cap == 0.0:
-                continue
-            factor = max(0.0, min(1.0, abs(value / cap)))
-            weight = abs(result[idx])
-            if weight > best_weight:
-                best_weight = weight
-                best_factor = factor
-
-        if best_factor is not None:
-            apply_regulate(
-                self.behavior,
-                self.context.aid,
-                best_factor,
-                sector="cp",
-                reason="cp_admm",
-                timestamp=self.context.current_timestamp,
-            )
-        return best_factor
 
 
 class MultiCommunityCPRole(Role):
@@ -1019,28 +1056,7 @@ class MultiCommunityCPRole(Role):
         # branch-failure event is the only reset signal reaching every CP.
 
     async def _handle_ask_energy(self, message: AskEnergyMessage, meta: dict) -> None:
-        try:
-            obs = self.behavior.observe(self.context.aid) or {}
-        except (AttributeError, KeyError):
-            obs = {}
-        key = _ACCESS_KEYS.get(message.sector)
-        if key and key in obs:
-            raw = obs[key]
-            reg = obs.get("regulation", 1.0)
-            try:
-                value = float(raw) * float(reg)
-            except (TypeError, ValueError):
-                value = 0.0
-        else:
-            value = obs_setpoint(obs)
-        if not math.isfinite(value):
-            value = 0.0
-        reply = ResponseEnergyMessage(
-            negotiation_id=message.negotiation_id,
-            setpoint=value,
-            available=0.0,
-        )
-        await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
+        await _reply_ask_energy(self.behavior, self.context, message, meta)
 
     async def _handle_negotiation_finished(
         self, message: NegotiationFinishedEvent, meta: dict

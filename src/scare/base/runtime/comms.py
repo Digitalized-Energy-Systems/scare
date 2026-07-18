@@ -71,8 +71,8 @@ def install_perturbation(
                     delay_s = self.delay_s_directed_edge_dict[key]
                 else:
                     delay_s = self._jittered_delay(msg)
-                # Loss is package-seeded like the delay (requirement 2 above);
-                # the base class draws from the global RNG instead.
+                # Loss is package-seeded like the delay (package-identity
+                # seeding, as above); the base class draws from the global RNG.
                 loss_seed = hash(
                     (msg.sender_id, msg.receiver_id, round(msg.sent_time, 9), "loss")
                 )

@@ -9,7 +9,6 @@ import numpy as np
 from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink
 from monee.model.extension import GridFormingGenerator, GridFormingSource
 
-from scare.base.addressing import is_child_aid
 from scare.base.model import SECTOR_CONSTRAINTS, Sector
 from scare.base.runtime.diagnostics import record_event, record_regulate
 from scare.base.util.addressing import create_branch_aid, get_by_branch_id
