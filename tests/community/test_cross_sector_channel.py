@@ -6,7 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from scare.base.model import Sector
-from scare.community.summary import CrossSectorChannel
+from scare.community.summary_state import CrossSectorChannel
 
 
 def test_publish_read_roundtrip_per_sector():

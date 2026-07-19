@@ -103,7 +103,7 @@ def test_replicated_kernel_no_coordinator_self_dispatch_only() -> None:
     )
     role_b._context = ctx_b  # type: ignore[attr-defined]
 
-    role_b._peer_summaries = {  # type: ignore[attr-defined]
+    role_b._publisher._peer_summaries = {  # type: ignore[attr-defined]
         "leader-A": _summary(
             "leader-A",
             supply_mw=10.0,

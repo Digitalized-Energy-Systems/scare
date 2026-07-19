@@ -318,7 +318,7 @@ def test_leader_emerged_registers_promoted_orphan_aid() -> None:
 
 
 def test_resend_allocation_targets_only_stale_leader() -> None:
-    """``_resend_allocation_if_stale`` re-sends only to a leader whose
+    """``ComponentCoordinator.resend_if_stale`` re-sends only to a leader whose
     echoed ``applied_version`` is behind the coordinator's latest
     counter, and skips leaders that are caught up (no O(N) re-broadcast).
     """
@@ -346,8 +346,8 @@ def test_resend_allocation_targets_only_stale_leader() -> None:
     role._record_event = lambda *args, **kwargs: None  # type: ignore[assignment]
 
     # Coordinator state as if version 3 had been dispatched.
-    role._allocation_version_counter = 3
-    role._last_dispatched_allocation = ComponentAllocation(
+    role._component.allocation_version_counter = 3
+    role._component.last_dispatched_allocation = ComponentAllocation(
         publisher="leader-A",
         sector=Sector.ELECTRICITY,
         service_fraction_by_tier={1: 1.0, 2: 0.5, 3: 0.0, 4: 0.0},
@@ -356,7 +356,7 @@ def test_resend_allocation_targets_only_stale_leader() -> None:
     leader_b_addr = _StubAddr("leader-B")
 
     # Stale leader echoed version=1 — should trigger a re-send.
-    asyncio.run(role._resend_allocation_if_stale("leader-B", leader_b_addr, 1))
+    asyncio.run(role._component.resend_if_stale("leader-B", leader_b_addr, 1))
     assert len(sent) == 1, f"expected one re-send to leader-B, got {sent}"
     resent_msg, resent_addr = sent[0]
     assert resent_addr is leader_b_addr
@@ -365,23 +365,23 @@ def test_resend_allocation_targets_only_stale_leader() -> None:
 
     # Caught-up leader (applied_version == latest) — no re-send.
     sent.clear()
-    asyncio.run(role._resend_allocation_if_stale("leader-B", leader_b_addr, 3))
+    asyncio.run(role._component.resend_if_stale("leader-B", leader_b_addr, 3))
     assert sent == []
 
     # Ahead-of-coordinator (shouldn't happen but defensive) — no re-send.
     sent.clear()
-    asyncio.run(role._resend_allocation_if_stale("leader-B", leader_b_addr, 99))
+    asyncio.run(role._component.resend_if_stale("leader-B", leader_b_addr, 99))
     assert sent == []
 
     # Coordinator's own seat — never re-send to self.
     sent.clear()
-    asyncio.run(role._resend_allocation_if_stale("leader-A", role._context.addr, 0))
+    asyncio.run(role._component.resend_if_stale("leader-A", role._context.addr, 0))
     assert sent == []
 
     # No stashed allocation — degenerate first-round case.
     sent.clear()
-    role._last_dispatched_allocation = None
-    asyncio.run(role._resend_allocation_if_stale("leader-B", leader_b_addr, 0))
+    role._component.last_dispatched_allocation = None
+    asyncio.run(role._component.resend_if_stale("leader-B", leader_b_addr, 0))
     assert sent == []
 
 

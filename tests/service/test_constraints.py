@@ -178,7 +178,7 @@ async def test_curtail_willingness_sensitivity_is_bounded():
     """The sensitivity multiplier in the auction willingness is clamped to
     ``[_SENS_MULT_MIN, _SENS_MULT_MAX]`` so it ranks within a tier but can
     never overcome the 1e4 priority tier step (no waterfall inversion)."""
-    from scare.service.control.constraints import _SENS_MULT_MAX, _SENS_MULT_MIN
+    from scare.service.control.constraint_tuning import _SENS_MULT_MAX, _SENS_MULT_MIN
 
     behavior = MockBehavior()
     behavior.set_obs(
@@ -683,7 +683,7 @@ async def test_gating_progress_gate_suspends_stalled_rearm():
     auction stops arming.  Driven directly so each call models one round
     (the in-flight guard is cleared between calls as ``_allocate_auction``
     would)."""
-    from scare.service.control.constraints import _CURTAIL_NO_PROGRESS_LIMIT
+    from scare.service.control.constraint_tuning import _CURTAIL_NO_PROGRESS_LIMIT
 
     behavior, monitor = _gating_monitor(gating=True, sector=Sector.ELECTRICITY)
     world = create_world()
@@ -716,7 +716,10 @@ def test_curtail_proximity_monotonic_in_hops():
     """The targeting proximity multiplier increases with cached
     ``hops_remaining`` (closer to origin) and is neutral with no state."""
     from scare.base.model import ConstraintStateMessage
-    from scare.service.control.constraints import _CURTAIL_PROX_MAX, _CURTAIL_PROX_MIN
+    from scare.service.control.constraint_tuning import (
+        _CURTAIL_PROX_MAX,
+        _CURTAIL_PROX_MIN,
+    )
 
     behavior = MockBehavior()
     behavior.set_obs("agent-0", {"p_mw": 5.0, "vm_pu": 1.0})

@@ -31,7 +31,8 @@ from scare.base.channel import (
 )
 from scare.base.model import Sector, StartBalanceNegotiation
 from scare.community.coalition_store import CoalitionConstraintStore
-from scare.community.summary import CrossSectorChannel, HolonSummaryRole
+from scare.community.summary import HolonSummaryRole
+from scare.community.summary_state import CrossSectorChannel
 
 # ---------------------------------------------------------------------------
 # Fake mango context: records outbound messages, carries an aid + sim
@@ -128,8 +129,8 @@ def _build_role(
     )
     role._context = _FakeContext(aid)
     # Force cooldown into the past so the first tick may fire.
-    role._last_xs_inversion_emit_t = -1e9
-    role._inversion_cooldown_s = 0.0
+    role._detector._last_xs_inversion_emit_t = -1e9
+    role._detector._inversion_cooldown_s = 0.0
     return role
 
 
