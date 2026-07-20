@@ -674,6 +674,10 @@ def _failure_windows(events_path: Path) -> list[tuple[float, float]]:
 # fires a ``slack_budget_violation`` the controller clears within a rebalance
 # round, so judge the peak draw over only the final ``_SLACK_SETTLE_S`` seconds.
 _SLACK_SETTLE_S: float = 2.0
+# NOTE: numerically equal to ``config.slack_budget_violation_tol`` (0.05) but
+# deliberately independent: that value is the ACTUATOR dead band. Keeping them
+# equal makes the (100%, 105%] band simultaneously un-actuated and forgiven —
+# ``in_unactuated_band`` in the per-slack detail surfaces exactly that case.
 _SLACK_TOL: float = 0.05
 
 
@@ -735,6 +739,11 @@ def _check_slack_budget(
                 "budget": budget,
                 "steady_peak": peak,
                 "threshold": threshold,
+                "utilization": peak / budget,
+                # Over budget yet inside the grading tolerance — the same band
+                # the runtime corrector's dead band ignores, so nothing will
+                # ever pull it back and no claim will ever flag it.
+                "in_unactuated_band": budget < peak <= threshold,
                 "violated": peak > threshold,
             }
             if peak > threshold:

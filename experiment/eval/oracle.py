@@ -397,6 +397,15 @@ def _adapter_observe(monee_net: Any) -> Any:
     child_by_aid = {f"child-{c.id}": c for c in monee_net.childs}
 
     class _OracleBehavior:
+    # NOTE (grading asymmetry, documented 2026-07-20): this obs carries CHILD
+    # model values only — node-level constraint vars (vm_pu, loading_percent,
+    # pressure_pu, t_k) are absent, so metrics' constraint_allowed_fraction
+    # reads 1.0 for every oracle row and the throttle-exclusion / tier1_immune
+    # grading is a no-op on the oracle arm. Merging node values here (mirror
+    # multi_energy_monee._install_child.observer) would fix it but also
+    # activates temp_infeasible on oracle rows — a substantive oracle-grading
+    # change needing its own A/B before adoption.
+
         def observe(self, aid: str) -> dict | None:
             child = child_by_aid.get(aid)
             if child is None:
@@ -497,6 +506,19 @@ def _build_min_shed_problem(
     # HeatLoad q, never Sink flow) so the slack must carry their sum — a fixed
     # ±10 goes infeasible above LV (MVLV ~179 kg/s vs LV ~5).
     heat_envelope_kgs = max(10.0, 2.0 * _heat_throughput_kgs(monee_net))
+    # U6 probe: bound the heat slack like el/gas are bounded (they get SCARE's
+    # exact budget; heat gets a feasibility-sized envelope ~16x demand). Set
+    # SCARE_ORACLE_HEAT_ENVELOPE_KGS to SCARE's observed heat slack flow to
+    # test whether the oracle's heat advantage is real or envelope artifact.
+    _env_override = os.environ.get("SCARE_ORACLE_HEAT_ENVELOPE_KGS")
+    if _env_override:
+        try:
+            heat_envelope_kgs = abs(float(_env_override))
+        except ValueError:
+            logger.warning(
+                "SCARE_ORACLE_HEAT_ENVELOPE_KGS=%r is not a number; ignoring",
+                _env_override,
+            )
     ext_grid_heat_bounds = (
         (-budgets["heat"], +budgets["heat"])
         if budgets["heat"] is not None

@@ -385,7 +385,12 @@ def served_by_load(
         elif is_disconnected:
             allowed = 1.0
         else:
-            allowed = constraint_allowed_fraction(obs, sec, tier=tier)
+            # Physics only (no tier-1 immunity): the immunity is runtime
+            # policy; with it, tier 1 is never constraint-throttled and the
+            # priority claims manufacture t1<t2 inversions.
+            allowed = constraint_allowed_fraction(
+                obs, sec, tier=tier, tier1_immune=False
+            )
         sec_components = components_by_sector.get(sec.value, {})
         comp_idx = sec_components.get(child.node_id, -1)
         rows.append(

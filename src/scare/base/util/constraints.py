@@ -34,6 +34,13 @@ def constraint_utilization(
 
 
 _CLAMP_TIER_DEADBAND: dict[int, float] = {
+    # Tier 1's entry is reached ONLY with ``tier1_immune=False`` (grading):
+    # without it, tier 1 fell to the 0.85 default — the HARSHEST band — so a
+    # tier-1 row was more readily excluded as constraint-throttled than the
+    # tier-2 row it is compared against, which can both hide a real t1<t2
+    # inversion and manufacture a fake one on the fatal priority claim.
+    # Strictest tier ⇒ most protective band (above tier 2's).
+    1: 0.97,
     2: 0.95,
     3: 0.90,
     4: 0.85,
@@ -88,6 +95,7 @@ def constraint_allowed_fraction(
     sector: Sector,
     *,
     tier: int | None = None,
+    tier1_immune: bool = True,
 ) -> float:
     """Tightest constraint-allowed served fraction ``∈ [0, 1]`` from local
     measurements (same tier deadband as :func:`clamp_to_constraints`).
@@ -103,9 +111,13 @@ def constraint_allowed_fraction(
     over-voltage still caps generators. Tier-1 immune.
     """
     # Tier 1 immune to the soft clamp; a true ConstraintViolation re-checks it.
-    if tier is not None and int(tier) == 1:
+    # ``tier1_immune=False`` (grading only): the immunity is a runtime
+    # protection policy, not physics — the eval's feasible-subset filter needs
+    # the physical value or tier 1 reads as always-servable and every
+    # physically-forced tier-1 shortfall is misread as a priority inversion.
+    if tier1_immune and tier is not None and int(tier) == 1:
         return 1.0
-    if tier is not None and int(tier) >= 2:
+    if tier is not None and int(tier) >= 1:
         deadband = _CLAMP_TIER_DEADBAND.get(int(tier), _CLAMP_DEFAULT_DEADBAND)
     else:
         deadband = _CLAMP_DEFAULT_DEADBAND

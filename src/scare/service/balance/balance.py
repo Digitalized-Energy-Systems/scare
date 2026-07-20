@@ -284,6 +284,7 @@ def _compute_flex_report(
     now: float,
     enable_heat_l2_dispatch: bool,
     round_id: str,
+    credit_gen_capacity: bool = False,
 ) -> AvailableFlexAnswer:
     """Leader-side flex aggregation over group members (read-only): supply/demand
     pools, per-(sector, tier) splits, unmet demand, and the heat delivered-plus-probe
@@ -326,6 +327,19 @@ def _compute_flex_report(
                 gen_supply = float(eff) if eff is not None else abs(cap)
             else:
                 gen_supply = abs(sp)
+                # R1 lever (``enable_gen_capacity_supply``): credit available
+                # capacity so the pool can ask for a ramp. A fresh over-voltage
+                # curtail-lock keeps the delivered-only credit (that supply
+                # must not inflate the pool); the congestion ceiling scales it.
+                if (
+                    credit_gen_capacity
+                    and sector is not Sector.HEAT
+                    and not has_gen_curtail_lock(behavior, aid, now)
+                ):
+                    ceiling = line_congestion_ceiling(
+                        behavior, aid, now, _LINE_CONGESTION_TTL_S
+                    )
+                    gen_supply = max(gen_supply, abs(cap) * ceiling)
             supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + gen_supply
         # Priority-tier demand aggregation (loads only: cap > 0).
         if cap > 0:
@@ -1118,6 +1132,62 @@ class L2DispatchHandler:
         self._role.context.schedule_instant_task(
             self._role._trigger.trigger_balance_negotiation()
         )
+
+    _REASSERT_TOL: float = 1e-3
+
+    async def reassert_standing_allocation(self) -> None:
+        """Restore-only re-apply of the last dispatched allocation.
+
+        The dispatch caps each load by local feasibility at write time;
+        constraint release fires no event, so a load capped to ~0 stays
+        latched below the standing allocation until the next L2 solve (the
+        no-trigger gate may never run one — the task-17 latch). Lift such
+        loads back toward ``min(allocation, constraint_allowed)``. Never
+        pulls a load down; heat excluded (the frontier owns heat restores);
+        every interlock still applies via ``apply_regulate``.
+        """
+        if topology_characteristic(self._role, tid="groups") != "leader":
+            return
+        sf = self._role._sess.last_dispatched_service_fraction
+        if not sf:
+            return
+        now = self._role.context.current_timestamp
+        members = [self._role.context.aid] + [
+            n.aid for n in self._role._live_neighbours()
+        ]
+        for aid in members:
+            # A promoted island reference must never enter the load path: its
+            # sign-flipping free var can read as positive cap, and a reassert
+            # write would seed a generator-keyed L2 floor (see the dispatch
+            # loop's identical guard).
+            if self._role._grid_former_policy.is_former(aid):
+                continue
+            obs = self._role.behavior.observe(aid) or {}
+            cap = obs_capacity(obs, behavior=self._role.behavior, aid=aid)
+            if cap <= 0:
+                continue
+            sec = obs_sector(obs, behavior=self._role.behavior, aid=aid)
+            if sec is None or sec is Sector.HEAT:
+                continue
+            prio = obs_priority(obs, behavior=self._role.behavior, aid=aid)
+            frac = sf.get(sec.value, {}).get(prio)
+            if frac is None:
+                continue
+            target = min(
+                max(0.0, min(1.0, float(frac))),
+                constraint_allowed_fraction(obs, sec, tier=prio),
+            )
+            current = float(obs.get("regulation", 1.0))
+            if target > current + self._REASSERT_TOL:
+                apply_regulate(
+                    self._role.behavior,
+                    aid,
+                    target,
+                    sector=sec.value,
+                    reason="l2_reassert",
+                    timestamp=now,
+                    priority_tier=prio,
+                )
 
     async def _dispatch_service_fractions(
         self, service_fraction: dict[str, dict[int, float]]
@@ -2268,6 +2338,9 @@ class EnergyBalanceNegotiator(Role):
         enable_l2_priority_floor: bool = True,
         enable_actuated_ledger_writeback: bool = True,
         enable_heat_l2_dispatch: bool = False,
+        enable_gen_capacity_supply: bool = False,
+        enable_l2_allocation_reassert: bool = False,
+        l2_allocation_reassert_s: float = 2.0,
         component_scope: bool = False,
     ) -> None:
         super().__init__()
@@ -2315,6 +2388,9 @@ class EnergyBalanceNegotiator(Role):
         # (dispatch-only; gossip stays heat-excluded) and report delivered heat
         # as the sector's flex supply pool.
         self.enable_heat_l2_dispatch = bool(enable_heat_l2_dispatch)
+        self.enable_gen_capacity_supply = bool(enable_gen_capacity_supply)
+        self.enable_l2_allocation_reassert = bool(enable_l2_allocation_reassert)
+        self.l2_allocation_reassert_s = float(l2_allocation_reassert_s)
 
         # Sector-specific convergence rate unless overridden.
         ts = SECTOR_TIMESCALE.get(sector, {})
@@ -2360,6 +2436,14 @@ class EnergyBalanceNegotiator(Role):
             store = {}
             self.behavior._scare_gossip_capable = store
         store.setdefault(self.sector, set()).add(self.context.aid)
+
+        # R2 drift fix: restore-only re-assert of the standing L2 allocation
+        # (constraint release fires no event — see the task-17 latch).
+        if self.enable_l2_allocation_reassert:
+            self.context.schedule_periodic_task(
+                self._dispatch.reassert_standing_allocation,
+                delay=self.l2_allocation_reassert_s,
+            )
 
         # Mango dispatches synchronously; wrap async handlers to self-schedule
         # (tracked by termination detection) and stamp the sender's heartbeat.
@@ -2565,6 +2649,7 @@ class EnergyBalanceNegotiator(Role):
             now=self.context.current_timestamp,
             enable_heat_l2_dispatch=self.enable_heat_l2_dispatch,
             round_id=message.round_id,
+            credit_gen_capacity=self.enable_gen_capacity_supply,
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
@@ -2651,6 +2736,9 @@ def create_energy_balance_role(
     enable_l2_priority_floor: bool = True,
     enable_actuated_ledger_writeback: bool = True,
     enable_heat_l2_dispatch: bool = False,
+    enable_gen_capacity_supply: bool = False,
+    enable_l2_allocation_reassert: bool = False,
+    l2_allocation_reassert_s: float = 2.0,
     component_scope: bool = False,
 ) -> EnergyBalanceNegotiator:
     if priority is None:
@@ -2672,5 +2760,8 @@ def create_energy_balance_role(
         enable_l2_priority_floor=enable_l2_priority_floor,
         enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,
         enable_heat_l2_dispatch=enable_heat_l2_dispatch,
+        enable_gen_capacity_supply=enable_gen_capacity_supply,
+        enable_l2_allocation_reassert=enable_l2_allocation_reassert,
+        l2_allocation_reassert_s=l2_allocation_reassert_s,
         component_scope=component_scope,
     )

@@ -363,6 +363,35 @@ class RestorationConfiguration:
     # (worse on every gate combined than alone) — prefer disabling
     # enable_heat_priority_waterfall wherever this is on.
     enable_heat_l2_dispatch: bool = True
+    # R1 estimator lever: credit non-slack generators their AVAILABLE capacity
+    # (rated |cap|, reduced by a fresh over-voltage curtail-lock — delivered
+    # only — and by the line-congestion ceiling) to the L2 supply pool instead
+    # of delivered |sp|. Delivered-credit makes the pool a function of its own
+    # previous output (self-limiting ratchet); capacity-credit lets the
+    # supply-priority allocation ask generators to ramp. False = legacy.
+    enable_gen_capacity_supply: bool = False
+
+    # R5 last-sink guard: refuse to shed the ONLY HeatLoad at a junction with
+    # a co-located fixed HeatGenerator below the fraction that absorbs the
+    # local injection (node-365 over-temperature class). CP outlet injection
+    # excluded (variable; owned by the CP heat-outlet guard).
+    # VALIDATED-NEGATIVE 2026-07-20 (task 19 cold_day A/B, fixed-monee
+    # substrate): the monee CP-write fix already clears the node-365/272
+    # violations in control, and enabling this guard forced draws at 25
+    # junctions on a supply-starved grid — NEW under-temp violation (node 314
+    # @310.0 K) and PWSF -0.006. Keep OFF; premise only matters where fixed
+    # HeatGenerator injection dominates the heat balance.
+    enable_heat_last_sink_guard: bool = False
+
+    # R2 drift fix (task-17 latch): the L2 dispatch caps each load by local
+    # feasibility at WRITE time; constraint release fires no event, so a load
+    # capped to ~0 stays below the standing allocation until the next solve —
+    # which the no-trigger gate may never run. Periodically LIFT such loads
+    # back toward min(allocation, constraint_allowed). Restore-only: never
+    # pulls a load down, so it cannot fight legitimate above-allocation L1
+    # serving or deepen a shed; all interlocks apply via apply_regulate.
+    enable_l2_allocation_reassert: bool = False
+    l2_allocation_reassert_s: float = 2.0
     # Cadence (s) of the heat holon's periodic rebalance trigger; aligned by
     # default with heat_cp_supply_refresh_s so allocations track the summary.
     heat_l2_rebalance_s: float = 2.0

@@ -79,7 +79,7 @@ _REGULATE_DEDUP_TOL: float = 1e-3
 
 
 L2_ALLOCATION_REASONS: frozenset[str] = frozenset(
-    {"holon_supply_priority", "holon_tier_alloc"}
+    {"holon_supply_priority", "holon_tier_alloc", "l2_reassert"}
 )
 
 
@@ -132,6 +132,24 @@ def set_l2_priority_floor(behavior: Any, aid: str, factor: float) -> None:
     still honours the holon's priority decision) without re-dispatching and
     abandoning an in-flight gossip."""
     _l2_floor_store(behavior)[aid] = float(factor)
+
+
+def _heat_last_sink_floor_store(behavior: Any) -> dict[str, float]:
+    """Per-aid serve-fraction floor for a HeatLoad that is the SOLE sink at a
+    junction with fixed local heat injection: ``aid -> floor``. Populated at
+    build time (``register_heat_last_sink_floor``); enforced in
+    :func:`apply_regulate` when ``enable_heat_last_sink_guard`` is on."""
+    return _get_behavior_store(behavior, "_scare_heat_last_sink_floor")
+
+
+def register_heat_last_sink_floor(behavior: Any, aid: str, floor: float) -> None:
+    """Register the minimum serve fraction that absorbs the junction's fixed
+    local injection (``min(1, injection/|load cap|)``)."""
+    _heat_last_sink_floor_store(behavior)[str(aid)] = max(0.0, min(1.0, float(floor)))
+
+
+def heat_last_sink_floor(behavior: Any, aid: str) -> float | None:
+    return _heat_last_sink_floor_store(behavior).get(str(aid))
 
 
 def _heat_curtail_lock_store(behavior: Any) -> dict[str, float]:
@@ -591,6 +609,24 @@ def apply_regulate(
         _sector_e = Sector(sector) if not isinstance(sector, Sector) else sector
     except ValueError:
         _sector_e = None
+    # --- Last-sink floor (heat only) ----------------------------------
+    # A junction's sole HeatLoad must keep absorbing the co-located fixed
+    # injection; below the floor the junction has no cooling draw and runs
+    # away thermally (permanent: MW-layer sheds set no lock, so no restore
+    # path fires). Clamp any writer's shed up to the floor.
+    if _sector_e is Sector.HEAT and cfg_value(_cfg, "enable_heat_last_sink_guard"):
+        _floor = heat_last_sink_floor(behavior, str(aid))
+        if _floor is not None and factor < _floor - tolerance:
+            record_event(
+                t=float(timestamp),
+                kind="heat_last_sink_floor_clamped",
+                aid=str(aid),
+                sector=str(sector),
+                detail=f"reason={reason} requested_factor={factor:.4f} "
+                f"floor={_floor:.4f}",
+            )
+            factor = _floor
+
     if _sector_e is Sector.HEAT and getattr(_cfg, "enable_heat_curtail_lock", True):
         _lock = _heat_curtail_lock_store(behavior)
         if reason == CURTAIL_AUCTION_REASON:

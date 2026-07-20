@@ -80,6 +80,7 @@ from scare.base.util import (
     obs_constraint_values,
     obs_setpoint,
     register_grid_former_rating,
+    register_heat_last_sink_floor,
     register_priority,
     register_sector,
     register_slack,
@@ -568,6 +569,37 @@ def _build_branch_sector_tables(
     return branch_sector_by_id, neighbour_sector_by_node
 
 
+def _register_heat_last_sink_floors(
+    behavior: RestorationEnvironmentBehavior, monee_net: Any
+) -> None:
+    """R5 last-sink guard registry: for each heat junction with fixed local
+    injection (HeatGenerator children) and exactly ONE HeatLoad, register the
+    serve-fraction floor that absorbs the injection
+    (``min(1, injection/|load|)``). CP outlet injection (SubHG) is excluded —
+    variable, owned by the CP heat-outlet guard."""
+    from monee.model.child import HeatGenerator, HeatLoad
+
+    by_node: dict[Any, dict[str, list]] = {}
+    for child in monee_net.childs:
+        m = child.model
+        if isinstance(m, HeatGenerator):
+            by_node.setdefault(child.node_id, {}).setdefault("gen", []).append(m)
+        elif isinstance(m, HeatLoad):
+            by_node.setdefault(child.node_id, {}).setdefault("load", []).append(child)
+    for node_id, kinds in by_node.items():
+        gens = kinds.get("gen", [])
+        loads = kinds.get("load", [])
+        if not gens or len(loads) != 1:
+            continue
+        # HeatGenerator stores q_mw_heat = -q_mw (injection); HeatLoad +q_mw.
+        injection = sum(abs(float(g.q_mw_heat)) for g in gens)
+        load_cap = abs(float(loads[0].model.q_mw_heat))
+        if injection <= 0.0 or load_cap <= 0.0:
+            continue
+        floor = min(1.0, injection / load_cap)
+        register_heat_last_sink_floor(behavior, _child_aid(loads[0].id), floor)
+
+
 def _populate_children(
     world: SimulationWorld,
     monee_net: Any,
@@ -576,6 +608,8 @@ def _populate_children(
     config: RestorationConfiguration,
 ) -> None:
     heat_component_by_node = _heat_component_by_node(monee_net)
+    if config.enable_heat_last_sink_guard:
+        _register_heat_last_sink_floors(behavior, monee_net)
     for child in monee_net.childs:
         aid = _child_aid(child.id)
         # Read the model directly: observe() needs energyflow, which only
@@ -949,6 +983,9 @@ def _make_balance_role(
         enable_l2_priority_floor=config.enable_l2_priority_floor,
         enable_actuated_ledger_writeback=config.enable_actuated_ledger_writeback,
         enable_heat_l2_dispatch=config.enable_heat_l2_dispatch,
+        enable_gen_capacity_supply=config.enable_gen_capacity_supply,
+        enable_l2_allocation_reassert=config.enable_l2_allocation_reassert,
+        l2_allocation_reassert_s=config.l2_allocation_reassert_s,
         component_scope=(
             config.enable_holonic and config.holon_admm_scope == "component"
         ),

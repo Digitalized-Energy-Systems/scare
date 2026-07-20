@@ -2825,6 +2825,7 @@ _REGULATE_REASON_LABELS: dict[str, tuple[str, str]] = {
     # Holonic ADMM
     "holon_supply_priority": ("priority waterfall", "#2E7D32"),
     "holon_tier_alloc": ("tier allocation", "#56A656"),
+    "l2_reassert": ("L2 re-assert", "#7BC17E"),
     # Cross-sector CP ADMM
     "cp_admm": ("CP-ADMM", "#17BECF"),
     "cp_priority_admm": ("CP priority ADMM", "#4FA3AF"),
