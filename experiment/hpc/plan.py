@@ -123,7 +123,16 @@ def _build_eval_tasks(cfg: CampaignConfig) -> list[TaskSpec]:
             n_seeds = exp.n_seeds or runs
             for variant in exp.variants or ["scare"]:
                 for ablation in exp.ablations or [{}]:
+                    # Ablation/sweep keys are RestorationConfiguration fields —
+                    # MAS-side only. The oracle solve reads grid/scenario/seed/
+                    # priorities and never the config, so an oracle arm under a
+                    # non-empty ablation is a bit-identical duplicate of the
+                    # oracle control (measured: 25 dead tasks in eval_full_v2).
+                    if variant == "oracle" and ablation:
+                        continue
                     for sweep in exp.sweeps or [{}]:
+                        if variant == "oracle" and sweep:
+                            continue
                         for scenario in exp.scenarios or [{"kind": "clean"}]:
                             for run_idx in range(n_seeds):
                                 # Seed mixes experiment, grid, run so

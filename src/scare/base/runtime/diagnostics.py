@@ -19,7 +19,11 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # Ring buffer of recent regulate/switch actions (<1 MB).
-_MAX_ACTIONS = 10000
+# Sized so heavy tasks don't saturate: cp_heavy/cross_sector tasks exceeded
+# the old 10000 cap, silently clipping regulates_total and turning
+# regulates_by_reason into a tail-window sample (window bias in the
+# reason plots).
+_MAX_ACTIONS = 50000
 
 
 @dataclass(frozen=True)

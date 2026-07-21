@@ -295,9 +295,6 @@
           "enable_holonic": false
         },
         {
-          "enable_qp_gossip": false
-        },
-        {
           "enable_priority_holon_allocation": false
         },
         {
@@ -704,6 +701,10 @@
         },
         {
           "enable_reconfig_feasibility_ranking": false
+        },
+        {
+          "$label": "l2_reassert",
+          "enable_l2_allocation_reassert": true
         }
       ],
       "scenarios": [
@@ -1175,10 +1176,10 @@
       "population": "compliant"
     },
     {
-      "$comment_block": "L1 gossip / sub-community dispatch. Same concentrated-5 deficit. enable_qp_gossip OFF reverts to legacy equal-share; clpu_ramp OFF removes inrush throttling; modularity vs label-propagation changes partitioning. Metric: PWSF, share-stall events, ramp-violation, community-size dispersion.",
+      "$comment_block": "L1 gossip / sub-community dispatch, concentrated-5 deficit on lv_small. GRID CHOICE IS LOAD-BEARING: on simbench_lv the L1 gossip issues ZERO regulate writes (all dispatch flows through L2/L3; eval_smoke_v3 tasks 23 vs 25 were byte-identical), so gossip levers only bind on lv_small (balance-reason writes present). enable_qp_gossip OFF reverts to legacy equal-share; clpu_ramp OFF removes inrush throttling; modularity vs label-propagation changes partitioning. Metric: PWSF, share-stall events, ramp-violation, community-size dispersion.",
       "name": "just_gossip_l1",
       "grids": [
-        "simbench_lv"
+        "simbench_lv_small"
       ],
       "n_seeds": 15,
       "variants": [
@@ -1454,6 +1455,15 @@
           "enable_l2_generator_ramp": false
         },
         {
+          "enable_gen_ramp_to_full": true
+        },
+        {
+          "$label": "gen_capacity_supply",
+          "enable_gen_capacity_supply": true
+        },
+        {
+          "$label": "gen_capacity_supply+ramp",
+          "enable_gen_capacity_supply": true,
           "enable_gen_ramp_to_full": true
         }
       ],
@@ -2368,7 +2378,7 @@
     "partition": "rosa_express.p",
     "time": "02:00:00",
     "mem": "4G",
-    "cpus": 1,
+    "cpus": 32,
     "max_concurrent": 64,
     "aggregate": true,
     "nodelist": "mpcb014,mpcb016"
@@ -2377,7 +2387,7 @@
     "partition": "rosa_express.p",
     "time": "2:00:00",
     "mem": "32G",
-    "cpus": 1,
+    "cpus": 32,
     "max_concurrent": 64,
     "aggregate": true,
     "nodelist": "mpcb014,mpcb015"

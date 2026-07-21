@@ -480,6 +480,11 @@ def _config_from_task(task: TaskSpec):
     ablation, and sweep dicts. Variant maps to a base preset; ablation /
     sweep are field overrides applied on top.
     """
+    # Baseline semantics (decided 2026-07-22): single_level = NO HIERARCHY
+    # (flat L1, no holonic L2), component_level = NO COMMUNITIES (one group
+    # per connected component). The L3 CP priority ADMM stays ON in both —
+    # it is cross-sector coupling machinery, not part of the hierarchy or
+    # community structure these baselines ablate.
     if task.variant == "single_level":
         base = RestorationConfiguration(
             enable_holonic=False,
