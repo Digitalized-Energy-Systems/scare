@@ -206,6 +206,23 @@ _DEP_HEAT_KWARGS = {
     "min_gen_mw": 0.0005,
 }
 
+# A CHP fleet cannot ride on the shrunken 0.5 kW load floor above. CHPs are
+# sized off the ELECTRICAL p_ref at their bus (``chp_p_share``) and monee pins
+# their heat by-product to 1.125x that with a hard equality, dumping it into the
+# co-located per-bus supply junction. Where that junction is degree-1 in the
+# water graph its mass balance pins the pipe flow to the junction's own draw, so
+# the by-product has to leave as temperature alone: at the 0.5 kW floor node 341
+# needed t_pu 3.757 against the Junction ceiling of 2.0 and the grid was born
+# infeasible (3 such leaves; Gurobi's IIS names only the worst). The floor sets
+# the leaf mass flow, so restoring it to the stock 5e-3 is the lever - it takes
+# the worst leaf to 0.395 pu. min_load_mw 2e-3 is NOT enough (1.115 pu still
+# infeasible; the usable ceiling is ~1.0 pu, not 2.0, because inlet water sits
+# near 1.0 pu). Costs the grid its heat-side shrink (heat/el 0.30 -> 1.19), which
+# el_dependent can afford: its premise is gas->power, and heat dependence still
+# rides on p2h_p_share + the token node_heat_gen_share.
+# NOT needed on gas_dependent: no CHP there, and no CP injection lands on a leaf.
+_EL_DEP_HEAT_KWARGS = {**_DEP_HEAT_KWARGS, "min_load_mw": 0.005}
+
 GRIDS: dict[str, Callable[[], "object"]] = {
     # Slack budget is a per-scenario knob (``scenario.slack_budget_pct``),
     # not baked into any grid, so one base grid serves multiple operator
@@ -356,7 +373,7 @@ GRIDS: dict[str, Callable[[], "object"]] = {
         coupling_shares={"chp_p_share": 1.4, "p2h_p_share": 0.5},
         primary_gen_scale=0.2,
         gas_kwargs={**_DEP_GAS_KWARGS, "gas_gen_share": 1.5},
-        heat_kwargs=_DEP_HEAT_KWARGS,
+        heat_kwargs=_EL_DEP_HEAT_KWARGS,
     ),
 }
 
