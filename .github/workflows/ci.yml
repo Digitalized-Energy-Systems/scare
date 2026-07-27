@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "ruff>=0.15"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The four local source dependencies are deliberately absent from
+      # pyproject (see the comment there). mango-agents MUST come from this
+      # branch -- the same-named PyPI release is different code.
+      - name: Install source dependencies
+        run: |
+          git clone --depth 1 --branch feature-transactional-apis \
+            https://github.com/OFFIS-DAI/mango.git ../mango
+          git clone --depth 1 https://github.com/Digitalized-Energy-Systems/monee.git ../monee
+          git clone --depth 1 https://github.com/Digitalized-Energy-Systems/mango-energy-environments.git ../mango-energy-environments
+          git clone --depth 1 https://github.com/Digitalized-Energy-Systems/distributed-resource-optimization.git ../distributed-resource-optimization
+          pip install -e ../mango -e ../monee -e ../distributed-resource-optimization -e ../mango-energy-environments
+
+      - run: pip install -e ".[dev]"
+
+      # PYTHONHASHSEED is pinned because set/dict iteration order feeds
+      # coordination-identity decisions; unpinned it makes runs incomparable.
+      - name: Run tests
+        env:
+          PYTHONHASHSEED: "0"
+        run: pytest tests/ -q

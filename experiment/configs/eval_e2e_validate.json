@@ -1,0 +1,150 @@
+{
+  "$comment_block": "End-to-end validation of the 2026-07-26 fix batch. Each experiment isolates ONE claim so the check is falsifiable: the pairs marked NO-OP must come back byte-identical to their control, and the pairs marked EFFECT must differ. simbench_lv_small at 10 s keeps a task to a few minutes locally.",
+  "name": "eval_e2e_validate",
+  "out_root": "experiment/_runs/validate",
+  "simulation_duration_s": 10.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": false,
+  "defaults": {
+    "runs_per_grid": 2,
+    "failure_lambda": 1.5,
+    "max_failures": 2
+  },
+  "experiments": [
+    {
+      "$comment": "NO-OP + EFFECT for holon_watchdog_s. Arm 1 states the shipped default explicitly and MUST be byte-identical to the control (proves replacing the hardcoded 30.0 with the config field changed nothing). Arm 2 must differ (proves the knob is live).",
+      "name": "v_watchdog",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 2,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "holon_watchdog_s": 30.0,
+          "$allow_default_valued": "NO-OP control: must be byte-identical to the baseline"
+        },
+        {
+          "holon_watchdog_s": 1.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "EFFECT for the priority-weighting fix. enable_priority_holon_allocation=False was BIT-IDENTICAL to the default across all 15 seeds in eval_full_v2 because the stable-sort tie-break reproduced the priority order. With _prorata_target it must now differ. The default arm is the control and must be unchanged by the fix (it takes the same _waterfall_target branch as before).",
+      "name": "v_priority_weighting",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 2,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_priority_holon_allocation": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "NO-OP + EFFECT for heat_node_reg_kgs. cold_day with a cold supply and 1.5x heat load is the regime the campaign's sub-ambient t_k records came from (ablation_thermal / just_heat / cold_day on cp_heavy); a clean scenario keeps every junction flowing and cannot exercise the fix. Scenario 1 omits the key (shipped path), 2 states 0.0 and must match it, 3 at 1e-6 must change the heat state. The oracle applies the McCormick heat MILP and must be immune to all three.",
+      "name": "v_heat_regulariser",
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 2,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5
+        },
+        {
+          "kind": "cold_day",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "heat_node_reg_kgs": 0.0,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5
+        },
+        {
+          "kind": "cold_day",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "heat_node_reg_kgs": 1e-06,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5
+        }
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "EFFECT for oracle_time_limit_s. 1.0 s left one seed with no incumbent at all (correctly refused as ungradeable), which proves the knob but breaks the paired comparison; 5 s still forces a non-optimal solve while keeping a usable solution. Control solves optimal in ~12 s.",
+      "name": "v_oracle_budget",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 2,
+      "variants": [
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        },
+        {
+          "kind": "clean",
+          "max_failures": 2,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "oracle_time_limit_s": 5.0
+        }
+      ],
+      "population": "all"
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "00:30:00",
+    "mem": "8G",
+    "cpus": 1,
+    "max_concurrent": 8,
+    "aggregate": true
+  }
+}

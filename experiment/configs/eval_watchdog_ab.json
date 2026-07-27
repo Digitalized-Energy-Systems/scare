@@ -1,0 +1,246 @@
+{
+  "$comment_block": "D1 validation A/B for the holon watchdog latch. Root cause: on simbench_lv_small the pv_peak net is born infeasible (monee stepper fails steps 0-4, t=0..0.47), so the environment serves observers the unsolved constructor net (multi_energy_monee.py:262-271). SCARE's component-scope supply-priority ADMM runs its first gas solve at t=0.04 on those constructor readings — gas supply=0.0010 against demand=1.0019, identical to 4 dp across every seed — and correctly waterfalls gas tiers 3-4 to zero. The physics recovers by ~t=0.5, but the forced-republish watchdogs (HolonSummaryRole / HolonicCommunityRole / CPPriorityAdmmRole) all ran at watchdog_s=30.0, equal to simulation_duration_s, so they never fire mid-run and the delta gate keeps the deficit allocation frozen: only 13 gas regulate writes in the whole 30 s run, gas served 0.364 vs 0.745/0.767 for the weak baselines and 0.831 for the oracle. Arms sweep holon_watchdog_s; 30.0 reproduces the published behaviour byte-for-byte.",
+  "name": "eval_watchdog_ab",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 5400.0,
+  "failure_delay_s_max": 5.0,
+  "write_timeseries": true,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 15,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "$comment": "Primary A/B. 30.0 == the shipped default and must reproduce the published gas collapse exactly; the lower values arm the recovery path. Success = gas served fraction recovers toward the component_level level (0.745) without giving back SCARE's electricity advantage (0.846 matched).",
+      "name": "watchdog_pv_peak",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "holon_watchdog_s": 10.0
+        },
+        {
+          "holon_watchdog_s": 5.0
+        },
+        {
+          "holon_watchdog_s": 2.0
+        },
+        {
+          "holon_watchdog_s": 1.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ],
+      "target_metrics": [
+        "outcomes__served_by_sector__gas__fraction",
+        "outcomes__served_by_sector__electricity__fraction",
+        "outcomes__priority_weighted_fraction",
+        "outcomes__regulates_by_reason__holon_supply_priority",
+        "claims__constraint_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "Reference arm: the same 15 seeds under the three non-SCARE variants, so the recovered gas number has the matched 0.745 / 0.767 / 0.831 comparison on the same failure draws rather than against the pooled campaign.",
+      "name": "watchdog_pv_peak_reference",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ],
+      "target_metrics": [
+        "outcomes__served_by_sector__gas__fraction",
+        "outcomes__served_by_sector__electricity__fraction",
+        "outcomes__priority_weighted_fraction"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "Negative control on a scenario whose physics solves from step 0. The gas ADMM already returns all-1.0 at t=0.04 here, so no arm should move: any delta is the watchdog perturbing a healthy run, which would make the pv_peak gain untrustworthy.",
+      "name": "watchdog_clean_control",
+      "grids": [
+        "simbench_lv_small"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "holon_watchdog_s": 2.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45
+        }
+      ],
+      "target_metrics": [
+        "outcomes__served_by_sector__gas__fraction",
+        "outcomes__priority_weighted_fraction",
+        "outcomes__regulates_total"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "Generalisation check: the same latch should bite anywhere a deficit allocation is computed early and never revised. simbench_lv under generator failure at slack 0.15 is the campaign's other low-PWSF, low-compliance regime (0.728 PWSF, 58% compliance).",
+      "name": "watchdog_generator_deficit",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "holon_watchdog_s": 2.0
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.15
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "outcomes__served_by_sector__gas__fraction",
+        "outcomes__served_by_sector__electricity__fraction",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "D2b: nodal-heat-balance regulariser. monee's Node.calc_signed_heat_flow reads grid.node_heat_reg_kgs to keep d(heat_bal)/dT_n non-zero at zero mass flow; no grid class declared it, so it was always 0.0. Reproduced under the live formulation (HEAT_NONCONVEX_MIQCQP on Pyomo+Gurobi): a zero-flow junction lands at exactly 0.3*t_ref_k = 106.800000 K; 1e-6 restores 356.000000 K and moves a determined node by 2.2e-5 K. 1e-8 does not bite. The oracle swaps in the McCormick heat MILP and is immune either way, which is why the campaign's 306 sub-ambient readings are all MAS-side. cp_heavy carries 300 of them. Arm 0.0 reproduces the published behaviour exactly. Success = sub-ambient t_k records go to ~0 without moving PWSF on the flowing majority.",
+      "name": "heat_regulariser_ab",
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "heat_node_reg_kgs": 0.0
+        },
+        {
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "heat_node_reg_kgs": 1e-06
+        },
+        {
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "heat_node_reg_kgs": 0.001
+        }
+      ],
+      "target_metrics": [
+        "claims__constraint_compliance__detail__by_variable__temperature__n_violations",
+        "claims__constraint_compliance__passed",
+        "outcomes__priority_weighted_fraction",
+        "outcomes__priority_weighted_fraction_by_sector__heat"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": "D4: oracle time budget. 400 of the 469 time-limited solves in eval_full_v2 stopped at the 300s default and NONE were on a hard grid (simbench_lv 248 with p90 gap 0.45, cp_heavy_dependent 91, cp_heavy 40, cp_dependent 21); the 69 that got 900s were the allowlisted ones. Every one had a feasible incumbent, so the budget buys bound-tightening, not feasibility. Measures how much of the uncertified 32.7% a longer budget actually converts, before spending it campaign-wide.",
+      "name": "oracle_budget_ab",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "oracle_time_limit_s": 300
+        },
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "oracle_time_limit_s": 900
+        },
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.45,
+          "oracle_time_limit_s": 1800
+        }
+      ],
+      "target_metrics": [
+        "outcomes__oracle_solve_optimal",
+        "outcomes__oracle_solver_stats__mip_gap",
+        "outcomes__oracle_solver_stats__runtime_s",
+        "outcomes__priority_weighted_fraction"
+      ],
+      "population": "all"
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "02:00:00",
+    "mem": "8G",
+    "cpus": 1,
+    "max_concurrent": 64,
+    "aggregate": true
+  }
+}

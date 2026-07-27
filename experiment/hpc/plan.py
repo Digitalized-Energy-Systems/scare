@@ -88,23 +88,62 @@ def _build_legacy_tasks(cfg: CampaignConfig) -> list[TaskSpec]:
     return tasks
 
 
+# Annotation opting an arm out of the no-op ablation check, for the rare case
+# where a duplicate-of-baseline arm is the intended design (e.g. a negative
+# control that must be bit-identical). Carries the reason so the exemption is
+# reviewable rather than a silent bypass.
+_ALLOW_DEFAULT_VALUED_ARM = "$allow_default_valued"
+
+
 def _validate_config_overrides(cfg: CampaignConfig) -> None:
     """Fail planning on ablation/sweep keys that are not
     ``RestorationConfiguration`` fields — the runner would otherwise silently
-    ignore them, degrading the arm to baseline."""
+    ignore them, degrading the arm to baseline — and on *ablation* arms that
+    only restate the defaults.
+
+    An ablation arm asserts "this component is off"; when every key already
+    holds its default value the arm is a bit-identical duplicate of the
+    baseline, so its published ``Δ`` is exactly 0 by construction and reads as
+    "the component does not matter". eval_full_v2 shipped four such arms
+    (``enable_monotonic_floor=False``, ``enable_heat_priority_waterfall=False``
+    in two experiments, ``enable_cross_sector_coalitions=False``), all of whose
+    flags already defaulted to the value the arm set.
+
+    Sweeps are exempt: including the default as one point is how a sweep anchors
+    its baseline, and the neighbouring points still vary.
+    """
     from scare.base.config import RestorationConfiguration
 
-    valid = {f.name for f in fields(RestorationConfiguration)}
+    spec = {f.name: f for f in fields(RestorationConfiguration)}
+    valid = set(spec)
     for exp in cfg.experiments:
         for axis, dicts in (("ablations", exp.ablations), ("sweeps", exp.sweeps)):
             for d in dicts:
                 # $-prefixed keys are annotations (e.g. $label drives the
                 # aggregate arm labels), stripped by the config layer.
-                unknown = sorted(k for k in set(d) - valid if not k.startswith("$"))
+                overrides = {k: v for k, v in d.items() if not k.startswith("$")}
+                unknown = sorted(set(overrides) - valid)
                 if unknown:
                     raise ValueError(
                         f"experiment {exp.name!r}: unknown "
                         f"RestorationConfiguration field(s) in {axis}: {unknown}"
+                    )
+                if axis != "ablations" or not overrides:
+                    continue
+                if d.get(_ALLOW_DEFAULT_VALUED_ARM):
+                    continue
+                restated = {
+                    k: v for k, v in overrides.items() if spec[k].default == v
+                }
+                if len(restated) == len(overrides):
+                    raise ValueError(
+                        f"experiment {exp.name!r}: ablation arm restates the "
+                        f"default for every key {restated} - it is a "
+                        f"bit-identical duplicate of the baseline and its delta "
+                        f"is 0 by construction. Flip the value to the non-default "
+                        f"side, or set "
+                        f'"{_ALLOW_DEFAULT_VALUED_ARM}": "<why>" if a duplicate '
+                        f"control is intended."
                     )
 
 
@@ -175,6 +214,8 @@ def create_campaign(
     *,
     source_path: Path | None = None,
     timestamp_dir: bool | None = None,
+    preflight: bool = False,
+    preflight_time_limit_s: float = 120.0,
 ) -> Path:
     use_ts = cfg.timestamp_dir if timestamp_dir is None else timestamp_dir
     name = cfg.name
@@ -188,6 +229,16 @@ def create_campaign(
             f"campaign dir already exists: {campaign_dir} "
             f"(remove it, or set timestamp_dir=true to auto-disambiguate)"
         )
+
+    tasks = build_tasks(cfg)
+    # Order matters: the cheap destination check first, then the minutes-long
+    # solvability check, and only then create anything. Reversed, a stale
+    # campaign dir costs a full preflight before it is reported.
+    if preflight:
+        from experiment.hpc.preflight import assert_preflight_clean
+
+        assert_preflight_clean(tasks, solve_time_limit_s=preflight_time_limit_s)
+
     campaign_dir.mkdir(parents=True)
     (campaign_dir / CAMPAIGN_LAYOUT["tasks"]).mkdir()
 
@@ -199,7 +250,6 @@ def create_campaign(
             Path(source_path).read_text(encoding="utf-8"), encoding="utf-8"
         )
 
-    tasks = build_tasks(cfg)
     with (campaign_dir / CAMPAIGN_LAYOUT["manifest"]).open("w", encoding="utf-8") as f:
         for t in tasks:
             f.write(json.dumps(t.to_dict(), sort_keys=True) + "\n")
@@ -375,6 +425,17 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Build every grid once locally to warm caches before submission",
     )
+    p.add_argument(
+        "--no-preflight",
+        action="store_true",
+        help="Skip the step-0 solvability check on each (grid, scenario) pair",
+    )
+    p.add_argument(
+        "--preflight-time-limit",
+        type=float,
+        default=120.0,
+        help="Per-solve budget for the preflight check (s); default 120",
+    )
     return p.parse_args()
 
 
@@ -392,7 +453,11 @@ def main() -> None:
         grid_names |= {g.name for e in cfg.experiments for g in e.grids}
         prebuild_grids(sorted(grid_names))
     campaign_dir = create_campaign(
-        cfg, source_path=args.config, timestamp_dir=timestamp_dir
+        cfg,
+        source_path=args.config,
+        timestamp_dir=timestamp_dir,
+        preflight=not args.no_preflight,
+        preflight_time_limit_s=args.preflight_time_limit,
     )
     print(campaign_dir)
 

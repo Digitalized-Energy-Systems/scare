@@ -21,6 +21,7 @@ from typing import Any
 from experiment.eval.metrics import (
     NON_GATING_CONSTRAINT_VARIABLES,
     _variable_tally_entry,
+    is_t_pu_floor_artifact,
 )
 
 
@@ -818,6 +819,11 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
     is now empty). De-energised / isolated junctions are filtered upstream in the
     ``constraints_final`` scan and never reach this gate.
 
+    Rows pinned at monee's ``t_pu`` Var floor are skipped here as well as on the
+    write side, so campaigns recorded before that filter existed re-grade from
+    their persisted ``constraints_final.csv`` without a re-run. Only the Var
+    floor is skipped; a genuinely cold junction still gates.
+
     Grid-feasibility companion to ``slack_budget_compliance``: together they
     make a run "compliant" only when it honoured both the operator slack budget
     and the gating physical envelope the oracle LP enforces by construction.
@@ -839,6 +845,9 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
     for r in rows:
         sec = r.get("sector", "")
         var = r.get("variable", "")
+        # Skipped before the tally so the artefact is not counted in n_checked.
+        if is_t_pu_floor_artifact(var, r.get("value")):
+            continue
         entry = by_sector.setdefault(
             sec,
             {
@@ -882,7 +891,9 @@ def _check_constraint_compliance(constraints_path: Path) -> dict[str, Any]:
     return {
         "passed": not gating,
         "detail": {
-            "n_checked": len(rows),
+            # Tallied rows, not len(rows): Var-floor artefacts are skipped above
+            # and must not inflate the denominator.
+            "n_checked": sum(e["n_checked"] for e in by_sector.values()),
             # ``n_violations`` is the GATING count (drives ``passed``); with an
             # empty non-gating set the nongating list is always empty.
             "n_violations": len(gating),

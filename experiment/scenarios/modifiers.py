@@ -30,6 +30,7 @@ def apply_microgrid_islanding(
     ),
     promote_all_generators: bool = False,
     grid_former_aids: "tuple[str, ...] | list[str] | set[str]" = (),
+    grid_former_headroom: float = 4.0,
 ) -> dict[str, int]:
     """Enable monee's islanding extension on *mes* and optionally convert
     selected generator-class children into ``GridForming*`` types so the
@@ -49,6 +50,10 @@ def apply_microgrid_islanding(
         grid_former_aids:
             Per-child opt-in aids of the form ``"child-{id}"``; ignored
             when ``promote_all_generators`` is True.
+        grid_former_headroom:
+            Multiplier on a promoted electricity former's active rating over
+            its pre-failure setpoint (default 4.0; see the sizing comment
+            below). 1.0 restores the old setpoint-pinned behaviour.
 
     Returns:
         ``{carrier: n_promoted}`` — children converted per sector.
@@ -86,7 +91,18 @@ def apply_microgrid_islanding(
             and "power" in grid_name
             and "electricity" in carrier_set
         ):
+            # Dispatch headroom over the pre-failure setpoint. A grid-former's
+            # *rating* is not its instantaneous output: pinned at the setpoint
+            # it can anchor an island's voltage but not carry its load, and the
+            # island solve is then infeasible with no way out — de-energising
+            # the unservable buses does NOT help (verified), only capacity
+            # does. This is the active-power twin of the reactive bug fixed
+            # just below. Feasibility threshold measured by replaying
+            # eval_full_v2 task 2044's captured LP state: x1 infeasible, x2
+            # solves; the default keeps the same kind of margin the reactive
+            # side got.
             p_max = max(1e-6, abs(float(getattr(m, "p_mw", 0.0) or 0.0)))
+            p_max *= max(1.0, float(grid_former_headroom))
             # Full four-quadrant reactive capability (|Q| up to the active
             # rating). A grid-forming inverter must supply the island's whole
             # reactive demand + line charging while pinning bus voltage; the
@@ -357,17 +373,36 @@ def apply_cold_day(
                 m.t_k = supply_t_k
 
 
+def _is_transformer(mes: "object", branch: "object") -> bool:
+    """True when *branch* couples two different voltage levels.
+
+    ``from_pandapower_net`` routes through MATPOWER, so a transformer arrives
+    as a plain ``GenericPowerBranch`` rather than a :class:`monee.model.branch.Trafo`
+    and ``tap`` is 1.0 on a nominal-ratio unit — neither the class nor the tap
+    identifies it. The endpoint base voltages do.
+    """
+    if not hasattr(getattr(branch, "model", None), "max_i_ka"):
+        return False
+    try:
+        from_kv = mes.node_by_id(branch.from_node_id).model.base_kv
+        to_kv = mes.node_by_id(branch.to_node_id).model.base_kv
+    except (AttributeError, KeyError, TypeError):
+        return False
+    return from_kv is not None and to_kv is not None and from_kv != to_kv
+
+
 def apply_pv_peak(
     mes: "object",
     *,
     gen_scale: float = 1.5,
     load_scale: float = 0.4,
     slack_vm_pu: float = 1.04,
+    trafo_ampacity_scale: float = 1.5,
 ) -> None:
     """Mutate ``mes`` in place to simulate a sunny-midday over-voltage
     stress scenario (the VDE-AR-N 4105 regime).
 
-    Three concerted factors:
+    Four concerted factors:
 
     1. High HV/MV transformer tap — slack ``ExtPowerGrid.vm_pu`` set to
        ``slack_vm_pu`` (default 1.04 pu), so the feeder sits ~1 % below
@@ -379,6 +414,27 @@ def apply_pv_peak(
     3. Daytime load trough — ``PowerLoad.p_mw`` × ``load_scale``
        (default 0.4×). Reactive load left nominal (the standard targets
        active-power imbalance).
+    4. Substation uprate — transformer ``max_i_ka`` × ``trafo_ampacity_scale``
+       (default 1.5×), the mirror of ``apply_line_stress``'s ``ampacity_scale``.
+
+    Why (4) is needed, measured on ``simbench_lv_small`` (1-LV-rural1, a
+    160 kVA substation carrying a 0.6 MW PV fleet): the MISOCP branch model
+    caps current at ``_ELL_THERMAL_HEADROOM = 3.0`` × rated, i.e. ~0.50 MVA
+    through the substation, while (2)+(3) demand ~0.88 MW of export. That is a
+    *hard* LP bound, so without the uprate the simulation solve is infeasible
+    at ``t=0`` with no failure applied and no agent having acted — observers
+    then read the unsolved net (see
+    ``RestorationEnvironmentBehavior._accept_or_keep``). It bit 350 of the 365
+    ``pv_peak`` tasks in ``eval_full_v2_20260724-141520``. gen_scale 1.4 and
+    1.5 are infeasible on the stock rating; 1.3 and below solve.
+
+    The uprate is preferred over lowering ``gen_scale`` because it produces
+    *more* voltage stress, not less: at 1.5×/1.5 six buses exceed 1.10 pu
+    (max 1.1493) against two at 1.2×/1.0 (max 1.1017) — above ~1.3× the
+    near-binding substation distorts the operating point and peak vm_pu
+    actually falls. Trade-off: ``max_i_ka`` also scales ``loading_*_pu``, so
+    substation loading in this arm is graded against the uprated rating.
+    Pass ``trafo_ampacity_scale=1.0`` to restore the stock rating.
 
     Call once on a fresh net — calling twice stacks the scales.
     """
@@ -417,6 +473,17 @@ def apply_pv_peak(
                 if hasattr(m.p_mw, "max"):
                     m.p_mw.max = +headroom
             except Exception:
+                pass
+
+    if trafo_ampacity_scale != 1.0:
+        for branch in mes.branches:
+            if not _is_transformer(mes, branch):
+                continue
+            try:
+                branch.model.max_i_ka = (
+                    float(branch.model.max_i_ka) * trafo_ampacity_scale
+                )
+            except (TypeError, ValueError):
                 pass
 
 
@@ -473,3 +540,40 @@ def apply_line_stress(
                 branch.model.max_i_ka = float(branch.model.max_i_ka) * ampacity_scale
             except Exception:
                 pass
+
+
+def apply_heat_node_regulariser(mes: "object", k_reg_kgs: float) -> int:
+    """Set ``node_heat_reg_kgs`` on every water/heat grid in *mes*.
+
+    ``monee.model.node.Node.calc_signed_heat_flow`` builds the nodal heat
+    balance from terms that are each multiplied by a mass flow, then adds a
+    conduction-style term scaled by this coefficient so the balance keeps a
+    non-zero derivative in ``T_n`` when those flows vanish. Without it a
+    zero-flow junction's temperature is constrained only by the ``t_pu in
+    [0.3, 2.0]`` Var box.
+
+    Measured on a source / live-sink / dead-leg net under the formulation a
+    simulated grid actually solves — ``grids.py`` sets EL_MISOCP and
+    GAS_NONCONVEX_MIQCQP and leaves heat at ``HEAT_NONCONVEX_MIQCQP``, on
+    Pyomo+Gurobi: the zero-flow node lands at exactly ``0.3 * t_ref_k`` =
+    106.800000 K, and ``1e-6`` restores 356.000000 K while a determined node
+    moves 353.831627 -> 353.831649 K (+2.2e-5, against a 1.0 K grading
+    tolerance). ``1e-8`` is too small to bite.
+
+    The oracle is unaffected either way: it swaps in the McCormick heat MILP,
+    which reformulates the balance and never exposes the degeneracy — which is
+    why the campaign's 306 sub-ambient readings are all on the MAS side and none
+    appear in ``heat_mccormick`` arms.
+
+    Returns the number of grids touched, so a caller can log a zero (e.g. an
+    electricity-only net) instead of assuming it applied.
+    """
+    seen: list = []
+    for grid in getattr(mes, "grids", []) or []:
+        # Duck-typed on the attribute the balance reads rather than isinstance:
+        # the water grid class is what declares it, and a gas/power grid must
+        # not silently acquire a heat coefficient.
+        if hasattr(grid, "node_heat_reg_kgs") and grid not in seen:
+            grid.node_heat_reg_kgs = float(k_reg_kgs)
+            seen.append(grid)
+    return len(seen)

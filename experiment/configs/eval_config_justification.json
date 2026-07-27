@@ -312,7 +312,7 @@
           "enable_heat_frontier": false
         },
         {
-          "enable_heat_priority_waterfall": false
+          "enable_heat_priority_waterfall": true
         },
         {
           "enable_heat_curtail_lock": false

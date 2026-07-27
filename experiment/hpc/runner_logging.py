@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -21,9 +22,20 @@ _SOLVER_FAILURE_LOGGERS: tuple[str, ...] = (
 class _SolverFailureCounter(logging.Filter):
     """Count solver-status escalations for per-task health.
 
-    An infeasible solve fires as a monee-ERROR + pyomo-WARNING pair, deduped
-    within ``_DEDUPE_WINDOW_S``; Gurobi/Pyomo env strings are also caught to
-    separate env issues from algorithm bugs.
+    One infeasible physics step fires several records (a monee backend ERROR
+    carrying the IIS, then the stepper's skip-mode WARNING), so they must be
+    deduplicated to one event. The stepper names the step —
+    ``Stepper step 19 failed`` — and that identity is what dedupes: records
+    carrying a step number collapse per step, and the backend ERROR that
+    precedes one is folded into it.
+
+    A wall-clock window cannot do this job. At ``_DEDUPE_WINDOW_S = 1.0`` it
+    also swallowed *genuinely distinct* steps whenever solves ran faster than a
+    second, which on eval_full_v2 reported 2277 events against 3202 real failed
+    steps — a 29 % undercount concentrated exactly on the fast-solving grids.
+
+    Gurobi/Pyomo env strings are counted separately to keep environment issues
+    apart from algorithm bugs.
     """
 
     _SOLVER_ERROR_MARKERS: tuple[str, ...] = (
@@ -31,43 +43,80 @@ class _SolverFailureCounter(logging.Filter):
         "HostID mismatch",
         "License",  # Gurobi LicenseError
     )
-    _DEDUPE_WINDOW_S: float = 1.0  # min spacing between distinct solves
+    _STEP_RE = re.compile(r"Stepper step (\d+) failed")
+    _BACKEND_LOGGERS: tuple[str, ...] = ("monee.solver.pyo", "monee.solver.gurobipy")
 
     def __init__(self) -> None:
         super().__init__()
         self.count = 0
         self.infeasible_count = 0
         self.warning_count = 0
-        self._last_infeasible_t: float = float("-inf")
+        #: Step indices whose physics solve failed, in first-seen order.
+        self.failed_steps: list[int] = []
+        self._seen_steps: set[int] = set()
+        # A backend failure is counted only once it is known not to be the
+        # first half of a pair: either the stepper names its step, or the next
+        # backend failure arrives. :meth:`finalize` flushes the last one.
+        self._pending = False
 
-    def _is_infeasible_msg(self, msg: str) -> bool:
-        # monee.solver.pyo ERROR path.
-        if "infeasible (status=" in msg or "Pyomo solve infeasible" in msg:
-            return True
-        # pyomo.core load_solutions WARNING path (both substrings, one record).
-        if (
+    @property
+    def first_failed_step(self) -> int | None:
+        return self.failed_steps[0] if self.failed_steps else None
+
+    @staticmethod
+    def _is_backend_infeasible(msg: str) -> bool:
+        return (
+            "infeasible (status=" in msg
+            or "Pyomo solve infeasible" in msg
+            or "Gurobi solve failed without a usable solution" in msg
+        )
+
+    @staticmethod
+    def _is_pyomo_echo(msg: str) -> bool:
+        """Pyomo's ``load_solutions`` warning — always the echo of a backend
+        ERROR for the same solve, never an event of its own."""
+        return (
             "Loading a SolverResults object" in msg
             and "termination condition: infeasible" in msg
-        ):
-            return True
-        # monee.solver.gurobipy (islanding backend) + monee.simulation.stepper
-        # skip-mode absorption — without these, stepper-path failures leave
-        # solver_failures at 0.
-        if "Gurobi solve failed without a usable solution" in msg:
-            return True
-        if "Stepper step" in msg and "failed" in msg:
-            return True
-        return False
+        )
+
+    def _count_infeasible(self) -> None:
+        self.infeasible_count += 1
+        self.count += 1
+
+    def _flush(self) -> None:
+        if self._pending:
+            self._pending = False
+            self._count_infeasible()
+
+    def finalize(self) -> None:
+        """Count a trailing backend failure the stepper never attributed.
+
+        The oracle path solves without a Stepper, so its infeasibility has no
+        step record to close it; call once when the task ends.
+        """
+        self._flush()
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         if record.levelno < logging.WARNING:
             return True
         msg = record.getMessage()
-        if self._is_infeasible_msg(msg):
-            if record.created - self._last_infeasible_t >= self._DEDUPE_WINDOW_S:
-                self.infeasible_count += 1
-                self.count += 1
-            self._last_infeasible_t = record.created
+
+        step = self._STEP_RE.search(msg)
+        if step is not None:
+            # Authoritative: one failed physics step, identified by index.
+            index = int(step.group(1))
+            self._pending = False
+            if index not in self._seen_steps:
+                self._seen_steps.add(index)
+                self.failed_steps.append(index)
+                self._count_infeasible()
+        elif record.name in self._BACKEND_LOGGERS and self._is_backend_infeasible(msg):
+            self._flush()
+            self._pending = True
+        elif self._is_pyomo_echo(msg):
+            # Counts only when the backend logger stayed silent.
+            self._pending = True
         elif "returned non-ok status" in msg:
             self.warning_count += 1
             self.count += 1

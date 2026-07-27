@@ -80,6 +80,13 @@ def aggregate(campaign_dir: Path) -> pd.DataFrame:
                 # warnings) so per-variant plots can show the split.
                 "solver_infeasibilities": status.get("solver_infeasibilities"),
                 "solver_warnings": status.get("solver_warnings"),
+                # first_failed_step == 0 separates a born-infeasible scenario
+                # from a control-induced one; without it both land in
+                # solver_infeasibilities and read as the same defect.
+                "first_failed_step": status.get("first_failed_step"),
+                "n_failed_steps": status.get("n_failed_steps"),
+                "physics_solves_ok": status.get("physics_solves_ok"),
+                "physics_solves_failed": status.get("physics_solves_failed"),
                 "exception_type": (exception or {}).get("type"),
                 "exception_message": (exception or {}).get("message"),
                 **flat,
@@ -262,6 +269,31 @@ def _format_md(
 _PRIMARY_OUTCOME = "outcomes__priority_weighted_fraction"
 _TIME_TO_STABILISE = "outcomes__time_to_stabilise_s"
 _REGULATES_TOTAL = "outcomes__regulates_total"
+
+# Gurobi reported an optimal solve (status 2) rather than hitting the time limit
+# (status 9). A time-limited oracle is not a reference point: on eval_full_v2
+# 469 of 1435 oracle runs (32.7%) were time-limited — 82.8% on lv_reconfig and
+# 56.7% in ``optimality_gap`` itself — and every variant's beats-oracle rate is
+# ~22x higher there than on certified pairs.
+_ORACLE_OPTIMAL_COL = "outcomes__oracle_solve_optimal"
+
+
+def _as_bool(value: object) -> bool:
+    """Truthiness for a CSV round-tripped boolean.
+
+    ``read_csv`` yields real bools for a clean column but ``"True"``/``"False"``
+    strings once any row is missing, and ``bool("False")`` is True — so the
+    string form must be handled explicitly or a time-limited oracle would be
+    counted as certified.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "1.0", "yes")
+    if value is None:
+        return False
+    try:
+        return bool(value) and value == value  # NaN-safe
+    except (TypeError, ValueError):
+        return False
 
 # Short labels for the justification table; fall back to the last two
 # ``__``-segments for anything not listed.
@@ -572,13 +604,16 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
     rows: list[list[str]] = []
     for grid, g in ok_vc.groupby("grid"):
         gc = g[compliant_mask(g) & g[_PRIMARY_OUTCOME].notna()]
-        orc = (
-            gc[gc["variant"] == "oracle"]
-            .drop_duplicates(key)
-            .set_index(key)[_PRIMARY_OUTCOME]
-        )
+        og = gc[gc["variant"] == "oracle"].drop_duplicates(key)
+        orc = og.set_index(key)[_PRIMARY_OUTCOME]
         if orc.empty:
             continue
+        # Oracle runs that hit the solver time limit are not a reference: a
+        # variant "beating" one is measuring the time limit, not the ladder.
+        if _ORACLE_OPTIMAL_COL in og.columns:
+            certified = og.set_index(key)[_ORACLE_OPTIMAL_COL].map(_as_bool)
+        else:
+            certified = None
         for variant, gv in gc.groupby("variant"):
             if variant == "oracle":
                 continue
@@ -591,6 +626,21 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
             vm, _ = mean_ci95(v_arr)
             om, _ = mean_ci95(o_arr)
             wins = int((v_arr.to_numpy() > o_arr.to_numpy() + 1e-9).sum())
+            if certified is None:
+                cert_cols = ["—", "—", "—"]
+            else:
+                cidx = common[certified.reindex(common).fillna(False).to_numpy()]
+                if len(cidx) == 0:
+                    cert_cols = ["0", "—", "—"]
+                else:
+                    cv = vv.loc[cidx].to_numpy()
+                    co = orc.loc[cidx].to_numpy()
+                    cwins = int((cv > co + 1e-9).sum())
+                    cert_cols = [
+                        str(len(cidx)),
+                        f"{cv.mean() - co.mean():+.4f}",
+                        f"{cwins}/{len(cidx)}",
+                    ]
             rows.append(
                 [
                     alias_grid(grid),
@@ -600,6 +650,7 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
                     f"{om:.4f}",
                     f"{vm - om:+.4f}",
                     f"{wins}/{len(common)}",
+                    *cert_cols,
                 ]
             )
     if not rows:
@@ -610,11 +661,19 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
         "## Variant vs oracle (paired on task identity, both compliant)",
         "",
         "_Each non-oracle variant against the oracle on the SAME tasks where "
-        "both are compliant and have a defined PWSF — the comparable optimality "
-        "gap. `Δ vs oracle` < 0 means the variant trails the oracle; a positive "
-        "Δ on a valid (rescaled-weight) oracle should be rare. Differs from the "
-        "unpaired table above, which can fabricate inversions when the oracle's "
-        "compliant/surviving subset differs from the variant's._",
+        "both are compliant and have a defined PWSF. `Δ vs oracle` < 0 means the "
+        "variant trails the oracle. Differs from the unpaired table above, which "
+        "can fabricate inversions when the oracle's compliant/surviving subset "
+        "differs from the variant's._\n\n"
+        "_The oracle is **not** a PWSF upper bound: it maximises a "
+        "near-lexicographic tier ladder (`oracle._ORACLE_TIER_WEIGHT` "
+        "1e6/1e4/1e2/1) and is scored on PWSF's 8:4:2:1, so `variant>oracle` can "
+        "be honest. It is also not a bound when the solve hit the time limit. "
+        "The `certified` columns restrict to pairs where the oracle reported "
+        "`solve_optimal`, which is the only subset where a win is interpretable: "
+        "on eval_full_v2 SCARE beat the oracle in 5.08% of time-limited pairs vs "
+        "**0.23%** of certified ones, a 22x enrichment — so read the certified "
+        "columns as the result and the unrestricted ones as the population._",
         _markdown_table(
             [
                 "grid",
@@ -624,6 +683,9 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
                 "oracle PWSF",
                 "Δ vs oracle",
                 "variant>oracle",
+                "n_certified",
+                "Δ (certified)",
+                "variant>oracle (certified)",
             ],
             rows,
         ),
@@ -817,6 +879,17 @@ def _format_eval_sections(
         parts.append(
             "## Sensitivity sweeps (priority-weighted served on compliant runs)"
         )
+        parts.append("")
+        parts.append(
+            "_Read `mean regulates` beside `mean PWSF`: a degradation sweep can "
+            "hold PWSF up simply because the controller stopped acting. On "
+            "eval_full_v2's packet-loss arms `regulates_total` fell monotonically "
+            "4181 -> 1352 -> 899 -> 660 -> 274 across 0/5/10/20/50% loss while "
+            "PWSF was non-monotone (20% scored 0.784, 50% scored 0.889, paired "
+            "p=8.6e-13) — the curve tracks the controller falling silent, not "
+            "graceful degradation. An arm whose PWSF holds while its regulate "
+            "count collapses is not evidence of robustness._"
+        )
         rows = []
         for sweep_key, g in ok_sw.groupby("sweep"):
             pwsf_c, rate, n_c, n_t = _compliant_split(g)
@@ -948,18 +1021,45 @@ def _format_eval_sections(
     if inv_col in df.columns:
         parts.append("")
         parts.append("## Diary invariant compliance")
+        # The oracle is an LP: it runs no negotiations, so it has no diary and
+        # the invariant holds over an empty one. Reporting that beside a MAS
+        # variant's rate reads as "equally correct" when the oracle is not in
+        # the comparison at all — so count the rows that actually had a diary.
+        diary_counters = [
+            c
+            for c in df.columns
+            if c.startswith("diary__") and c != inv_col
+        ]
         rows = []
         for variant, g in df.groupby("variant"):
             s = g[inv_col].dropna()
             if s.empty:
                 continue
+            if diary_counters:
+                observed = int(g.loc[s.index, diary_counters].notna().any(axis=1).sum())
+            else:
+                observed = len(s)
             ok_pct = 100.0 * float(s.astype(bool).sum()) / len(s)
-            rows.append([alias_variant(variant), len(s), f"{ok_pct:.1f}%"])
+            rows.append(
+                [
+                    alias_variant(variant),
+                    len(s),
+                    f"{ok_pct:.1f}%" if observed else "n/a (no diary)",
+                    str(len(s) - observed),
+                ]
+            )
         parts.append(
             _markdown_table(
-                ["variant", "n", "invariant holds"],
+                ["variant", "n", "invariant holds", "n with no diary"],
                 rows,
             )
+        )
+        parts.append("")
+        parts.append(
+            "_`n with no diary` counts rows where the invariant was evaluated "
+            "against no recorded negotiation, so it holds vacuously. The oracle "
+            "solves an LP and never negotiates, so its whole column is vacuous "
+            "and is shown as `n/a` rather than a perfect score._"
         )
 
     parts.extend(_format_justification_sections(ok, targets))

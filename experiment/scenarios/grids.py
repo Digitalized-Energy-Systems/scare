@@ -8,7 +8,7 @@ from statistics import median
 import monee.express as mx
 import simbench
 from monee.io.from_pandapower import from_pandapower_net
-from monee.model.child import ExtPowerGrid
+from monee.model.child import ExtHydrGrid, ExtPowerGrid, PowerGenerator
 from monee.model.formulation import (
     EL_MISOCP_FORMULATION,
     GAS_NONCONVEX_MIQCQP_FORMULATION,
@@ -45,6 +45,10 @@ def create_large_lv_simbench(
     heat_kwargs: dict | None = None,
     gas_kwargs: dict | None = None,
     slack_vm_pu: float | None = None,
+    couplings: tuple[str, ...] = ("chp", "p2g", "p2h"),
+    coupling_shares: dict | None = None,
+    heat_slack_budget_kgs: float | None = None,
+    primary_gen_scale: float | None = None,
 ):
     """Build a simbench LV multi-energy network.
 
@@ -99,6 +103,28 @@ def create_large_lv_simbench(
         The MV grids' native slack setpoint (~1.025) lets loaded feeder
         buses droop below the 0.95 gate; lifting it shifts the whole
         profile back in-bounds. Left ``None`` the simbench default stands.
+    couplings:
+        Which coupling-point types monee may place. Restricting the set
+        concentrates the fleet on one conversion direction — the basis of
+        the CP-dependence grids (``("p2g", "p2h")`` makes every CP a
+        power→gas or power→heat converter; ``("chp", "p2h")`` makes them
+        gas→power/heat).
+    coupling_shares:
+        Per-type rating shares forwarded to monee (``chp_p_share``,
+        ``p2g_p_share``, ``p2h_p_share``); each unit's rating is
+        ``share · cp_size_multiplier · p_ref`` at its bus. Use to size a
+        fleet against the carrier it must actually cover.
+    heat_slack_budget_kgs:
+        Stamps ``_scare_slack_budget_kgs`` on the heat-side ``ExtHydrGrid``.
+        ``apply_slack_budget`` leaves heat unbounded, so without this the
+        heat slack backfills any CP outage and heat can never be
+        CP-dependent. Both the oracle LP and the MAS read the stamp.
+    primary_gen_scale:
+        Scales every ``PowerGenerator.p_mw`` after build. Unlike
+        ``replace_primary_generation`` (which drains the pool by exactly the
+        CP output and also touches the heat pool) this shrinks the primary
+        fleet independently of CP sizing, so a CHP fleet can be made
+        strictly necessary without constraining its rating to the pool.
     """
 
     def create():
@@ -108,12 +134,13 @@ def create_large_lv_simbench(
             mn,
             coupling_density=density,
             centralized=False,
-            couplings=("chp", "p2g", "p2h"),
+            couplings=couplings,
             coupling_kwargs={
                 "seed": 1,
                 "use_hg_variants": True,
                 "cp_size_multiplier": cp_size_multiplier,
                 "replace_primary_generation": replace_primary_generation,
+                **(coupling_shares or {}),
             },
             heat_kwargs={"node_based_heat_loads": True, **(heat_kwargs or {})},
             gas_kwargs={**_GAS_KWARGS, **(gas_kwargs or {})},
@@ -127,6 +154,22 @@ def create_large_lv_simbench(
         mes.apply_formulation(EL_MISOCP_FORMULATION)
         mes.apply_formulation(GAS_NONCONVEX_MIQCQP_FORMULATION)
 
+        if primary_gen_scale is not None:
+            for child in mes.childs:
+                if isinstance(child.model, PowerGenerator):
+                    child.model.p_mw = float(child.model.p_mw) * primary_gen_scale
+
+        if heat_slack_budget_kgs is not None:
+            for child in mes.childs:
+                m = child.model
+                if not isinstance(m, ExtHydrGrid):
+                    continue
+                grid_name = str(
+                    getattr(mes.node_by_id(child.node_id).grid, "name", "")
+                ).lower()
+                if "water" in grid_name or "heat" in grid_name:
+                    m._scare_slack_budget_kgs = float(heat_slack_budget_kgs)
+
         if backup_lines_per_sector > 0:
             add_backup_lines(
                 mes,
@@ -137,6 +180,31 @@ def create_large_lv_simbench(
 
     return create
 
+
+# Sector re-scaling shared by the two CP-necessity grids. The stock LV overlay
+# sizes gas at ~4x and heat at ~1.4x the electrical sector (per-bus floors
+# dominate: 105 load buses x min_load_kgs 1.8e-4 / min_load_mw 5e-3), so a
+# converter fleet able to close either balance would have to draw several times
+# the grid's whole electrical load. Lowering the shares AND the floors brings
+# both carriers to the electrical scale. ``auto_diameter`` is deliberately NOT
+# set: on the shrunken DHS it sizes supply pipes below the water-pipe
+# piecewise range and the LP goes infeasible (verified — see the H1/H4 probes).
+#
+# Heat carries only a token distributed fleet (``node_heat_gen_share`` 0.1 of
+# the stock 1.0, on a 0.5 kW floor) so most heat has to arrive as converter
+# output or slack import. Driving it to 0.0 is NOT possible: with no local
+# injection the DHS goes infeasible on the long supply pipes (IIS on the
+# WaterPipe piecewise LBs + the node temperature equations), and capping the
+# heat slack instead is likewise infeasible rather than merely costly — the
+# heat network is hydraulically pinned, the same effect the U6 heat-envelope
+# probe hit. Heat dependence therefore comes from the supply mix, not a bound.
+_DEP_GAS_KWARGS = {"gas_load_share": 0.5, "min_load_kgs": 2e-5, "gas_gen_share": 0.0}
+_DEP_HEAT_KWARGS = {
+    "heat_load_share": 0.3,
+    "min_load_mw": 0.0005,
+    "node_heat_gen_share": 0.1,
+    "min_gen_mw": 0.0005,
+}
 
 GRIDS: dict[str, Callable[[], "object"]] = {
     # Slack budget is a per-scenario knob (``scenario.slack_budget_pct``),
@@ -246,6 +314,50 @@ GRIDS: dict[str, Callable[[], "object"]] = {
         cp_size_multiplier=2.0,
         replace_primary_generation=True,
     ),
+    # CP-necessity pillar. ``cp_*_dependent`` above only *shifts* rated capacity
+    # into the CPs (9-18 % of the primary pool) and the slack backfills the
+    # rest, so removing every CP costs <= 1 % PWSF and the "cross-sector ADMM is
+    # the only recovery path" premise never binds. These two make a carrier
+    # structurally unservable without its converters, in the two possible
+    # directions:
+    #
+    #   gas_dependent : gas has NO native production (gas_gen_share=0) and the
+    #     operator budget covers only part of gas demand; the remainder can only
+    #     be synthesised by P2G from the (deliberately surplus, 1.5x) PV fleet.
+    #     power -> gas.
+    #   el_dependent : the primary PV fleet is cut to 20 % so the electrical
+    #     balance cannot close on generation + budget alone; the gap is exactly
+    #     the CHP fleet's rated electrical output, which is fuelled from gas.
+    #     gas -> power.
+    #
+    # Fleet ratings are the EXACT complement of the budget (p2g_p_share 0.85,
+    # chp_p_share 1.4), not generous: sized with headroom the carrier still
+    # closes after several converter failures, so a 3-failure draw moved gas /
+    # electricity by 0.000 and the grids looked as inert as cp_heavy_dependent.
+    # At ~1 % headroom each lost unit shows up immediately.
+    # Both cut the distributed heat fleet to a token 10 %, so heat leans on
+    # converter output (P2H, plus CHP heat on the chp variant) alongside the
+    # slack — partial CP dependence in both directions.
+    # Gas/heat sector magnitudes are re-scaled (shares + the per-bus floors)
+    # because the stock LV overlay sizes gas at ~4x and heat at ~1.4x the
+    # electrical sector — a converter fleet able to cover either would have to
+    # draw several times the grid's entire electrical load.
+    "simbench_lv_gas_dependent": create_large_lv_simbench(
+        0.4,
+        couplings=("p2g", "p2h"),
+        coupling_shares={"p2g_p_share": 0.85, "p2h_p_share": 1.0},
+        primary_gen_scale=1.5,
+        gas_kwargs=_DEP_GAS_KWARGS,
+        heat_kwargs=_DEP_HEAT_KWARGS,
+    ),
+    "simbench_lv_el_dependent": create_large_lv_simbench(
+        0.4,
+        couplings=("chp", "p2h"),
+        coupling_shares={"chp_p_share": 1.4, "p2h_p_share": 0.5},
+        primary_gen_scale=0.2,
+        gas_kwargs={**_DEP_GAS_KWARGS, "gas_gen_share": 1.5},
+        heat_kwargs=_DEP_HEAT_KWARGS,
+    ),
 }
 
 
@@ -333,8 +445,10 @@ def add_backup_lines(
         if len(leaves) < 2:
             leaves = sorted(sector_node_ids)
 
-        # Median branch params for this sector.
-        def _median_attr(attr: str) -> float:
+        # Median branch params for this sector. None (not a magic default)
+        # when the attribute is absent, so _create_backup_branch's own
+        # defaults apply instead of a silently-wrong value.
+        def _median_attr(attr: str) -> float | None:
             vals = []
             for br in sector_branches:
                 v = getattr(br.model, attr, None)
@@ -343,9 +457,12 @@ def add_backup_lines(
                         vals.append(float(v))
                     except (TypeError, ValueError):
                         continue
-            return float(median(vals)) if vals else 1.0
+            return float(median(vals)) if vals else None
 
         params = {a: _median_attr(a) for a in spec["branch_attr"]}
+        params = {k: v for k, v in params.items() if v is not None}
+        if sector == "electricity":
+            params.update(_el_backup_impedance(mes, sector_branches, params))
 
         # Pair leaf i with leaf (i + n//2): bridges head-to-tail of the
         # sorted leaf list, tending to link separate feeders. Skip pairs
@@ -386,17 +503,78 @@ def add_backup_lines(
     return added
 
 
+def _el_backup_impedance(mes, sector_branches, params) -> dict:
+    r"""Median line impedance for an electricity backup tie, in ohm/m.
+
+    The geometric attributes (``length_m``, ``r_ohm_per_m``, ``x_ohm_per_m``)
+    only exist on :class:`monee.model.branch.PowerLine`. simbench arrives via
+    ``from_pandapower_net`` -> MATPOWER as ``GenericPowerBranch``, which stores
+    ``br_r_pu`` / ``br_x_pu`` directly and carries none of the three — so on
+    these grids the geometric median has nothing to average and the tie has to
+    be sized from the per-unit values instead.
+
+    Getting this wrong is not cosmetic. With the old ``1.0`` fallback every
+    electricity tie was built at 1.0 ohm/m over 1.0 m, i.e.
+    :math:`r_{pu} = 1.0 / (0.4^2/1) = 6.25` — **424x** the median line on
+    ``simbench_lv_reconfig``. Closing such a tie cannot carry load without
+    driving buses under the 0.5 pu floor, so the physics LP went infeasible the
+    moment the reconfigurator switched one in (eval_full_v2: 41 tasks, IIS =
+    the whole network minus the slack bus).
+
+    Returned in per-unit (``r_pu`` / ``x_pu``), not ohm/m: the ohm conversion
+    needs ``base_r = V_base^2 / S_base`` on the tie's *own* voltage level, and
+    a sector spans both (the substation's HV side sits at 20 kV while every tie
+    lives at 0.4 kV). :func:`_create_backup_branch` converts per pair.
+
+    Returns ``{}`` when the geometric attributes are natively present (gas and
+    heat, where the median is real) or when no per-unit values can be read.
+    """
+    if "r_ohm_per_m" in params and "x_ohm_per_m" in params:
+        return {}
+    r_pu, x_pu = [], []
+    for br in sector_branches:
+        try:
+            r, x = float(br.model.br_r_pu), float(br.model.br_x_pu)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        # PowerBranch subclasses seed br_*_pu at 0 and only fill them in
+        # equations(); a zero would drag the median toward a short circuit.
+        if r > 0.0 and x > 0.0:
+            r_pu.append(r)
+            x_pu.append(x)
+    if not r_pu:
+        return {}
+    return {
+        "length_m": float(params.get("length_m") or 50.0),
+        "r_pu": median(r_pu),
+        "x_pu": median(x_pu),
+    }
+
+
 def _create_backup_branch(creator, mes, from_id, to_id, params, sector: str):
     """Dispatch to the per-sector ``monee.express.create_*`` helper,
     marking the new branch ``backup=True`` and ``on_off=0``."""
     if sector == "electricity":
+        length_m = params.get("length_m", 50.0)
+        r_ohm_per_m = params.get("r_ohm_per_m", 0.0001)
+        x_ohm_per_m = params.get("x_ohm_per_m", 0.00007)
+        if "r_pu" in params:
+            # Convert on this tie's own voltage level (see
+            # _el_backup_impedance); PowerLine.calc_r_x inverts this exactly.
+            from_node = mes.node_by_id(from_id)
+            base_kv = float(getattr(from_node.model, "base_kv", 0.0) or 0.0)
+            sn_mva = float(getattr(from_node.grid, "sn_mva", 0.0) or 0.0)
+            if base_kv > 0.0 and sn_mva > 0.0:
+                base_r = base_kv**2 / sn_mva
+                r_ohm_per_m = params["r_pu"] * base_r / length_m
+                x_ohm_per_m = params["x_pu"] * base_r / length_m
         bid = creator(
             mes,
             from_node_id=from_id,
             to_node_id=to_id,
-            length_m=params.get("length_m", 50.0),
-            r_ohm_per_m=params.get("r_ohm_per_m", 0.0001),
-            x_ohm_per_m=params.get("x_ohm_per_m", 0.00007),
+            length_m=length_m,
+            r_ohm_per_m=r_ohm_per_m,
+            x_ohm_per_m=x_ohm_per_m,
             on_off=0,
             name=f"backup_el_{from_id}_{to_id}",
         )

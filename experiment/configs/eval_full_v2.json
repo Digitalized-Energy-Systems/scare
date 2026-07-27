@@ -1,6 +1,26 @@
 {
   "$comment": [
-    "eval_full_v2 — the complete campaign. Composition:",
+    "eval_full_v2 \u2014 REVISED 2026-07-27. Two changes on top of the campaign that produced eval_full_v2_20260724-141520; every figure below is measured, not estimated (no-failure oracle LP, per-grid):",
+    "  1. Every slack_budget_pct is raised to its grid's MEASURED minimum servable",
+    "     value, so no grid sheds load in the no-failure baseline LP any more:",
+    "     lv 0.50, lv_reconfig 0.50, lv_small unchanged, cp_dependent 0.50,",
+    "     cp_heavy 0.55, cp_heavy_dependent 0.55, medium 0.95, mvlv 1.00.",
+    "     Experiments spanning grids with different minima are split into one entry",
+    "     per grid, keeping the experiment NAME so analysis still groups them.",
+    "     CONSEQUENCE: the slack-budget sweep largely collapses (functional_baseline",
+    "     on lv goes 0.30/0.45/0.60 -> 0.50/0.60; on medium all three -> 0.95), and",
+    "     on medium/mvlv the budget is no longer a stress axis at all \u2014 those two",
+    "     grids have almost no local supply (medium: 1 sgen at 6.5 kW vs 251 kW of",
+    "     load; mvlv gas is single-fed), so 'servable baseline' and 'binding budget'",
+    "     are mutually exclusive there.",
+    "     CONSEQUENCE 2: the slack-budget levers lose their regime. just_slack_budget, sweep_slack and deadcheck_slack_target_fraction ran cp_heavy_dependent at 0.15 precisely because the budget bound there; at the servable minimum 0.55 it does not bind, so those three experiments now measure levers that cannot fire. Decide deliberately: keep them at 0.15 (accepting a 20 % pre-failure shed) or drop them.",
+    "     NOT fixable by budget and deliberately left: line_stress electricity",
+    "     (ampacity-limited, 0.805 at both 0.50 and 0.55), cold_day heat (0.666,",
+    "     DHS transport under 1.5x load), and a 1-4 % residual heat gap on every",
+    "     grid (McCormick-DHS / hydraulics).",
+    "  2. New cp_necessity + just_cp_necessity pillars on two new grids where the",
+    "     coupling points are actually load-bearing \u2014 see their $comment.",
+    "eval_full_v2 \u2014 the complete campaign. Composition:",
     "  base:   eval_full_recoverable.json (recoverable-loss pillars, line_stress split, 30-seed core)",
     "  merge:  eval_full.json scaling (4 grids incl. simbench_mvlv ~778 MES nodes) + ablation_reconfig (4-variant)",
     "  append: extension_campaign.json (islanding + temporal extensions)",
@@ -24,13 +44,82 @@
   },
   "experiments": [
     {
-      "$comment": "Pillar 1 — Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
+      "$comment": "Pillar 1 \u2014 Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
       "name": "functional_baseline",
       "grids": [
-        "simbench_lv",
-        "simbench_lv_cp_heavy_dependent",
-        "simbench_lv_small",
-        "simbench_lv_medium"
+        "simbench_lv"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.6
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 1 \u2014 Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
+      "name": "functional_baseline",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        },
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.6
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 1 \u2014 Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
+      "name": "functional_baseline",
+      "grids": [
+        "simbench_lv_small"
       ],
       "n_seeds": 30,
       "variants": [
@@ -69,8 +158,38 @@
       ]
     },
     {
+      "$comment": "Pillar 1 \u2014 Functional restoration quality.  Three slack budgets show the curve from loose (60 %) to tight (30 %).  Skewed priority distribution exercises the priority-weighted served metric properly.",
+      "name": "functional_baseline",
+      "grids": [
+        "simbench_lv_medium"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.95
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.95
+        }
+      ]
+    },
+    {
       "$comment": [
-        "Bullet 1 headline — island self-anchoring, the ONLY recovery path ",
+        "Bullet 1 headline \u2014 island self-anchoring, the ONLY recovery path ",
         "that converts disconnect_lost load back to SERVED (reconfig/coalition ",
         "only move loss into agent_shed). ENABLED 2026-07-07 after three fixes:",
         "  B) samplers were blind to GridForming* after microgrid promotion -> ",
@@ -89,7 +208,7 @@
         "scare>oracle in this regime (0.685>0.652) because the oracle min-shed ",
         "LP and scare min-de-energisation objective disagree on islanding, so ",
         "the oracle is NOT a valid ceiling here (open: characterise that ",
-        "asymmetry). simbench_lv ONLY — medium still needs active headroom ",
+        "asymmetry). simbench_lv ONLY \u2014 medium still needs active headroom ",
         "(formulation forces e=1 at all GF buses); small untested."
       ],
       "name": "recoverable_islanding",
@@ -110,7 +229,7 @@
           "failure_type": "island",
           "max_failures": 2,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.3
+          "slack_budget_pct": 0.5
         },
         {
           "$label": "control_no_islanding",
@@ -119,13 +238,13 @@
           "failure_type": "island",
           "max_failures": 2,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.3
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
       "$comment": [
-        "Bullet 1 (runnable) — FLISR / feeder-reconfiguration recovery.",
+        "Bullet 1 (runnable) \u2014 FLISR / feeder-reconfiguration recovery.",
         "simbench_lv_reconfig carries normally-open backup ties. A branch ",
         "failure strands downstream load that is recoverable by closing a tie ",
         "(GridReconfigurator) rather than de-energising it. Tight slack (0.30) ",
@@ -151,16 +270,16 @@
           "failure_type": "branch",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.3
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
       "$comment": [
-        "Bullet 1 (runnable) — coalition / cross-sector-redispatch recovery.",
+        "Bullet 1 (runnable) \u2014 coalition / cross-sector-redispatch recovery.",
         "On cp_heavy_dependent a generator (incl. CP) failure creates a deficit ",
         "recoverable by ramping remaining generation and routing through ",
-        "coupling points (CP-ADMM + coalitions) — a decision-recoverable loss, ",
+        "coupling points (CP-ADMM + coalitions) \u2014 a decision-recoverable loss, ",
         "not a topological one. Very tight slack (0.15) forbids external ",
         "backfill so the MAS must actually redispatch; 4 variants expose the ",
         "spread at the low-slack corner where Lens D found the benchmark bites."
@@ -182,19 +301,12 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
-        },
-        {
-          "kind": "clean",
-          "failure_type": "generator",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.3
+          "slack_budget_pct": 0.55
         }
       ]
     },
     {
-      "$comment": "Pillar 2 — Optimality gap.  Pairs every scare run with an oracle on the same (grid, seed).",
+      "$comment": "Pillar 2 \u2014 Optimality gap.  Pairs every scare run with an oracle on the same (grid, seed).",
       "name": "optimality_gap",
       "grids": [
         "simbench_lv"
@@ -209,13 +321,7 @@
           "kind": "clean",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.3
-        },
-        {
-          "kind": "clean",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
@@ -229,18 +335,75 @@
           "generator_share": 0.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
-      "$comment": "Pillar 3 — variant comparison: scare vs single-level (gossip only) vs oracle.",
+      "$comment": "Pillar 3 \u2014 variant comparison: scare vs single-level (gossip only) vs oracle.",
       "name": "variant_comparison",
       "grids": [
-        "simbench_lv",
-        "simbench_lv_cp_heavy_dependent",
-        "simbench_lv_small",
-        "simbench_lv_medium"
+        "simbench_lv"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 3 \u2014 variant comparison: scare vs single-level (gossip only) vs oracle.",
+      "name": "variant_comparison",
+      "grids": [
+        "simbench_lv_cp_heavy_dependent"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        }
+      ]
+    },
+    {
+      "$comment": "Pillar 3 \u2014 variant comparison: scare vs single-level (gossip only) vs oracle.",
+      "name": "variant_comparison",
+      "grids": [
+        "simbench_lv_small"
       ],
       "n_seeds": 30,
       "variants": [
@@ -267,12 +430,42 @@
       ]
     },
     {
+      "$comment": "Pillar 3 \u2014 variant comparison: scare vs single-level (gossip only) vs oracle.",
+      "name": "variant_comparison",
+      "grids": [
+        "simbench_lv_medium"
+      ],
+      "n_seeds": 30,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.95
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.95
+        }
+      ]
+    },
+    {
       "$comment": [
-        "Pillar 4 — ablation matrix, split by theme so each flag runs in a",
+        "Pillar 4 \u2014 ablation matrix, split by theme so each flag runs in a",
         "scenario that can actually exercise it.  Replaces the original",
         "single-scenario design that left ~14/22 flags inert (their gating",
-        "conditions — CPs, voltage stress, heat sector, line overload,",
-        "Hebbian warmup, etc. — never fired in the concentrated-5 LV regime).",
+        "conditions \u2014 CPs, voltage stress, heat sector, line overload,",
+        "Hebbian warmup, etc. \u2014 never fired in the concentrated-5 LV regime).",
         "Each block names the flag set it tests + the scenario that triggers",
         "them; the {} default in each block is the per-block baseline."
       ],
@@ -301,7 +494,7 @@
           "enable_tier_stratified_holon_admm": false
         },
         {
-          "enable_monotonic_floor": false
+          "enable_monotonic_floor": true
         },
         {
           "enable_distributed_failure_notice": false
@@ -316,12 +509,12 @@
           "failure_type": "concentrated",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
-      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent + generator failures + slack 0.15 means restoration must flow through CPs — the only regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions all have signal.",
+      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent + generator failures + slack 0.15 means restoration must flow through CPs \u2014 the only regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions all have signal.",
       "name": "ablation_cross_sector",
       "grids": [
         "simbench_lv_cp_heavy_dependent"
@@ -339,11 +532,11 @@
           "enable_dynamic_cp_topology": false
         },
         {
-          "enable_cross_sector_coalitions": false
+          "enable_cross_sector_coalitions": true
         },
         {
-          "enable_holon_coalition": false,
-          "enable_cross_sector_coalitions": false
+          "enable_holon_coalition": true,
+          "enable_cross_sector_coalitions": true
         },
         {
           "enable_holon_summary": false,
@@ -357,12 +550,12 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ]
     },
     {
-      "$comment_block": "Line-loading / constraint-aware path.  line_stress (load_scale=1.8, ampacity_scale=0.5) forces lines into overload — the only regime where line_loading_constraint, constraint_aware_gossip, multihop_constraint, and curtailment_auction all fire.",
+      "$comment_block": "Line-loading / constraint-aware path.  line_stress (load_scale=1.8, ampacity_scale=0.5) forces lines into overload \u2014 the only regime where line_loading_constraint, constraint_aware_gossip, multihop_constraint, and curtailment_auction all fire.",
       "name": "ablation_line_stress",
       "grids": [
         "simbench_lv"
@@ -393,7 +586,7 @@
           "ampacity_scale": 0.5,
           "max_failures": 2,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
@@ -440,7 +633,7 @@
           "enable_heat_frontier": false
         },
         {
-          "enable_heat_priority_waterfall": false
+          "enable_heat_priority_waterfall": true
         },
         {
           "enable_heat_cp_supply": false
@@ -456,7 +649,7 @@
           "heat_load_scale": 1.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
         },
         {
           "kind": "cold_day",
@@ -466,7 +659,7 @@
           "heat_load_scale": 1.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
         }
       ]
     },
@@ -495,12 +688,12 @@
           "failure_type": "branch",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
-      "$comment": "Pillar 5a — packet loss robustness.",
+      "$comment": "Pillar 5a \u2014 packet loss robustness.",
       "name": "robustness_packet_loss",
       "grids": [
         "simbench_lv"
@@ -531,7 +724,7 @@
           "kind": "clean",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
@@ -539,12 +732,12 @@
           "generator_share": 0.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
-      "$comment": "Pillar 5b — latency jitter.",
+      "$comment": "Pillar 5b \u2014 latency jitter.",
       "name": "robustness_latency",
       "grids": [
         "simbench_lv"
@@ -572,7 +765,7 @@
           "kind": "clean",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
@@ -580,12 +773,12 @@
           "generator_share": 0.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
-      "$comment": "Pillar 6 — multi-failure / cascading.",
+      "$comment": "Pillar 6 \u2014 multi-failure / cascading.",
       "name": "cascading",
       "grids": [
         "simbench_lv"
@@ -599,19 +792,19 @@
           "kind": "clean",
           "n_failures": 1,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
           "n_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
@@ -619,14 +812,14 @@
           "generator_share": 0.5,
           "n_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
       "$comment": [
-        "Voltage-stress pillar — VDE-AR-N 4105 operating point.  Sunny midday: PV runs near nameplate while residential load drops to the morning trough, reversing feeder power flow.  ``vm_pu`` drifts toward the upper bound; without the Q-V droop the constraint monitor must shed real-power injection to recover (lost served energy).  With the droop, local Q absorption keeps voltage in deadband and full PV output is preserved.",
-        "Two-row ablation in a single experiment: scare-with-droop vs scare-without-droop on identical (grid, seed, scenario) — direct attribution of the droop's contribution."
+        "Voltage-stress pillar \u2014 VDE-AR-N 4105 operating point.  Sunny midday: PV runs near nameplate while residential load drops to the morning trough, reversing feeder power flow.  ``vm_pu`` drifts toward the upper bound; without the Q-V droop the constraint monitor must shed real-power injection to recover (lost served energy).  With the droop, local Q absorption keeps voltage in deadband and full PV output is preserved.",
+        "Two-row ablation in a single experiment: scare-with-droop vs scare-without-droop on identical (grid, seed, scenario) \u2014 direct attribution of the droop's contribution."
       ],
       "name": "voltage_stress",
       "grids": [
@@ -649,7 +842,7 @@
     },
     {
       "$comment": [
-        "Line-loading stress pillar — exercises the line-thermal constraint pipeline.  Loads are scaled up 1.8x and every PowerLine's ampacity is halved, guaranteeing overload after a single branch failure redirects flow.  Three-row ablation in one experiment: full pipeline vs monitor-off vs reconfig-ranking-off — direct attribution of each new mechanism.",
+        "Line-loading stress pillar \u2014 exercises the line-thermal constraint pipeline.  Loads are scaled up 1.8x and every PowerLine's ampacity is halved, guaranteeing overload after a single branch failure redirects flow.  Three-row ablation in one experiment: full pipeline vs monitor-off vs reconfig-ranking-off \u2014 direct attribution of each new mechanism.",
         "With the full pipeline: branch-mode monitor fires on overload, sends StartBalanceNegotiation to the lower-priority endpoint group, the reconfigurator's 6c ranking avoids the most-loaded restoration path.",
         "Monitor-off baseline shows what the system does when line overload is silent (the legacy behaviour).  Ranking-off baseline tests whether the priority-aware shedding alone is enough without changing reconfiguration choices."
       ],
@@ -672,7 +865,7 @@
           "ampacity_scale": 0.5,
           "max_failures": 2,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "ablations": [
@@ -681,7 +874,7 @@
     },
     {
       "$comment": [
-        "Line-loading stress pillar — exercises the line-thermal constraint pipeline.  Loads are scaled up 1.8x and every PowerLine's ampacity is halved, guaranteeing overload after a single branch failure redirects flow.  Three-row ablation in one experiment: full pipeline vs monitor-off vs reconfig-ranking-off — direct attribution of each new mechanism.",
+        "Line-loading stress pillar \u2014 exercises the line-thermal constraint pipeline.  Loads are scaled up 1.8x and every PowerLine's ampacity is halved, guaranteeing overload after a single branch failure redirects flow.  Three-row ablation in one experiment: full pipeline vs monitor-off vs reconfig-ranking-off \u2014 direct attribution of each new mechanism.",
         "With the full pipeline: branch-mode monitor fires on overload, sends StartBalanceNegotiation to the lower-priority endpoint group, the reconfigurator's 6c ranking avoids the most-loaded restoration path.",
         "Monitor-off baseline shows what the system does when line overload is silent (the legacy behaviour).  Ranking-off baseline tests whether the priority-aware shedding alone is enough without changing reconfiguration choices."
       ],
@@ -714,15 +907,54 @@
           "ampacity_scale": 0.5,
           "max_failures": 2,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
-      "$comment": "Cold-day thermal stress — narrows heat sector against its lower bound; CP plants matter when they can convert gas/power to extra heat output.",
+      "$comment": "Cold-day thermal stress \u2014 narrows heat sector against its lower bound; CP plants matter when they can convert gas/power to extra heat output.",
       "name": "cold_day_stress",
       "grids": [
-        "simbench_lv",
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "kind": "cold_day",
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "kind": "cold_day",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "supply_t_k": 343.15,
+          "heat_load_scale": 1.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    },
+    {
+      "$comment": "Cold-day thermal stress \u2014 narrows heat sector against its lower bound; CP plants matter when they can convert gas/power to extra heat output.",
+      "name": "cold_day_stress",
+      "grids": [
         "simbench_lv_cp_heavy"
       ],
       "n_seeds": 15,
@@ -737,7 +969,7 @@
           "kind": "clean",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
         },
         {
           "kind": "cold_day",
@@ -745,7 +977,7 @@
           "heat_load_scale": 1.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
         },
         {
           "kind": "cold_day",
@@ -755,12 +987,12 @@
           "heat_load_scale": 1.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
         }
       ]
     },
     {
-      "$comment": "Generator-class failures — the historical CP-flexibility scenario.  Compares branch / generator / mixed contingency populations.",
+      "$comment": "Generator-class failures \u2014 the historical CP-flexibility scenario.  Compares branch / generator / mixed contingency populations.",
       "name": "generator_failure",
       "grids": [
         "simbench_lv"
@@ -778,14 +1010,14 @@
           "failure_type": "branch",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
@@ -793,25 +1025,22 @@
           "generator_share": 0.5,
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
       "$comment": [
-        "Pillar 7 — Scaling.  Four simbench distribution grids spanning roughly a decade of MES node count:",
-        "  small  ≈   36+ nodes (1-LV-rural1 — since 2026-07-11 the TUNED recipe: density 0.5, 0.4x CPs, slack-fed heat, auto pipes)",
-        "  medium ≈  137 nodes (1-LV-semiurb4)",
-        "  large  ≈  396 nodes (1-LV-rural3, the established LV benchmark)",
-        "  mvlv   ≈  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay; gas_gen_share pinned 0.0 vs 1.5 on the LV rungs)",
-        "All run with the same 45 % slack budget. CAVEAT: grid size is NOT the only varying axis — the small rung differs in coupling recipe and the mvlv rung in gas supply topology; treat the ladder as size-dominated, not size-pure, and prefer within-LV (medium/large) contrasts for clean scaling claims."
+        "Pillar 7 \u2014 Scaling.  Four simbench distribution grids spanning roughly a decade of MES node count:",
+        "  small  \u2248   36+ nodes (1-LV-rural1 \u2014 since 2026-07-11 the TUNED recipe: density 0.5, 0.4x CPs, slack-fed heat, auto pipes)",
+        "  medium \u2248  137 nodes (1-LV-semiurb4)",
+        "  large  \u2248  396 nodes (1-LV-rural3, the established LV benchmark)",
+        "  mvlv   \u2248  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay; gas_gen_share pinned 0.0 vs 1.5 on the LV rungs)",
+        "All run with the same 45 % slack budget. CAVEAT: grid size is NOT the only varying axis \u2014 the small rung differs in coupling recipe and the mvlv rung in gas supply topology; treat the ladder as size-dominated, not size-pure, and prefer within-LV (medium/large) contrasts for clean scaling claims."
       ],
       "name": "scaling",
       "grids": [
-        "simbench_lv_small",
-        "simbench_lv_medium",
-        "simbench_lv",
-        "simbench_mvlv"
+        "simbench_lv_small"
       ],
       "n_seeds": 10,
       "variants": [
@@ -837,7 +1066,112 @@
     },
     {
       "$comment": [
-        "Pillar 8 — Reconfiguration.  Uses simbench_lv_reconfig: the constrained LV grid",
+        "Pillar 7 \u2014 Scaling.  Four simbench distribution grids spanning roughly a decade of MES node count:",
+        "  small  \u2248   36+ nodes (1-LV-rural1 \u2014 since 2026-07-11 the TUNED recipe: density 0.5, 0.4x CPs, slack-fed heat, auto pipes)",
+        "  medium \u2248  137 nodes (1-LV-semiurb4)",
+        "  large  \u2248  396 nodes (1-LV-rural3, the established LV benchmark)",
+        "  mvlv   \u2248  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay; gas_gen_share pinned 0.0 vs 1.5 on the LV rungs)",
+        "All run with the same 45 % slack budget. CAVEAT: grid size is NOT the only varying axis \u2014 the small rung differs in coupling recipe and the mvlv rung in gas supply topology; treat the ladder as size-dominated, not size-pure, and prefer within-LV (medium/large) contrasts for clean scaling claims."
+      ],
+      "name": "scaling",
+      "grids": [
+        "simbench_lv_medium"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.95
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.95
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Pillar 7 \u2014 Scaling.  Four simbench distribution grids spanning roughly a decade of MES node count:",
+        "  small  \u2248   36+ nodes (1-LV-rural1 \u2014 since 2026-07-11 the TUNED recipe: density 0.5, 0.4x CPs, slack-fed heat, auto pipes)",
+        "  medium \u2248  137 nodes (1-LV-semiurb4)",
+        "  large  \u2248  396 nodes (1-LV-rural3, the established LV benchmark)",
+        "  mvlv   \u2248  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay; gas_gen_share pinned 0.0 vs 1.5 on the LV rungs)",
+        "All run with the same 45 % slack budget. CAVEAT: grid size is NOT the only varying axis \u2014 the small rung differs in coupling recipe and the mvlv rung in gas supply topology; treat the ladder as size-dominated, not size-pure, and prefer within-LV (medium/large) contrasts for clean scaling claims."
+      ],
+      "name": "scaling",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Pillar 7 \u2014 Scaling.  Four simbench distribution grids spanning roughly a decade of MES node count:",
+        "  small  \u2248   36+ nodes (1-LV-rural1 \u2014 since 2026-07-11 the TUNED recipe: density 0.5, 0.4x CPs, slack-fed heat, auto pipes)",
+        "  medium \u2248  137 nodes (1-LV-semiurb4)",
+        "  large  \u2248  396 nodes (1-LV-rural3, the established LV benchmark)",
+        "  mvlv   \u2248  778 nodes (1-MVLV-urban-5.303, the largest pure-distribution MV+LV grid; retuned gas/heat overlay; gas_gen_share pinned 0.0 vs 1.5 on the LV rungs)",
+        "All run with the same 45 % slack budget. CAVEAT: grid size is NOT the only varying axis \u2014 the small rung differs in coupling recipe and the mvlv rung in gas supply topology; treat the ladder as size-dominated, not size-pure, and prefer within-LV (medium/large) contrasts for clean scaling claims."
+      ],
+      "name": "scaling",
+      "grids": [
+        "simbench_mvlv"
+      ],
+      "n_seeds": 10,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 1.0
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 1.0
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Pillar 8 \u2014 Reconfiguration.  Uses simbench_lv_reconfig: the constrained LV grid",
         "augmented with 5 normally-open backup branches per sector (15 total).  Failures",
         "bias toward branches because the reconfiguration pathway only fires on",
         "BranchFailureEvent; generator failures don't test reconfiguration."
@@ -859,20 +1193,20 @@
           "failure_type": "branch",
           "max_failures": 2,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "clean",
           "failure_type": "branch",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
       "$comment": [
-        "Pillar 9 — CP flexibility shift.  The headline experiment for the cross-sector ADMM",
+        "Pillar 9 \u2014 CP flexibility shift.  The headline experiment for the cross-sector ADMM",
         "layer.  Uses three new grid variants built with monee's cp_size_multiplier and",
         "replace_primary_generation knobs:",
         "  cp_heavy_45            : CP rated output 2x, additive (loss of CP recoverable)",
@@ -880,14 +1214,13 @@
         "                            disables BOTH the unit and the displaced primary gen)",
         "  cp_heavy_dependent_45  : both knobs combined (maximum cross-carrier dependence)",
         "On the dependent variants, gossip + local-gen fallback alone cannot recover from a CP",
-        "failure because the displaced primary gen is gone — the cross-sector ADMM is",
+        "failure because the displaced primary gen is gone \u2014 the cross-sector ADMM is",
         "the only path to compensate.",
         "Failures: generator-class so CPs themselves are part of the failure population."
       ],
       "name": "cp_flexibility",
       "grids": [
         "simbench_lv_cp_heavy",
-        "simbench_lv_cp_dependent",
         "simbench_lv_cp_heavy_dependent"
       ],
       "n_seeds": 15,
@@ -903,7 +1236,7 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
         },
         {
           "kind": "clean",
@@ -911,7 +1244,50 @@
           "generator_share": 0.6,
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Pillar 9 \u2014 CP flexibility shift.  The headline experiment for the cross-sector ADMM",
+        "layer.  Uses three new grid variants built with monee's cp_size_multiplier and",
+        "replace_primary_generation knobs:",
+        "  cp_heavy_45            : CP rated output 2x, additive (loss of CP recoverable)",
+        "  cp_dependent_45        : CP rated output 1x, replaces primary gen (loss of CP",
+        "                            disables BOTH the unit and the displaced primary gen)",
+        "  cp_heavy_dependent_45  : both knobs combined (maximum cross-carrier dependence)",
+        "On the dependent variants, gossip + local-gen fallback alone cannot recover from a CP",
+        "failure because the displaced primary gen is gone \u2014 the cross-sector ADMM is",
+        "the only path to compensate.",
+        "Failures: generator-class so CPs themselves are part of the failure population."
+      ],
+      "name": "cp_flexibility",
+      "grids": [
+        "simbench_lv_cp_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.6,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
         }
       ]
     },
@@ -925,7 +1301,42 @@
       ],
       "name": "concentrated_imbalance",
       "grids": [
-        "simbench_lv",
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "kind": "clean",
+          "failure_type": "concentrated",
+          "n_failures": 6,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    },
+    {
+      "$comment": [
+        "Concentrated imbalance.  failure_type=concentrated picks a load-rich node and",
+        "BFS-walks outward, producing spatially-clustered failures that target one",
+        "sub-community with stark deficit while neighbours retain slack capacity.",
+        "This is the test designed to surface the holonic ADMM's inter-group",
+        "redistribution; on the cp_heavy_dependent grid the CP-ADMM may also engage."
+      ],
+      "name": "concentrated_imbalance",
+      "grids": [
         "simbench_lv_cp_heavy_dependent"
       ],
       "n_seeds": 15,
@@ -941,22 +1352,42 @@
           "failure_type": "concentrated",
           "n_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.3
+          "slack_budget_pct": 0.55
         },
         {
           "kind": "clean",
           "failure_type": "concentrated",
           "n_failures": 6,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.3
+          "slack_budget_pct": 0.55
         }
       ]
     },
     {
-      "$comment": "CP-size sweep — measures how PWSF varies with CP rated output on the dependent variant.  Replaces the old todo for sizing studies.",
+      "$comment": "CP-size sweep \u2014 measures how PWSF varies with CP rated output on the dependent variant.  Replaces the old todo for sizing studies.",
       "name": "cp_size_sweep",
       "grids": [
-        "simbench_lv_cp_dependent",
+        "simbench_lv_cp_dependent"
+      ],
+      "n_seeds": 5,
+      "variants": [
+        "scare",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    },
+    {
+      "$comment": "CP-size sweep \u2014 measures how PWSF varies with CP rated output on the dependent variant.  Replaces the old todo for sizing studies.",
+      "name": "cp_size_sweep",
+      "grids": [
         "simbench_lv_cp_heavy",
         "simbench_lv_cp_heavy_dependent"
       ],
@@ -971,13 +1402,197 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
         }
       ]
     },
     {
+      "name": "cp_necessity",
+      "grids": [
+        "simbench_lv_gas_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.6,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        }
+      ],
       "$comment": [
-        "Agent dropout robustness pillar — pending a mango scheduling hook for",
+        "CP-NECESSITY pillar. The cp_*_dependent grids only SHIFT rated capacity into",
+        "the coupling points (9-18 % of the primary pool) and the operator slack",
+        "backfills the rest, so deactivating every CP in the no-failure LP costs",
+        "0.0001-0.0115 PWSF \u2014 less than the plain simbench_lv control (0.0074), and a",
+        "3-CP failure draw moves nothing at all (0.9951 -> 0.9947 on cp_heavy_dependent,",
+        "measured). These two grids make a carrier structurally unservable without its",
+        "converters. All figures below are the no-failure oracle LP, proven optimal",
+        "(Gurobi status 2, MIPGap 0), CPs-on vs all 47 CPs deactivated:",
+        "  gas_dependent @0.40 (gas depends on power): gas has NO native production and",
+        "    the budget covers only 40 % of gas demand; P2G synthesises the rest from",
+        "    the surplus (1.5x) PV fleet. gas 1.000 -> 0.400 (= exactly the budget,",
+        "    3 seeds), heat 0.88/0.92 -> 0.72/0.74, PWSF -0.090 +- 0.002.",
+        "  el_dependent @0.55 (power depends on gas): the PV fleet is cut to 20 %, so",
+        "    the electrical balance closes only on CHP output, fuelled from gas.",
+        "    el 1.000 -> 0.734 (predicted (0.0567+0.2763)/0.4456 = 0.747; the rest is",
+        "    losses), heat 0.99 -> 0.72/0.74, PWSF -0.084 +- 0.004.",
+        "MARGINAL SENSITIVITY (k random CP failures, the regime these scenarios sample):",
+        "  gas_dependent loses ~2.7 pts of gas per failed P2G (k=1 0.972, k=2 0.946).",
+        "  el_dependent absorbs CHP losses in HEAT, not electricity: the LP curtails",
+        "  P2H (an electricity consumer) instead of shedding load, so el stays ~1.000",
+        "  through k=3 while heat drops 0.988 -> 0.978. Electricity only breaks once the",
+        "  fleet is gone. If marginal el sensitivity is wanted, cut chp_p_share to ~0.8",
+        "  (or drop P2H from this grid and carry heat dependence on gas_dependent only).",
+        "Budgets are each grid's minimum servable value so the no-failure baseline is",
+        "NOT budget-limited and the whole gap is the converters. Failures are",
+        "generator-class so CPs are in the failure population."
+      ]
+    },
+    {
+      "name": "cp_necessity",
+      "grids": [
+        "simbench_lv_el_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "single_level",
+        "component_level",
+        "oracle"
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        },
+        {
+          "kind": "clean",
+          "failure_type": "mixed",
+          "generator_share": 0.6,
+          "max_failures": 4,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        }
+      ]
+    },
+    {
+      "name": "just_cp_necessity",
+      "grids": [
+        "simbench_lv_gas_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_cp_admm": false,
+          "enable_cp_priority_admm": false
+        },
+        {
+          "enable_cp_priority_admm": false
+        },
+        {
+          "enable_dynamic_cp_topology": false
+        },
+        {
+          "enable_heat_cp_supply": false
+        },
+        {
+          "enable_holon_coalition": true,
+          "enable_cross_sector_coalitions": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "outcomes__priority_weighted_fraction_by_sector__gas",
+        "outcomes__priority_weighted_fraction_by_sector__electricity",
+        "outcomes__priority_weighted_fraction_by_sector__heat",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "name": "just_cp_necessity",
+      "grids": [
+        "simbench_lv_el_dependent"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_cp_admm": false,
+          "enable_cp_priority_admm": false
+        },
+        {
+          "enable_cp_priority_admm": false
+        },
+        {
+          "enable_dynamic_cp_topology": false
+        },
+        {
+          "enable_heat_cp_supply": false
+        },
+        {
+          "enable_holon_coalition": true,
+          "enable_cross_sector_coalitions": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "failure_type": "generator",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        }
+      ],
+      "target_metrics": [
+        "outcomes__priority_weighted_fraction",
+        "outcomes__priority_weighted_fraction_by_sector__gas",
+        "outcomes__priority_weighted_fraction_by_sector__electricity",
+        "outcomes__priority_weighted_fraction_by_sector__heat",
+        "claims__constraint_compliance__passed",
+        "claims__slack_budget_compliance__passed"
+      ],
+      "population": "all"
+    },
+    {
+      "$comment": [
+        "Agent dropout robustness pillar \u2014 pending a mango scheduling hook for",
         "mid-sim agent unregister.  Empty grids keep this entry as a placeholder."
       ],
       "name": "robustness_dropout_TODO",
@@ -1009,7 +1624,7 @@
           "failure_type": "island",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         },
         {
           "kind": "microgrid",
@@ -1022,12 +1637,12 @@
           ],
           "promote_all_generators": true,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ]
     },
     {
-      "$comment": "Scenario row 1 = multi-hour horizon WITHOUT temporal extensions; row 2 = same horizon with gas linepack + thermal LTC. Heat+gas generator failures + tight slack (0.15) put the deficit on the storage carriers. physics_time_scale=1 (sim clock = physical time), interval 10 => dt 10s, dur 21600 => 6h/2160 steps; sector_timescale sets physical control cadences (elec 30s, gas 120s, heat 600s poll). Periodic-only physics solving (ablation cooldown/max_acts) settles at converged agent states each step; stays feasible (0% solve fail) with PWSF flat vs coarser intervals — benchmarked ~7 min MAS / ~3 min oracle per task at 6h on the tiny LV-S (each MILP ~0.09s). Note interval < elec poll (30s) so physics updates faster than agents observe; finer than 30s only refines trajectory resolution. Tuned LV-S keeps the per-step solve cheap.",
+      "$comment": "Scenario row 1 = multi-hour horizon WITHOUT temporal extensions; row 2 = same horizon with gas linepack + thermal LTC. Heat+gas generator failures + tight slack (0.15) put the deficit on the storage carriers. physics_time_scale=1 (sim clock = physical time), interval 10 => dt 10s, dur 21600 => 6h/2160 steps; sector_timescale sets physical control cadences (elec 30s, gas 120s, heat 600s poll). Periodic-only physics solving (ablation cooldown/max_acts) settles at converged agent states each step; stays feasible (0% solve fail) with PWSF flat vs coarser intervals \u2014 benchmarked ~7 min MAS / ~3 min oracle per task at 6h on the tiny LV-S (each MILP ~0.09s). Note interval < elec poll (30s) so physics updates faster than agents observe; finer than 30s only refines trajectory resolution. Tuned LV-S keeps the per-step solve cheap.",
       "name": "extension_temporal",
       "grids": [
         "simbench_lv_small"
@@ -1037,7 +1652,7 @@
         "scare",
         "oracle"
       ],
-      "$ablation_comment": "physics_time_scale=1 makes the sim clock physical time; pair it with periodic-only physics solving (huge cooldown + max_acts=0) so the physics settles at CONVERGED agent states each 10-s step instead of re-solving mid-negotiation on every setpoint write — the latter caused ~27% infeasible-then-stale solves at the slow real-time cadence. Applies to both scenario rows and both variants, so no A/B confound.",
+      "$ablation_comment": "physics_time_scale=1 makes the sim clock physical time; pair it with periodic-only physics solving (huge cooldown + max_acts=0) so the physics settles at CONVERGED agent states each 10-s step instead of re-solving mid-negotiation on every setpoint write \u2014 the latter caused ~27% infeasible-then-stale solves at the slow real-time cadence. Applies to both scenario rows and both variants, so no A/B confound.",
       "ablations": [
         {
           "energy_flow_cooldown_s_override": 1000000.0,
@@ -1163,7 +1778,7 @@
           "failure_type": "concentrated",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -1268,7 +1883,7 @@
           "failure_type": "generator",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ],
       "target_metrics": [
@@ -1320,7 +1935,7 @@
           "ampacity_scale": 0.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -1405,7 +2020,7 @@
           "enable_heat_frontier": false
         },
         {
-          "enable_heat_priority_waterfall": false
+          "enable_heat_priority_waterfall": true
         },
         {
           "enable_heat_curtail_lock": false
@@ -1421,7 +2036,7 @@
           "heat_load_scale": 1.5,
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.55
         }
       ],
       "target_metrics": [
@@ -1473,7 +2088,7 @@
           "failure_type": "generator",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ],
       "target_metrics": [
@@ -1504,7 +2119,7 @@
           "kind": "clean",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -1537,7 +2152,7 @@
           "failure_type": "branch",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -1559,7 +2174,7 @@
           "failure_type": "generator",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ],
       "n_seeds": 15,
@@ -1579,7 +2194,7 @@
       "population": "all"
     },
     {
-      "$comment_block": "Architectural attribution (deficit). scare vs flat single_level vs component_level on the concentrated-5 deficit — the whole-hierarchy value that per-lever LOO cannot isolate. Paired variant deltas vs scare.",
+      "$comment_block": "Architectural attribution (deficit). scare vs flat single_level vs component_level on the concentrated-5 deficit \u2014 the whole-hierarchy value that per-lever LOO cannot isolate. Paired variant deltas vs scare.",
       "name": "just_architecture_deficit",
       "grids": [
         "simbench_lv"
@@ -1590,7 +2205,7 @@
           "failure_type": "concentrated",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "n_seeds": 15,
@@ -1631,7 +2246,7 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ],
       "target_metrics": [
@@ -1711,7 +2326,7 @@
           "failure_type": "concentrated",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -1750,7 +2365,7 @@
           "failure_type": "concentrated",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -1789,7 +2404,7 @@
           "failure_type": "concentrated",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -1841,7 +2456,7 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ],
       "target_metrics": [
@@ -1886,7 +2501,7 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ],
       "target_metrics": [
@@ -1927,7 +2542,7 @@
           "kind": "clean",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -1975,7 +2590,7 @@
           "failure_type": "concentrated",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -2023,7 +2638,7 @@
           "failure_type": "concentrated",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -2078,7 +2693,7 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ],
       "target_metrics": [
@@ -2113,7 +2728,7 @@
           "kind": "clean",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -2150,7 +2765,7 @@
           "failure_type": "generator",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.15
+          "slack_budget_pct": 0.55
         }
       ],
       "target_metrics": [
@@ -2186,7 +2801,7 @@
           "failure_type": "branch",
           "max_failures": 4,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -2284,7 +2899,7 @@
           "kind": "clean",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -2325,7 +2940,7 @@
           "kind": "clean",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [
@@ -2363,7 +2978,7 @@
           "kind": "clean",
           "max_failures": 3,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.5
         }
       ],
       "target_metrics": [

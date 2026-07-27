@@ -32,6 +32,7 @@ from monee.model.core import Var
 from monee.model.formulation import (
     GAS_NONCONVEX_MIQCQP_FORMULATION,
     make_heat_convex_milp_formulation,
+    orient_unidirectional_water_pipes,
 )
 from monee.model.node import Bus
 from monee.problem import (
@@ -162,7 +163,21 @@ def oracle_solver_for_task(
 ) -> _OracleGurobiSolver:
     """Solver with per-grid termination params; extended budget for grids (or
     microgrid/islanding scenarios) whose MIQCQP cannot converge inside the
-    default 300 s."""
+    default 300 s.
+
+    A scenario may override the budget with ``oracle_time_limit_s``. The grid
+    allowlist alone under-covers: on eval_full_v2 **400 of the 469 time-limited
+    oracle solves stopped at the 300 s default**, none of them on a hard grid —
+    simbench_lv 248 (p90 gap 0.45), cp_heavy_dependent 91, cp_heavy 40,
+    cp_dependent 21 — while the 69 that got 900 s were the allowlisted ones.
+    Every one of the 469 had a feasible incumbent (``sol_count > 0``), so the
+    budget buys bound-tightening, not feasibility, and it is worth spending only
+    where the gap is wide: raising 300 s here changes which pairs the report can
+    treat as certified (see ``aggregate._paired_vs_oracle_section``).
+    """
+    override = (scenario or {}).get("oracle_time_limit_s")
+    if override is not None:
+        return _OracleGurobiSolver(params={"TimeLimit": float(override)})
     hard = grid in _ORACLE_HARD_GRIDS or (scenario or {}).get("kind") == "microgrid"
     return _OracleGurobiSolver(params=dict(_ORACLE_HARD_PRESET) if hard else None)
 
@@ -483,6 +498,19 @@ def _build_min_shed_problem(
     # McCormick-DHS keeps on_off in linear terms so backup lines stay intact.
     # Safe in-place — the net is oracle-dedicated.
     apply_oracle_heat_linearisation(monee_net)
+    # McCormick-DHS pins each pipe to its as-built flow direction, so a failure
+    # that removes a junction's inbound pipe leaves it unsuppliable and the LP
+    # infeasible (eval_full_v2: 31 of 35 oracle failures). Re-orient the pipes
+    # the post-failure topology needs reversed; a no-op when the as-built
+    # directions still supply every draw, so unaffected tasks are unchanged.
+    reversed_pipes = orient_unidirectional_water_pipes(monee_net)
+    if reversed_pipes:
+        logger.info(
+            "oracle: reversed %d water pipe(s) for the post-failure supply "
+            "direction: %s",
+            len(reversed_pipes),
+            reversed_pipes,
+        )
     monee_net.apply_formulation(GAS_NONCONVEX_MIQCQP_FORMULATION)
     # Enforce the operator slack budget on the LP itself via
     # ``create_min_load_shedding_problem``'s native ``ext_grid_*_bounds`` (no
@@ -753,7 +781,7 @@ def run_oracle(
             f"(status={solver_stats.get('status')})"
         )
         if report is not None:
-            reason = f"{reason}; {report!r}"
+            reason = f"{reason}; {_iis_signature(report)}"
         logger.error("oracle: %s", reason)
         return _oracle_failure_payload(reason, solver_stats)
 
@@ -761,6 +789,41 @@ def run_oracle(
     behavior = _adapter_observe(solved_net)
     served = served_breakdown(solved_net, behavior, priorities=priorities)
     return _oracle_success_payload(solved_net, behavior, served, solver_stats)
+
+
+# How many IIS members to name in the persisted failure reason. The whole point
+# is to make a recurring infeasibility groupable straight from summary.csv, and
+# the campaign's signatures are 1-3 members wide; the cap only bounds the
+# pathological case.
+_IIS_NAMES_IN_REASON: int = 4
+
+
+def _iis_signature(report: Any) -> str:
+    """One-line IIS rendering that NAMES the conflicting members.
+
+    ``repr(GurobiIISReport)`` gives only counts, so eval_full_v2 persisted
+    ``constraints=1, bounds=1`` for 29 of its 35 oracle failures and the names
+    survived solely in each task's ``run.log`` — meaning the single recurring
+    conflict behind them was invisible to any aggregate. With names, those 29
+    collapse to one signature: ``branch_<A>_<B>_0__mass_flow_neg_kgs [LB]``
+    against ``node_<A>_eq_35``, i.e. the non-negativity bound on a branch's
+    reverse mass flow versus the nodal balance at its own from-node, on the
+    heat/water network after a reconfiguration.
+    """
+    bounds = list(getattr(report, "bounds", None) or [])
+    constraints = list(getattr(report, "constraints", None) or [])
+    if not bounds and not constraints:
+        return repr(report)
+
+    def _fmt(items: list[str]) -> str:
+        shown = ", ".join(str(i) for i in items[:_IIS_NAMES_IN_REASON])
+        extra = len(items) - _IIS_NAMES_IN_REASON
+        return f"[{shown}{f', +{extra} more' if extra > 0 else ''}]"
+
+    return (
+        f"IIS bounds({len(bounds)})={_fmt(bounds)} "
+        f"constraints({len(constraints)})={_fmt(constraints)}"
+    )
 
 
 def _oracle_success_payload(
@@ -1010,7 +1073,9 @@ def compute_baseline_served(
             apply_cold_day(fresh, **kwargs)
         elif kind == "pv_peak":
             kwargs = {
-                k: scenario[k] for k in ("gen_scale", "load_scale") if k in scenario
+                k: scenario[k]
+                for k in ("gen_scale", "load_scale", "trafo_ampacity_scale")
+                if k in scenario
             }
             apply_pv_peak(fresh, **kwargs)
         elif kind == "line_stress":
@@ -1031,6 +1096,9 @@ def compute_baseline_served(
                 carriers=carriers,
                 promote_all_generators=promote_all,
                 grid_former_aids=former_aids,
+                grid_former_headroom=float(
+                    scenario.get("grid_former_headroom", 4.0)
+                ),
             )
         slack_budget_pct = scenario.get("slack_budget_pct")
         if slack_budget_pct is not None:

@@ -188,6 +188,81 @@ def _branch_is_active(branch: Any) -> bool:
 # absorbs numerical wiggle at the bound.
 _HEAT_T_TOL_K: float = 1.0
 
+# monee bounds the nodal temperature variable at t_pu >= 0.3 (model/node.py) and
+# reports t_k = t_pu * t_ref. A junction pinned at exactly 0.3 * t_ref is the
+# solver resting on that Var floor, not a measured temperature, so grading it
+# against the 313.15 K service floor scores an artefact of the formulation.
+#
+# This is deliberately the *narrowest* rule that removes the artefact: it flips
+# exactly 1 task of 8335 (003250). Two wider rules were rejected — excluding
+# every below-ambient reading flips 3, and excluding every sub-floor t_k row
+# (proposed on the grounds that such loads read served == 0) flips 287. That
+# last one is circular: ``_heat_served_feasible`` below drives served to 0 from
+# the same t_k band, so the join that motivated it can only ever return 100%.
+_T_PU_VAR_FLOOR: float = 0.3
+_T_REF_K: float = 356.0
+_T_PU_FLOOR_TOL_K: float = 1e-3
+
+
+def is_t_pu_floor_artifact(variable: str, value: Any) -> bool:
+    """True for a ``t_k`` reading pinned at monee's ``t_pu`` Var floor.
+
+    Eval-layer only. It must NOT move into ``scare.base.model``: the live
+    simulator consults ``is_energised_reading`` at ``constraints.py``,
+    ``cp_heat_guard.py`` and ``restoration.py``, so widening that predicate
+    would change control behaviour and invalidate every recorded run.
+    """
+    if variable != "t_k":
+        return False
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return abs(v - _T_PU_VAR_FLOOR * _T_REF_K) < _T_PU_FLOOR_TOL_K
+
+
+# Liquid water freezes at 273.15 K, so a heat junction reading below it cannot
+# be a temperature the network was at. Such readings come from monee's nodal
+# heat balance going rank-deficient in T_n once the mass-flow terms vanish:
+# ``node.py`` guards that with a conduction regulariser scaled by
+# ``grid.node_heat_reg_kgs``, but that attribute is never set anywhere in monee,
+# SCARE or mango-energy-environments, so the coefficient is always 0.0 and T_n
+# is pinned only by its Var box ``t_pu in [0.3, 2.0]`` = [106.8, 712] K.
+_T_K_FREEZING: float = 273.15
+
+
+def is_nonphysical_t_k(variable: str, value: Any) -> bool:
+    """True for a ``t_k`` reading below the freezing point of water.
+
+    REPORTING ONLY — deliberately not wired into the compliance gate.
+
+    On eval_full_v2 this covers 166 of 906 violation records across 55 tasks;
+    excluding them from the verdict would flip 14 tasks to compliant, **all of
+    them SCARE**, so it is not a neutral correction and must not be applied
+    silently. The wider "below ambient (296.15 K)" variant covers 308 records /
+    66 tasks and flips 63 (62 SCARE, 1 component-level); ambient is also
+    scenario-dependent (cold-day runs sit near 270 K), which makes it a weaker
+    physical argument than the freezing point.
+
+    The still-wider "every reading under the 312.15 K service floor" rule flips
+    287 tasks and was rejected in an earlier audit as circular: it was motivated
+    by those loads reading ``served == 0``, but ``_heat_served_feasible`` drives
+    served to 0 from the same band, so the join could only ever return 100%.
+    This predicate is not that rule — it consults nothing but the reading and a
+    physical constant.
+
+    The real fix is upstream (give the regulariser a non-zero coefficient, or
+    anchor T_n when the mass flow vanishes); until then this quantifies how much
+    of the heat gate is measuring a formulation artefact rather than control.
+    """
+    if variable != "t_k":
+        return False
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and v < _T_K_FREEZING
+
 
 def _heat_served_feasible(obs: dict, sec: Any) -> bool:
     """False iff a heat load's node temperature is outside the oracle's hard
@@ -1228,6 +1303,8 @@ def constraint_rows(monee_net: Any) -> list[dict[str, Any]]:
             # val is already finite (guarded above).
             if not is_energised_reading(var, val):
                 continue
+            if is_t_pu_floor_artifact(var, val):
+                continue
             rows.append(_violation_row("node", node.id, sec, var, val, lo, hi))
 
     el_loading = SECTOR_CONSTRAINTS.get(Sector.ELECTRICITY, {}).get("loading_percent")
@@ -1431,26 +1508,17 @@ def time_to_stabilise_s(world: Any, *, hold_s: float = 1.0) -> float | None:
     return None
 
 
-# Optimality gap (vs oracle)
-
-
-def optimality_gap(scare_pw_served: float, oracle_pw_served: float) -> float:
-    """Relative gap ``(oracle - scare) / oracle`` clipped to ``[0, 1]``.
-    Negative inputs (oracle worse than scare) clip to 0 — but are logged: since
-    the oracle is the constraint-respecting optimum, scare > oracle signals
-    either an oracle bug (e.g. a priority-blind LP) or scare credited above
-    feasibility, both worth surfacing rather than silently flooring to a
-    'perfect' gap of 0."""
-    if oracle_pw_served <= 0:
-        return 0.0
-    gap = (oracle_pw_served - scare_pw_served) / oracle_pw_served
-    if not math.isfinite(gap):
-        return 0.0
-    if gap < 0:
-        logger.warning(
-            "optimality_gap negative (scare %.4f > oracle %.4f): clipping to 0; "
-            "oracle should dominate — check oracle validity / feasibility.",
-            scare_pw_served,
-            oracle_pw_served,
-        )
-    return max(0.0, min(1.0, gap))
+# Gap vs oracle
+#
+# There is deliberately no scalar ``optimality_gap`` helper. One existed and had
+# no caller anywhere in the pipeline; it clipped a negative gap to 0 and logged
+# "oracle should dominate — check oracle validity", which is the wrong first
+# question on two counts. Empirically, scare > oracle concentrates ~20x in
+# under-converged solves (eval_full_v2: 0.23% of 871 certified-optimal pairs vs
+# 4.68% of 406 uncertified), so it usually measures the MIQCQP's time limit
+# rather than coordination quality. Structurally, the oracle maximises a
+# near-lexicographic ladder (``oracle._ORACLE_TIER_WEIGHT`` 1e6/1e4/1e2/1) and is
+# scored on PWSF's 8:4:2:1 (``_tier_weight``), so its PWSF was never a strict
+# upper bound — a small residual, not the driver. Clipping also flattered SCARE
+# by shrinking the mean gap. ``plots.optimality_gap_scatter`` is the one
+# reporting site; it keeps the sign and points at the certification table.

@@ -26,6 +26,11 @@ from experiment.eval.aliases import alias_experiment, alias_grid, alias_variant
 from experiment.eval.compliance import compliant_mask, mean_ci95
 from experiment.eval.loader import CampaignData, load_campaign
 from experiment.eval.overview import write_overview
+from experiment.eval.population import (
+    default_arm_mask,
+    matched_frame,
+    population_note,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +119,13 @@ def _optimality_gap(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 def _stress_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
     """Combined stress view: PWSF per variant AND the compliance composition,
-    across every hard stress scenario class, in one two-panel figure."""
+    across every hard stress scenario class, in one two-panel figure.
+
+    Default arms only: the panel compares controllers, and a deliberately
+    ablated SCARE arm pooled into the SCARE bar is not the controller.
+    """
     done = _completed_sims(campaign.summary)
+    done = done[default_arm_mask(done)]
     if done.empty:
         return []
     return [
@@ -187,11 +197,15 @@ def _variant_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 
 def _cp_influence(campaign: CampaignData, out_dir: Path) -> list[str]:
-    """Coupling-point optimization influence, pooled over EVERY completed
-    task (all experiments) so each (grid, variant) cell has real sample
-    mass — the basic-result view of how much the L3 cross-sector ADMM
-    actually steers each grid."""
-    done = _completed_sims(campaign.summary)
+    """Coupling-point optimization influence over the matched population, so
+    each (grid, variant) cell has sample mass without the variants being
+    averaged over different experiment mixes.
+
+    Pooling every completed task gave the cell mass but made the per-variant
+    bars incomparable: SCARE's rows were 56% deliberately-degraded arms against
+    an oracle with none.
+    """
+    done, prov = matched_frame(_completed_sims(campaign.summary))
     if done.empty:
         return []
     return [
@@ -199,19 +213,21 @@ def _cp_influence(campaign: CampaignData, out_dir: Path) -> list[str]:
             plots.cp_influence_bar(
                 done,
                 out_dir / "cp_influence.png",
+                subtitle=population_note(prov),
             )
         )
     ]
 
 
 def _restoration_time(campaign: CampaignData, out_dir: Path) -> list[str]:
-    """Campaign-wide time-to-stabilise box plot.
+    """Campaign-wide time-to-stabilise box plot over the matched population.
 
-    Pools every completed task across all experiments so the per-variant box
-    has enough samples to be meaningful (the ``variant_comparison`` slice
-    alone collapses to n=1 per variant in small campaigns).
+    Pools across experiments so the per-variant box has enough samples to be
+    meaningful (the ``variant_comparison`` slice alone collapses to n=1 per
+    variant in small campaigns), but only over default arms of experiments
+    every variant ran — otherwise the SCARE box is largely ablated arms.
     """
-    done = _completed_sims(campaign.summary)
+    done, _ = matched_frame(_completed_sims(campaign.summary))
     if done.empty:
         return []
     return [
@@ -964,10 +980,46 @@ def _table_status(campaign: CampaignData) -> str:
     return "\n".join(parts)
 
 
+_VARIANT_MEAN_HEADER = (
+    "| variant | n_compliant/n_total | compliance | mean PWSF | 95% CI |",
+    "|---|---|---|---|---|",
+)
+
+
+def _variant_mean_rows(done: pd.DataFrame, metric: str) -> list[str]:
+    rows: list[str] = []
+    for variant, g in done.groupby("variant"):
+        n_total = len(g)
+        comp = g[compliant_mask(g)]
+        n_comp = len(comp)
+        rate = 100.0 * n_comp / n_total if n_total else float("nan")
+        if n_comp == 0:
+            mean_str, ci_str = "—", "—"
+        else:
+            mean, ci = mean_ci95(comp[metric])
+            mean_str = f"{mean:.4f}"
+            ci_str = "—" if pd.isna(ci) else f"±{ci:.4f}"
+        rows.append(
+            f"| {alias_variant(str(variant))} | {n_comp}/{n_total} | "
+            f"{rate:.0f}% | {mean_str} | {ci_str} |"
+        )
+    return rows
+
+
 def _table_variant_means(campaign: CampaignData) -> str:
     """Per-variant PWSF on the COMPLIANT subset with 95% CI (matches
-    ``hpc.aggregate``). UNPAIRED, pooled across grids+experiments — for the
-    paired view see ``summary.md``. PWSF = electricity + heat + gas (gas HHV).
+    ``hpc.aggregate``), POOLED and then MATCHED. UNPAIRED — for the paired view
+    see ``summary.md``. PWSF = electricity + heat + gas (gas HHV).
+
+    The pooled table averages each variant over whatever experiment mix it ran
+    in, and those mixes are not comparable: on eval_full_v2, 56.3% of SCARE's
+    completed rows are deliberately-ablated or swept arms against 7.6% /
+    1.0% for the level baselines and 0.0% for the oracle. The matched table
+    restricts to default arms of the experiments every variant ran. Both are
+    printed because every correction here moves numbers in SCARE's favour
+    (there, +0.0069 SCARE / -0.0049 oracle, narrowing the gap 0.0474 -> 0.0356),
+    and a reader must be able to see the selection rule and its size rather
+    than be handed the flattering frame alone.
     """
     df = campaign.summary
     metric = "outcomes__priority_weighted_fraction"
@@ -980,29 +1032,32 @@ def _table_variant_means(campaign: CampaignData) -> str:
     if done.empty:
         return "_(no successful runs)_"
     lines = [
-        "_Compliant-subset PWSF (slack + grid feasibility), unpaired, pooled "
-        "across grids AND experiments (each variant is averaged over whatever "
-        "experiment mix it ran in); electricity + heat + gas (gas HHV-converted). "
-        "Paired comparison: see `summary.md`._",
+        "_Compliant-subset PWSF (slack + grid feasibility), unpaired; "
+        "electricity + heat + gas (gas HHV-converted). Paired comparison: see "
+        "`summary.md`._",
         "",
-        "| variant | n_compliant/n_total | compliance | mean PWSF | 95% CI |",
-        "|---|---|---|---|---|",
+        "**Pooled** — each variant over its own experiment mix. Not a "
+        "controller comparison when those mixes differ; read it against the "
+        "matched table below.",
+        "",
+        *_VARIANT_MEAN_HEADER,
+        *_variant_mean_rows(done, metric),
     ]
-    for variant, g in done.groupby("variant"):
-        n_total = len(g)
-        comp = g[compliant_mask(g)]
-        n_comp = len(comp)
-        rate = 100.0 * n_comp / n_total if n_total else float("nan")
-        if n_comp == 0:
-            mean_str, ci_str = "—", "—"
-        else:
-            mean, ci = mean_ci95(comp[metric])
-            mean_str = f"{mean:.4f}"
-            ci_str = "—" if pd.isna(ci) else f"±{ci:.4f}"
-        lines.append(
-            f"| {alias_variant(str(variant))} | {n_comp}/{n_total} | "
-            f"{rate:.0f}% | {mean_str} | {ci_str} |"
+
+    matched, prov = matched_frame(done, n_variants=done["variant"].nunique())
+    if prov["n_experiments"] and not matched.empty:
+        lines += [
+            "",
+            f"**Matched** — {population_note(prov)}",
+            "",
+            *_VARIANT_MEAN_HEADER,
+            *_variant_mean_rows(matched, metric),
+        ]
+        by_variant = ", ".join(
+            f"{alias_variant(str(v))} {n}"
+            for v, n in sorted(prov["rows_by_variant"].items())
         )
+        lines += ["", f"_Matched rows by variant: {by_variant}._"]
     return "\n".join(lines)
 
 

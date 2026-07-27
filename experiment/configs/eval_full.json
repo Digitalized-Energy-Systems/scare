@@ -183,7 +183,7 @@
           "enable_tier_stratified_holon_admm": false
         },
         {
-          "enable_monotonic_floor": false
+          "enable_monotonic_floor": true
         },
         {
           "enable_distributed_failure_notice": false
@@ -221,11 +221,11 @@
           "enable_dynamic_cp_topology": false
         },
         {
-          "enable_cross_sector_coalitions": false
+          "enable_cross_sector_coalitions": true
         },
         {
-          "enable_holon_coalition": false,
-          "enable_cross_sector_coalitions": false
+          "enable_holon_coalition": true,
+          "enable_cross_sector_coalitions": true
         },
         {
           "enable_holon_summary": false,
@@ -322,7 +322,7 @@
           "enable_heat_frontier": false
         },
         {
-          "enable_heat_priority_waterfall": false
+          "enable_heat_priority_waterfall": true
         },
         {
           "enable_heat_cp_supply": false

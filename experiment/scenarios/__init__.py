@@ -13,6 +13,7 @@ from experiment.scenarios.grids import (
 )
 from experiment.scenarios.modifiers import (
     apply_cold_day,
+    apply_heat_node_regulariser,
     apply_line_stress,
     apply_microgrid_islanding,
     apply_pv_peak,
@@ -26,6 +27,7 @@ __all__ = [
     "add_backup_lines",
     "create_large_lv_simbench",
     "apply_cold_day",
+    "apply_heat_node_regulariser",
     "apply_line_stress",
     "apply_microgrid_islanding",
     "apply_pv_peak",

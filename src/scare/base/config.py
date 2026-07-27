@@ -99,6 +99,17 @@ class RestorationConfiguration:
     # cadence. Faster catches inversions sooner but costs O(N²) messages.
     holon_summary_period_s: float = 0.25
 
+    # Period (s) of the forced re-publish / re-form / re-balance watchdogs in
+    # HolonSummaryRole, HolonicCommunityRole and CPPriorityAdmmRole. These exist
+    # to break a stalled delta gate: a publish is suppressed while no tier moves,
+    # so an allocation that stops changing is frozen until a watchdog forces one
+    # through. 30.0 is the historical hardcoded value and equals
+    # ``simulation_duration_s`` in every shipped campaign config, so the watchdogs
+    # fire at most once, at the horizon — i.e. never usefully. Kept as the default
+    # so runs stay byte-identical to prior campaigns; set it well below the
+    # horizon to actually arm the recovery path.
+    holon_watchdog_s: float = 30.0
+
     # Per-tier served-fraction tolerance for flagging an inversion: pair
     # (high, low) flagged when frac[high] < frac[low] - tol.
     holon_summary_inversion_tol: float = 1e-3
@@ -523,6 +534,13 @@ class RestorationConfiguration:
 
     # Holon ADMM iteration cap. Trades convergence quality against wallclock (can
     # leave residuals 1e-3 to 2e-2 unconverged on simbench_lv).
+    #
+    # INERT under the default ``holon_admm_scope="component"``: that path returns
+    # a priority waterfall from ``supply_priority_admm`` (no ub-overrides + no CP
+    # coupling + supply>0 short-circuits before any iteration), so no ADMM runs
+    # and neither this nor ``holon_admm_abs_tol`` can bind. ``sweep_holon_admm``
+    # measured exactly one distinct result across 7 arms for that reason. Sweep
+    # them only alongside ``holon_admm_scope`` in ("holon", "sector").
     holon_admm_max_iters: int = 50
 
     # ADMM absolute residual tolerance (stop when |r| < this). Relaxed from the
@@ -602,6 +620,10 @@ class RestorationConfiguration:
     cp_bridge_cost: int = 2
 
     # Max members per holon (excluding the lex-smallest initiator).
+    # INERT under the default ``holon_admm_scope="component"``: holons are only
+    # chunked for the legacy holon/sector scopes, while component scope elects a
+    # per-component coordinator over the holon_summary mesh. ``sweep_holon_size``
+    # returned one distinct result across all 4 arms for that reason.
     holon_max_size: int = 4
 
     # Gossip protocol parameters.

@@ -1126,6 +1126,7 @@ def _attach_cp_priority_admm_role(
             heat_supply_from_deficit=config.enable_heat_cp_supply,
             demand_union=config.enable_cp_demand_union,
             gossip_warm_start=config.enable_cp_gossip_warm_start,
+            watchdog_s=config.holon_watchdog_s,
         )
     )
 
@@ -1681,6 +1682,7 @@ def _build_topologies(
                         my_node_id=leader_node,
                         leader_node_ids=sector_leader_node_ids.get(sector, {}),
                         topology_mirror=mirror,
+                        watchdog_s=config.holon_watchdog_s,
                     )
                 )
             if dyn_holon_role is not None:
@@ -1751,6 +1753,7 @@ def _build_topologies(
                         peer_leader_addrs=peer_leader_addrs,
                         enable_heat_cp_supply=config.enable_heat_cp_supply,
                         heat_refresh_s=config.heat_cp_supply_refresh_s,
+                        watchdog_s=config.holon_watchdog_s,
                     )
                 )
 

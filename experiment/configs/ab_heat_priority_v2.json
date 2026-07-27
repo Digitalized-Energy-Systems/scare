@@ -21,9 +21,9 @@
       "variants": ["scare"],
       "ablations": [
         {},
-        { "enable_heat_priority_waterfall": false },
-        { "enable_heat_l2_dispatch": true },
-        { "enable_heat_l2_dispatch": true, "enable_heat_priority_waterfall": false }
+        { "enable_heat_priority_waterfall": true },
+        { "enable_heat_l2_dispatch": false },
+        { "enable_heat_l2_dispatch": false, "enable_heat_priority_waterfall": true }
       ],
       "scenarios": [
         {
@@ -43,9 +43,9 @@
       "variants": ["scare"],
       "ablations": [
         {},
-        { "enable_heat_priority_waterfall": false },
-        { "enable_heat_l2_dispatch": true },
-        { "enable_heat_l2_dispatch": true, "enable_heat_priority_waterfall": false }
+        { "enable_heat_priority_waterfall": true },
+        { "enable_heat_l2_dispatch": false },
+        { "enable_heat_l2_dispatch": false, "enable_heat_priority_waterfall": true }
       ],
       "scenarios": [
         {

@@ -47,6 +47,8 @@ _GRID_ID: dict[str, str] = {
     "simbench_lv_medium": "S6",
     "simbench_lv_cp_dependent": "S7",
     "simbench_mvlv": "S8",
+    "simbench_lv_gas_dependent": "S9",
+    "simbench_lv_el_dependent": "S10",
 }
 
 # Pretty-name map
@@ -63,6 +65,8 @@ _GRID_PRETTY: dict[str, str] = {
     "simbench_lv_cp_heavy": "CP-heavy (2x, additive)",
     "simbench_lv_cp_dependent": "CP-dependent (replacing)",
     "simbench_lv_cp_heavy_dependent": "CP-heavy-dependent (2x, replacing)",
+    "simbench_lv_gas_dependent": "Gas-dependent (gas via P2G from power)",
+    "simbench_lv_el_dependent": "Electricity-dependent (power via CHP from gas)",
 }
 
 # Short names for the simbench codes.

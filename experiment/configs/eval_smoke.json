@@ -204,7 +204,7 @@
       ],
       "ablations": [
         {
-          "community_partition_method": "label_propagation"
+          "community_partition_method": "modularity"
         },
         {
           "community_partition_method": "modularity"

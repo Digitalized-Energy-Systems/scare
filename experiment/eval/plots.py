@@ -27,6 +27,9 @@ from experiment.eval.compliance import (
 from experiment.eval.compliance import (
     mean_ci95 as _mean_ci,
 )
+from experiment.eval.compliance import (
+    unsolved_mask as _unsolved_mask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -471,6 +474,19 @@ def _compliance_subtitle(rate: float | None, n_compliant: int, n_total: int) -> 
     )
 
 
+def _with_subtitle(title: str, subtitle: str | None) -> str:
+    """Title with a muted second line. A figure drawn on a restricted
+    population must carry the selection rule where the figure is read, not only
+    in the report prose that may be cropped away from it.
+    """
+    if not subtitle:
+        return title
+    return (
+        f"{title}<br><span style='font-size:11px;color:{_MUTED_COLOR}'>"
+        f"{subtitle}</span>"
+    )
+
+
 def _variant_color(variant: str, fallback: str | None = None) -> str:
     return _VARIANT_COLOR.get(
         variant, fallback or _QUAL_PALETTE[hash(variant) % len(_QUAL_PALETTE)]
@@ -845,13 +861,30 @@ _COMPLIANCE_CATS: list[tuple[str, str, str, str]] = [
     ("temperature", "temperature", "#D62728", "."),
     ("line_load", "line loading", "#E1A44C", "-"),
     ("multi", "multi", "#555555", "+"),
+    ("unsolved", "not solved", "#B0B0B0", "|"),
 ]
 
 
 def _compliance_category(df: pd.DataFrame) -> pd.Series:
-    """Per-row compliance category over ``_COMPLIANCE_CATS`` keys."""
-    slack_ok = df["claims__slack_budget_compliance__passed"].fillna(False).astype(bool)
-    cc_ok = df["claims__constraint_compliance__passed"].fillna(False).astype(bool)
+    """Per-row compliance category over ``_COMPLIANCE_CATS`` keys.
+
+    ``unsolved`` carries the rows ``compliant_mask`` excludes for being graded
+    off a state the physics never produced; without it the composition panel
+    would show them as ``valid`` while the PWSF panel beside it had already
+    dropped them, and the two halves of the same figure would disagree about
+    what compliant means.
+    """
+    def flag(col: str) -> pd.Series:
+        # Absent on campaigns recorded before the claim existed; treat as
+        # passing so the panel degrades to what it can see instead of raising
+        # and taking the whole figure out via report.py's section guard.
+        if col not in df.columns:
+            return pd.Series(True, index=df.index)
+        return df[col].fillna(False).astype(bool)
+
+    slack_ok = flag("claims__slack_budget_compliance__passed")
+    cc_ok = flag("claims__constraint_compliance__passed")
+    unsolved = _unsolved_mask(df)
 
     def nv(v: str) -> pd.Series:
         c = f"claims__constraint_compliance__detail__by_variable__{v}__n_violations"
@@ -875,6 +908,8 @@ def _compliance_category(df: pd.DataFrame) -> pd.Series:
     single = (~compliant) & (n_reasons == 1)
     for key, mask in reasons.items():
         cat[single & mask] = key
+    # Last: a row read off an unsolved net has no real violation to attribute.
+    cat[unsolved] = "unsolved"
     return cat
 
 
@@ -1177,7 +1212,7 @@ def _pair_key_label(key: Any, names: Any = None) -> str:
 
 
 def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
-    title = "Optimality gap: SCARE vs centralized oracle (compliant pairs)"
+    title = "SCARE vs centralized oracle (compliant pairs)"
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
@@ -1233,15 +1268,21 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
 
     # Mean gap annotation.
     pivot["gap"] = pivot["oracle"] - pivot["scare"]
-    # Surface SCARE-beats-oracle pairs: the oracle is the constraint-respecting
-    # optimum, so a negative gap signals an oracle bug or scare credited above
-    # feasibility. (The scalar metrics.optimality_gap clips these to 0; this is
-    # the actual reporting site, so the warning belongs here too.)
+    # Surface SCARE-beats-oracle pairs. These overwhelmingly measure the SOLVER,
+    # not coordination: on eval_full_v2 the rate is 0.23% (2/871) over oracle
+    # solves that reached proven optimality against 4.68% (19/406) over the rest
+    # — a 20x split, so an under-converged MIQCQP incumbent is the explanation
+    # for nearly all of them. The tier-ladder mismatch (oracle maximises
+    # 1e6/1e4/1e2/1, scored here on PWSF's 8:4:2:1) means a negative gap is not
+    # proof of a defect either, but it is a small residual, not the driver.
+    # Counted, never clipped: the mean gap is what the chapter reports.
     n_neg = int((pivot["gap"] < -1e-9).sum())
     if n_neg:
         logger.warning(
             "optimality_gap_scatter: %d/%d compliant scare/oracle pairs have "
-            "scare > oracle (negative gap, min %.4f) — oracle should dominate.",
+            "scare > oracle (negative gap, min %.4f). Check the oracle "
+            "certification table first — these concentrate ~20x in "
+            "under-converged solves, where the 'optimum' is an incumbent.",
             n_neg,
             len(pivot),
             float(pivot["gap"].min()),
@@ -1274,7 +1315,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
 
 
 def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
-    title = "Optimality gap by grid (compliant pairs)"
+    title = "Gap to centralized oracle by grid (compliant pairs)"
     if df.empty:
         return _save(_empty_fig("no data", title), out_path)
     metric = "outcomes__priority_weighted_fraction"
@@ -2922,10 +2963,11 @@ def cp_influence_bar(
     out_path: Path,
     *,
     title: str = (
-        "Coupling-point optimization — activity and restored load (all runs, by grid)"
+        "Coupling-point optimization — activity and restored load, by grid"
     ),
+    subtitle: str | None = None,
 ) -> Path:
-    """Two panels, shared grid axis, pooled over every completed run.
+    """Two panels, shared grid axis, over whatever population the caller passes.
 
     LEFT — CP contribution: mean delivered coupling-point converter output
     per task in MW, from ``outcomes.cp_generation`` (end-of-sim solved net;
@@ -3261,7 +3303,7 @@ def cp_influence_bar(
     return _save(
         _apply_theme(
             fig,
-            title=title,
+            title=_with_subtitle(title, subtitle),
             height=height,
             width=int(_BAR_FIG_WIDTH * 1.55),
             font_bump=2,

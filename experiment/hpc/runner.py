@@ -74,6 +74,7 @@ from experiment.hpc.runner_logging import (
 from experiment.scenarios import (
     GRIDS,
     apply_cold_day,
+    apply_heat_node_regulariser,
     apply_line_stress,
     apply_microgrid_islanding,
     apply_pv_peak,
@@ -391,7 +392,11 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         apply_cold_day(net, **kwargs)
         logger.info("Applied cold_day scenario: %s", kwargs or "<defaults>")
     elif kind == "pv_peak":
-        kwargs = {k: scenario[k] for k in ("gen_scale", "load_scale") if k in scenario}
+        kwargs = {
+            k: scenario[k]
+            for k in ("gen_scale", "load_scale", "trafo_ampacity_scale")
+            if k in scenario
+        }
         apply_pv_peak(net, **kwargs)
         logger.info("Applied pv_peak scenario: %s", kwargs or "<defaults>")
     elif kind == "line_stress":
@@ -408,11 +413,13 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
         carriers = scenario.get("carriers", ("electricity", "water", "gas"))
         promote_all = bool(scenario.get("promote_all_generators", True))
         former_aids = tuple(scenario.get("grid_former_aids", ()))
+        headroom = float(scenario.get("grid_former_headroom", 4.0))
         counts = apply_microgrid_islanding(
             net,
             carriers=carriers,
             promote_all_generators=promote_all,
             grid_former_aids=former_aids,
+            grid_former_headroom=headroom,
         )
         logger.info(
             "Applied microgrid scenario: carriers=%s promote_all=%s promoted=%s",
@@ -446,6 +453,18 @@ def _apply_scenario(net: Any, task: TaskSpec, logger: logging.Logger) -> None:
             "Applied slack_budget_pct=%s hard_cap=%s (per-scenario operator policy)",
             slack_budget_pct,
             list(hard_cap) if hard_cap else [],
+        )
+
+    # Nodal-heat-balance regulariser. A scenario key rather than a
+    # RestorationConfiguration field on purpose: the oracle never reads the
+    # config, so a config field would give the MAS regularised heat physics and
+    # the oracle unregularised physics — an actuator-parity break, not an
+    # ablation. Absent => untouched, so runs stay byte-identical by default.
+    heat_reg = scenario.get("heat_node_reg_kgs")
+    if heat_reg is not None:
+        applied = apply_heat_node_regulariser(net, float(heat_reg))
+        logger.info(
+            "Applied heat_node_reg_kgs=%s to %d water grid(s)", heat_reg, applied
         )
 
     # Temporal-storage extensions (GasLinepack / LumpedThermalCapacitance).
@@ -545,10 +564,24 @@ def _compute_baseline(task: TaskSpec, logger: logging.Logger) -> dict[str, Any] 
         base_net = GRIDS[task.grid]()
         _apply_scenario(base_net, task, logger)
         base_priorities = _resolve_priorities(base_net, task, logger)
+        # The baseline LP is a SECOND oracle solve, and it takes its own solver:
+        # left to default it gets ``_OracleGurobiSolver()``'s 300 s regardless of
+        # what the post-failure solve got. Forward the budget only when the
+        # scenario asked for one, so the shipped paths stay byte-identical.
+        # (Pre-existing and deliberately untouched here: the 900 s
+        # ``_ORACLE_HARD_PRESET`` likewise never reaches this call, so on
+        # lv_reconfig/mvlv the restoration ratio divides a 900 s-capped post
+        # state by a 300 s-capped baseline.)
+        baseline_solver = (
+            oracle_solver_for_task(task.grid, task.scenario or {})
+            if (task.scenario or {}).get("oracle_time_limit_s") is not None
+            else None
+        )
         baseline_served = compute_baseline_served(
             task.grid,
             scenario=task.scenario or {},
             priorities=base_priorities,
+            solver=baseline_solver,
         )
         logger.info(
             "Pre-failure baseline: served=%.4f / demand=%.4f (PWSF=%.4f)",
@@ -597,9 +630,14 @@ def _write_simulation_outputs(
     logger: logging.Logger,
     started: float,
     baseline_served: dict[str, Any] | None,
+    status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the MAS simulation, write every per-task artefact, and return the
     claims-validation payload.
+
+    ``status`` is stamped with the physics-solve tally in place; this is the
+    only scope holding the behavior, and the guard below refuses to grade a
+    run whose every solve failed.
     """
     world, failures, net = asyncio.run(
         _run_simulation(plan, task, logger, out_dir=out_dir)
@@ -627,6 +665,9 @@ def _write_simulation_outputs(
     # state as ok — mirror the oracle's refusing-to-grade guard.
     solves_ok = getattr(behavior, "_physics_solves_ok", None)
     solves_failed = int(getattr(behavior, "_physics_solves_failed", 0) or 0)
+    if status is not None:
+        status["physics_solves_ok"] = None if solves_ok is None else int(solves_ok)
+        status["physics_solves_failed"] = solves_failed
     if solves_ok is not None and int(solves_ok) == 0:
         raise RuntimeError(
             f"no physics solve succeeded during the simulation "
@@ -773,7 +814,7 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
                 )
         else:
             claims = _write_simulation_outputs(
-                out_dir, plan, task, logger, started, baseline_served
+                out_dir, plan, task, logger, started, baseline_served, status
             )
         # Escalate ``ok`` to ``claims_failed`` when a fatal claim failed.
         failing = _failing_fatal_claims(claims, plan)
@@ -840,9 +881,20 @@ def run_task(campaign_dir: Path, task_id: int, *, reraise: bool = False) -> int:
         except Exception:  # noqa: BLE001
             pass
         status["duration_s"] = round(time.monotonic() - started, 3)
+        # Attribute any backend failure the stepper never closed (oracle path).
+        solver_counter.finalize()
         status["solver_failures"] = solver_counter.count
         status["solver_infeasibilities"] = solver_counter.infeasible_count
         status["solver_warnings"] = solver_counter.warning_count
+        # A first failure at step 0 means the net was infeasible before any
+        # failure was injected or any agent acted — a scenario defect, not a
+        # control outcome, and the two must not be read as one number.
+        status["first_failed_step"] = solver_counter.first_failed_step
+        status["n_failed_steps"] = len(solver_counter.failed_steps)
+        # physics_solves_* are stamped by _write_simulation_outputs (the only
+        # scope holding the behavior); default them so the column always exists.
+        status.setdefault("physics_solves_ok", None)
+        status.setdefault("physics_solves_failed", None)
         # Sampling can undershoot the requested count (small grids, clamps);
         # record what was actually injected so analysis can stratify on it.
         try:

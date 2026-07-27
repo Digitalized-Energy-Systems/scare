@@ -132,7 +132,7 @@
           "enable_cp_admm": false
         },
         {
-          "enable_cross_sector_coalitions": false
+          "enable_cross_sector_coalitions": true
         }
       ],
       "scenarios": [
@@ -212,7 +212,7 @@
           "enable_heat_frontier": false
         },
         {
-          "enable_heat_priority_waterfall": false
+          "enable_heat_priority_waterfall": true
         },
         {
           "enable_heat_cp_supply": false

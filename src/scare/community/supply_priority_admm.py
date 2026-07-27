@@ -55,6 +55,28 @@ def _waterfall_target(
     return out
 
 
+def _prorata_target(
+    demand_per_cell: np.ndarray,
+    supply_pool: float,
+) -> np.ndarray:
+    """Priority-blind allocation: one common service fraction for every cell.
+
+    The counterfactual for ``enable_priority_weighting=False``. Flattening the
+    weights and reusing :func:`_waterfall_target` does NOT produce it: cells are
+    laid out tier-ascending (``_flat_idx`` = sec*n_tier + tier_idx over sorted
+    ``tiers``), so the stable tie-break visits tier 1 first and reproduces the
+    priority order exactly. The flag was measurably inert for that reason —
+    every ``enable_priority_holon_allocation=False`` arm in eval_full_v2 came
+    back bit-identical to its baseline.
+    """
+    out = np.zeros_like(demand_per_cell, dtype=float)
+    total = float(demand_per_cell.sum())
+    if total <= 0.0 or supply_pool <= 0.0:
+        return out
+    frac = min(1.0, float(supply_pool) / total)
+    return demand_per_cell * frac
+
+
 async def allocate_supply_priority(
     *,
     sectors: list[str],
@@ -212,10 +234,14 @@ async def allocate_supply_priority(
     # sum(T) == holon_supply_total for zero-residual convergence.
     total_demand_sum = float(total_demand_per_cell.sum())
     if total_demand_sum > holon_supply_total > 0:
-        total_T = _waterfall_target(
-            total_demand_per_cell,
-            priorities,
-            holon_supply_total,
+        total_T = (
+            _waterfall_target(
+                total_demand_per_cell,
+                priorities,
+                holon_supply_total,
+            )
+            if enable_priority_weighting
+            else _prorata_target(total_demand_per_cell, holon_supply_total)
         )
         logger.debug(
             "supply-priority ADMM target reset to priority waterfall "
@@ -248,7 +274,11 @@ async def allocate_supply_priority(
                 sec_demand[jj] = total_demand_per_cell[jj]
             sec_supply = sc_supply_by_sector[sec]
             if float(sec_demand.sum()) > sec_supply:
-                sc_T += _waterfall_target(sec_demand, priorities, sec_supply)
+                sc_T += (
+                    _waterfall_target(sec_demand, priorities, sec_supply)
+                    if enable_priority_weighting
+                    else _prorata_target(sec_demand, sec_supply)
+                )
             else:
                 sc_T += sec_demand
         service_fraction: dict[str, dict[int, float]] = {}
