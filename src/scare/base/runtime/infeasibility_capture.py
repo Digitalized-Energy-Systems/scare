@@ -19,20 +19,63 @@ from scare.base.runtime.trace import optimization
 logger = logging.getLogger(__name__)
 
 
+# Setpoints an agent can write that move the LP but are NOT captured by
+# ``regulation`` alone. ``q_mvar`` is the one that matters most: Q(U) droop
+# writes it directly, and without it an electrical infeasibility replays as
+# feasible. On eval_full_v2_20260727, 25 of 48 infeasible LV-S tasks could not
+# be reproduced from their snapshot for exactly this reason, and replaying them
+# returned ``success=True`` — which reads as "phantom infeasibility" rather than
+# "the snapshot is missing state".
+_CHILD_SETPOINTS = ("regulation", "q_mvar", "p_mw", "on_off")
+
+# Element-level fields the LP reads that agents/reconfiguration can move.
+_ELEMENT_SETPOINTS = ("regulation", "on_off")
+
+
+def _setpoints(model: Any, fields: tuple[str, ...]) -> dict[str, float]:
+    """Non-default numeric setpoints on *model*, as plain floats.
+
+    ``regulation`` defaults to 1.0 and everything else to 0.0/absent, so a
+    field is recorded only when it is present and departs from that default.
+    """
+    out: dict[str, float] = {}
+    for name in fields:
+        if not hasattr(model, name):
+            continue
+        raw = getattr(model, name)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        default = 1.0 if name == "regulation" else 0.0
+        if value != default:
+            out[name] = value
+    return out
+
+
 def _summarize_net(net: Any) -> dict[str, Any]:
     """JSON-serialisable snapshot of the monee network state.
 
-    Captures the dimensions the LP depends on (active branches, child
-    regulation factors) — enough to rebuild the failing LP standalone.
+    Captures the dimensions the LP depends on — active branches/nodes plus
+    every non-default setpoint on childs, branches and nodes — so the failing
+    LP can be rebuilt standalone. ``nondefault_regulations`` is retained
+    verbatim for readers of older snapshots.
     """
     inactive_branches: list[Any] = []
+    branch_setpoints: dict[str, dict[str, float]] = {}
     branches_total = 0
     for br in net.branches:
         branches_total += 1
         if not getattr(br, "active", True):
             inactive_branches.append(list(br.id) if isinstance(br.id, tuple) else br.id)
+        sp = _setpoints(getattr(br, "model", None), _ELEMENT_SETPOINTS)
+        if sp:
+            branch_setpoints[str(br.id)] = sp
 
     regulations: dict[str, float] = {}
+    child_setpoints: dict[str, dict[str, float]] = {}
     for child in net.childs:
         try:
             reg = float(getattr(child.model, "regulation", 1.0))
@@ -40,11 +83,18 @@ def _summarize_net(net: Any) -> dict[str, Any]:
             reg = float("nan")
         if reg != 1.0:
             regulations[child_aid(child.id)] = reg
+        sp = _setpoints(child.model, _CHILD_SETPOINTS)
+        if sp:
+            child_setpoints[child_aid(child.id)] = sp
 
     inactive_nodes: list[Any] = []
+    node_setpoints: dict[str, dict[str, float]] = {}
     for node in net.nodes:
         if not getattr(node, "active", True):
             inactive_nodes.append(node.id)
+        sp = _setpoints(getattr(node, "model", None), _ELEMENT_SETPOINTS)
+        if sp:
+            node_setpoints[str(node.id)] = sp
 
     return {
         "n_branches_total": branches_total,
@@ -53,6 +103,9 @@ def _summarize_net(net: Any) -> dict[str, Any]:
         "inactive_nodes": inactive_nodes,
         "n_children_with_nondefault_regulation": len(regulations),
         "nondefault_regulations": regulations,
+        "child_setpoints": child_setpoints,
+        "branch_setpoints": branch_setpoints,
+        "node_setpoints": node_setpoints,
     }
 
 

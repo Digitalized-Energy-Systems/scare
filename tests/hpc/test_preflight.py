@@ -1,6 +1,7 @@
 """The preflight refuses to submit a campaign that cannot solve step 0."""
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -115,3 +116,90 @@ def test_failure_is_reported_per_pair(monkeypatch):
     )
     assert calls == ["good", "bad"]
     assert [r.ok for r in results] == [True, False]
+
+
+# --- margin + contingency reporting -------------------------------------
+#
+# Step-0 solvability is necessary but not sufficient: LV-S passed it while
+# sitting at exactly 100% of the LP's hard ampacity bound and carrying a
+# single-branch kill switch. Both are reported, neither blocks submission.
+
+
+def test_tight_pair_solves_but_is_flagged():
+    loaded = PreflightResult("simbench_lv_small", {"kind": "pv_peak"}, True,
+                             max_loading_pct=300.0)
+    roomy = PreflightResult("simbench_lv", {"kind": "clean"}, True,
+                            max_loading_pct=81.0)
+    assert loaded.tight and not roomy.tight
+    assert "300.0%" in loaded.margin_detail
+
+
+def test_missing_loading_is_not_treated_as_tight():
+    """An unsolved net's Var defaults are phantoms — absent means unknown."""
+    assert not PreflightResult("g", {}, True, max_loading_pct=None).tight
+
+
+def test_kill_switch_is_reported_in_margin_detail():
+    res = PreflightResult(
+        "simbench_lv_small", {"kind": "clean"}, True,
+        max_loading_pct=90.0, kill_switches=[[37, 36, 0]], n_contingencies_scanned=47,
+    )
+    assert res.tight is False  # loading alone is fine ...
+    assert "1/47 single-branch contingencies infeasible" in res.margin_detail
+    assert "[37, 36, 0]" in res.margin_detail
+
+
+def test_tight_and_kill_switches_warn_but_do_not_abort(monkeypatch, caplog):
+    risky = [
+        PreflightResult("simbench_lv_small", {"kind": "pv_peak"}, True,
+                        max_loading_pct=300.0, kill_switches=[[37, 36, 0]],
+                        n_contingencies_scanned=47),
+    ]
+    monkeypatch.setattr(
+        "experiment.hpc.preflight.preflight_scenarios", lambda *a, **k: risky
+    )
+    with caplog.at_level(logging.WARNING):
+        assert assert_preflight_clean([]) == risky  # no SystemExit
+    assert "no margin" in caplog.text
+    assert "simbench_lv_small" in caplog.text
+
+
+def test_contingency_scan_finds_the_branch_that_breaks_the_lp(monkeypatch):
+    """One solve per branch; a branch whose removal makes the LP infeasible is
+    a kill switch, while one that merely sheds load is the experiment working."""
+    from experiment.hpc import preflight as pf
+
+    class _Branch:
+        def __init__(self, bid):
+            self.id, self.active = bid, True
+
+    def fake_build(task):
+        return SimpleNamespace(branches=[_Branch((1, 2, 0)), _Branch((37, 36, 0))])
+
+    def fake_solve(net, _limit):
+        dead = [b.id for b in net.branches if not b.active]
+        return (dead == [(37, 36, 0)], "infeasible" if dead else "", [])
+
+    monkeypatch.setattr(pf, "_build_net", fake_build)
+    monkeypatch.setattr(pf, "_solve_step0", fake_solve)
+
+    kills, n = pf.scan_branch_contingencies(_task(0, "simbench_lv_small", {}))
+    assert n == 2
+    assert kills == [[37, 36, 0]]
+
+
+def test_contingency_scan_respects_the_limit(monkeypatch):
+    from experiment.hpc import preflight as pf
+
+    class _Branch:
+        def __init__(self, bid):
+            self.id, self.active = bid, True
+
+    monkeypatch.setattr(
+        pf, "_build_net",
+        lambda task: SimpleNamespace(branches=[_Branch((i, i + 1, 0)) for i in range(9)]),
+    )
+    monkeypatch.setattr(pf, "_solve_step0", lambda net, _l: (False, "", []))
+
+    _, n = pf.scan_branch_contingencies(_task(0, "g", {}), limit=3)
+    assert n == 3

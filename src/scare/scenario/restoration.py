@@ -741,6 +741,8 @@ def _populate_children(
                         s_nom_mva=s_nom,
                         cos_phi_min=vde_cos_phi_min(s_nom),
                         voltage_ref_pu=config.qv_droop_voltage_ref_pu,
+                        settling_tau_s=config.qv_droop_settling_tau_s,
+                        attack_tau_s=config.qv_droop_attack_tau_s,
                     )
                 )
 
@@ -1071,12 +1073,23 @@ def _cp_signed_capacity_by_sector(cp_type: str, obs: dict) -> dict[str, float]:
         out[el] = -cap_in * eta_el
         out[he] = -cap_in * eta_he
     elif "p2g" in ct or "powertogas" in ct:
-        cap_in = abs(_first_nonzero("el_mw", "load_p_mw"))
-        if cap_in <= 0:
+        # Size from the OUTPUT side. ``el_mw`` on a monee ``PowerToGas`` is a
+        # solver Var seeded at 1.1 (``monee.model.multi:652``), not a rating:
+        # reading it made all 26 units on simbench_lv_gas_dependent report an
+        # identical 1.1 MW while their real rates vary 5x, overstating fleet
+        # gas output 214x (20.02 MW vs a measured 0.093) and fleet electricity
+        # draw to 64x the grid's ENTIRE demand. The L3 cascade then zeroed every
+        # P2G to protect the electricity row, so gas CPs never dispatched.
+        # ``gas_mass_flow_kgs`` carries the constructor's
+        # ``mass_flow_setpoint_kgs`` — the actual sizing — as it does for CHP/G2P.
+        cap_out = kgps_to_mw(
+            abs(_first_nonzero("gas_mass_flow_kgs", "mass_flow_setpoint_kgs"))
+        )
+        if cap_out <= 0:
             return {}
         eta = _first_nonzero("eta_gas", "efficiency", default=0.6)
-        out[el] = cap_in
-        out[ga] = -cap_in * eta
+        out[ga] = -cap_out
+        out[el] = cap_out / eta if eta > 0 else cap_out
     elif "g2p" in ct or "gastopower" in ct:
         cap_in = kgps_to_mw(
             abs(_first_nonzero("gas_mass_flow_kgs", "mass_flow_setpoint_kgs"))

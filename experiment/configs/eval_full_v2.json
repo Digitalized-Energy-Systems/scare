@@ -314,6 +314,8 @@
       "n_seeds": 30,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -1045,6 +1047,8 @@
       "n_seeds": 10,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -1080,6 +1084,8 @@
       "n_seeds": 10,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -1115,6 +1121,8 @@
       "n_seeds": 10,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -1150,6 +1158,8 @@
       "n_seeds": 10,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -1372,6 +1382,8 @@
       "n_seeds": 5,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -1394,6 +1406,8 @@
       "n_seeds": 5,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "scenarios": [
@@ -1609,6 +1623,8 @@
       "n_seeds": 5,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "ablations": [
@@ -1650,6 +1666,8 @@
       "n_seeds": 5,
       "variants": [
         "scare",
+        "single_level",
+        "component_level",
         "oracle"
       ],
       "$ablation_comment": "physics_time_scale=1 makes the sim clock physical time; pair it with periodic-only physics solving (huge cooldown + max_acts=0) so the physics settles at CONVERGED agent states each 10-s step instead of re-solving mid-negotiation on every setpoint write \u2014 the latter caused ~27% infeasible-then-stale solves at the slow real-time cadence. Applies to both scenario rows and both variants, so no A/B confound.",

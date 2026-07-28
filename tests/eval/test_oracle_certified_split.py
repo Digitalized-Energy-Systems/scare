@@ -82,4 +82,72 @@ def test_missing_optimal_column_degrades_to_dashes_not_a_crash():
     df = _frame([_row("scare", 0, 0.9), _row("oracle", 0, 0.8)])
     df = df.drop(columns=["outcomes__oracle_solve_optimal"])
     out = "\n".join(_paired_vs_oracle_section(df))
-    assert "n_certified" in out
+    assert "n_certified" in out and "n_usable" in out
+
+
+# --- three-way verdict ---------------------------------------------------
+#
+# ``certified`` is a BIASED filter — certified pairs are the shallow-deficit
+# tail — so discarding every uncertified pair is not neutral. But an uncertified
+# oracle still reports a FEASIBLE incumbent, so where the oracle already matches
+# or beats the variant the true optimum is at least as good and the conclusion
+# survives. Only "uncertified AND variant ahead" is genuinely indeterminate.
+
+
+def _row_of(out, needle="scare"):
+    return next(
+        ln
+        for ln in out.splitlines()
+        if ln.startswith("|") and needle in ln.lower() and "grid" not in ln
+    )
+
+
+def test_uncertified_pair_the_oracle_wins_is_still_usable():
+    # seed 0: uncertified, but the oracle leads -> usable (the optimum is only
+    # better, so "variant trails oracle" holds regardless of convergence).
+    # seed 1: uncertified and the VARIANT leads -> indeterminate.
+    # seed 2: certified -> usable by definition.
+    df = _frame(
+        [
+            _row("scare", 0, 0.70),
+            _row("oracle", 0, 0.80, optimal=False),
+            _row("scare", 1, 0.95),
+            _row("oracle", 1, 0.80, optimal=False),
+            _row("scare", 2, 0.60),
+            _row("oracle", 2, 0.90, optimal=True),
+        ]
+    )
+    line = _row_of("\n".join(_paired_vs_oracle_section(df)))
+    cells = [c.strip() for c in line.strip("|").split("|")]
+    # certified keeps 1 of 3 pairs; the three-way verdict keeps 2 and marks 1.
+    assert cells[7] == "1", line  # n_certified
+    assert cells[10] == "2", line  # n_usable
+    assert cells[12] == "1", line  # n_indeterminate
+
+
+def test_usable_subset_recovers_pairs_certified_discards():
+    """The bias case: every pair is uncertified but the oracle leads on all of
+    them, so certified reports nothing while usable reports the whole set."""
+    df = _frame(
+        [
+            _row("scare", 0, 0.70),
+            _row("oracle", 0, 0.80, optimal=False),
+            _row("scare", 1, 0.60),
+            _row("oracle", 1, 0.90, optimal=False),
+        ]
+    )
+    line = _row_of("\n".join(_paired_vs_oracle_section(df)))
+    cells = [c.strip() for c in line.strip("|").split("|")]
+    assert cells[7] == "0" and cells[8] == "—", line  # certified: nothing to say
+    assert cells[10] == "2", line  # usable: both pairs
+    assert cells[11] == "-0.2000", line  # mean(0.65) - mean(0.85)
+    assert cells[12] == "0", line
+
+
+def test_a_variant_win_over_a_certified_oracle_stays_usable():
+    """Certified wins are honest (tier ladder vs PWSF weights) and must not be
+    filtered out as indeterminate."""
+    df = _frame([_row("scare", 0, 0.95), _row("oracle", 0, 0.90, optimal=True)])
+    line = _row_of("\n".join(_paired_vs_oracle_section(df)))
+    cells = [c.strip() for c in line.strip("|").split("|")]
+    assert cells[10] == "1" and cells[12] == "0", line

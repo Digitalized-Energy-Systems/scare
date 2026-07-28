@@ -1,0 +1,48 @@
+{
+  "$comment": [
+    "Powered 3-arm confirmation for the Q(U) settling lag, 40 paired seeds on simbench_lv_small pv_peak.",
+    "Arm {} = the default (symmetric tau=3 after the revert below); arm attack=3.0 is bit-identical to it and was the symmetric reference while {} still carried attack=0; arm settling=0 = the legacy instantaneous droop.",
+    "RESULT: the lag kills the limit cycle outright (ptp -0.024 pu, flips 29->0 on 39/40 seeds, duration -14.6 s, all p<1e-4) and improves the raw inversion signal priority_invariant_strict 0.375->0.575 (p=0.039). It costs ~1pp of electricity served on tiers 3-4 (p=0.010) and flips the gating priority_invariant on 6/40 seeds (p=0.031). That cost is REAL, not a shifting exclusion set (n_loads_throttled is 0 in both arms).",
+    "REFUTED: fast attack (attack tau=0) was meant to win the served energy back by clearing the opening over-voltage in one tick. It does not — el_served mean 0.959 vs the symmetric 0.974, duration +2.5 s, and one seed still limit-cycles. The bang-bang was delivering ~0.147 MVar of AVERAGE absorption vs the settled 0.031, so the headroom it bought needs a re-tuned Q(U) curve to recover, not a re-shaped lag. Default reverted to symmetric.",
+    "Judge on: tail-half avg_vm_pu ptp + flips (oscillation), electricity served by tier and claims__priority_invariant__passed (the regression), duration_s and events__qv_droop (cost)."
+  ],
+  "name": "ab_qv_droop_settling_wide",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1200.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 40,
+    "failure_lambda": 0.5,
+    "max_failures": 1
+  },
+  "experiments": [
+    {
+      "name": "qv_settling_wide",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 40,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "qv_droop_attack_tau_s": 3.0 },
+        { "qv_droop_settling_tau_s": 0.0 }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "02:00:00",
+    "mem": "16G",
+    "cpus": 1
+  }
+}

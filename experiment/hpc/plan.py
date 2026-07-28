@@ -216,6 +216,7 @@ def create_campaign(
     timestamp_dir: bool | None = None,
     preflight: bool = False,
     preflight_time_limit_s: float = 120.0,
+    preflight_contingencies: bool = False,
 ) -> Path:
     use_ts = cfg.timestamp_dir if timestamp_dir is None else timestamp_dir
     name = cfg.name
@@ -237,7 +238,11 @@ def create_campaign(
     if preflight:
         from experiment.hpc.preflight import assert_preflight_clean
 
-        assert_preflight_clean(tasks, solve_time_limit_s=preflight_time_limit_s)
+        assert_preflight_clean(
+            tasks,
+            solve_time_limit_s=preflight_time_limit_s,
+            scan_contingencies=preflight_contingencies,
+        )
 
     campaign_dir.mkdir(parents=True)
     (campaign_dir / CAMPAIGN_LAYOUT["tasks"]).mkdir()
@@ -431,6 +436,15 @@ def _parse_args() -> argparse.Namespace:
         help="Skip the step-0 solvability check on each (grid, scenario) pair",
     )
     p.add_argument(
+        "--preflight-contingencies",
+        action="store_true",
+        help=(
+            "Also sweep every single-branch failure per (grid, scenario) pair "
+            "and report the ones that make the physics infeasible. One solve "
+            "per branch — minutes to hours, so opt-in."
+        ),
+    )
+    p.add_argument(
         "--preflight-time-limit",
         type=float,
         default=120.0,
@@ -458,6 +472,7 @@ def main() -> None:
         timestamp_dir=timestamp_dir,
         preflight=not args.no_preflight,
         preflight_time_limit_s=args.preflight_time_limit,
+        preflight_contingencies=args.preflight_contingencies,
     )
     print(campaign_dir)
 

@@ -1,0 +1,48 @@
+{
+  "$comment": [
+    "A/B for the VDE-AR-N 4105 §5.7.2 settling lag on the Q(U) droop (qv_droop_settling_tau_s).",
+    "Motivation: in eval_full_v2_20260727-043406 the LV-S voltage trajectory limit-cycles bang-bang for the whole run. Measured on task 7216: plant |dV/dQ| = 0.093 pu/MVar, aggregate droop slope Sq_max/0.02 = 45.7 MVar/pu => loop gain 4.25. Q(U) is proportional-only with no settling time, so the discrete map e_{n+1} = -4.25*e_n diverges and clips on the deadband. LV-S is 1-LV-rural1: 0.91 MVar of inverter capability circle (VVW gives each unit its FULL circle) behind a 160 kVA substation.",
+    "Arms: tau=3.0 is the new default (effective gain 0.71 at the 0.5 s poll, settles in ~9 s); tau=0 reproduces the legacy instantaneous droop; the VVW-off and droop-off arms are the reference points from the eval campaign.",
+    "Judge on: sustained oscillation (tail-half avg_vm_pu peak-to-peak and direction flips in timeseries.csv), events__qv_droop, duration_s, and that PWSF / voltage violations / claims do not regress."
+  ],
+  "name": "ab_qv_droop_settling",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1200.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 15,
+    "failure_lambda": 0.5,
+    "max_failures": 1
+  },
+  "experiments": [
+    {
+      "name": "qv_settling",
+      "grids": ["simbench_lv_small"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "qv_droop_settling_tau_s": 0.0 },
+        { "enable_vvw_coordination": false },
+        { "enable_qv_droop": false }
+      ],
+      "scenarios": [
+        {
+          "kind": "pv_peak",
+          "max_failures": 1,
+          "priority_assignment": "skewed"
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "02:00:00",
+    "mem": "16G",
+    "cpus": 1
+  }
+}

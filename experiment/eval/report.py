@@ -1070,6 +1070,8 @@ def _table_oracle_quality(campaign: CampaignData) -> str:
     df = campaign.summary
     opt_col = "outcomes__oracle_solver_stats__solve_optimal"
     gap_col = "outcomes__oracle_solver_stats__mip_gap"
+    bound_col = "outcomes__oracle_solver_stats__obj_bound"
+    sol_col = "outcomes__oracle_solver_stats__sol_count"
     if df.empty or opt_col not in df.columns or "variant" not in df.columns:
         return ""
     rows = df[(df["variant"] == "oracle") & df[opt_col].notna()]
@@ -1084,16 +1086,36 @@ def _table_oracle_quality(campaign: CampaignData) -> str:
         "vs-oracle comparisons use an under-converged incumbent as the "
         '"optimum" and must not be read as a SCARE quality signal._',
         "",
-        "| experiment | grid | n | certified | median gap (uncertified) |",
-        "|---|---|---|---|---|",
+        "_`no incumbent` counts uncertified solves that returned NO feasible "
+        "solution (`sol_count == 0`) — only those are unusable outright. Every "
+        "other uncertified row carries a feasible incumbent plus a valid dual "
+        "bound (`obj_bound`), so it still bounds the optimum from both sides; "
+        "see the `usable` columns of the paired vs-oracle table in "
+        "`summary.md`, which is the filter to read rather than `certified`. "
+        "On eval_full_v2_20260727 every uncertified solve was a wall-clock "
+        "`TIME_LIMIT` and none lacked an incumbent._",
+        "",
+        "| experiment | grid | n | certified | median gap (uncertified) "
+        "| median bound gap (uncertified) | no incumbent |",
+        "|---|---|---|---|---|---|---|",
     ]
     for (exp, grid), g in rows.groupby(["experiment", "grid"]):
         opt = g[opt_col].astype(str).str.lower().isin(("true", "1", "1.0"))
         rate = 100.0 * opt.sum() / len(g)
         rest = g.loc[~opt, gap_col].dropna() if gap_col in g.columns else []
         med = f"{float(rest.median()):.3f}" if len(rest) else "—"
+        bounds = g.loc[~opt, bound_col].dropna() if bound_col in g.columns else []
+        med_bound = f"{float(bounds.median()):.4g}" if len(bounds) else "—"
+        if sol_col in g.columns:
+            no_inc = int((~opt & (g[sol_col].fillna(0) <= 0)).sum())
+            no_inc_s = f"{no_inc}" + (" ⚠" if no_inc else "")
+        else:
+            no_inc_s = "—"
         flag = " ⚠" if rate < 90.0 else ""
-        lines.append(f"| {exp} | {grid} | {len(g)} | {rate:.0f}%{flag} | {med} |")
+        lines.append(
+            f"| {exp} | {grid} | {len(g)} | {rate:.0f}%{flag} | {med} "
+            f"| {med_bound} | {no_inc_s} |"
+        )
     lines.append("")
     return "\n".join(lines)
 

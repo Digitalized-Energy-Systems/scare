@@ -278,6 +278,15 @@ _REGULATES_TOTAL = "outcomes__regulates_total"
 _ORACLE_OPTIMAL_COL = "outcomes__oracle_solve_optimal"
 
 
+def _subset_cols(v_num, o_num, mask) -> list[str]:
+    """``[n, Δ, wins/n]`` over the ``mask`` subset of a paired comparison."""
+    n = int(mask.sum())
+    if n == 0:
+        return ["0", "—", "—"]
+    v, o = v_num[mask], o_num[mask]
+    return [str(n), f"{v.mean() - o.mean():+.4f}", f"{int((v > o + 1e-9).sum())}/{n}"]
+
+
 def _as_bool(value: object) -> bool:
     """Truthiness for a CSV round-tripped boolean.
 
@@ -625,22 +634,29 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
             o_arr = orc.loc[common]
             vm, _ = mean_ci95(v_arr)
             om, _ = mean_ci95(o_arr)
-            wins = int((v_arr.to_numpy() > o_arr.to_numpy() + 1e-9).sum())
+            v_num = v_arr.to_numpy()
+            o_num = o_arr.to_numpy()
+            beats = v_num > o_num + 1e-9
+            wins = int(beats.sum())
             if certified is None:
                 cert_cols = ["—", "—", "—"]
+                usable_cols = ["—", "—", "—"]
             else:
-                cidx = common[certified.reindex(common).fillna(False).to_numpy()]
-                if len(cidx) == 0:
-                    cert_cols = ["0", "—", "—"]
-                else:
-                    cv = vv.loc[cidx].to_numpy()
-                    co = orc.loc[cidx].to_numpy()
-                    cwins = int((cv > co + 1e-9).sum())
-                    cert_cols = [
-                        str(len(cidx)),
-                        f"{cv.mean() - co.mean():+.4f}",
-                        f"{cwins}/{len(cidx)}",
-                    ]
+                cert_mask = certified.reindex(common).fillna(False).to_numpy()
+                cert_cols = _subset_cols(v_num, o_num, cert_mask)
+                # Three-way verdict. The oracle's PWSF comes from a FEASIBLE
+                # incumbent, so on an uncertified pair where the oracle already
+                # matches or beats the variant, the true optimum is at least as
+                # good and "variant trails oracle" still holds — only the
+                # reverse case is indeterminate. This recovers the pairs the
+                # binary certified filter discards, and discarding them is not
+                # neutral: certified ⊂ shallow-deficit (on eval_full_v2_
+                # 20260727 uncertified oracle tasks carry ~2x the weighted shed,
+                # 18x on lv_reconfig, and certification falls monotonically with
+                # failure count), so the certified subset is the easy tail.
+                usable_mask = cert_mask | ~beats
+                usable_cols = _subset_cols(v_num, o_num, usable_mask)
+                usable_cols[-1] = str(int((~usable_mask).sum()))
             rows.append(
                 [
                     alias_grid(grid),
@@ -651,6 +667,7 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
                     f"{vm - om:+.4f}",
                     f"{wins}/{len(common)}",
                     *cert_cols,
+                    *usable_cols,
                 ]
             )
     if not rows:
@@ -670,10 +687,23 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
         "1e6/1e4/1e2/1) and is scored on PWSF's 8:4:2:1, so `variant>oracle` can "
         "be honest. It is also not a bound when the solve hit the time limit. "
         "The `certified` columns restrict to pairs where the oracle reported "
-        "`solve_optimal`, which is the only subset where a win is interpretable: "
-        "on eval_full_v2 SCARE beat the oracle in 5.08% of time-limited pairs vs "
-        "**0.23%** of certified ones, a 22x enrichment — so read the certified "
-        "columns as the result and the unrestricted ones as the population._",
+        "`solve_optimal`: on eval_full_v2 SCARE beat the oracle in 5.08% of "
+        "time-limited pairs vs **0.23%** of certified ones, a 22x enrichment._\n\n"
+        "_**Read the `usable` columns as the result**, not `certified`. Every "
+        "uncertified oracle solve is a wall-clock time-out with a FEASIBLE "
+        "incumbent (eval_full_v2_20260727: 862 `OPTIMAL` / 483 `TIME_LIMIT` / 5 "
+        "`INFEASIBLE`, and no uncertified row lacks an incumbent), so on a pair "
+        "where the oracle already matches or beats the variant the true optimum "
+        "is at least as good and the conclusion holds regardless of convergence. "
+        "Only `indeterminate` pairs — uncertified AND variant-ahead — are "
+        "unusable. This matters because `certified` is a BIASED filter: "
+        "uncertified oracle tasks carry ~2x the weighted shed (18x on "
+        "lv_reconfig) and certification falls monotonically with failure count, "
+        "so certified ⊂ the easy tail, and on eval_full_v2_20260727 restricting "
+        "to it flipped the sign of the backup-branches row. Caveat: the "
+        "monotone argument is rigorous in the oracle's own tier ladder and only "
+        "heuristic in PWSF, and on `usable` pairs `Δ` is a LOWER bound on the "
+        "variant's true shortfall._",
         _markdown_table(
             [
                 "grid",
@@ -686,6 +716,9 @@ def _paired_vs_oracle_section(ok_vc: pd.DataFrame) -> list[str]:
                 "n_certified",
                 "Δ (certified)",
                 "variant>oracle (certified)",
+                "n_usable",
+                "Δ (usable)",
+                "n_indeterminate",
             ],
             rows,
         ),

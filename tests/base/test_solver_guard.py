@@ -10,13 +10,15 @@ from __future__ import annotations
 import pytest
 
 
-# All tests rewrite PER_SOLVER_OPTIONS; restore the original snapshot
-# after each test so other suites don't see leaked state.
+# All tests rewrite PER_SOLVER_OPTIONS and DEFAULT_GUROBI_PARAMS; restore both
+# snapshots after each test so other suites don't see leaked state.
 @pytest.fixture(autouse=True)
 def _restore_per_solver_options():
+    from monee.solver import gurobipy as _gp
     from monee.solver import pyo as _pyo
 
     original = {k: dict(v) for k, v in _pyo.PER_SOLVER_OPTIONS.items()}
+    original_gp = dict(_gp.DEFAULT_GUROBI_PARAMS)
     # Reset the module-level "_INSTALLED" so each test sees a clean run.
     from scare.base.runtime import solver_guard
 
@@ -25,6 +27,8 @@ def _restore_per_solver_options():
     yield
     _pyo.PER_SOLVER_OPTIONS.clear()
     _pyo.PER_SOLVER_OPTIONS.update(original)
+    _gp.DEFAULT_GUROBI_PARAMS.clear()
+    _gp.DEFAULT_GUROBI_PARAMS.update(original_gp)
     solver_guard._INSTALLED["done"] = False
     solver_guard._INSTALLED["limit_s"] = None
 
@@ -131,6 +135,49 @@ def test_env_var_override(monkeypatch):
 
     assert installed_limit_s() == 15.0
     assert _pyo.PER_SOLVER_OPTIONS["scip"]["limits/time"] == 15.0
+
+
+def test_install_caps_native_gurobipy_backend():
+    """``solver="gurobi"`` resolves to monee's NATIVE gurobipy backend, which
+    reads ``DEFAULT_GUROBI_PARAMS`` and never consults ``PER_SOLVER_OPTIONS``.
+    Patching only Pyomo left every physics solve at monee's 300 s default.
+    """
+    from monee.solver import gurobipy as _gp
+
+    from scare.base.runtime.solver_guard import install_solver_time_limit
+
+    _gp.DEFAULT_GUROBI_PARAMS["TimeLimit"] = 300
+
+    install_solver_time_limit(47.0)
+
+    assert _gp.DEFAULT_GUROBI_PARAMS["TimeLimit"] == 47.0
+
+
+def test_native_backend_construction_picks_up_the_cap():
+    """End-to-end on the seam that actually mattered: a solver built the way
+    ``resolve_solver("gurobi")`` builds it must carry the capped limit."""
+    from monee.solver.gurobipy import GurobipySolver
+
+    from scare.base.runtime.solver_guard import install_solver_time_limit
+
+    install_solver_time_limit(47.0)
+
+    assert GurobipySolver()._params["TimeLimit"] == 47.0
+    # An explicit per-instance limit (the oracle's) still wins.
+    assert GurobipySolver(params={"TimeLimit": 900})._params["TimeLimit"] == 900
+
+
+def test_native_backend_limit_is_not_raised():
+    """Same tighten-never-loosen rule as the Pyomo path."""
+    from monee.solver import gurobipy as _gp
+
+    from scare.base.runtime.solver_guard import install_solver_time_limit
+
+    _gp.DEFAULT_GUROBI_PARAMS["TimeLimit"] = 30.0
+
+    install_solver_time_limit(60.0)
+
+    assert _gp.DEFAULT_GUROBI_PARAMS["TimeLimit"] == 30.0
 
 
 def test_install_survives_missing_monee():

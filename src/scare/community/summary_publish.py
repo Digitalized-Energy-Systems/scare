@@ -13,7 +13,9 @@ from mango.express.topology import topology_characteristic, topology_neighbors
 from scare.base.channel import (
     HolonSummary,
 )
+from scare.base.model import Sector
 from scare.base.util import (
+    kgps_to_mw,
     lookup_slack,
     lookup_slack_eff_budget,
     obs_capacity,
@@ -103,9 +105,28 @@ class SummaryPublisher:
 
         # Delta gate: skip when no tier moved by more than ``inversion_tol``.
         # The watchdog forces through to advance the version frontier.
-        if not force and not self._role._summary_changed(
+        gated = not force and not self._role._summary_changed(
             per_tier_served, per_tier_demand
-        ):
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[%s] L2 summary publish sector=%s force=%s gated=%s "
+                "demand=%.6f served=%.6f supply=%.6f slack=%.6f "
+                "d_by_tier=%s s_by_tier=%s prev_s_by_tier=%s tol=%g",
+                self._role.context.aid,
+                self._role.sector.value,
+                force,
+                gated,
+                float(sum(per_tier_demand.values())),
+                float(sum(per_tier_served.values())),
+                supply_total,
+                slack_budget_total,
+                {t: round(v, 8) for t, v in sorted(per_tier_demand.items())},
+                {t: round(v, 8) for t, v in sorted(per_tier_served.items())},
+                {t: round(v, 8) for t, v in sorted(self._last_published_served.items())},
+                self._role.inversion_tol,
+            )
+        if gated:
             return
 
         # Cache before ``send_message`` so a re-entrant publish sees the
@@ -157,6 +178,17 @@ class SummaryPublisher:
     ) -> bool:
         """True iff any tier moved by more than ``inversion_tol`` vs the
         last published vectors (union of tiers, so a drop to 0 counts).
+
+        Deltas are compared in MW. ``inversion_tol`` is an ABSOLUTE threshold,
+        but gas is carried in native kg/s, so comparing it raw made the gate
+        ~42x looser for gas than for electricity/heat: on
+        ``simbench_lv_gas_dependent`` the whole grid's gas demand is 0.0036
+        kg/s against a 1e-3 tolerance, so every one of the 17 load-carrying
+        leaders could shed its ENTIRE load without the gate opening. Gas
+        ``served`` then stayed frozen at the pre-dispatch t~0.08 snapshot
+        (where ``served == demand`` because nothing is regulated yet) for the
+        whole run, and the L3 CP kernel — which reads exactly this field —
+        was told gas was 100% served while 60% of it was shed.
         """
         if not self._last_published_served and not self._last_published_demand:
             return True  # first publish
@@ -167,12 +199,26 @@ class SummaryPublisher:
             | set(self._last_published_demand)
         )
         tol = self._role.inversion_tol
+        scale = self._tol_scale()
         for t in tiers:
-            if abs(served.get(t, 0.0) - self._last_published_served.get(t, 0.0)) > tol:
+            d_served = served.get(t, 0.0) - self._last_published_served.get(t, 0.0)
+            if abs(d_served) * scale > tol:
                 return True
-            if abs(demand.get(t, 0.0) - self._last_published_demand.get(t, 0.0)) > tol:
+            d_demand = demand.get(t, 0.0) - self._last_published_demand.get(t, 0.0)
+            if abs(d_demand) * scale > tol:
                 return True
         return False
+
+    def _tol_scale(self) -> float:
+        """Native-units-to-MW multiplier for this sector's delta comparison.
+
+        Electricity/heat per-tier values are already MW (scale 1.0); gas is
+        kg/s. Only the COMPARISON is rescaled — the published values stay in
+        native units, since the L3 consumer does its own ``kgps_to_mw``.
+        """
+        if self._role.sector == Sector.GAS:
+            return kgps_to_mw(1.0)
+        return 1.0
 
     async def _on_summary(self, message: HolonSummary, meta: dict) -> None:
         sender = mango_sender_addr(meta)

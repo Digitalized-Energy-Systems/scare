@@ -117,6 +117,16 @@ class ReactivePowerDroopRole(Role):
     parent node ``vm_pu``, computes the Q(U) setpoint clipped to the capability
     circle, and dispatches via ``behavior.act(aid, "set_q", q)``. Self-contained
     (no subscriptions); each distinct command records a ``qv_droop`` event.
+
+    ``settling_tau_s`` is the VDE-AR-N 4105 §5.7.2 settling time: the setpoint
+    reaches the plant through a first-order lag rather than instantly. Q(U) is
+    proportional-only and the whole fleet closes the loop through one shared bus
+    voltage, so on a weak feeder the aggregate gain exceeds 1 and the droop
+    limit-cycles; the lag scales that gain by ``dt/tau``. ``attack_tau_s``
+    lags a RISING |Q| separately (None = symmetric): only the release half
+    destabilises, so a fast attack still clears the opening over-voltage in one
+    tick. Both default to the legacy instantaneous droop — production passes
+    ``qv_droop_settling_tau_s`` / ``qv_droop_attack_tau_s``.
     """
 
     def __init__(
@@ -126,6 +136,8 @@ class ReactivePowerDroopRole(Role):
         s_nom_mva: float,
         cos_phi_min: float | None = None,
         voltage_ref_pu: float = 1.0,
+        settling_tau_s: float = 0.0,
+        attack_tau_s: float | None = None,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -145,6 +157,32 @@ class ReactivePowerDroopRole(Role):
                 f"measured voltage); got {voltage_ref_pu!r}"
             )
         self.voltage_ref_pu = float(voltage_ref_pu)
+        if not math.isfinite(settling_tau_s) or settling_tau_s < 0.0:
+            raise ValueError(
+                "settling_tau_s must be finite and non-negative (0 disables the "
+                f"lag); got {settling_tau_s!r}"
+            )
+        self.settling_tau_s = float(settling_tau_s)
+        if attack_tau_s is not None and (
+            not math.isfinite(attack_tau_s) or attack_tau_s < 0.0
+        ):
+            raise ValueError(
+                "attack_tau_s must be finite and non-negative, or None for a "
+                f"symmetric lag; got {attack_tau_s!r}"
+            )
+        self.attack_tau_s = None if attack_tau_s is None else float(attack_tau_s)
+        # Committed Q the plant is holding (monee convention) and the unfiltered
+        # Q(U) target it is ramping toward. Inverters start at unity power
+        # factor, so the committed state starts at 0.
+        self._q_filt: float = 0.0
+        self._q_target: float | None = None
+        # Settle tolerance from the last full pass; sizes the "filter arrived"
+        # test on cache-gated ticks (exponential decay never lands exactly).
+        self._q_tol: float = 1e-6
+        self._last_step_t: float | None = None
+        self._poll_period_s: float = float(
+            SECTOR_TIMESCALE.get(Sector.ELECTRICITY, {}).get("poll_period_s", 0.5)
+        )
         # Last commanded Q (monee convention); gates duplicate records.
         self._last_q: float | None = None
         # Last observed droop inputs; ``_step`` returns early if none moved
@@ -171,8 +209,47 @@ class ReactivePowerDroopRole(Role):
         self._sens_prev_dq: float | None = None
 
     def setup(self) -> None:
-        poll = SECTOR_TIMESCALE.get(Sector.ELECTRICITY, {}).get("poll_period_s", 0.5)
-        self.context.schedule_periodic_task(self._step, delay=poll)
+        self._poll_period_s = float(
+            SECTOR_TIMESCALE.get(Sector.ELECTRICITY, {}).get("poll_period_s", 0.5)
+        )
+        self.context.schedule_periodic_task(self._step, delay=self._poll_period_s)
+
+    def _settled(self) -> bool:
+        """True when the committed Q has arrived at the Q(U) target, so a tick
+        with unchanged inputs really is a no-op."""
+        if self._q_target is None:
+            return True
+        if self.settling_tau_s <= 0.0 and not (self.attack_tau_s or 0.0) > 0.0:
+            return True
+        return abs(self._q_target - self._q_filt) <= self._q_tol
+
+    def _commit(self, q_cmd: float, dt: float) -> float:
+        """Advance the VDE-AR-N 4105 §5.7.2 settling lag one tick and return the
+        Q the plant should now hold.
+
+        The lag is optionally asymmetric: ``attack_tau_s`` governs a RISING |Q|
+        (deeper voltage support), ``settling_tau_s`` a falling one. Only the
+        release destabilises the loop, so a fast attack keeps the opening
+        over-voltage cleared in one tick without reviving the limit cycle. A
+        tau of 0 on either side commits that direction instantly.
+        """
+        self._q_target = q_cmd
+        # A sign flip counts as attack too: the support direction reversed, so
+        # it is fresh demand rather than a release of the old one.
+        rising = (
+            abs(q_cmd) > abs(self._q_filt) or q_cmd * self._q_filt < 0.0
+        )
+        tau = (
+            self.attack_tau_s
+            if rising and self.attack_tau_s is not None
+            else self.settling_tau_s
+        )
+        if tau <= 0.0:
+            self._q_filt = q_cmd
+        else:
+            alpha = max(0.0, min(1.0, dt / tau))
+            self._q_filt += alpha * (q_cmd - self._q_filt)
+        return self._q_filt
 
     async def _step(self) -> None:
         if not self.behavior.has_action(self.context.aid, "set_q"):
@@ -201,8 +278,18 @@ class ReactivePowerDroopRole(Role):
         if not math.isfinite(regulation):
             regulation = 1.0
         regulation = max(0.0, min(2.0, regulation))
+        # Settling-lag clock. Stamped before the cache gate so a static plateau
+        # cannot bank dt and let the next moving tick jump the whole ramp.
+        now_t = self.context.current_timestamp
+        dt = (
+            self._poll_period_s
+            if self._last_step_t is None
+            else max(0.0, now_t - self._last_step_t)
+        )
+        self._last_step_t = now_t
         # Cache gate: skip when every droop input is within tolerance of the
-        # previous tick (first call passes, caches None).
+        # previous tick (first call passes, caches None) AND the lag has already
+        # delivered the target — mid-ramp the output still moves on frozen inputs.
         if (
             self._last_obs_v is not None
             and self._last_obs_p is not None
@@ -210,6 +297,7 @@ class ReactivePowerDroopRole(Role):
             and abs(v_f - self._last_obs_v) < _OBS_DELTA_TOL
             and abs(p_mag - self._last_obs_p) < _OBS_DELTA_TOL
             and abs(regulation - self._last_obs_reg) < _OBS_DELTA_TOL
+            and self._settled()
         ):
             # Unchanged inputs => unchanged relief; still re-stamp the ledger
             # so the auction hand-off doesn't lose it during static plateaus.
@@ -258,6 +346,8 @@ class ReactivePowerDroopRole(Role):
             q_cmd = 0.0
         else:
             q_cmd = vde_q_curve(v_f / self.voltage_ref_pu, q_max)
+        self._q_tol = max(1e-6, 1e-4 * q_max)
+        q_committed = self._commit(q_cmd, dt)
         # Coordinated hand-off: publish remaining reactive voltage-relief so the
         # auction sheds active only for the residual. ``headroom = q_max-|q_cmd|``
         # is the unused circle (~0 at saturation ⇒ no discount). Published before
@@ -282,10 +372,12 @@ class ReactivePowerDroopRole(Role):
                         1.0 - _DVDQ_EMA_ALPHA
                     ) * self._dvdq + _DVDQ_EMA_ALPHA * sample
                     self._dvdq_n += 1
+            # Pair Δv against the COMMITTED Δq — under a settling lag the target
+            # is not what the plant saw.
             if self._sens_prev_q is not None:
-                self._sens_prev_dq = q_cmd - self._sens_prev_q
+                self._sens_prev_dq = q_committed - self._sens_prev_q
             self._sens_prev_v = v_f
-            self._sens_prev_q = q_cmd
+            self._sens_prev_q = q_committed
             # Confidence gate + safety asymmetry: nothing until calibrated, then
             # only a safe fraction.
             if self._dvdq_n >= _DVDQ_MIN_SAMPLES:
@@ -306,10 +398,9 @@ class ReactivePowerDroopRole(Role):
         # DELIVERED reactive equals the circle target q_cmd; ``circle_q`` already
         # bounds delivered Q, so the raw command stays within the rating for
         # regulation ≥ floor. At regulation=1 (default) this is a no-op.
-        q_dispatch = q_cmd / max(regulation, _REG_DELIVERY_FLOOR)
+        q_dispatch = q_committed / max(regulation, _REG_DELIVERY_FLOOR)
         # Idempotency: skip the act() write when within tolerance of the last.
-        tol = max(1e-6, 1e-4 * q_max)
-        if self._last_q is not None and abs(q_dispatch - self._last_q) < tol:
+        if self._last_q is not None and abs(q_dispatch - self._last_q) < self._q_tol:
             return
         self.behavior.act(self.context.aid, "set_q", q_dispatch)
         self._last_q = q_dispatch
@@ -318,6 +409,7 @@ class ReactivePowerDroopRole(Role):
             kind="qv_droop",
             aid=self.context.aid,
             sector=Sector.ELECTRICITY.value,
-            detail=f"v={v_f:.4f} q={q_cmd:.6f} q_disp={q_dispatch:.6f} "
-            f"q_max={q_max:.6f} p={p_dispatched:.4f} reg={regulation:.3f}",
+            detail=f"v={v_f:.4f} q={q_cmd:.6f} q_f={q_committed:.6f} "
+            f"q_disp={q_dispatch:.6f} q_max={q_max:.6f} "
+            f"p={p_dispatched:.4f} reg={regulation:.3f}",
         )

@@ -228,9 +228,16 @@ class HolonSummaryRole(Role):
         self.context.schedule_instant_task(self._tick())
         # Watchdog: low-cadence safety net for missed events.
         self.context.schedule_periodic_task(self._tick, delay=self.watchdog_s)
-        # Heat→L3 refresh: heat has no event-driven publish trigger, so
-        # drive a faster delta-gated republish to keep the CP-ADMM current.
-        if self.sector == Sector.HEAT and self.enable_heat_cp_supply:
+        # L3 refresh: drive a faster delta-gated republish so the CP-ADMM's
+        # view stays current. Applies to EVERY sector that feeds L3, not just
+        # heat: ``enable_heat_cp_supply`` also flips electricity and gas into
+        # the delivered-supply reframe (see ``_build_demands``'s
+        # ``input_capped_mode``), so all three are read through ``served``.
+        # While this was heat-only, el/gas published just twice in a 30 s run —
+        # the mandatory first tick at t~0.08 and the watchdog at t=30 — so L3
+        # spent the whole run reading a PRE-FAILURE snapshot in which
+        # ``served == demand``.
+        if self.enable_heat_cp_supply:
             self.context.schedule_periodic_task(
                 self._publish_and_check, delay=self.heat_refresh_s
             )

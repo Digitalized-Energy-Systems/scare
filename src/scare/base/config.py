@@ -416,6 +416,34 @@ class RestorationConfiguration:
     # Exposed for the re-centred-droop sweep.
     qv_droop_voltage_ref_pu: float = 1.0
 
+    # Q(U) settling time (s), VDE-AR-N 4105 §5.7.2. The Q(U) characteristic is a
+    # pure proportional law and the fleet closes the loop through one shared bus
+    # voltage, so the aggregate loop gain is
+    # ``|dV/dQ| · Σq_max / (V_HIGH − V_DEADBAND_HIGH)`` — with the FULL circle
+    # (``enable_vvw_coordination``) that is 4.25 on LV-S, where 0.91 MVar of
+    # inverter circle sits behind a 160 kVA substation, and the droop
+    # limit-cycles bang-bang between the deadband edge and saturation for the
+    # whole run. The first-order lag scales that gain by ``dt/tau``: at the
+    # 0.5 s electricity poll, 3.0 gives an effective 0.71 (stable) and settles
+    # in ~9 s, inside the 30 s horizon. The standard's own ~10 s settles slower
+    # than the horizon. 0 disables the lag (legacy instantaneous droop).
+    qv_droop_settling_tau_s: float = 3.0
+
+    # Attack time constant (s) — the lag applied when |Q| is RISING (deeper
+    # voltage support). None (default) = symmetric, reuse the settling time.
+    # REFUTED as a default: the theory was that only the release half
+    # destabilises, so a fast attack (0.0) would clear the opening pv_peak
+    # over-voltage in one tick and recover the ~1pp of tier-3/4 electricity the
+    # symmetric lag costs. Measured on 40 paired lv_small pv_peak seeds it does
+    # NOT — served energy is no better (mean el_served 0.959 vs 0.974), runtime
+    # is +2.5 s, and one seed still limit-cycles (tail ptp 0.023 vs 0.0005).
+    # The served-energy gap is not a transient artifact: the bang-bang was
+    # delivering ~0.147 MVar of AVERAGE absorption against the settled
+    # equilibrium's 0.031, i.e. the defect was incidentally buying voltage
+    # headroom. Recovering it needs a re-tuned Q(U) curve (deadband /
+    # ``qv_droop_voltage_ref_pu``), not a re-shaped lag. Kept as a knob.
+    qv_droop_attack_tau_s: float | None = None
+
     # Prior |dV/dQ| (p.u./MVar) seeding the droop's sensitivity EMA, used only
     # under ``enable_qv_auction_coordination`` to size advertised reactive relief.
     # LOWER under-credits reactive (auction sheds more active, robust); HIGHER

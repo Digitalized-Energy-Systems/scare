@@ -364,6 +364,41 @@ class CPPriorityAdmmRole(Role):
             return False
         return True
 
+    def _trace_demands(self, demands: list[SectorDemand], participants: int) -> None:
+        """Log the kernel's INPUTS beside its output.
+
+        Without this only the committed factor is observable, and a factor of 0
+        is ambiguous: the kernel may be trading off scarce input, or it may be
+        seeing no deficit at all. ``base_supply`` is the discriminator.
+
+        A shedding holon computes ``served < demand`` CORRECTLY; what makes the
+        kernel see ``supply == demand`` is that the shed value is never
+        published — the delta gate in ``SummaryPublisher._summary_changed``
+        compares an absolute ``holon_summary_inversion_tol`` against kg/s for
+        gas but MW for electricity/heat, so no gas change ever clears it, and
+        the only forced republish is the watchdog. Read this trace together
+        with the ``L3 supply`` provenance line, which separates the served /
+        slack / pool terms.
+        """
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        for d in demands:
+            total = float(sum(float(v[0]) for v in d.demand_by_tier.values()))
+            supply = float(d.base_supply[0]) if len(d.base_supply) else 0.0
+            tiers = {t: round(float(v[0]), 6) for t, v in sorted(d.demand_by_tier.items())}
+            logger.debug(
+                "[%s] L3 demand sector=%s demand=%.6f supply=%.6f deficit=%.6f "
+                "by_tier=%s cap=%.6f participants=%d",
+                self.cp_id,
+                d.sector,
+                total,
+                supply,
+                total - supply,
+                tiers,
+                float(self.capacity_by_sector.get(d.sector, 0.0)),
+                participants,
+            )
+
     def _build_demands(self, reachable: Any = _UNRESOLVED) -> list[SectorDemand]:
         """Aggregate the latest HolonSummary per leader into one
         :class:`SectorDemand` per bridged sector; sectors with no summaries are
@@ -395,9 +430,14 @@ class CPPriorityAdmmRole(Role):
                 Sector.ELECTRICITY.value,
                 Sector.GAS.value,
             )
+            # Provenance of agg_supply, for the L3 trace: a phantom surplus is
+            # only diagnosable if the served / slack / pool terms are separable.
+            parts = {"served": 0.0, "slack": 0.0, "pool": 0.0}
+            n_admitted = 0
             for summary in bucket.values():
                 if not self._summary_admitted(summary, now, reachable):
                     continue
+                n_admitted += 1
                 if heat_deficit_mode:
                     # Heat is temperature-limited, not MW-limited; unbounded heat
                     # slack reads as infinite so L3 never ramps a heat CP. Use
@@ -405,7 +445,9 @@ class CPPriorityAdmmRole(Role):
                     served_map = (summary.served_by_sector_priority or {}).get(
                         sec_v, {}
                     )
-                    agg_supply += sum(float(v) for v in served_map.values())
+                    served = sum(float(v) for v in served_map.values())
+                    agg_supply += served
+                    parts["served"] += served
                 elif input_capped_mode:
                     # B_s = delivered + binding slack's eff_budget: keep existing
                     # service feasible, then cap extra draw at the slack budget
@@ -413,17 +455,44 @@ class CPPriorityAdmmRole(Role):
                     served_map = (summary.served_by_sector_priority or {}).get(
                         sec_v, {}
                     )
-                    agg_supply += sum(float(v) for v in served_map.values())
+                    served = sum(float(v) for v in served_map.values())
+                    agg_supply += served
+                    parts["served"] += served
                     slack_map = summary.slack_budget_by_sector or {}
-                    agg_supply += float(slack_map.get(sec_v, 0.0))
+                    slack = float(slack_map.get(sec_v, 0.0))
+                    agg_supply += slack
+                    parts["slack"] += slack
                 else:
                     supply_dict = summary.supply_by_sector or {}
-                    agg_supply += float(supply_dict.get(sec_v, 0.0))
+                    pool = float(supply_dict.get(sec_v, 0.0))
+                    agg_supply += pool
+                    parts["pool"] += pool
                 d_map = (summary.demand_by_sector_priority or {}).get(sec_v, {})
                 for tier, val in d_map.items():
                     agg_demand[int(tier)] = agg_demand.get(int(tier), 0.0) + float(val)
             if not agg_demand and agg_supply == 0.0:
                 continue
+            if logger.isEnabledFor(logging.DEBUG):
+                mode = (
+                    "heat_deficit"
+                    if heat_deficit_mode
+                    else ("input_capped" if input_capped_mode else "pool")
+                )
+                logger.debug(
+                    "[%s] L3 supply sector=%s mode=%s n_summaries=%d/%d "
+                    "raw_served=%.6f raw_slack=%.6f raw_pool=%.6f raw_total=%.6f "
+                    "raw_demand=%.6f",
+                    self.cp_id,
+                    sec_v,
+                    mode,
+                    n_admitted,
+                    len(bucket),
+                    parts["served"],
+                    parts["slack"],
+                    parts["pool"],
+                    agg_supply,
+                    float(sum(agg_demand.values())),
+                )
             # Kernel works in MW; HolonSummary carries gas in native kg/s.
             # Convert so it nets against CP capacity (the ~55× HHV factor would
             # otherwise break the gas waterfall).
@@ -489,10 +558,11 @@ class CPPriorityAdmmRole(Role):
         if applied:
             self._last_committed_factor = my_factor
         logger.debug(
-            "[%s] gossip cascade committed factor=%.4f "
+            "[%s] gossip cascade committed factor=%.4f cap=%s "
             "(iters=%d, converged=%s, applied=%s)",
             self.cp_id,
             my_factor,
+            {k: round(v, 6) for k, v in sorted(self.capacity_by_sector.items())},
             iterations,
             converged,
             applied,
@@ -516,10 +586,17 @@ class CPPriorityAdmmRole(Role):
             return
         demands = self._build_demands(reachable_nodes)
         if not demands:
+            logger.debug(
+                "[%s] L3 gossip round SKIPPED: no demands built "
+                "(summaries cached: %s)",
+                self.cp_id,
+                {s: len(b) for s, b in self._leader_summaries.items()},
+            )
             return
         participants = sorted(
             self._reachable_peer_cp_ids(reachable_nodes) | {self.cp_id}
         )
+        self._trace_demands(demands, len(participants))
         self._gossip_round_id += 1
         # SIM-second timeouts (carrier clock): a round commits (apply_regulate) on convergence
         # or round_timeout_s. 30s round/1s iter never completed in the ~10s sim -> CP converter
@@ -556,6 +633,11 @@ class CPPriorityAdmmRole(Role):
         reachable_nodes = self._reachable_node_set()
         demands = self._build_demands(reachable_nodes)
         if not demands:
+            logger.debug(
+                "[%s] L3 kernel SKIPPED: no demands built (summaries cached: %s)",
+                self.cp_id,
+                {s: len(b) for s, b in self._leader_summaries.items()},
+            )
             return
         reachable = self._reachable_peer_cp_ids(reachable_nodes)
         cps: list[CPSpec] = [self._own_spec()]
@@ -564,6 +646,7 @@ class CPPriorityAdmmRole(Role):
             if s is None:
                 continue
             cps.append(CPSpec(cp_id=aid, capacity_by_sector=dict(s.capacity_by_sector)))
+        self._trace_demands(demands, len(cps))
 
         try:
             # Lexicographic-cascade sharing ADMM: one round per priority tier
