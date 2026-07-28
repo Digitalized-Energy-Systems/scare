@@ -1,0 +1,49 @@
+{
+  "$comment": [
+    "A/B for cp_admm_scale_free -- the L3 lexicographic cascade solved in a non-dimensional frame, with the r-ridge relative to each CP's own ||c_i||^2 and the minimum-usage point of the optimal face selected.",
+    "Motivation: rho, inner_abs_tol and both ADMM residuals are absolute constants carrying MW, while r is dimensionless and the coupling constraint sigma + sum_i r_i c_i <= B - theta is homogeneous, so the optimal r is invariant under rescaling the data but the solver is not. On simbench_lv_* the CPs are ~3.6 kW (||c_i||^2 ~ 1.4e-5) and every residual is under admm_abs_tol=1e-3 at the end of the FIRST iteration of each tier -- before the r-update has seen the tier's binding constraint through z/u. The cascade returns its r=0 initialisation with converged=True. Measured offline on a traced gas_dependent round: iterations=4 (four tiers x one iteration), gas coverage -0.00%; the same problem scaled 10x gives 217%. With the flag on, r is identical to 12 digits across six decades of scaling and lands at 100.0% of the sector deficit in ~60-170 iterations, degrading gracefully to ~124% at the gossip path's ~10 iterations/round.",
+    "This supersedes the earlier r_regularization hypothesis: alpha cancels at the fixed point when minimize_usage is off, so it only sizes the FIRST r-step -- which is what gated the stopping test. Holding alpha at 0.1 and moving inner_abs_tol 1e-3 -> 1e-4 alone flips coverage 0% -> 218%.",
+    "Arms: default (flag on) vs the legacy counterfactual, crossed with the two solver paths so gossip and the replicated kernel are both covered.",
+    "Judge on: cp_generation_breakdown / CP dispatch being non-zero on the two dependent grids, gas and heat PWSF, and that electricity PWSF and slack compliance do not regress -- electricity is the CPs' INPUT sector, so a fleet that finally dispatches draws real power."
+  ],
+  "name": "ab_cp_admm_scale_free",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 5400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 15,
+    "failure_lambda": 0.5,
+    "max_failures": 2
+  },
+  "experiments": [
+    {
+      "name": "cp_scale_free",
+      "grids": ["simbench_lv_gas_dependent", "simbench_lv_el_dependent"],
+      "n_seeds": 15,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "cp_admm_scale_free": false },
+        { "cp_admm_algorithm": "lexicographic" },
+        { "cp_admm_scale_free": false, "cp_admm_algorithm": "lexicographic" }
+      ],
+      "scenarios": [
+        {
+          "kind": "cross_sector",
+          "max_failures": 2,
+          "priority_assignment": "skewed"
+        }
+      ]
+    }
+  ],
+  "slurm": {
+    "partition": "rosa_express.p",
+    "time": "04:00:00",
+    "mem": "16G",
+    "cpus": 1
+  }
+}

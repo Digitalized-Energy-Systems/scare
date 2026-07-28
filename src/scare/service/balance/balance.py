@@ -50,6 +50,7 @@ from scare.base.util import (
     l2_effective_floor,
     last_actuated_factor,
     line_congestion_ceiling,
+    lookup_cp_supply,
     lookup_slack,
     lookup_slack_eff_budget,
     note_actuated_factor,
@@ -275,6 +276,34 @@ class NegotiationSession:
     last_dispatched_service_fraction: dict[str, dict[int, float]] | None = None
 
 
+def _credit_cp_supply(
+    supply_by_sector: dict[str, float],
+    cp_aids: list[str] | None,
+    behavior: Any,
+    now: float,
+) -> None:
+    """Add this leader's coupling points' committed production to the pool.
+
+    ``supply_by_sector`` is otherwise built by walking node children, but every
+    converter is a monee *branch* and has no member aid, so its output is
+    invisible here. That is harmless where the carrier has native generation and
+    fatal where it does not: ``simbench_lv_gas_dependent`` is built with
+    ``gas_gen_share=0`` (gas exists only as P2G output), so the pool reads 0.0000,
+    and the holon sheds every gas load — including tier 1 — within 0.2 s.
+
+    Scoped to *this* leader's CP connectors, never the grid-wide fleet: a
+    holon may only count converters it is actually coupled to. Credits are
+    delivered-and-fresh (see :func:`~scare.base.util.lookup_cp_supply`), so a
+    throttled or failed converter stops contributing on its own.
+    """
+    for aid in cp_aids or ():
+        produced = lookup_cp_supply(behavior, aid, now)
+        if not produced:
+            continue
+        for sec_key, mw in produced.items():
+            supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + float(mw)
+
+
 def _compute_flex_report(
     *,
     member_aids: list[str],
@@ -285,10 +314,15 @@ def _compute_flex_report(
     enable_heat_l2_dispatch: bool,
     round_id: str,
     credit_gen_capacity: bool = False,
+    cp_supply_aids: list[str] | None = None,
 ) -> AvailableFlexAnswer:
     """Leader-side flex aggregation over group members (read-only): supply/demand
     pools, per-(sector, tier) splits, unmet demand, and the heat delivered-plus-probe
-    frontier."""
+    frontier.
+
+    ``cp_supply_aids`` are this leader's coupling-point connectors, whose
+    committed production is credited into ``supply_by_sector`` — see
+    :func:`_credit_cp_supply`."""
     total_flex = 0.0
     total_balance = 0.0
     total_shedded = 0.0
@@ -367,6 +401,11 @@ def _compute_flex_report(
         total_balance += sp
         if sp > 0 and available > 0:
             total_shedded += available
+
+    # Before the heat override on purpose: that branch REPLACES the heat entry,
+    # so heat keeps its A/B-validated probe and only gas/electricity take the
+    # converter credit. Crediting heat here too would be double-counted.
+    _credit_cp_supply(supply_by_sector, cp_supply_aids, behavior, now)
 
     # Heat has no bounded slack pool, so report delivered-to-loads plus an upward
     # probe share of the gap (delivered alone ratchets DOWN toward the frontier).
@@ -2339,6 +2378,7 @@ class EnergyBalanceNegotiator(Role):
         enable_actuated_ledger_writeback: bool = True,
         enable_heat_l2_dispatch: bool = False,
         enable_gen_capacity_supply: bool = False,
+        enable_cp_supply_credit: bool = False,
         enable_l2_allocation_reassert: bool = False,
         l2_allocation_reassert_s: float = 2.0,
         component_scope: bool = False,
@@ -2389,6 +2429,7 @@ class EnergyBalanceNegotiator(Role):
         # as the sector's flex supply pool.
         self.enable_heat_l2_dispatch = bool(enable_heat_l2_dispatch)
         self.enable_gen_capacity_supply = bool(enable_gen_capacity_supply)
+        self.enable_cp_supply_credit = bool(enable_cp_supply_credit)
         self.enable_l2_allocation_reassert = bool(enable_l2_allocation_reassert)
         self.l2_allocation_reassert_s = float(l2_allocation_reassert_s)
 
@@ -2641,6 +2682,14 @@ class EnergyBalanceNegotiator(Role):
         if message.include_connectors:
             for addr in topology_connectors(self, tid="groups"):
                 member_aids.append(addr.aid)
+        cp_supply_aids: list[str] = []
+        if self.enable_cp_supply_credit:
+            try:
+                cp_supply_aids = [
+                    addr.aid for addr in topology_connectors(self, tid="groups")
+                ]
+            except Exception:  # noqa: BLE001 - no connector topology on this grid
+                cp_supply_aids = []
         reply = _compute_flex_report(
             member_aids=member_aids,
             behavior=self.behavior,
@@ -2650,6 +2699,7 @@ class EnergyBalanceNegotiator(Role):
             enable_heat_l2_dispatch=self.enable_heat_l2_dispatch,
             round_id=message.round_id,
             credit_gen_capacity=self.enable_gen_capacity_supply,
+            cp_supply_aids=cp_supply_aids,
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
@@ -2737,6 +2787,7 @@ def create_energy_balance_role(
     enable_actuated_ledger_writeback: bool = True,
     enable_heat_l2_dispatch: bool = False,
     enable_gen_capacity_supply: bool = False,
+    enable_cp_supply_credit: bool = False,
     enable_l2_allocation_reassert: bool = False,
     l2_allocation_reassert_s: float = 2.0,
     component_scope: bool = False,
@@ -2761,6 +2812,7 @@ def create_energy_balance_role(
         enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,
         enable_heat_l2_dispatch=enable_heat_l2_dispatch,
         enable_gen_capacity_supply=enable_gen_capacity_supply,
+        enable_cp_supply_credit=enable_cp_supply_credit,
         enable_l2_allocation_reassert=enable_l2_allocation_reassert,
         l2_allocation_reassert_s=l2_allocation_reassert_s,
         component_scope=component_scope,

@@ -986,6 +986,7 @@ def _make_balance_role(
         enable_actuated_ledger_writeback=config.enable_actuated_ledger_writeback,
         enable_heat_l2_dispatch=config.enable_heat_l2_dispatch,
         enable_gen_capacity_supply=config.enable_gen_capacity_supply,
+        enable_cp_supply_credit=config.enable_cp_supply_credit,
         enable_l2_allocation_reassert=config.enable_l2_allocation_reassert,
         l2_allocation_reassert_s=config.l2_allocation_reassert_s,
         component_scope=(
@@ -1136,6 +1137,8 @@ def _attach_cp_priority_admm_role(
             bridged_sectors=sectors,
             algorithm=config.cp_admm_algorithm,
             r_regularization=config.cp_admm_r_regularization,
+            scale_free=config.cp_admm_scale_free,
+            publish_supply_credit=config.enable_cp_supply_credit,
             heat_supply_from_deficit=config.enable_heat_cp_supply,
             demand_union=config.enable_cp_demand_union,
             gossip_warm_start=config.enable_cp_gossip_warm_start,

@@ -30,7 +30,12 @@ from mango import sender_addr as mango_sender_addr
 
 from scare.base.channel import CPSummary, HolonSummary, MonotonicVersion
 from scare.base.model import Sector
-from scare.base.util import apply_regulate, async_dispatch, kgps_to_mw
+from scare.base.util import (
+    apply_regulate,
+    async_dispatch,
+    kgps_to_mw,
+    publish_cp_supply,
+)
 from scare.service.coupling.cp_priority_admm import (
     CPSpec,
     SectorDemand,
@@ -89,6 +94,8 @@ class CPPriorityAdmmRole(Role):
         admm_abs_tol: float = 1e-3,
         algorithm: str = "lexicographic",
         r_regularization: float = 0.1,
+        scale_free: bool = False,
+        publish_supply_credit: bool = False,
         heat_supply_from_deficit: bool = False,
         demand_union: bool = False,
         gossip_warm_start: bool = False,
@@ -122,6 +129,8 @@ class CPPriorityAdmmRole(Role):
         self.admm_abs_tol = float(admm_abs_tol)
         self.algorithm = str(algorithm)
         self.r_regularization = float(r_regularization)
+        self.scale_free = bool(scale_free)
+        self.publish_supply_credit = bool(publish_supply_credit)
 
         self._version = MonotonicVersion()
         # Peer caches keyed by publisher aid.
@@ -535,6 +544,30 @@ class CPPriorityAdmmRole(Role):
             meta,
         )
 
+    def _publish_supply_credit(self, factor: float) -> None:
+        """Hand this CP's committed production back to the L2 supply pool.
+
+        L2 sums ``supply_by_sector`` over node children, and a converter is a
+        monee branch — so without this its output is invisible to the leaders
+        that decide how much load to shed. Only the produced side is credited
+        (signed capacity < 0); the consumed side stays out, since crediting a
+        draw as supply would be nonsense and booking it as demand belongs to
+        whichever leader owns that sector's pool.
+        """
+        if not self.publish_supply_credit:
+            return
+        produced = {
+            sec: abs(cap) * factor
+            for sec, cap in self.capacity_by_sector.items()
+            if cap < 0.0
+        }
+        publish_cp_supply(
+            self.behavior,
+            self.cp_id,
+            produced,
+            float(self.context.current_timestamp),
+        )
+
     def _on_gossip_commit(
         self,
         r: np.ndarray,
@@ -557,6 +590,7 @@ class CPPriorityAdmmRole(Role):
         )
         if applied:
             self._last_committed_factor = my_factor
+        self._publish_supply_credit(my_factor)
         logger.debug(
             "[%s] gossip cascade committed factor=%.4f cap=%s "
             "(iters=%d, converged=%s, applied=%s)",
@@ -610,6 +644,9 @@ class CPPriorityAdmmRole(Role):
             inner_iters_max=self.admm_max_iters,
             inner_abs_tol=self.admm_abs_tol,
             r_regularization=self.r_regularization,
+            normalize=self.scale_free,
+            r_regularization_relative=self.scale_free,
+            minimize_usage=self.scale_free,
             adaptive_rho=True,
             rho_mu=10.0,
             rho_tau=2.0,
@@ -660,6 +697,9 @@ class CPPriorityAdmmRole(Role):
                 inner_iters_max=self.admm_max_iters,
                 inner_abs_tol=self.admm_abs_tol,
                 r_regularization=self.r_regularization,
+                normalize=self.scale_free,
+                r_regularization_relative=self.scale_free,
+                minimize_usage=self.scale_free,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -685,6 +725,7 @@ class CPPriorityAdmmRole(Role):
         )
         if applied:
             self._last_committed_factor = my_factor
+        self._publish_supply_credit(my_factor)
         logger.debug(
             "[%s] L3 kernel committed factor=%.4f (peers=%d, sectors=%d, "
             "iters=%d, converged=%s, applied=%s)",

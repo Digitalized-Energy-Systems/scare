@@ -222,6 +222,49 @@ def line_relief_headroom(behavior: Any, aid: str, now: float) -> float | None:
     return float(headroom)
 
 
+# A CP's credit must outlive the L2 flex round that reads it but not a failure
+# that stops the converter; one rebalance period.
+_CP_SUPPLY_TTL_S: float = 5.0
+
+
+def _cp_supply_store(behavior: Any) -> dict[str, tuple]:
+    """Per-CP delivered production for the L2 supply pool:
+    ``aid -> ({sector: mw_produced}, t_set)``.
+
+    L2 builds ``supply_by_sector`` by walking its NODE CHILDREN
+    (``balance._compute_flex_report``), but every converter is a monee *branch*
+    and so has no member aid. On a grid whose carrier is produced only by
+    converters (``simbench_lv_gas_dependent`` sets ``gas_gen_share=0``) the pool
+    therefore reads zero and the holon sheds 100 % of that carrier's load —
+    correctly, given what it was told. This store is how a CP hands its
+    committed output back to the leaders that need it. Freshness-stamped."""
+    return _get_behavior_store(behavior, "_scare_cp_supply")
+
+
+def publish_cp_supply(
+    behavior: Any, aid: str, supply_by_sector: dict[str, float], now: float
+) -> None:
+    """Record a CP's DELIVERED per-sector production (MW, positive = produced).
+
+    Delivered, not rated: mirrors the ``gen_supply = abs(sp)`` convention for
+    generator children, so a throttled converter cannot inflate the pool."""
+    _cp_supply_store(behavior)[str(aid)] = (
+        {str(s): float(v) for s, v in supply_by_sector.items() if float(v) > 0.0},
+        float(now),
+    )
+
+
+def lookup_cp_supply(behavior: Any, aid: str, now: float) -> dict[str, float] | None:
+    """Fresh per-sector production for *aid*, or None when absent/stale."""
+    entry = _cp_supply_store(behavior).get(str(aid))
+    if entry is None:
+        return None
+    by_sector, t_set = entry
+    if (now - float(t_set)) >= _CP_SUPPLY_TTL_S:
+        return None
+    return dict(by_sector)
+
+
 def _line_congestion_store(behavior: Any) -> dict[tuple[str, str], tuple]:
     """Additive congestion price per ``(branch_key, aid) -> (price, t)``,
     ``price = 1 - ceiling``. Keyed by branch so a generator under several congested

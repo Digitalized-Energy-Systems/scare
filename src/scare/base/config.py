@@ -53,6 +53,28 @@ class RestorationConfiguration:
     # Biases the step, not the fixed point. α=0 is correct but can oscillate.
     cp_admm_r_regularization: float = 0.1
 
+    # Solve the L3 cascade in a non-dimensional frame with α read relative to
+    # each CP's own ‖c_i‖², and select the minimum-usage point of the optimal
+    # face. rho/inner_abs_tol/the residuals are absolute MW constants, so on an
+    # LV feeder every residual sits under admm_abs_tol from iteration 1 and the
+    # cascade returns its r=0 init with converged=True — measured gas coverage
+    # 0%, and 217% for the same problem scaled 10x. With this on, r is
+    # invariant to grid scale (12 digits over 6 decades) and lands at 100.0% of
+    # the sector deficit. False reproduces every pre-2026-07-28 campaign
+    # bit-for-bit; keep it as the A/B counterfactual.
+    cp_admm_scale_free: bool = True
+
+    # Credit a coupling point's committed production into its holon's L2 supply
+    # pool. ``supply_by_sector`` is summed over NODE CHILDREN, but every
+    # converter is a monee branch, so its output is invisible to the leaders
+    # that decide how much load to shed. Harmless where the carrier has native
+    # generation; fatal where it does not — simbench_lv_gas_dependent is built
+    # with gas_gen_share=0 (gas exists ONLY as P2G output), so every gas holon
+    # read supply=0.0000 and shed all 27 gas loads, tier 1 included, at t=0.2,
+    # pinning gas PWSF at exactly 0. Heat is excluded (it already has
+    # _HEAT_L2_PROBE_SHARE). False restores the pre-2026-07-28 accounting.
+    enable_cp_supply_credit: bool = True
+
     # Gossip only: build the round demand set over the UNION of all bridged
     # sectors, not just the initiator's. Initiator = lowest cp_id = a P2G on
     # cp_heavy ("branch-*" < "node-*"), which bridges elec+gas only, so heat never
