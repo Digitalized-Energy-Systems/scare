@@ -242,27 +242,48 @@ def _cp_supply_store(behavior: Any) -> dict[str, tuple]:
 
 
 def publish_cp_supply(
-    behavior: Any, aid: str, supply_by_sector: dict[str, float], now: float
+    behavior: Any,
+    aid: str,
+    supply_by_leader_sector: dict[str, dict[str, float]],
+    now: float,
 ) -> None:
-    """Record a CP's DELIVERED per-sector production (MW, positive = produced).
+    """Record a CP's DELIVERED production, split per consuming holon leader.
 
     Delivered, not rated: mirrors the ``gen_supply = abs(sp)`` convention for
-    generator children, so a throttled converter cannot inflate the pool."""
+    generator children, so a throttled converter cannot inflate the pool.
+
+    Addressed per leader because the pool is summed across leaders
+    (``holon_component.aggregate_holon_flex``) while mango hands every leader of
+    a sector the SAME grid-wide connector list. An unaddressed credit would
+    therefore be counted once per leader — ~39x for gas on
+    ``simbench_lv_gas_dependent``. The CP splits its output across the leaders it
+    actually serves, so the sum over leaders is exactly what it produced."""
     _cp_supply_store(behavior)[str(aid)] = (
-        {str(s): float(v) for s, v in supply_by_sector.items() if float(v) > 0.0},
+        {
+            str(leader): {
+                str(s): float(v) for s, v in by_sector.items() if float(v) > 0.0
+            }
+            for leader, by_sector in supply_by_leader_sector.items()
+        },
         float(now),
     )
 
 
-def lookup_cp_supply(behavior: Any, aid: str, now: float) -> dict[str, float] | None:
-    """Fresh per-sector production for *aid*, or None when absent/stale."""
+def lookup_cp_supply(
+    behavior: Any, aid: str, leader_aid: str, now: float
+) -> dict[str, float] | None:
+    """Fresh per-sector production *aid* attributed to *leader_aid*.
+
+    None when absent or stale. A credit addressed to a different leader is not
+    visible here — that is what keeps the cross-leader sum conservative."""
     entry = _cp_supply_store(behavior).get(str(aid))
     if entry is None:
         return None
-    by_sector, t_set = entry
+    by_leader, t_set = entry
     if (now - float(t_set)) >= _CP_SUPPLY_TTL_S:
         return None
-    return dict(by_sector)
+    share = by_leader.get(str(leader_aid))
+    return dict(share) if share else None
 
 
 def _line_congestion_store(behavior: Any) -> dict[tuple[str, str], tuple]:

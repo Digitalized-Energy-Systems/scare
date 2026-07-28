@@ -28,7 +28,12 @@ from distributed_resource_optimization.carrier.mango import MangoCarrier
 from mango import Role
 from mango import sender_addr as mango_sender_addr
 
-from scare.base.channel import CPSummary, HolonSummary, MonotonicVersion
+from scare.base.channel import (
+    CPSetpoint,
+    CPSummary,
+    HolonSummary,
+    MonotonicVersion,
+)
 from scare.base.model import Sector
 from scare.base.util import (
     apply_regulate,
@@ -142,11 +147,18 @@ class CPPriorityAdmmRole(Role):
         self._leader_summaries: dict[str, dict[str, HolonSummary]] = {
             s.value: {} for s in summary_sectors
         }
+        # Reply path for the post-commit L2 wake-up, learned from the summaries
+        # themselves: mango's connector cross-product carries no locality, so the
+        # senders are the only measured leader set.
+        self._leader_addrs: dict[str, dict[str, Any]] = {
+            s.value: {} for s in summary_sectors
+        }
 
         # Throttle / dirty-tracking.
         self._dirty: bool = True
         self._last_rebalance_t: float = -1e9
         self._last_committed_factor: float | None = None
+        self._last_wake_factor: float | None = None
 
         # Injected after construction (scenario-build time).
         self._topology_mirror: GridTopologyMirror | None = None
@@ -288,6 +300,7 @@ class CPPriorityAdmmRole(Role):
         if prior is not None and message.version <= prior.version:
             return  # stale
         bucket[leader_aid] = message
+        self._leader_addrs.setdefault(message.sector.value, {})[leader_aid] = sender
         self._dirty = True
         await self._maybe_rebalance()
 
@@ -394,7 +407,9 @@ class CPPriorityAdmmRole(Role):
         for d in demands:
             total = float(sum(float(v[0]) for v in d.demand_by_tier.values()))
             supply = float(d.base_supply[0]) if len(d.base_supply) else 0.0
-            tiers = {t: round(float(v[0]), 6) for t, v in sorted(d.demand_by_tier.items())}
+            tiers = {
+                t: round(float(v[0]), 6) for t, v in sorted(d.demand_by_tier.items())
+            }
             logger.debug(
                 "[%s] L3 demand sector=%s demand=%.6f supply=%.6f deficit=%.6f "
                 "by_tier=%s cap=%.6f participants=%d",
@@ -561,12 +576,73 @@ class CPPriorityAdmmRole(Role):
             for sec, cap in self.capacity_by_sector.items()
             if cap < 0.0
         }
+        # Split each sector's output across the leaders that actually fed us
+        # demand for it, so summing the credits over leaders reproduces exactly
+        # what this CP made. Crediting every leader the full amount would
+        # multiply the pool by the leader count (see publish_cp_supply).
+        by_leader: dict[str, dict[str, float]] = {}
+        for sec, mw in produced.items():
+            leaders = sorted(self._leader_summaries.get(sec, {}))
+            if not leaders:
+                continue
+            share = mw / float(len(leaders))
+            for leader_aid in leaders:
+                by_leader.setdefault(leader_aid, {})[sec] = share
         publish_cp_supply(
             self.behavior,
             self.cp_id,
-            produced,
+            by_leader,
             float(self.context.current_timestamp),
         )
+
+    # Min flow shift before waking L2; mirrors the receiver's own predicate
+    # (``HolonicCommunityRole._CP_PREDICATE_DEAD_BAND_MW``) so a commit that
+    # would be dead-banded there is never sent.
+    _L2_WAKE_DEAD_BAND_MW: float = 1e-3
+
+    async def _wake_l2(self, factor: float) -> None:
+        """Tell the leaders that fed us demand that our setpoint moved.
+
+        L2 has no trigger of its own once its reactive burst dies down:
+        ``RebalanceRound.dirty`` clears on the first round and the periodic
+        ``_try_rebalance`` runs at ``holon_watchdog_s`` (30 s — a whole episode),
+        so only heat, which owns a separate poll, keeps rebalancing. This is the
+        L3->L2 edge ``EnergyConverterRole`` published as :class:`CPSetpoint`;
+        ``CPPriorityAdmmRole`` replaced that role without carrying the edge over,
+        leaving ``HolonicCommunityRole._handle_cp_setpoint`` with no publisher.
+        On ``simbench_lv_gas_dependent`` gas leaders then decided twice (t=0.08,
+        t=0.18) — both before any P2G had produced — and that blanket 0.0
+        allocation stood for the remaining 29.8 s, so gas served stayed 0.
+
+        Addressed to the summary senders, not to a connector list: mango's
+        connectors are a locality-free cross-product (see
+        ``balance._credit_cp_supply``).
+        """
+        prev = self._last_wake_factor
+        if prev is not None:
+            peak_cap = max(
+                (abs(c) for c in self.capacity_by_sector.values()), default=0.0
+            )
+            if peak_cap * abs(factor - prev) < self._L2_WAKE_DEAD_BAND_MW:
+                return
+        self._last_wake_factor = factor
+
+        flows = {sec: cap * factor for sec, cap in self.capacity_by_sector.items()}
+        setpoint = CPSetpoint(
+            publisher=self.cp_id,
+            version=self._version.next(),
+            caused_by={},
+            timestamp_s=float(self.context.current_timestamp),
+            cp_id=self.cp_id,
+            sector_flows_mw=flows,
+            regulation_factor=float(factor),
+        )
+        for sector in self.bridged_sectors:
+            for addr in self._leader_addrs.get(sector.value, {}).values():
+                try:
+                    await self.context.send_message(setpoint, receiver_addr=addr)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[%s] L2 wake-up send failed: %s", self.cp_id, exc)
 
     def _on_gossip_commit(
         self,
@@ -591,6 +667,8 @@ class CPPriorityAdmmRole(Role):
         if applied:
             self._last_committed_factor = my_factor
         self._publish_supply_credit(my_factor)
+        # Sync callback (DRO's on_commit), so the wake-up has to be scheduled.
+        self.context.schedule_instant_task(self._wake_l2(my_factor))
         logger.debug(
             "[%s] gossip cascade committed factor=%.4f cap=%s "
             "(iters=%d, converged=%s, applied=%s)",
@@ -621,8 +699,7 @@ class CPPriorityAdmmRole(Role):
         demands = self._build_demands(reachable_nodes)
         if not demands:
             logger.debug(
-                "[%s] L3 gossip round SKIPPED: no demands built "
-                "(summaries cached: %s)",
+                "[%s] L3 gossip round SKIPPED: no demands built (summaries cached: %s)",
                 self.cp_id,
                 {s: len(b) for s, b in self._leader_summaries.items()},
             )
@@ -726,6 +803,7 @@ class CPPriorityAdmmRole(Role):
         if applied:
             self._last_committed_factor = my_factor
         self._publish_supply_credit(my_factor)
+        await self._wake_l2(my_factor)
         logger.debug(
             "[%s] L3 kernel committed factor=%.4f (peers=%d, sectors=%d, "
             "iters=%d, converged=%s, applied=%s)",

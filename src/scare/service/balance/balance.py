@@ -53,6 +53,7 @@ from scare.base.util import (
     lookup_cp_supply,
     lookup_slack,
     lookup_slack_eff_budget,
+    mw_to_kgps,
     note_actuated_factor,
     obs_capacity,
     obs_min_max,
@@ -281,6 +282,7 @@ def _credit_cp_supply(
     cp_aids: list[str] | None,
     behavior: Any,
     now: float,
+    leader_aid: str = "",
 ) -> None:
     """Add this leader's coupling points' committed production to the pool.
 
@@ -291,17 +293,31 @@ def _credit_cp_supply(
     ``gas_gen_share=0`` (gas exists only as P2G output), so the pool reads 0.0000,
     and the holon sheds every gas load — including tier 1 — within 0.2 s.
 
-    Scoped to *this* leader's CP connectors, never the grid-wide fleet: a
-    holon may only count converters it is actually coupled to. Credits are
-    delivered-and-fresh (see :func:`~scare.base.util.lookup_cp_supply`), so a
-    throttled or failed converter stops contributing on its own.
+    Credits are delivered-and-fresh (see
+    :func:`~scare.base.util.lookup_cp_supply`), so a throttled or failed
+    converter stops contributing on its own.
+
+    Locality comes from the CP side, not from ``cp_aids``: mango resolves
+    connectors as a pure cross-product with no locality term
+    (``mango/express/topology.py:265``), so every leader of a sector receives the
+    identical grid-wide CP list — measured, all 39 gas leaders get one distinct
+    26-CP list and each CP appears in 81 lists. Since
+    ``holon_component.aggregate_holon_flex`` SUMS ``supply_by_sector`` across
+    leaders, an unaddressed credit would inflate a sector's pool by the leader
+    count. Each CP therefore splits its output across the leaders it actually
+    serves and addresses each share, so the cross-leader sum is conservative.
+
+    Units: this pool is in each sector's NATIVE observation unit (``p_mw`` for
+    electricity/heat, ``mass_flow_kgs`` for gas), while a CP's capacities are all
+    MW. Crediting gas MW straight in would overstate the pool by 3.6·HHV = 42.4x.
     """
     for aid in cp_aids or ():
-        produced = lookup_cp_supply(behavior, aid, now)
+        produced = lookup_cp_supply(behavior, aid, leader_aid, now)
         if not produced:
             continue
         for sec_key, mw in produced.items():
-            supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + float(mw)
+            add = mw_to_kgps(float(mw)) if sec_key == Sector.GAS.value else float(mw)
+            supply_by_sector[sec_key] = supply_by_sector.get(sec_key, 0.0) + add
 
 
 def _compute_flex_report(
@@ -315,6 +331,7 @@ def _compute_flex_report(
     round_id: str,
     credit_gen_capacity: bool = False,
     cp_supply_aids: list[str] | None = None,
+    leader_aid: str = "",
 ) -> AvailableFlexAnswer:
     """Leader-side flex aggregation over group members (read-only): supply/demand
     pools, per-(sector, tier) splits, unmet demand, and the heat delivered-plus-probe
@@ -405,7 +422,7 @@ def _compute_flex_report(
     # Before the heat override on purpose: that branch REPLACES the heat entry,
     # so heat keeps its A/B-validated probe and only gas/electricity take the
     # converter credit. Crediting heat here too would be double-counted.
-    _credit_cp_supply(supply_by_sector, cp_supply_aids, behavior, now)
+    _credit_cp_supply(supply_by_sector, cp_supply_aids, behavior, now, leader_aid)
 
     # Heat has no bounded slack pool, so report delivered-to-loads plus an upward
     # probe share of the gap (delivered alone ratchets DOWN toward the frontier).
@@ -2700,6 +2717,7 @@ class EnergyBalanceNegotiator(Role):
             round_id=message.round_id,
             credit_gen_capacity=self.enable_gen_capacity_supply,
             cp_supply_aids=cp_supply_aids,
+            leader_aid=str(self.context.aid),
         )
         await self.context.send_message(reply, receiver_addr=mango_sender_addr(meta))
 
