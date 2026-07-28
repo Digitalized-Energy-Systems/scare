@@ -966,7 +966,7 @@ def variant_pwsf_compliance_bar(
             )
             m, ci = _mean_ci(vals) if vals else (float("nan"), 0.0)
             means.append(m)
-            cis.append(0.0 if ci != ci else ci)
+            cis.append(ci)
         fig.add_trace(
             go.Bar(
                 y=labels,
@@ -1127,7 +1127,7 @@ def stress_class_variant_bar(
             else:
                 m, ci = float("nan"), 0.0
             means.append(m)
-            cis.append(0.0 if ci != ci else ci)  # NaN CI -> 0 (single sample)
+            cis.append(ci)  # keep NaN for n<2: a zero-length whisker reads as certainty
             hover.append(
                 f"<b>{alias_variant(variant)}</b><br>class: {label}<br>"
                 f"mean PWSF (compliant): {m:.4f}<br>95% CI: {_ci_label(ci)}<br>"
@@ -1349,7 +1349,7 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
         )
     fig.add_hline(y=0, line=dict(color="#BBBBBB", dash="dash", width=1))
     fig.update_yaxes(
-        title="relative gap (oracle − SCARE) / oracle", tickformat=".2f", zeroline=False
+        title="relative gap to oracle", tickformat=".2f", zeroline=False
     )
     fig.update_xaxes(title="grid")
     fig.update_layout(showlegend=False, boxgap=0.45, boxgroupgap=0.2)
@@ -1438,7 +1438,7 @@ def ablation_impact_bar(
             annotation_font=dict(color="#701E96", size=_ANNOTATION_FONT_SIZE),
         )
     fig.update_xaxes(
-        title="mean priority-weighted served fraction",
+        title="mean PWSF over compliant runs",
         range=[0, 1.05],
         tickformat=".2f",
     )
@@ -1681,7 +1681,7 @@ def cascading_curve(df: pd.DataFrame, out_path: Path) -> Path:
         )
     )
     fig.update_yaxes(
-        title="priority-weighted served fraction (compliant)",
+        title="PWSF (compliant runs)",
         range=[0, 1.05],
         tickformat=".2f",
     )
@@ -1924,7 +1924,7 @@ def served_by_tier(
             )
         )
     fig.update_layout(barmode="group", bargap=0.3, bargroupgap=0.08)
-    fig.update_xaxes(title="priority tier (1 = most critical)")
+    fig.update_xaxes(title="priority tier")
     fig.update_yaxes(title="served fraction", range=[0, 1.05], tickformat=".2f")
     return _save(
         _apply_theme(
@@ -2414,7 +2414,7 @@ def restoration_loss_split_by_tier_bar(
         tickformat=".3f",
     )
     # Tier 1 (most critical) on top.
-    fig.update_yaxes(title="priority tier (1 = most critical)", autorange="reversed")
+    fig.update_yaxes(title="priority tier", autorange="reversed")
     height = int(
         _hbar_height(len(tier_labels)) * 0.7
     )  # -30%: compact next to the taller vertical panels

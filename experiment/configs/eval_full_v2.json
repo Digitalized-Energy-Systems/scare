@@ -27,7 +27,9 @@
     "  append: eval_config_justification.json (per-lever justification: just_*/deadcheck_*/sweep_*)",
     "  dropped: cooldown_sweep (superseded by sweep_cooldown w/ target_metrics; ttl/community sweeps likewise superseded)",
     "task_timeout_s=5400: extension_temporal (6 h physical horizon) and MVLV scaling tasks exceed the old 2400.",
-    "slurm mem=16G / time=02:00:00: islanding native-gurobi MILP and the 778-node MVLV grid need the headroom."
+    "slurm mem=16G / time=02:00:00: islanding native-gurobi MILP and the 778-node MVLV grid need the headroom.",
+    "CUT 2026-07-28 (priced from eval_full_v2_20260727-043406, 789 measured CPU-h): (1) all six ablation_* experiments removed - each block's flag set is a subset of the just_* block on the SAME grid and scenario; the only unique live arm (ablation_core {enable_holonic,enable_cp_admm}=False, |t|=5.4) is grafted into just_holonic_core. (2) optimality_gap removed - its expanded definition was byte-identical to functional_baseline[simbench_lv] (same grid/seeds/variants/scenarios) and both carry the oracle, so the gap is computable from that pillar. (3) arms whose paired per-seed results were BIT-IDENTICAL to their own baseline on every metric in their target_metrics removed. KEPT despite reading inert: the CP-layer arms (enable_cp_admm / enable_dynamic_cp_topology / enable_cp_nominal_budget) - they are flat because the CP layer currently dispatches ~0, which 92f9537 addresses; re-test rather than delete.",
+    "CUT 2026-07-28 (b): simbench_lv_cp_heavy_dependent retired from the CP-rationale experiments. Measured on eval_full_v2_20260727-043406, scare, paired by seed: on cp_heavy_dependent enable_cp_admm=False is BIT-IDENTICAL to baseline and the full stack (cp_admm+cp_priority_admm off) moves PWSF -0.00118 (|t|=0.6, n=15); the same ablation on el_dependent moves +0.08420 (|t|=33.5). The grid's own $comment already recorded this ('a 3-CP failure draw moves nothing at all, 0.9951 -> 0.9947'). just_cross_sector / just_architecture_cross_sector / cp_flexibility / recoverable_coalition are REPOINTED to el_dependent (same 0.55 budget = its minimum servable) so the measurement has signal; the CP-knob sweeps and the answered slack_target_fraction deadcheck drop the grid outright. cp_heavy_dependent is KEPT in functional_baseline / variant_comparison / concentrated_imbalance, where it serves as a structurally different second LV grid rather than a CP testbed. NOTE gas_dependent also reads flat today (+0.00141, |t|=0.3) because the gas CP layer dispatches ~0 (92f9537); el_dependent is the only currently-live CP grid."
   ],
   "name": "eval_full_v2",
   "out_root": "experiment/_runs/eval",
@@ -286,7 +288,7 @@
       ],
       "name": "recoverable_coalition",
       "grids": [
-        "simbench_lv_cp_heavy_dependent"
+        "simbench_lv_el_dependent"
       ],
       "n_seeds": 30,
       "variants": [
@@ -302,42 +304,6 @@
           "max_failures": 3,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.55
-        }
-      ]
-    },
-    {
-      "$comment": "Pillar 2 \u2014 Optimality gap.  Pairs every scare run with an oracle on the same (grid, seed).",
-      "name": "optimality_gap",
-      "grids": [
-        "simbench_lv"
-      ],
-      "n_seeds": 30,
-      "variants": [
-        "scare",
-        "single_level",
-        "component_level",
-        "oracle"
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.5
-        },
-        {
-          "kind": "clean",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.6
-        },
-        {
-          "kind": "clean",
-          "failure_type": "mixed",
-          "generator_share": 0.5,
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.5
         }
       ]
     },
@@ -458,239 +424,6 @@
           "max_failures": 4,
           "priority_assignment": "skewed",
           "slack_budget_pct": 0.95
-        }
-      ]
-    },
-    {
-      "$comment": [
-        "Pillar 4 \u2014 ablation matrix, split by theme so each flag runs in a",
-        "scenario that can actually exercise it.  Replaces the original",
-        "single-scenario design that left ~14/22 flags inert (their gating",
-        "conditions \u2014 CPs, voltage stress, heat sector, line overload,",
-        "Hebbian warmup, etc. \u2014 never fired in the concentrated-5 LV regime).",
-        "Each block names the flag set it tests + the scenario that triggers",
-        "them; the {} default in each block is the per-block baseline."
-      ],
-      "name": "ablation_core",
-      "$comment_block": "Holonic / QP-gossip / priority core.  Concentrated 5-failure on simbench_lv drives the deficit-heavy holon ADMM, gossip, and priority-allocation paths.",
-      "grids": [
-        "simbench_lv"
-      ],
-      "n_seeds": 15,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {},
-        {
-          "enable_holonic": false,
-          "enable_cp_admm": false
-        },
-        {
-          "enable_holonic": false
-        },
-        {
-          "enable_priority_holon_allocation": false
-        },
-        {
-          "enable_tier_stratified_holon_admm": false
-        },
-        {
-          "enable_monotonic_floor": true
-        },
-        {
-          "enable_distributed_failure_notice": false
-        },
-        {
-          "enable_dynamic_holon_topology": false
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "concentrated",
-          "n_failures": 5,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.5
-        }
-      ]
-    },
-    {
-      "$comment_block": "Cross-sector / CP layer.  cp_heavy_dependent + generator failures + slack 0.15 means restoration must flow through CPs \u2014 the only regime where CP ADMM, dynamic CP filtering, and cross-sector coalitions all have signal.",
-      "name": "ablation_cross_sector",
-      "grids": [
-        "simbench_lv_cp_heavy_dependent"
-      ],
-      "n_seeds": 15,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {},
-        {
-          "enable_cp_admm": false
-        },
-        {
-          "enable_dynamic_cp_topology": false
-        },
-        {
-          "enable_cross_sector_coalitions": true
-        },
-        {
-          "enable_holon_coalition": true,
-          "enable_cross_sector_coalitions": true
-        },
-        {
-          "enable_holon_summary": false,
-          "enable_holon_coalition": false,
-          "enable_cross_sector_coalitions": false
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "generator",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.55
-        }
-      ]
-    },
-    {
-      "$comment_block": "Line-loading / constraint-aware path.  line_stress (load_scale=1.8, ampacity_scale=0.5) forces lines into overload \u2014 the only regime where line_loading_constraint, constraint_aware_gossip, multihop_constraint, and curtailment_auction all fire.",
-      "name": "ablation_line_stress",
-      "grids": [
-        "simbench_lv"
-      ],
-      "n_seeds": 15,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {},
-        {
-          "enable_line_loading_constraint": false
-        },
-        {
-          "enable_constraint_aware_gossip": false
-        },
-        {
-          "enable_multihop_constraint": false
-        },
-        {
-          "enable_curtailment_auction": false
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "line_stress",
-          "load_scale": 1.8,
-          "ampacity_scale": 0.5,
-          "max_failures": 2,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.5
-        }
-      ]
-    },
-    {
-      "$comment_block": "Voltage support.  pv_peak pushes vm_pu past the 1.03 pu deadband so the Q-V droop role actually fires.",
-      "name": "ablation_voltage",
-      "grids": [
-        "simbench_lv_small"
-      ],
-      "n_seeds": 15,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {},
-        {
-          "enable_vvw_coordination": false
-        },
-        {
-          "enable_qv_droop": false
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "pv_peak",
-          "max_failures": 1,
-          "priority_assignment": "skewed"
-        }
-      ]
-    },
-    {
-      "$comment_block": "Thermal stress.  cold_day on cp_heavy forces a heat-sector deficit so the heat-control stack has signal: enable_heat_frontier (temperature-frontier controller vs bang-bang), enable_heat_priority_waterfall (tier-aware shedding vs tier-blind), enable_heat_cp_supply (heat->L3 coupling-point supply link vs idle CPs), plus clpu_ramp (ramp-rate-gated).  Replaces the retired enable_heat_recovery flag.",
-      "name": "ablation_thermal",
-      "grids": [
-        "simbench_lv_cp_heavy"
-      ],
-      "n_seeds": 15,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {},
-        {
-          "enable_heat_frontier": false
-        },
-        {
-          "enable_heat_priority_waterfall": true
-        },
-        {
-          "enable_heat_cp_supply": false
-        },
-        {
-          "enable_clpu_ramp": false
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "cold_day",
-          "supply_t_k": 343.15,
-          "heat_load_scale": 1.5,
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.55
-        },
-        {
-          "kind": "cold_day",
-          "failure_type": "mixed",
-          "generator_share": 0.5,
-          "supply_t_k": 343.15,
-          "heat_load_scale": 1.5,
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.55
-        }
-      ]
-    },
-    {
-      "$comment_block": "Reconfiguration ranking.  simbench_lv_reconfig has alternative paths so the path-ranking flag has alternatives to choose between.",
-      "name": "ablation_reconfig",
-      "grids": [
-        "simbench_lv_reconfig"
-      ],
-      "n_seeds": 15,
-      "variants": [
-        "scare",
-        "single_level",
-        "component_level",
-        "oracle"
-      ],
-      "ablations": [
-        {},
-        {
-          "enable_reconfig_feasibility_ranking": false
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "branch",
-          "max_failures": 4,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.5
         }
       ]
     },
@@ -1231,7 +964,7 @@
       "name": "cp_flexibility",
       "grids": [
         "simbench_lv_cp_heavy",
-        "simbench_lv_cp_heavy_dependent"
+        "simbench_lv_el_dependent"
       ],
       "n_seeds": 15,
       "variants": [
@@ -1400,8 +1133,7 @@
       "$comment": "CP-size sweep \u2014 measures how PWSF varies with CP rated output on the dependent variant.  Replaces the old todo for sizing studies.",
       "name": "cp_size_sweep",
       "grids": [
-        "simbench_lv_cp_heavy",
-        "simbench_lv_cp_heavy_dependent"
+        "simbench_lv_cp_heavy"
       ],
       "n_seeds": 5,
       "variants": [
@@ -1757,13 +1489,7 @@
           "enable_holonic": false
         },
         {
-          "enable_dynamic_holon_topology": false
-        },
-        {
           "enable_priority_holon_allocation": false
-        },
-        {
-          "enable_tier_stratified_holon_admm": false
         },
         {
           "enable_holon_summary": false
@@ -1781,13 +1507,14 @@
           "enable_change_only_dispatch": false
         },
         {
-          "enable_monotonic_floor": true
-        },
-        {
           "holon_admm_scope": "sector"
         },
         {
           "holon_admm_scope": "holon"
+        },
+        {
+          "enable_holonic": false,
+          "enable_cp_admm": false
         }
       ],
       "scenarios": [
@@ -1851,7 +1578,7 @@
       "$comment_block": "L3 cross-sector / CP layer. cp_heavy_dependent + generator failures + slack 0.15: restoration MUST flow through coupling points (the displaced primary gen is gone), the only regime where CP-ADMM, dynamic CP filtering, coalitions and heat->L3 supply have signal. Metric: served on dependent grid, cross-sector recovery, slack compliance.",
       "name": "just_cross_sector",
       "grids": [
-        "simbench_lv_cp_heavy_dependent"
+        "simbench_lv_el_dependent"
       ],
       "n_seeds": 15,
       "variants": [
@@ -1937,9 +1664,6 @@
           "enable_curtailment_auction": false
         },
         {
-          "enable_line_relief_reassert": true
-        },
-        {
           "enable_branch_downstream_relief": false
         },
         {
@@ -1999,9 +1723,6 @@
         {
           "enable_qv_auction_coordination": true,
           "enable_qv_feeder_gate": false
-        },
-        {
-          "enable_curtail_auction_gating": true
         },
         {
           "enable_curtail_auction_targeting": true
@@ -2088,9 +1809,6 @@
           "enable_l2_generator_ramp": false
         },
         {
-          "enable_gen_ramp_to_full": true
-        },
-        {
           "$label": "gen_capacity_supply",
           "enable_gen_capacity_supply": true
         },
@@ -2113,38 +1831,6 @@
         "claims__slack_budget_compliance__passed",
         "outcomes__priority_weighted_fraction",
         "claims__constraint_compliance__passed"
-      ],
-      "population": "all"
-    },
-    {
-      "$comment_block": "Gas pressure regulator. clean 4-failure on simbench_lv produces genuine gas under-pressure (de-energised ~0 cases are excluded at aggregation per DEENERGISED_PRESSURE_PU). Regulator walks the slack pressure_pu setpoint before shedding. Metric: genuine gas under-pressure task count + gas served.",
-      "name": "just_gas_pressure",
-      "grids": [
-        "simbench_lv"
-      ],
-      "n_seeds": 15,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {},
-        {
-          "enable_gas_pressure_regulator": false
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "max_failures": 4,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.5
-        }
-      ],
-      "target_metrics": [
-        "claims__constraint_compliance__detail__by_variable__pressure__n_violations",
-        "outcomes__priority_weighted_fraction",
-        "claims__constraint_compliance__passed",
-        "claims__slack_budget_compliance__passed"
       ],
       "population": "all"
     },
@@ -2184,7 +1870,7 @@
       "$comment_block": "Architectural attribution (cross-sector). Same three variants on cp_heavy_dependent generator @0.15 where the L3 CP layer is load-bearing.",
       "name": "just_architecture_cross_sector",
       "grids": [
-        "simbench_lv_cp_heavy_dependent"
+        "simbench_lv_el_dependent"
       ],
       "scenarios": [
         {
@@ -2236,69 +1922,6 @@
         {}
       ],
       "target_metrics": [
-        "outcomes__priority_weighted_fraction",
-        "claims__constraint_compliance__passed",
-        "claims__slack_budget_compliance__passed"
-      ],
-      "population": "all"
-    },
-    {
-      "$comment": "--- Phase-1 dead-candidate probes. Sim has unseeded-uuid4 nondeterminism (balance.py gossip routing) so compare the 5-seed metric DISTRIBUTION, not bit-identical runs: if the flipped rows are statistically indistinguishable from {}, the field is dead -> delete. Any separation => the field is live.",
-      "name": "deadcheck_slack_target_fraction",
-      "grids": [
-        "simbench_lv_cp_heavy_dependent"
-      ],
-      "n_seeds": 10,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {},
-        {
-          "slack_target_fraction": 0.5
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "generator",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.55
-        }
-      ],
-      "target_metrics": [
-        "outcomes__priority_weighted_fraction",
-        "claims__constraint_compliance__passed",
-        "claims__slack_budget_compliance__passed"
-      ],
-      "population": "all"
-    },
-    {
-      "$comment": "qv_dvdq_prior should be inert with auction-coordination OFF (default). If these two rows differ, the prior leaks into the default path (a bug).",
-      "name": "deadcheck_qv_dvdq_prior",
-      "grids": [
-        "simbench_lv_small"
-      ],
-      "n_seeds": 10,
-      "variants": [
-        "scare"
-      ],
-      "ablations": [
-        {},
-        {
-          "qv_dvdq_prior": 0.1
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "pv_peak",
-          "max_failures": 1,
-          "priority_assignment": "skewed"
-        }
-      ],
-      "target_metrics": [
-        "claims__constraint_compliance__detail__by_variable__voltage__n_violations",
         "outcomes__priority_weighted_fraction",
         "claims__constraint_compliance__passed",
         "claims__slack_budget_compliance__passed"
@@ -2431,103 +2054,6 @@
         "claims__slack_budget_compliance__passed"
       ],
       "population": "compliant"
-    },
-    {
-      "$comment": "Coalition tunables only bite with the coalition lever ON, so every row enables it.",
-      "name": "sweep_coalition",
-      "grids": [
-        "simbench_lv_cp_heavy_dependent"
-      ],
-      "n_seeds": 10,
-      "variants": [
-        "scare"
-      ],
-      "sweeps": [
-        {
-          "enable_holon_coalition": true,
-          "holon_coalition_constraint_ttl_s": 4.0
-        },
-        {
-          "enable_holon_coalition": true,
-          "holon_coalition_constraint_ttl_s": 8.0
-        },
-        {
-          "enable_holon_coalition": true,
-          "holon_coalition_constraint_ttl_s": 16.0
-        },
-        {
-          "enable_holon_coalition": true,
-          "holon_coalition_accept_window_s": 0.5
-        },
-        {
-          "enable_holon_coalition": true,
-          "holon_coalition_accept_window_s": 1.0
-        },
-        {
-          "enable_holon_coalition": true,
-          "holon_coalition_accept_window_s": 2.0
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "generator",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.55
-        }
-      ],
-      "target_metrics": [
-        "outcomes__priority_weighted_fraction",
-        "claims__constraint_compliance__passed",
-        "claims__slack_budget_compliance__passed"
-      ],
-      "population": "compliant"
-    },
-    {
-      "name": "sweep_cp_admm",
-      "grids": [
-        "simbench_lv_cp_heavy_dependent"
-      ],
-      "n_seeds": 10,
-      "variants": [
-        "scare"
-      ],
-      "sweeps": [
-        {
-          "cp_admm_r_regularization": 0.0
-        },
-        {
-          "cp_admm_r_regularization": 0.1
-        },
-        {
-          "cp_admm_r_regularization": 0.3
-        },
-        {
-          "cp_bridge_cost": 1
-        },
-        {
-          "cp_bridge_cost": 2
-        },
-        {
-          "cp_bridge_cost": 4
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "generator",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.55
-        }
-      ],
-      "target_metrics": [
-        "outcomes__priority_weighted_fraction",
-        "claims__constraint_compliance__passed",
-        "claims__slack_budget_compliance__passed"
-      ],
-      "population": "all"
     },
     {
       "name": "sweep_ttl",
@@ -2667,61 +2193,6 @@
       "population": "compliant"
     },
     {
-      "$comment": "CP-oscillation guard tunables only bite on the component_level path (cps_join_communities), so every row sets it.",
-      "name": "sweep_cp_osc",
-      "grids": [
-        "simbench_lv_cp_heavy_dependent"
-      ],
-      "n_seeds": 10,
-      "variants": [
-        "component_level"
-      ],
-      "sweeps": [
-        {
-          "cp_oscillation_ema_alpha": 0.1
-        },
-        {
-          "cp_oscillation_ema_alpha": 0.3
-        },
-        {
-          "cp_oscillation_ema_alpha": 0.5
-        },
-        {
-          "cp_oscillation_deadband_mw": 0.01
-        },
-        {
-          "cp_oscillation_deadband_mw": 0.05
-        },
-        {
-          "cp_oscillation_deadband_mw": 0.1
-        },
-        {
-          "cp_oscillation_min_interval_s": 0.5
-        },
-        {
-          "cp_oscillation_min_interval_s": 1.0
-        },
-        {
-          "cp_oscillation_min_interval_s": 2.0
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "generator",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.55
-        }
-      ],
-      "target_metrics": [
-        "outcomes__priority_weighted_fraction",
-        "claims__constraint_compliance__passed",
-        "claims__slack_budget_compliance__passed"
-      ],
-      "population": "all"
-    },
-    {
       "name": "sweep_gas",
       "grids": [
         "simbench_lv"
@@ -2754,42 +2225,6 @@
         "outcomes__priority_weighted_fraction",
         "claims__constraint_compliance__passed",
         "claims__slack_budget_compliance__passed"
-      ],
-      "population": "all"
-    },
-    {
-      "name": "sweep_slack",
-      "grids": [
-        "simbench_lv_cp_heavy_dependent"
-      ],
-      "n_seeds": 10,
-      "variants": [
-        "scare"
-      ],
-      "sweeps": [
-        {
-          "slack_budget_violation_tol": 0.02
-        },
-        {
-          "slack_budget_violation_tol": 0.05
-        },
-        {
-          "slack_budget_violation_tol": 0.1
-        }
-      ],
-      "scenarios": [
-        {
-          "kind": "clean",
-          "failure_type": "generator",
-          "max_failures": 3,
-          "priority_assignment": "skewed",
-          "slack_budget_pct": 0.55
-        }
-      ],
-      "target_metrics": [
-        "claims__slack_budget_compliance__passed",
-        "outcomes__priority_weighted_fraction",
-        "claims__constraint_compliance__passed"
       ],
       "population": "all"
     },
