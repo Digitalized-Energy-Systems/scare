@@ -188,10 +188,10 @@
     "partition": "rosa_express.p",
     "time": "03:00:00",
     "mem": "16G",
-    "cpus": 1,
+    "cpus": 2,
     "max_concurrent": 64,
     "aggregate": true,
-    "nodelist": "mpcb014,mpcb015"
+    "nodelist": "mpcb014,mpcb016,mpcb004"
   },
   "slurm_eval": {
     "partition": "rosa_express.p",
@@ -200,6 +200,6 @@
     "cpus": 1,
     "max_concurrent": 64,
     "aggregate": true,
-    "nodelist": "mpcb014,mpcb015"
+    "nodelist": "mpcb014,mpcb016,mpcb004"
   }
 }
