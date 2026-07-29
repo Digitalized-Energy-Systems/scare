@@ -1,0 +1,53 @@
+{
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 8,
+    "failure_lambda": 0.5,
+    "max_failures": 1
+  },
+  "name": "ab_cp_tier_fair_deadline",
+  "$comment": [
+    "Defect #2: the gossip round budget is CARRIER-clock time and mango's carrier clock is SIMULATION time, so every iteration costs a message round-trip and the whole 4-tier cascade gets round/iter = 2.0/0.2 = ~10 iterations TOTAL. Measured on the 47-CP el_dependent feeder: tier 0 consumed 10-11 of them and tiers 1..3 then broke at iteration 0 - no optimisation at all.",
+    "Identified as a UNITS bug, not an algorithm difference: offline on a wall-clock SimpleCarrier the same 2.0/0.2 never binds, the cascade finishes in ms, and gossip matches the replicated kernel to 0.001-0.004 on both real fleets.",
+    "enable_cp_gossip_tier_fair_deadline splits the SAME overall bound into cumulative per-tier deadlines, so every tier gets a slice and a tier that converges early hands its unused time on.",
+    "Arms: default(on) / off(today) / lexicographic(upper reference - the replicated kernel has no message cost and gets admm_max_iters=200 PER TIER). Reference from ab_cp_gossip_vs_lexicographic: gas_dependent gossip 1.773 -> lexicographic 1.893 PWSF, gas served 0.383 -> 0.677.",
+    "Runs on top of the mirror fix, so el_dependent's 47-CP fleet is whole for the first time.",
+    "Judge on: the 'timed out at tier N iter 0' pattern in run.log, outcomes__cp_generation, served_by_sector, PWSF."
+  ],
+  "experiments": [
+    {
+      "name": "tier_fair",
+      "grids": [
+        "simbench_lv_el_dependent",
+        "simbench_lv_gas_dependent"
+      ],
+      "n_seeds": 8,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_cp_gossip_tier_fair_deadline": false
+        },
+        {
+          "cp_admm_algorithm": "lexicographic"
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        }
+      ]
+    }
+  ]
+}

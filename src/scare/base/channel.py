@@ -105,6 +105,11 @@ class HolonSummary(SectorTierFlex, Decision):
     # from ``supply_by_sector`` so L3 CP-ADMM caps a CP's input-sector draw at
     # the slack budget rather than the aggregate generator pool.
     slack_budget_by_sector: dict[str, float] = field(default_factory=dict)
+    # Σ max(0, budget − |current import|) over the same slack members. The
+    # budget is a cap on total import while ``served_by_sector_priority`` is a
+    # flow already drawing on it, so a consumer that wants "current service plus
+    # what more is available" must add THIS, not ``slack_budget_by_sector``.
+    slack_headroom_by_sector: dict[str, float] = field(default_factory=dict)
     # Publisher's monee node id; used for deliverability filtering via
     # ``GridTopologyMirror.reachable_from``.
     home_node_id: Any = None
@@ -167,10 +172,16 @@ class CPSummary(Decision):
       substitution honours CP physics.
     * ``home_node_id`` — CP host node id, for reachability via the mirror.
 
-    Republished (delta gate + watchdog) only on a material capacity shift.
+    * ``regulation`` — the publisher's last committed factor ``r_i``. Peers
+      subtract ``Σ r_i·c_i`` from the sector base supply so the kernel sees the
+      base *without* the fleet's own contribution; leaving it in makes the CP
+      fleet credit itself twice and gives the round-to-round map a gain of −1.
+
+    Republished (delta gate + watchdog) on a material capacity or factor shift.
     """
 
     capacity_by_sector: dict[str, float] = field(default_factory=dict)
+    regulation: float = 0.0
     home_node_id: Any = None
 
 

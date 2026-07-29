@@ -72,7 +72,10 @@ from scare.service.balance.gossip_math import (
     qp_priority_weight,
     step_size,
 )
-from scare.service.balance.grid_former import GridFormerPolicy
+from scare.service.balance.grid_former import (
+    GRID_FORMER_SUPPLY_PROBE_SHARE,
+    GridFormerPolicy,
+)
 from scare.service.balance.neighbour_router import NeighbourRouter
 from scare.service.balance.trust import TrustLedger, TrustParams
 
@@ -100,15 +103,6 @@ _HEAT_CLEAR_FRACTION: float = 0.6
 # ~6 rebalance rounds per 30 s task (tier-4 under-settles) — 0.3-0.5 is the knob,
 # though the 0.4 A/B was confounded by concurrent CP-fix tree changes.
 _HEAT_L2_PROBE_SHARE: float = 0.2
-
-# Credit ``delivered + share*(rating-delivered)`` so the free-Var former produces
-# to meet offered load; a positive share over-credits when it shares an island with
-# a budgeted slack (offered load routes through the slack and the L2 floor blocks
-# re-shed). recoverable_islanding seed 100000023: share 0.0 -> PWSF 0.42, gas slack
-# PASS; 0.5 -> 0.66, FAIL (110% over); rating -> 0.77, FAIL (151%). Default 0 keeps
-# the gas slack compliant. Analogue of ``_HEAT_L2_PROBE_SHARE`` (heat has no slack
-# budget).
-_GRID_FORMER_SUPPLY_PROBE_SHARE: float = 0.0
 
 _MAX_HOPS = 100
 
@@ -1245,6 +1239,63 @@ class L2DispatchHandler:
                     priority_tier=prio,
                 )
 
+    def _heat_corner_factors(
+        self, members: list[str], service_fraction: dict[str, dict[int, float]]
+    ) -> dict[str, float]:
+        """Per-load HEAT factors that spend each tier's allocated MW at the
+        CORNERS instead of running every load in the tier at one fraction.
+
+        A DHS junction is held above its ``t_k`` floor by mass flow THROUGH it,
+        so modulating every load to the same fraction thins flow network-wide
+        and drags every junction toward the floor. Serving a chosen subset in
+        full keeps full flow — and temperature — on every path still served.
+        Measured on eval_full_v2_20260728-202054 cold_day_stress: the oracle and
+        both baselines put 82.8-84.1% of heat loads at a corner (0 or 1) and
+        take 0/90 temperature violations; SCARE puts 54.5% there and takes
+        46/90. The oracle sheds MORE loads outright (19.1% vs 16.5%) yet serves
+        MORE heat (+0.115), and at the 86 junctions where SCARE freezes it
+        serves the load at a median of 100%.
+
+        Same MW per tier as the uniform fraction — this only redistributes it —
+        so the tier ladder and every served/PWSF aggregate are untouched. One
+        boundary load per tier absorbs the remainder, which is also why the
+        oracle's own shape is 84% corners rather than 100%. Largest-cap-first
+        with an ``aid`` tiebreak keeps it deterministic (a reproducibility
+        requirement: unseeded ordering has broken campaign determinism before).
+        """
+        by_tier: dict[int, list[tuple[float, str]]] = {}
+        for aid in members:
+            if self._role._grid_former_policy.is_former(aid):
+                continue
+            obs = self._role.behavior.observe(aid) or {}
+            cap = obs_capacity(obs, behavior=self._role.behavior, aid=aid)
+            if cap <= 0:
+                continue
+            if obs_sector(obs, behavior=self._role.behavior, aid=aid) is not Sector.HEAT:
+                continue
+            prio = obs_priority(obs, behavior=self._role.behavior, aid=aid)
+            by_tier.setdefault(int(prio), []).append((float(cap), str(aid)))
+
+        out: dict[str, float] = {}
+        for tier, entries in by_tier.items():
+            frac = service_fraction.get(Sector.HEAT.value, {}).get(tier)
+            if frac is None:
+                continue
+            frac = max(0.0, min(1.0, float(frac)))
+            budget = frac * sum(cap for cap, _ in entries)
+            for cap, aid in sorted(entries, key=lambda e: (-e[0], e[1])):
+                if cap <= 0.0:
+                    out[aid] = 0.0
+                elif budget >= cap:
+                    out[aid] = 1.0
+                    budget -= cap
+                else:
+                    # Boundary load takes the remainder so the tier total is
+                    # exact; everything after it falls to 0 (budget is spent).
+                    out[aid] = max(0.0, min(1.0, budget / cap))
+                    budget = 0.0
+        return out
+
     async def _dispatch_service_fractions(
         self, service_fraction: dict[str, dict[int, float]]
     ) -> None:
@@ -1252,6 +1303,9 @@ class L2DispatchHandler:
 
         ``service_fraction[sector][tier] ∈ [0, 1]`` becomes each matching load's
         regulation factor. Generators untouched; the LP routes freed supply.
+
+        With ``enable_heat_discrete_tier_dispatch`` the HEAT sector instead
+        spends each tier's MW at the corners — see :meth:`_heat_corner_factors`.
         """
         # Record what we actually dispatch so an identical later allocation can
         # take the floor-refresh-only path (no gossip preemption).
@@ -1264,6 +1318,12 @@ class L2DispatchHandler:
             members = [self._role.context.aid]
             for neigh in self._role._live_neighbours():
                 members.append(neigh.aid)
+
+            heat_corner = (
+                self._heat_corner_factors(members, service_fraction)
+                if self._role.enable_heat_discrete_tier_dispatch
+                else {}
+            )
 
             applied = 0
             shed_count = 0
@@ -1301,6 +1361,8 @@ class L2DispatchHandler:
                     # No allocation for this (sec, tier): preserve current state.
                     continue
                 factor = max(0.0, min(1.0, float(frac)))
+                if sec is Sector.HEAT and str(aid) in heat_corner:
+                    factor = heat_corner[str(aid)]
                 # El/gas: local feasibility caps the holon allocation. HEAT
                 # exempt (frontier controller owns its temperature).
                 if sec is not Sector.HEAT:
@@ -2390,6 +2452,7 @@ class EnergyBalanceNegotiator(Role):
         step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
         enable_qp_gossip: bool = True,
         enable_l2_generator_ramp: bool = True,
+        enable_heat_discrete_tier_dispatch: bool = False,
         enable_change_only_dispatch: bool = True,
         enable_l2_priority_floor: bool = True,
         enable_actuated_ledger_writeback: bool = True,
@@ -2403,7 +2466,7 @@ class EnergyBalanceNegotiator(Role):
         super().__init__()
         self.behavior = behavior
         self._grid_former_policy = GridFormerPolicy(
-            behavior, probe_share=_GRID_FORMER_SUPPLY_PROBE_SHARE
+            behavior, probe_share=GRID_FORMER_SUPPLY_PROBE_SHARE
         )
         self.sector = sector
         # True when L2 runs per connected component (holon cliques are not
@@ -2436,6 +2499,9 @@ class EnergyBalanceNegotiator(Role):
         # R3: ramp dispatchable DGs in the L2 service-fraction dispatch instead
         # of shed-only enforcement (see config.enable_l2_generator_ramp).
         self.enable_l2_generator_ramp = enable_l2_generator_ramp
+        # Spend each heat tier's MW at the corners instead of one uniform
+        # fraction (see BalanceNegotiator._heat_corner_factors).
+        self.enable_heat_discrete_tier_dispatch = enable_heat_discrete_tier_dispatch
         # Coordination overhaul: gate the upward L1→L2/L3 notifications on the
         # converged setpoint actually moving, so a gossip that re-converges to
         # the same result does not re-trigger the holon ADMM — the cascade
@@ -2800,6 +2866,7 @@ def create_energy_balance_role(
     step_decay_k0: int = _STEP_DECAY_K0_DEFAULT,
     enable_qp_gossip: bool = True,
     enable_l2_generator_ramp: bool = True,
+    enable_heat_discrete_tier_dispatch: bool = False,
     enable_change_only_dispatch: bool = True,
     enable_l2_priority_floor: bool = True,
     enable_actuated_ledger_writeback: bool = True,
@@ -2825,6 +2892,7 @@ def create_energy_balance_role(
         step_decay_k0=step_decay_k0,
         enable_qp_gossip=enable_qp_gossip,
         enable_l2_generator_ramp=enable_l2_generator_ramp,
+        enable_heat_discrete_tier_dispatch=enable_heat_discrete_tier_dispatch,
         enable_change_only_dispatch=enable_change_only_dispatch,
         enable_l2_priority_floor=enable_l2_priority_floor,
         enable_actuated_ledger_writeback=enable_actuated_ledger_writeback,

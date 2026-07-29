@@ -1,0 +1,72 @@
+{
+  "$comment": [
+    "Paired flag A/B for the two write-path fixes to SCARE's jumpy heat constraint envelope (eval_full_v2_20260728: SCARE max_t_k tail peak-to-peak >20 K on 58.9% of matched tasks vs 0.0% for single_level, and 1242 temperature violations vs 20-26).",
+    "Mechanism under test, two independent levers on the SAME failure:",
+    "  (1) enable_cp_heat_guard_plant_tracking - the CPHeatOutletGuard only ever writes DOWN, so while the L3 kernel parks the CP near zero the outlet cools for reasons the ceiling did not cause; the AIMD recovery credited that cooling to itself and ratcheted +0.05/poll open-loop, and the next commit spent the whole accumulated headroom in one tick (measured 372 K -> 407.55 K on branch-371-114, then a halving, ~6 s period). Bounding recovery to one step above the STANDING regulation closes the loop.",
+    "  (2) enable_cp_regulate_slew_limit - the sector=\"cp\" path in apply_regulate had only a ceiling (clamps DOWN), unlike the electricity and heat paths which already bound their steps. Symmetric per-write bound on kernel commits; the guard's cp_heat_outlet_relief bypasses it.",
+    "Arms: {} = both on (new defaults); then each lever off alone; then both off = eval_full_v2_20260728 behaviour.",
+    "Judge on: legacy_metrics__max_t_k__max minus __min (the swing), claims__constraint_compliance detail temperature n_violations / worst_overshoot, events__cp_heat_outlet_relief / cp_regulate_slew_limited, and that heat served fraction + PWSF + outcomes__cp_generation n_active do NOT regress (the slew limit delays a legitimate ramp by design).",
+    "NOTE: this campaign does not isolate enable_cp_own_supply_netting, which removes the r_{k+1} = R - r_k oscillator upstream of both levers. Expect these two to stop binding once that lands; run this A/B against a fixed netting setting."
+  ],
+  "name": "ab_cp_thermal_oscillation",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": true,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 10,
+    "failure_lambda": 0.5,
+    "max_failures": 1
+  },
+  "experiments": [
+    {
+      "name": "thermal_swing_lv",
+      "grids": ["simbench_lv"],
+      "n_seeds": 10,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_cp_heat_guard_plant_tracking": false },
+        { "enable_cp_regulate_slew_limit": false },
+        {
+          "enable_cp_heat_guard_plant_tracking": false,
+          "enable_cp_regulate_slew_limit": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    },
+    {
+      "name": "thermal_swing_cp_heavy",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 6,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "enable_cp_heat_guard_plant_tracking": false },
+        { "enable_cp_regulate_slew_limit": false },
+        {
+          "enable_cp_heat_guard_plant_tracking": false,
+          "enable_cp_regulate_slew_limit": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    }
+  ]
+}

@@ -204,8 +204,19 @@ class CoalitionManager:
             sec = obs_sector(obs, behavior=self._role.behavior, aid=aid)
             if sec is None:
                 continue
-            cap = obs_capacity(obs, behavior=self._role.behavior, aid=aid)
             sec_v = sec.value
+            # A promoted island reference is a generator, never a load: its free
+            # Var reads 0 at init and flips positive when it absorbs, so the plain
+            # cap-sign test below would drop it from supply and then bill it as
+            # tiered demand (project_islanding_former_guard_off).
+            if self._role._grid_former_policy.is_former(aid):
+                supply_by_sector[sec_v] = supply_by_sector.get(
+                    sec_v, 0.0
+                ) + self._role._grid_former_policy.supply_credit(
+                    aid, obs_setpoint(obs, behavior=self._role.behavior, aid=aid)
+                )
+                continue
+            cap = obs_capacity(obs, behavior=self._role.behavior, aid=aid)
             if cap < 0:  # generator-class — register supply
                 # Slack advertises its (effective) budget (see publish).
                 if lookup_slack(self._role.behavior, aid) is not None:

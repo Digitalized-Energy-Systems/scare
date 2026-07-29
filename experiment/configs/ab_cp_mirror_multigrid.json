@@ -1,0 +1,37 @@
+{
+  "$comment": [
+    "Isolates the mirror's multi-grid-edge drop on simbench_lv_el_dependent - the only grid it changes.",
+    "sector_from_grid returns None for a multi-grid node (its docstring: 'must be resolved by context'; a CHPHGControlNode carries [PowerGrid, GasGrid]). _branch_sector_str reads the FROM-NODE ONLY, so the 26 GenericTransferBranch stubs carrying each CHP's electrical output into its bus were tagged '' and mirror_from_monee dropped them (if not tag: continue).",
+    "Measured offline on the built grid: sector-scoped electricity reach from a CHP control node = 1 node (ITSELF); the 47-CP fleet forms 2 disjoint components, 26 CHPs (155 nodes, gas) and 21 P2H (258 nodes, electricity+heat), overlap 0. Reproduced exactly in-sim: participants={26, 21}, never 47, with sectors_in_round={1, 2} - the CHP round sees ONE sector, its gas input. A single-sector CP round has no coupling to optimise, so minimize_usage pins all 26 CHPs at r=0 under gossip AND lexicographic alike (measured: heat_mw 0.0019-0.0123, n_active 0.1-3.7 of 47). With the fallback the CHP reaches 413 nodes across all three sectors and the fleet forms one 47-CP round.",
+    "Reference points on this grid: component_level (unregulated fleet) delivers heat_mw 0.2804, heat served 0.888, PWSF 2.940; SCARE currently 0.0019-0.0123 / 0.56 / 2.53.",
+    "Scoped to the mirror on purpose - _branch_sector_str keeps its from-node reading for the line-loading monitor, reconfiguration cut and relief actuator call sites, which ask 'is this an electricity power line' and would otherwise gain 26 CHP transfer stubs.",
+    "gas_dependent is the negative control: it has no node-hosted CP, already forms one 47-CP component, and must come out bit-identical.",
+    "Judge on: participants= / sectors= in the L3 trace, outcomes__cp_generation n_active/heat_mw/el_mw, served_by_sector heat fraction, PWSF."
+  ],
+  "name": "ab_cp_mirror_multigrid",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 8, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "mirror_multigrid",
+      "grids": ["simbench_lv_el_dependent", "simbench_lv_gas_dependent"],
+      "n_seeds": 8,
+      "variants": ["scare"],
+      "ablations": [{}, { "enable_mirror_multigrid_edges": false }],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        }
+      ]
+    }
+  ]
+}

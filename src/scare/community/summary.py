@@ -48,6 +48,10 @@ from scare.community.summary_state import (
     _CoalitionAggregate,
     _PendingCoalition,
 )
+from scare.service.balance.grid_former import (
+    GRID_FORMER_SUPPLY_PROBE_SHARE,
+    GridFormerPolicy,
+)
 
 if TYPE_CHECKING:
     from mango_energy_environments import RestorationEnvironmentBehavior
@@ -91,6 +95,9 @@ class HolonSummaryRole(Role):
     ) -> None:
         super().__init__()
         self.behavior = behavior
+        self._grid_former_policy = GridFormerPolicy(
+            behavior, probe_share=GRID_FORMER_SUPPLY_PROBE_SHARE
+        )
         self.sector = sector
         self.period_s = period_s
         # Heat→L3: heat's summary triggers are off, so refresh faster to

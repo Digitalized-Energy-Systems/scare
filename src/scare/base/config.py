@@ -28,6 +28,21 @@ class RestorationConfiguration:
     # it nothing pushes back on injection-driven over-temp. False: no guard.
     # (eval_full_v2_20260711: hot CP outlets = the dominant compliance failure.)
     enable_cp_heat_outlet_guard: bool = True
+
+    # Bound the guard's AIMD recovery to one step above the CP's STANDING
+    # regulation. The guard only ever writes DOWN, so while another writer parks
+    # the CP below the ceiling the outlet cools for reasons the ceiling did not
+    # cause, yet recovery kept crediting that cooling to itself: on
+    # eval_full_v2_20260728 the L3 gossip commit alternates ~0 / 1.0 round to
+    # round, the ceiling ratcheted +0.05/poll open-loop through each ~3 s "off"
+    # half-cycle, and the next commit spent all the accumulated headroom in one
+    # tick — outlet 370 K -> 399-407 K, guard halves, repeat. The 10 K hysteresis
+    # band cannot damp this because the disturbance is a step in the manipulated
+    # variable, not a drift. Tracking the plant turns the release into a closed
+    # loop: the CP walks up in _RECOVER_STEP increments and the guard observes
+    # the thermal response of each one. False restores the open-loop ramp.
+    enable_cp_heat_guard_plant_tracking: bool = True
+
     # Refresh cadence (s) for a heat leader's HolonSummary so the delivered-heat
     # vector reaches L3 (heat's normal L1/L2 triggers are off).
     heat_cp_supply_refresh_s: float = 2.0
@@ -75,6 +90,63 @@ class RestorationConfiguration:
     # _HEAT_L2_PROBE_SHARE). False restores the pre-2026-07-28 accounting.
     enable_cp_supply_credit: bool = True
 
+    # L3 input-sector base supply adds the slack's UNUSED headroom
+    # (budget − |current import|) instead of its whole budget. ``Σ served`` is a
+    # flow already drawing on that budget, so ``served + budget`` counts the
+    # slack twice: on eval_full_v2_20260728 el_dependent task 004610 published
+    # served=0.2378 slack=0.2763 against demand=0.4456, i.e. a +0.068 MW SURPLUS
+    # while the sector was shedding 47% of its load, and on mvlv the budget alone
+    # (71.7) was 1.6x demand (44.4). The sign flip zeroes the waterfall marginal,
+    # and ``cp_admm_scale_free``'s minimize_usage ridge then pulls r to 0 — every
+    # CP on gas_dependent was commanded to 0.0000 at t=1.758 while L2 was
+    # simultaneously shedding gas tiers 3 and 4. False restores served + budget.
+    enable_cp_slack_headroom: bool = True
+
+    # Net the CP fleet's OWN committed production out of the L3 base supply
+    # before the kernel adds it back as ``Σ r_i·c_i``. ``base_supply`` for a
+    # produced sector is ``Σ served``, which already contains the fleet's current
+    # delivery (via ``enable_cp_supply_credit`` and the physics), so the kernel
+    # credits itself twice and the round-to-round map becomes r_{k+1} = R − r_k —
+    # gain exactly −1, which cannot converge. Measured on eval_full_v2_20260728:
+    # lag-1 autocorrelation of the fleet-mean factor is negative in 22/25 sampled
+    # tasks (median −0.74, four tasks below −0.97) while the consecutive-PAIR sum
+    # is near-constant (cv 0.75 -> 0.32); el_dependent ends 27 CPs at exactly 0.0
+    # and 20 at exactly 1.0. Netting makes the map independent of r_k. False
+    # restores the self-crediting base supply.
+    enable_cp_own_supply_netting: bool = True
+
+    # Resolve a mirror edge's sector from EITHER endpoint, so a branch leaving a
+    # multi-grid node still enters the reachability graph. ``sector_from_grid``
+    # returns None for a multi-grid node ("must be resolved by context" — a
+    # CHPHGControlNode carries [PowerGrid, GasGrid]) and ``mirror_from_monee``
+    # drops untagged branches, so on simbench_lv_el_dependent the 26
+    # GenericTransferBranch stubs carrying each CHP's electrical output were
+    # absent: sector-scoped electricity reach from a CHP was 1 node (itself),
+    # the 47-CP fleet split into a 21-CP electricity+heat round and a 26-CP
+    # GAS-ONLY round, and a single-sector CP round has no coupling to optimise,
+    # so all 26 CHPs sat at r=0 under every kernel realisation (gossip and
+    # lexicographic alike). Scoped to the mirror on purpose: _branch_sector_str
+    # keeps its from-node-only reading for the line-loading / reconfiguration /
+    # relief call sites, which ask "is this an electricity power line". Only
+    # el_dependent's components change; every other grid already has a P2G/P2H
+    # branch bridging the same pair. False restores the dropped edges.
+    enable_mirror_multigrid_edges: bool = True
+
+    # Gossip only: split cp_gossip_round_timeout_s across the tier ladder as
+    # cumulative per-tier deadlines instead of one shared round deadline. The
+    # budget is CARRIER-clock time and mango's carrier clock is SIMULATION time,
+    # so each iteration costs a message round-trip and the whole 4-tier cascade
+    # gets round/iter = ~10 iterations TOTAL. Measured on the 47-CP
+    # el_dependent feeder: tier 0 consumed 10-11 of them and tiers 1..3 then
+    # broke at iteration 0 — no optimisation at all — so the cascade answered
+    # only the top tier and committed. Offline on a wall-clock SimpleCarrier the
+    # same settings never bind and gossip matches the replicated kernel to
+    # 0.001-0.004, which is what identifies this as a units bug rather than an
+    # algorithm difference. Slices are absolute deadlines, so a tier that
+    # converges early hands its unused time on and the overall bound is
+    # unchanged. False restores the single shared deadline bit-for-bit.
+    enable_cp_gossip_tier_fair_deadline: bool = True
+
     # Gossip only: build the round demand set over the UNION of all bridged
     # sectors, not just the initiator's. Initiator = lowest cp_id = a P2G on
     # cp_heavy ("branch-*" < "node-*"), which bridges elec+gas only, so heat never
@@ -97,6 +169,45 @@ class RestorationConfiguration:
     # rounds continue one another and converge across rounds. False restores
     # cold starts.
     enable_cp_gossip_warm_start: bool = True
+
+    # Symmetric slew limit (per write) on L3 kernel commits to a CP, applied in
+    # ``apply_regulate``. The gossip cascade commits on ``round_timeout_s``
+    # whether or not it converged, and which tier the round died in decides the
+    # factor: a round that reaches the last tier answers the full problem and
+    # commits ~1.0, one that expires in tier 0 answers only tier-1 demand and
+    # commits ~0. On eval_full_v2_20260728 that made 98.9% of commits bang-bang
+    # (r>0.9 or r<0.05) with 49% of consecutive commits flipping by >0.5. Every
+    # other actuator path in ``apply_regulate`` already bounds its steps —
+    # ``_LINE_RELIEF_RESTORE_STEP`` exists because "a one-shot release
+    # limit-cycles loading 40-170%" — but the ``sector="cp"`` path had only a
+    # ceiling, which clamps DOWN and cannot damp an alternation. Symmetric on
+    # purpose: a one-sided (restore-only) bound would ratchet the CP to zero,
+    # since the down half-cycle is unconstrained. The guard's own
+    # ``cp_heat_outlet_relief`` bypasses it — a thermal excursion needs the full
+    # geometric cut immediately. A BACKSTOP, not a cure: it bounds the transient
+    # but does not remove the oscillator (``enable_cp_own_supply_netting``) or
+    # converge the cascade (``cp_gossip_round_timeout_s``); expect it to stop
+    # binding once those land. False: unbounded steps.
+    enable_cp_regulate_slew_limit: bool = True
+
+    # Max change per L3 commit under ``enable_cp_regulate_slew_limit``. Bounds
+    # the transient without moving the fixed point: repeated identical commits
+    # still reach the requested factor exactly (an EMA never would, breaking the
+    # ``>= 1.0`` ceiling release and the dedup tolerance). At the observed ~3 s
+    # commit cadence a full 0 -> 1 ramp costs ~12 s of a 30 s run.
+    cp_regulate_slew_step: float = 0.25
+
+    # Sim-second budget for one gossip cascade round and for one inner iteration.
+    # Their ratio is the REAL iteration budget: at 2.0/0.2 the whole 4-tier
+    # lexicographic cascade gets ~10 iterations (measured total_iters 10-11), so
+    # ``admm_max_iters`` (200/tier) never binds and no round has ever converged —
+    # every commit on eval_full_v2_20260728 logged converged=False. Previously
+    # hardcoded in ``CPPriorityAdmmRole._run_gossip_round`` and absent from every
+    # campaign config, so this ratio has never been A/B'd; 30.0/1.0 is known to
+    # be worse (the round never completes inside a ~10 s sim, so no CP ever
+    # dispatched). Defaults reproduce the hardcoded values bit-for-bit.
+    cp_gossip_round_timeout_s: float = 2.0
+    cp_gossip_iter_timeout_s: float = 0.2
 
     # Distributed FailureNotice propagation via ProblemDetector. False:
     # centralised callback triggers all leaders (legacy ablation).
@@ -340,8 +451,19 @@ class RestorationConfiguration:
     # island → every step infeasible (verified: restoring formers to full re-
     # feasibilises the exact state, load-shed does not). Guard pins the former δ=0
     # in the MW gossip (dropped from dual) + backstops ``apply_regulate`` for
-    # non-gossip writes; never actuated. Inert outside islanding.
-    enable_grid_former_curtail_guard: bool = False
+    # non-gossip writes; never actuated.
+    #
+    # DEFAULT ON since 2026-07-29. It is structurally inert outside islanding —
+    # only ``apply_microgrid_islanding`` creates ``GridForming*`` models, and both
+    # readers (``_maybe_register_grid_former``, ``is_grid_former_child``) return
+    # early on any other model — so flipping it is byte-identical on every
+    # non-microgrid task. It was OFF and set by NO config, which silently disabled
+    # the whole former policy on the one arm that needs it: eval_full_v2
+    # 20260728-202054 curtailed 38/38 promoted gas formers to regulation 0.0 (0/38
+    # in the clean twin) and read them as zero supply, dropping the gas pool from
+    # 104% to 51% of demand and zeroing tiers 3-4. See
+    # project_islanding_former_guard_off.
+    enable_grid_former_curtail_guard: bool = True
 
     # NOTE (islanding gas slack): under the former guard the gas slack settles ~61%
     # of B with gas still shed — NOT reclaimable. Both prototyped fixes REFUTED
@@ -368,6 +490,24 @@ class RestorationConfiguration:
     # (max feasible service), using local dT/dreg as gain. Replaces bang-bang
     # gating with partial-frontier serving. All tiers; heat-scoped.
     enable_heat_frontier: bool = True
+
+    # Spend each heat tier's allocated MW at the CORNERS (serve a chosen subset
+    # in full, shed the rest) instead of running every load in the tier at one
+    # fraction. A DHS junction is held above its t_k floor by mass flow through
+    # it, so uniform modulation thins flow network-wide and cools every
+    # junction. On eval_full_v2_20260728-202054 cold_day_stress the oracle and
+    # both baselines sit at 82.8-84.1% corner allocations with 0/90 temperature
+    # violations; SCARE sits at 54.5% with 46/90. Same MW per tier — this only
+    # redistributes it — so the tier ladder and PWSF accounting are unchanged.
+    # Opt-in until A/B-validated: it moves every heat load in every run.
+    enable_heat_discrete_tier_dispatch: bool = False
+
+    # Seed for the heat |dT_k/dP| estimator (K per MW) that HeatFrontierController
+    # sizes its step with. None = ``_SENSITIVITY_DEFAULT[HEAT]`` (10.0), which is
+    # ~350x below the measured gain and leaves the controller bang-bang; set
+    # ``_SENSITIVITY_HEAT_MEASURED`` (3500.0) to engage the proportional term.
+    # Opt-in until A/B-validated: it moves every heat load in every run.
+    heat_sensitivity_seed_k_per_mw: float | None = None
 
     # Priority waterfall for the heat frontier controller. True: a cold heat
     # load defers its own (otherwise tier-blind) shed while strictly lower-

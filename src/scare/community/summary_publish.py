@@ -62,6 +62,7 @@ class SummaryPublisher:
         per_tier_demand: dict[int, float] = {}
         supply_total: float = 0.0
         slack_budget_total: float = 0.0  # slack-only; caps CP input draw
+        slack_headroom_total: float = 0.0  # budget still unused right now
         try:
             member_aids = [self._role.context.aid] + [
                 addr.aid for addr in topology_neighbors(self._role, tid="groups")
@@ -77,6 +78,15 @@ class SummaryPublisher:
             sector = obs_sector(obs, behavior=self._role.behavior, aid=aid)
             if sector != self._role.sector:
                 continue
+            # A promoted island reference is a generator, never a load: its
+            # free Var reads 0 at init and flips positive when it absorbs, so
+            # the plain cap-sign test below would drop it from supply and then
+            # bill it as tiered demand (project_islanding_former_guard_off).
+            if self._role._grid_former_policy.is_former(aid):
+                supply_total += self._role._grid_former_policy.supply_credit(
+                    aid, obs_setpoint(obs, behavior=self._role.behavior, aid=aid)
+                )
+                continue
             cap = obs_capacity(obs, behavior=self._role.behavior, aid=aid)
             if cap < 0:
                 # Generator / slack injector feeds L3's supply pool. A
@@ -90,9 +100,17 @@ class SummaryPublisher:
                     # floor gives a converter (Ση<1) zero headroom → r=0, starving
                     # the over-draw actuator (CP kernel splits native-vs-CP, one B).
                     if self._role.cp_budget_nominal:
-                        slack_budget_total += abs(slack_meta.cap)
+                        budget = abs(slack_meta.cap)
                     else:
-                        slack_budget_total += v
+                        budget = v
+                    slack_budget_total += budget
+                    # obs_setpoint on a slack is its LP-chosen operating point,
+                    # i.e. how much of ``budget`` is already flowing and hence
+                    # already counted in some community's ``per_tier_served``.
+                    used = abs(
+                        obs_setpoint(obs, behavior=self._role.behavior, aid=aid)
+                    )
+                    slack_headroom_total += max(0.0, budget - used)
                 else:
                     supply_total += abs(cap)
                 continue
@@ -111,7 +129,7 @@ class SummaryPublisher:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[%s] L2 summary publish sector=%s force=%s gated=%s "
-                "demand=%.6f served=%.6f supply=%.6f slack=%.6f "
+                "demand=%.6f served=%.6f supply=%.6f slack=%.6f headroom=%.6f "
                 "d_by_tier=%s s_by_tier=%s prev_s_by_tier=%s tol=%g",
                 self._role.context.aid,
                 self._role.sector.value,
@@ -121,6 +139,7 @@ class SummaryPublisher:
                 float(sum(per_tier_served.values())),
                 supply_total,
                 slack_budget_total,
+                slack_headroom_total,
                 {t: round(v, 8) for t, v in sorted(per_tier_demand.items())},
                 {t: round(v, 8) for t, v in sorted(per_tier_served.items())},
                 {t: round(v, 8) for t, v in sorted(self._last_published_served.items())},
@@ -138,6 +157,9 @@ class SummaryPublisher:
         supply_by_sector = {sec_key: supply_total} if supply_total > 0.0 else {}
         slack_budget_by_sector = (
             {sec_key: slack_budget_total} if slack_budget_total > 0.0 else {}
+        )
+        slack_headroom_by_sector = (
+            {sec_key: slack_headroom_total} if slack_headroom_total > 0.0 else {}
         )
         demand_by_sector_priority = (
             {sec_key: dict(per_tier_demand)} if per_tier_demand else {}
@@ -158,6 +180,7 @@ class SummaryPublisher:
             demand_by_sector_priority=demand_by_sector_priority,
             served_by_sector_priority=served_by_sector_priority,
             slack_budget_by_sector=slack_budget_by_sector,
+            slack_headroom_by_sector=slack_headroom_by_sector,
             home_node_id=self._role._my_node_id,
         )
         # Record our own summary too — the invariant check treats self

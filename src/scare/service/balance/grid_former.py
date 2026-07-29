@@ -19,6 +19,19 @@ from typing import Any
 
 from scare.base.util import lookup_grid_former_rating
 
+# Credit ``delivered + share*(rating-delivered)`` so the free-Var former produces
+# to meet offered load; a positive share over-credits when it shares an island with
+# a budgeted slack (offered load routes through the slack and the L2 floor blocks
+# re-shed). recoverable_islanding seed 100000023: share 0.0 -> PWSF 0.42, gas slack
+# PASS; 0.5 -> 0.66, FAIL (110% over); rating -> 0.77, FAIL (151%). Default 0 keeps
+# the gas slack compliant. Analogue of ``_HEAT_L2_PROBE_SHARE`` (heat has no slack
+# budget).
+# CAVEAT: those three points were measured while promotion silently shrank the gas
+# slack budget 25% (fixed 2026-07-29) and while the guard was off, so the >0 shares
+# were over-crediting against a budget that was itself too small — re-measure before
+# quoting them as a refutation of a positive share.
+GRID_FORMER_SUPPLY_PROBE_SHARE: float = 0.0
+
 
 class GridFormerPolicy:
     def __init__(self, behavior: Any, *, probe_share: float) -> None:

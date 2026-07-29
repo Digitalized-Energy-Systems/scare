@@ -1,0 +1,87 @@
+{
+  "$comment": [
+    "Paired A/B for the heat |dT_k/dP| estimator seed (_SENSITIVITY_DEFAULT[HEAT], K per MW), the root cause of SCARE's constraint-compliance gap on eval_full_v2_20260728-202054.",
+    "DEFECT: the seed was 10.0, so HeatFrontierController sized its step with sensitivity*cap = 0.075 K per unit regulation for a 7.5 kW load against a measured ~27 K. 99.4% of all 67719 frontier moves in that campaign saturated at +-MAX_STEP: the proportional term never engaged and the controller was bang-bang against an 8.0 K hold band that one step overshoots 21.7% of the time. SCARE limit-cycled (1.10 direction reversals per load vs 0.15 for the baselines, 445 vs 153 moves per task) and the final graded solve caught it on whichever side the last poll left it -- cold_day_stress failed 46/90 for SCARE and 0/90 for every other variant.",
+    "FIX: seed 3500.0, the campaign-measured median |dT_k/dP| over 53423 consecutive frontier poll pairs (SCARE 3022, component_level and single_level 3556 -- three variants agreeing says it is a DHS property, not a control artifact). The seed also gates the EMA, whose sample = min(sample, 10*value+1) clamp needs ~6 accepted samples to climb from 10 to 3000, more than a 30 s run affords.",
+    "ARMS: ablation {} is the CONTROL (seed 10.0, the shipped default -- deliberately left as the default so this change is inert for every concurrently running campaign); heat_sensitivity_seed_k_per_mw=3500.0 is the TREATMENT. Seeds depend only on (experiment, grid, run_idx), so the two arms are paired on the same failure draw. component_level runs both arms too: it also carries a GridConstraintMonitor with the frontier, so it is the regression check, not just a reference.",
+    "SCENARIOS mirror the campaign's cold_day_stress exactly (both grids, both slack budgets). The two cold_day scenarios carry 43 of the 46 SCARE failures; kind=clean (3/30) is kept as the no-regression case.",
+    "JUDGE ON, paired by (grid, scenario, seed): claims__constraint_compliance__passed and its by_variable__temperature__n_violations / worst_overshoot; legacy_metrics__avg_t_k__min; PWSF and served_by_sector heat fraction (a controller that settles could settle LOW -- compliance holding while serving collapses is not a win); and the frontier limit-cycle fingerprint from run.log, i.e. the share of moves at |step| = MAX_STEP and direction reversals per load."
+  ],
+  "name": "ab_heat_sensitivity_seed",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 30, "failure_lambda": 1.5, "max_failures": 4 },
+  "experiments": [
+    {
+      "name": "cold_day_stress",
+      "grids": ["simbench_lv"],
+      "n_seeds": 15,
+      "variants": ["scare", "component_level"],
+      "ablations": [{}, { "heat_sensitivity_seed_k_per_mw": 3500.0 }],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "heat_load_scale": 1.5,
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5,
+          "supply_t_k": 343.15
+        },
+        {
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "heat_load_scale": 1.5,
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5,
+          "supply_t_k": 343.15
+        }
+      ]
+    },
+    {
+      "name": "cold_day_stress_cp_heavy",
+      "grids": ["simbench_lv_cp_heavy"],
+      "n_seeds": 15,
+      "variants": ["scare", "component_level"],
+      "ablations": [{}, { "heat_sensitivity_seed_k_per_mw": 3500.0 }],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        },
+        {
+          "heat_load_scale": 1.5,
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55,
+          "supply_t_k": 343.15
+        },
+        {
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "heat_load_scale": 1.5,
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55,
+          "supply_t_k": 343.15
+        }
+      ]
+    }
+  ]
+}

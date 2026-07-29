@@ -1,0 +1,40 @@
+{
+  "$comment": [
+    "Isolates defect 3: the in-sim gossip path does not reach the answer the same kernel produces offline.",
+    "Gossip and the coordinator cascade are the SAME algorithm - gossip.py's own docstring says it reuses the closed-form (z, sigma) cell update from kernel.py and is 'same answer, no coordinator'. Only the realisation differs: x_bar is rebuilt from peers' broadcast x_i (a peer that misses iter_timeout_s is held over at its LAST-SEEN x_i, so the iterate runs on stale data), and the round is bounded on the CARRIER (sim) clock at round_timeout_s / iter_timeout_s = 2.0/0.2 = ~10 iterations TOTAL shared across all 4 tiers, against admm_max_iters=200 PER TIER for the replicated path.",
+    "Measured motivation, el_dependent: solving the cascade offline on the campaign's own published B (B_el=0.4422, B_heat=0.3518, B_gas=0.4329) with the real 21xP2H + 26xCHP fleet gives P2H=1.000 CHP=0.408 = 0.174 MW of CP heat, at 3 iterations/tier and at convergence alike. The sim delivers 0.005-0.024 MW and logs cp_priority_admm mean_factor=0.057. So the kernel is not being clamped downstream - the gossip realisation is landing somewhere else.",
+    "Arms separate PROTOCOL from BUDGET: 'lexicographic' removes both the message staleness and the iteration cap; 'gossip_long' keeps gossip and only quadruples the round budget (8.0/0.2 = ~40 iterations). If gossip_long recovers most of the gap it is the budget; if only lexicographic does, it is the stale x_bar.",
+    "Both accounting fixes (enable_cp_slack_headroom / enable_cp_own_supply_netting) are ON in every arm - this campaign is about the realisation, not the books.",
+    "Judge on: outcomes__cp_generation n_active/heat_mw/gas_mw against the 0.174 MW offline target, served_by_sector heat/gas fraction, PWSF, and the n_active SPREAD across seeds."
+  ],
+  "name": "ab_cp_gossip_vs_lexicographic",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 8, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "cp_realisation",
+      "grids": ["simbench_lv_el_dependent", "simbench_lv_gas_dependent"],
+      "n_seeds": 8,
+      "variants": ["scare"],
+      "ablations": [
+        {},
+        { "cp_admm_algorithm": "lexicographic" },
+        { "cp_gossip_round_timeout_s": 8.0 }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        }
+      ]
+    }
+  ]
+}

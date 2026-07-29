@@ -104,6 +104,11 @@ class CPPriorityAdmmRole(Role):
         heat_supply_from_deficit: bool = False,
         demand_union: bool = False,
         gossip_warm_start: bool = False,
+        slack_headroom: bool = False,
+        own_supply_netting: bool = False,
+        gossip_round_timeout_s: float = 2.0,
+        gossip_iter_timeout_s: float = 0.2,
+        gossip_tier_fair_deadline: bool = False,
     ) -> None:
         super().__init__()
         self.behavior = behavior
@@ -120,6 +125,21 @@ class CPPriorityAdmmRole(Role):
         # Gossip only: carry ADMM state across rounds (see
         # RestorationConfiguration.enable_cp_gossip_warm_start).
         self.gossip_warm_start = bool(gossip_warm_start)
+        # Input-sector base supply adds the slack's unused headroom, not its
+        # whole budget (RestorationConfiguration.enable_cp_slack_headroom).
+        self.slack_headroom = bool(slack_headroom)
+        # Net the fleet's own committed production out of base_supply
+        # (RestorationConfiguration.enable_cp_own_supply_netting).
+        self.own_supply_netting = bool(own_supply_netting)
+        # Gossip only: their RATIO is the real per-round iteration budget shared
+        # across every tier of the cascade (RestorationConfiguration
+        # .cp_gossip_round_timeout_s / .cp_gossip_iter_timeout_s).
+        self.gossip_round_timeout_s = float(gossip_round_timeout_s)
+        self.gossip_iter_timeout_s = float(gossip_iter_timeout_s)
+        # Gossip only: cumulative per-tier deadlines so the ladder's tail is
+        # not starved (RestorationConfiguration
+        # .enable_cp_gossip_tier_fair_deadline).
+        self.gossip_tier_fair_deadline = bool(gossip_tier_fair_deadline)
         self.home_node_id = home_node_id
         self.watchdog_s = watchdog_s
         # Freshness bound on cached HolonSummary entries; the leader watchdog
@@ -251,14 +271,19 @@ class CPPriorityAdmmRole(Role):
 
     async def _publish(self, *, force: bool = False) -> None:
         """Send a fresh :class:`CPSummary` to every known peer CP. Delta-gated on
-        capacity; ``force=True`` bypasses the gate.
+        capacity and regulation; ``force=True`` bypasses the gate.
         """
         if not self._peer_cp_addrs and not force:
             return
-        # Delta gate: skip when capacity hasn't materially shifted.
-        if not force and not self._capacity_changed():
+        regulation = self._standing_regulation()
+        # Delta gate: skip when neither capacity nor our factor moved. The
+        # factor has to be in the gate — peers net it out of their base supply,
+        # so a stale one reintroduces exactly the self-crediting that
+        # enable_cp_own_supply_netting removes.
+        if not force and not self._capacity_changed(regulation):
             return
         self._last_published_capacity = dict(self.capacity_by_sector)
+        self._last_published_regulation = regulation
 
         summary = CPSummary(
             publisher=self.cp_id,
@@ -266,6 +291,7 @@ class CPPriorityAdmmRole(Role):
             caused_by={},
             timestamp_s=float(self.context.current_timestamp),
             capacity_by_sector=dict(self.capacity_by_sector),
+            regulation=regulation,
             home_node_id=self.home_node_id,
         )
         for addr in self._peer_cp_addrs.values():
@@ -278,7 +304,9 @@ class CPPriorityAdmmRole(Role):
                     exc,
                 )
 
-    def _capacity_changed(self) -> bool:
+    _REGULATION_REPUBLISH_TOL: float = 1e-3
+
+    def _capacity_changed(self, regulation: float | None = None) -> bool:
         if getattr(self, "_last_published_capacity", None) is None:
             return True
         prev = self._last_published_capacity
@@ -286,6 +314,12 @@ class CPPriorityAdmmRole(Role):
             return True
         for sec, v in self.capacity_by_sector.items():
             if abs(float(v) - float(prev.get(sec, 0.0))) > 1e-6:
+                return True
+        if regulation is not None:
+            prev_r = getattr(self, "_last_published_regulation", None)
+            if prev_r is None:
+                return True
+            if abs(regulation - float(prev_r)) > self._REGULATION_REPUBLISH_TOL:
                 return True
         return False
 
@@ -423,6 +457,44 @@ class CPPriorityAdmmRole(Role):
                 participants,
             )
 
+    def _standing_regulation(self) -> float:
+        """This CP's regulation as the physics currently has it.
+
+        Not ``_last_committed_factor``: ``apply_regulate`` can clamp a commit
+        (heat ceiling, curtail lock) and a CP that has never been committed is
+        born at 1.0, so the observation is the only value that matches what the
+        measured ``served`` actually contains.
+        """
+        try:
+            obs = self.behavior.observe(self.cp_id) or {}
+        except (AttributeError, KeyError):
+            obs = {}
+        try:
+            return float(np.clip(float(obs["regulation"]), 0.0, 1.0))
+        except (KeyError, TypeError, ValueError):
+            if self._last_committed_factor is not None:
+                return float(self._last_committed_factor)
+            return 1.0
+
+    def _fleet_production_mw(self, sector: str, reachable: Any) -> float:
+        """``Σ_i r_i·|c_{i,s}|`` (MW) over the CPs that PRODUCE into *sector*,
+        across exactly the participant set the kernel will solve over.
+
+        Peers report ``r_i`` on their :class:`CPSummary`; an unreachable or
+        never-heard-from peer is outside the round's frame and so contributes
+        nothing here either.
+        """
+        cap = float(self.capacity_by_sector.get(sector, 0.0))
+        total = -cap * self._standing_regulation() if cap < 0.0 else 0.0
+        for aid in self._reachable_peer_cp_ids(reachable):
+            summary = self._peer_cps.get(aid)
+            if summary is None:
+                continue
+            peer_cap = float((summary.capacity_by_sector or {}).get(sector, 0.0))
+            if peer_cap < 0.0:
+                total += -peer_cap * float(np.clip(summary.regulation, 0.0, 1.0))
+        return total
+
     def _build_demands(self, reachable: Any = _UNRESOLVED) -> list[SectorDemand]:
         """Aggregate the latest HolonSummary per leader into one
         :class:`SectorDemand` per bridged sector; sectors with no summaries are
@@ -482,7 +554,15 @@ class CPPriorityAdmmRole(Role):
                     served = sum(float(v) for v in served_map.values())
                     agg_supply += served
                     parts["served"] += served
-                    slack_map = summary.slack_budget_by_sector or {}
+                    # served is a flow already drawing on the slack, so the
+                    # additive term has to be the UNUSED remainder; adding the
+                    # whole budget books the slack twice and flips the sign of
+                    # the deficit (see enable_cp_slack_headroom).
+                    slack_map = (
+                        summary.slack_headroom_by_sector
+                        if self.slack_headroom
+                        else summary.slack_budget_by_sector
+                    ) or {}
                     slack = float(slack_map.get(sec_v, 0.0))
                     agg_supply += slack
                     parts["slack"] += slack
@@ -523,6 +603,25 @@ class CPPriorityAdmmRole(Role):
             if sec_v == Sector.GAS.value:
                 agg_supply = kgps_to_mw(agg_supply)
                 agg_demand = {t: kgps_to_mw(v) for t, v in agg_demand.items()}
+            # Every branch above measures a sector state that the fleet is
+            # already contributing to, and the kernel adds that contribution
+            # back as Σ r_i·c_i. Netting it out here is what makes the round's
+            # answer independent of the round before it (see
+            # enable_cp_own_supply_netting); capacities are MW, so this must
+            # follow the gas conversion.
+            if self.own_supply_netting:
+                own = self._fleet_production_mw(sec_v, reachable)
+                if own > 0.0:
+                    net = max(0.0, agg_supply - own)
+                    logger.debug(
+                        "[%s] L3 net-own sector=%s supply=%.6f fleet=%.6f -> %.6f",
+                        self.cp_id,
+                        sec_v,
+                        agg_supply,
+                        own,
+                        net,
+                    )
+                    agg_supply = net
             demands.append(
                 SectorDemand(
                     sector=sec_v,
@@ -669,6 +768,9 @@ class CPPriorityAdmmRole(Role):
         self._publish_supply_credit(my_factor)
         # Sync callback (DRO's on_commit), so the wake-up has to be scheduled.
         self.context.schedule_instant_task(self._wake_l2(my_factor))
+        # Peers net our production out of their base supply, so a new factor is
+        # only correct for them once they have it.
+        self.context.schedule_instant_task(self._publish())
         logger.debug(
             "[%s] gossip cascade committed factor=%.4f cap=%s "
             "(iters=%d, converged=%s, applied=%s)",
@@ -712,6 +814,8 @@ class CPPriorityAdmmRole(Role):
         # SIM-second timeouts (carrier clock): a round commits (apply_regulate) on convergence
         # or round_timeout_s. 30s round/1s iter never completed in the ~10s sim -> CP converter
         # never fired, elec slack over-drew; 2.0s/0.2s commits-on-timeout (partial still curtails).
+        # Config-driven since 2026-07-29 so the budget (round/iter = ~10 iterations
+        # shared across ALL tiers, so no round has yet converged) is sweepable.
         start = create_gossip_cascade_start(
             round_id=self._gossip_round_id,
             participants=participants,
@@ -727,8 +831,9 @@ class CPPriorityAdmmRole(Role):
             adaptive_rho=True,
             rho_mu=10.0,
             rho_tau=2.0,
-            iter_timeout_s=0.2,
-            round_timeout_s=2.0,
+            iter_timeout_s=self.gossip_iter_timeout_s,
+            round_timeout_s=self.gossip_round_timeout_s,
+            tier_fair_deadline=self.gossip_tier_fair_deadline,
         )
         await self._gossip_participant.on_exchange_message(
             self._gossip_carrier,
@@ -804,6 +909,9 @@ class CPPriorityAdmmRole(Role):
             self._last_committed_factor = my_factor
         self._publish_supply_credit(my_factor)
         await self._wake_l2(my_factor)
+        # Peers net our production out of their base supply (see
+        # _fleet_production_mw), so a new factor has to reach them.
+        await self._publish()
         logger.debug(
             "[%s] L3 kernel committed factor=%.4f (peers=%d, sectors=%d, "
             "iters=%d, converged=%s, applied=%s)",

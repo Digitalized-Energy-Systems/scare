@@ -212,11 +212,18 @@ def test_commit_callback_writes_apply_regulate_once():
 
 def test_commit_callback_clamps_to_zero_one():
     """Out-of-range r is clamped before apply_regulate (defensive)."""
+    from scare.base.config import RestorationConfiguration
+
     role, _, behavior = _make_role(
         "cp-001",
         capacity_by_sector={"electricity": 1.0, "heat": -1.0},
         bridged_sectors=[Sector.ELECTRICITY, Sector.HEAT],
         peer_addrs={},
+    )
+    # Isolate the [0, 1] clip from the write-path slew limit, which would
+    # otherwise bound the 1.0 -> 0.0 step (covered in test_cp_heat_guard).
+    behavior._scare_config = RestorationConfiguration(
+        enable_cp_regulate_slew_limit=False
     )
     role._on_gossip_commit(
         r=np.array([1.4]),

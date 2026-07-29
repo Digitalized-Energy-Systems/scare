@@ -1,0 +1,57 @@
+{
+  "name": "ab_islanding_former_guard",
+  "base_seed": 3600000000,
+  "out_root": "experiment/_runs/ab",
+  "timestamp_dir": false,
+  "simulation_duration_s": 30.0,
+  "failure_delay_s_max": 2.0,
+  "task_timeout_s": 1800,
+  "write_timeseries": true,
+  "write_trajectories": true,
+  "defaults": {
+    "runs_per_grid": 30,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "name": "extension_islanding",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 3,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {}
+      ],
+      "sweeps": [
+        {}
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "heat_mccormick": true,
+          "failure_type": "island",
+          "n_failures": 5,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "kind": "microgrid",
+          "failure_type": "island",
+          "n_failures": 5,
+          "carriers": [
+            "electricity",
+            "water",
+            "gas"
+          ],
+          "promote_all_generators": true,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        }
+      ]
+    }
+  ]
+}

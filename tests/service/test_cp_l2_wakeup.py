@@ -248,7 +248,9 @@ async def test_commit_schedules_the_wake_because_on_commit_is_sync():
 
     role._on_gossip_commit(r=np.array([0.4]), converged=True, iterations=3)
     assert _setpoints(ctx) == []  # not sent yet — it is a coroutine
-    assert len(ctx.scheduled) == 1
+    # The commit also schedules a CPSummary republish (peers net our factor out
+    # of their base supply), so assert on the wake itself, not the queue length.
+    assert any(c.__name__ == "_wake_l2" for c in ctx.scheduled)
 
     await ctx.drain()
     assert len(_setpoints(ctx)) == 1

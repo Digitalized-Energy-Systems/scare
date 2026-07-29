@@ -100,16 +100,57 @@ def test_hysteresis_band_holds_and_keeps_entry_fresh():
 
 def test_recovery_is_additive_and_releases_at_full():
     guard, beh = _make(t_k=HOT)
-    _tick(guard, 2)  # ceiling -> 0.25
+    _tick(guard, 2)  # ceiling -> 0.25, guard self-actuated the plant to match
     beh.t_k = COOL
     _tick(guard)
     now = guard.context.current_timestamp
     assert cp_heat_ceiling(beh, CP_AID, now) == pytest.approx(
         _DECREASE_FACTOR**2 + _RECOVER_STEP
     )
-    _tick(guard, 20)  # ramp to 1.0 -> entry cleared (no cap)
+    # The plant follows the released ceiling (a kernel commit landing at the
+    # cap), so each step is observed before the next is granted.
+    for _ in range(20):
+        beh.regulation = min(1.0, guard._ceiling)
+        _tick(guard)
     now = guard.context.current_timestamp
     assert cp_heat_ceiling(beh, CP_AID, now) is None
+
+
+def test_recovery_holds_while_plant_parked_below_ceiling():
+    """The regression: a cool outlet is NOT evidence the ceiling is safe when
+    another writer holds the CP below it. Recovery must not run open-loop."""
+    guard, beh = _make(t_k=HOT)
+    _tick(guard, 2)  # ceiling -> 0.25
+    beh.t_k = COOL
+    beh.regulation = 0.02  # L3 commits ~0; the guard never writes UP
+    _tick(guard, 20)
+    now = guard.context.current_timestamp
+    # Frozen where the wind-down left it: reg + step sits below the standing
+    # ceiling, and the never-tighten clamp holds it there.
+    assert cp_heat_ceiling(beh, CP_AID, now) == pytest.approx(_DECREASE_FACTOR**2)
+
+
+def test_plant_tracking_off_restores_open_loop_ramp():
+    beh = _FakeBehavior(t_k=HOT, regulation=1.0)
+    guard = CPHeatOutletGuard(beh, outlet_aid=OUTLET_AID, plant_tracking=False)
+    guard._context = _FakeContext()
+    _tick(guard, 2)
+    beh.t_k = COOL
+    beh.regulation = 0.02
+    _tick(guard, 20)
+    now = guard.context.current_timestamp
+    assert cp_heat_ceiling(beh, CP_AID, now) is None
+
+
+def test_plant_tracking_never_tightens_the_ceiling():
+    """A parked plant degrades recovery to a HOLD; only the hot branch cuts."""
+    guard, beh = _make(t_k=HOT)
+    _tick(guard)  # ceiling -> 0.5
+    beh.t_k = COOL
+    beh.regulation = 0.0
+    _tick(guard, 5)
+    now = guard.context.current_timestamp
+    assert cp_heat_ceiling(beh, CP_AID, now) == pytest.approx(_DECREASE_FACTOR)
 
 
 def test_deenergised_outlet_holds_ceiling_without_tightening():
@@ -165,6 +206,55 @@ def test_apply_regulate_non_cp_sector_not_clamped():
         timestamp=10.5,
     )
     assert applied and beh.acted[-1] == pytest.approx(1.0)
+
+
+def _slew_step() -> float:
+    from scare.base.config import RestorationConfiguration
+
+    return RestorationConfiguration().cp_regulate_slew_step
+
+
+def test_cp_kernel_commit_is_slew_limited_symmetrically():
+    beh = _FakeBehavior(t_k=COOL)
+    step = _slew_step()
+    # Cold start passes unbounded: a born CP must take its first dispatch.
+    apply_regulate(
+        beh, CP_AID, 0.5, sector="cp", reason="cp_priority_admm", timestamp=1.0
+    )
+    assert beh.acted[-1] == pytest.approx(0.5)
+    # Up and down are bounded by the same step — a one-sided bound would
+    # ratchet the CP to zero under the kernel's alternating commits.
+    apply_regulate(
+        beh, CP_AID, 1.0, sector="cp", reason="cp_priority_admm", timestamp=2.0
+    )
+    assert beh.acted[-1] == pytest.approx(0.5 + step)
+    apply_regulate(
+        beh, CP_AID, 0.0, sector="cp", reason="cp_priority_admm", timestamp=3.0
+    )
+    assert beh.acted[-1] == pytest.approx(0.5)
+
+
+def test_slew_limit_preserves_the_fixed_point():
+    """Repeated identical commits still land exactly on the request (an EMA
+    would only approach it, breaking the >= 1.0 ceiling release)."""
+    beh = _FakeBehavior(t_k=COOL)
+    for i in range(12):
+        apply_regulate(
+            beh, CP_AID, 1.0, sector="cp", reason="cp_priority_admm", timestamp=float(i)
+        )
+    assert beh.acted[-1] == pytest.approx(1.0)
+
+
+def test_guard_relief_bypasses_the_slew_limit():
+    """A hot outlet needs the full geometric cut on the poll that sees it."""
+    beh = _FakeBehavior(t_k=HOT)
+    apply_regulate(
+        beh, CP_AID, 1.0, sector="cp", reason="cp_priority_admm", timestamp=1.0
+    )
+    apply_regulate(
+        beh, CP_AID, 0.0, sector="cp", reason="cp_heat_outlet_relief", timestamp=2.0
+    )
+    assert beh.acted[-1] == pytest.approx(0.0)
 
 
 def test_floor_constant_below_first_geometric_steps():

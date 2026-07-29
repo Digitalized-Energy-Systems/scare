@@ -21,6 +21,8 @@ near-wash — and neither was islanding:
    extension had restored, worth +0.067 PWSF.
 """
 
+import pytest
+from monee.model.extension.islanding.gas import GasIslandingMode
 from monee.solver.core import find_ignored_nodes
 
 from experiment.eval.metrics import _disconnected_node_ids
@@ -86,6 +88,88 @@ def test_budget_is_independent_of_grid_former_headroom():
         apply_slack_budget(net, 0.45)
         budgets.append(_budgets(net))
     assert budgets[0] == budgets[1] == budgets[2]
+
+
+def test_a_promoted_gas_former_cannot_absorb_gas():
+    """A ``Source`` injects; ``GridFormingSource`` bounds its balancing Var
+    symmetrically, and nothing in the objective prices the positive half — so
+    the LP parked the promoted fleet there as free sinks, drawing a net 0.0102
+    kg/s (44 % of the gas slack budget) that the compliance wind-down paid for
+    by shedding real load."""
+    net = GRIDS["simbench_lv"]()
+    apply_microgrid_islanding(net, carriers=_CARRIERS, promote_all_generators=True)
+
+    formers = [
+        c for c in net.childs if type(c.model).__name__ == "GridFormingSource"
+    ]
+    gas = [c for c in formers if "gas" in str(net.node_by_id(c.node_id).grid.name).lower()]
+    assert gas, "nothing promoted on the gas grid — test is vacuous"
+    for child in gas:
+        var = child.model.mass_flow_kgs
+        assert var.max == 0.0, f"child-{child.id} may absorb gas"
+        # Injection headroom must survive: the former still anchors the island.
+        assert var.min is not None and var.min < 0.0
+
+
+def _gas_formers(net):
+    return [
+        c
+        for c in net.childs
+        if type(c.model).__name__ == "GridFormingSource"
+        and "gas" in str(net.node_by_id(c.node_id).grid.name).lower()
+    ]
+
+
+def test_a_non_leading_gas_former_holds_its_pre_promotion_setpoint():
+    """Where the ext grid leads the component ``stamp_gf_leadership`` marks
+    EVERY former non-leading, ``overwrite()`` pins nothing and ``equations()``
+    returned ``[]`` — leaving ``mass_flow_kgs`` in the node balance alone, pinned
+    by no equation and priced by no objective (plain energy flow carries none).
+    The LP returned an arbitrary degenerate split: the fleet delivered 0.0013 of
+    its 0.0118 kg/s while the slack ran to its budget and the rest became shed
+    gas."""
+    net = GRIDS["simbench_lv"]()
+    apply_microgrid_islanding(net, carriers=_CARRIERS, promote_all_generators=True)
+    GasIslandingMode().stamp_gf_leadership(net)
+
+    formers = _gas_formers(net)
+    assert formers, "nothing promoted on the gas grid — test is vacuous"
+    # The whole point: with a slack in the component, none of them leads.
+    assert not any(m.model._gf_leading for m in formers)
+    for child in formers:
+        assert child.model.equations(None, None), f"child-{child.id} left unpinned"
+
+
+def test_a_LEADING_gas_former_keeps_its_free_balancing_var():
+    """The pin must lift the moment the unit actually becomes the island
+    reference — that Var is what absorbs the island's imbalance."""
+    net = GRIDS["simbench_lv"]()
+    apply_microgrid_islanding(net, carriers=_CARRIERS, promote_all_generators=True)
+    former = _gas_formers(net)[0].model
+    former._gf_leading = True
+    assert former.equations(None, None) == []
+
+
+def test_promotion_preserves_each_source_injection_headroom():
+    """The former's injection bound is the magnitude of the ``Source`` it
+    replaced, so the clean arm's supply is still physically reachable."""
+    clean = GRIDS["simbench_lv"]()
+    pre = {}
+    for child in clean.childs:
+        grid = str(clean.node_by_id(child.node_id).grid.name).lower()
+        if "gas" in grid and type(child.model).__name__ == "Source":
+            pre[child.id] = abs(float(child.model.mass_flow_kgs))
+
+    micro = GRIDS["simbench_lv"]()
+    apply_microgrid_islanding(micro, carriers=_CARRIERS, promote_all_generators=True)
+    post = {
+        c.id: abs(float(c.model.mass_flow_kgs.min))
+        for c in micro.childs
+        if type(c.model).__name__ == "GridFormingSource"
+        and "gas" in str(micro.node_by_id(c.node_id).grid.name).lower()
+    }
+    assert pre and post.keys() == pre.keys()
+    assert sum(post.values()) == pytest.approx(sum(pre.values()), rel=1e-9)
 
 
 def test_islanding_config_survives_the_copy_every_solver_returns():

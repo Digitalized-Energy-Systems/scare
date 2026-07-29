@@ -106,6 +106,15 @@ GEN_RESTORE_REASONS: frozenset[str] = frozenset(
 )
 
 
+# L3 kernel commits to a coupling point — slew-limited under
+# ``enable_cp_regulate_slew_limit``. Deliberately excludes the heat guard's
+# ``cp_heat_outlet_relief``: an over-temperature outlet needs the full geometric
+# cut on the poll that sees it.
+CP_KERNEL_COMMIT_REASONS: frozenset[str] = frozenset(
+    {"cp_priority_admm", "cp_admm", "cp_multi_community"}
+)
+
+
 def _last_regulate_store(behavior: Any) -> dict[str, float]:
     return _get_behavior_store(behavior, "_scare_last_regulate")
 
@@ -692,6 +701,35 @@ def apply_regulate(
                     ),
                 )
             factor = _cp_ceil
+
+        # Symmetric slew limit on kernel commits. The cascade commits on
+        # round_timeout_s regardless of convergence, so its factor alternates
+        # between the full-cascade answer and a truncated-tier one; bounding the
+        # step per write keeps the fixed point exact (repeated identical commits
+        # still land on it) while the transient can no longer slam the outlet
+        # across the whole t_k envelope in one tick. Cold start (no recorded
+        # factor) passes: a born CP must be able to take its first dispatch.
+        if reason in CP_KERNEL_COMMIT_REASONS and cfg_value(
+            _cfg, "enable_cp_regulate_slew_limit"
+        ):
+            _step = float(cfg_value(_cfg, "cp_regulate_slew_step"))
+            _prev = _last_regulate_store(behavior).get(str(aid))
+            if _prev is not None and _step > 0.0:
+                _slewed = min(
+                    float(_prev) + _step, max(float(_prev) - _step, factor)
+                )
+                if abs(_slewed - factor) > tolerance:
+                    record_event(
+                        t=float(timestamp),
+                        kind="cp_regulate_slew_limited",
+                        aid=str(aid),
+                        sector=str(sector),
+                        detail=(
+                            f"reason={reason} requested_factor={factor:.4f} "
+                            f"prev={float(_prev):.4f} stepped={_slewed:.4f}"
+                        ),
+                    )
+                factor = _slewed
 
     # --- Heat curtailment-auction lock (heat sector only) -------------
     # While the auction holds a heat load down for a live temperature

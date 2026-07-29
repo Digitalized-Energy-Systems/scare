@@ -136,6 +136,7 @@ def _inject_holon_summary(
     demand_by_tier: dict[int, float],
     served_by_tier: dict[int, float] | None = None,
     slack_budget_mw: float = 0.0,
+    slack_headroom_mw: float = 0.0,
     version: int = 1,
 ) -> None:
     """Populate the role's leader-summaries cache directly so the
@@ -157,6 +158,9 @@ def _inject_holon_summary(
         demand_by_sector_priority={sv: dict(demand_by_tier)},
         served_by_sector_priority={sv: dict(served_by_tier)},
         slack_budget_by_sector={sv: slack_budget_mw} if slack_budget_mw > 0 else {},
+        slack_headroom_by_sector=(
+            {sv: slack_headroom_mw} if slack_headroom_mw > 0 else {}
+        ),
     )
     role._leader_summaries.setdefault(sv, {})[leader_aid] = summary  # type: ignore[attr-defined]
 

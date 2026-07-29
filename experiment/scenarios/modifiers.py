@@ -143,7 +143,30 @@ def apply_microgrid_islanding(
                 child.model = GridFormingSource(
                     pressure_pu=1.0,
                     mass_flow_max_kgs=mass_max,
+                    # Hold the replaced ``Source``'s setpoint while NOT leading an
+                    # island. Where the ext grid leads the component
+                    # (``stamp_gf_leadership`` then marks all 38 non-leading), the
+                    # former's Var is otherwise pinned by no equation and priced by
+                    # no objective — the plain energy flow carries none — so the LP
+                    # returns an arbitrary degenerate split and the fleet delivered
+                    # 0.0013 of its 0.0118 kg/s while the slack ran to its budget
+                    # and the shortfall became shed gas. Freedom is restored the
+                    # moment the unit actually becomes an island reference.
+                    nominal_mass_flow_kgs=-mass_max,
                 )
+                # ``GridFormingSource`` bounds its balancing Var symmetrically
+                # (±mass_max) because a generic former must be able to absorb an
+                # island's surplus. A gas well cannot consume gas: the positive
+                # half is a modelling artifact, and nothing in the objective
+                # prices it, so the LP parks the promoted fleet there as free
+                # sinks. Measured on the islanding A/B (simbench_lv, seed
+                # 3600000000): the 38 promoted formers ran a NET DRAW of 0.0102
+                # kg/s — 44 % of the whole 0.0233 kg/s gas slack budget — which
+                # the slack-compliance wind-down then paid for by shedding real
+                # gas load down to tier 2. Surplus is still absorbable by backing
+                # the former's own injection off toward zero, which is what a
+                # source physically does.
+                child.model.mass_flow_kgs.max = 0.0
                 _stamp_pre_promotion(
                     child.model, "kgs", getattr(m, "mass_flow_kgs", 0.0)
                 )

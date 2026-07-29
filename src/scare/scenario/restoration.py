@@ -150,6 +150,44 @@ def _branch_sector_str(branch: Any, monee_net: Any) -> str:
     return sec.value if sec else ""
 
 
+def _mirror_sector_str(branch: Any, monee_net: Any) -> str:
+    """Sector tag for the reachability MIRROR only.
+
+    :func:`_branch_sector_str` reads the from-node alone, and
+    ``sector_from_grid`` returns None for a multi-grid node ("must be resolved
+    by context" — a ``CHPHGControlNode`` carries ``[PowerGrid, GasGrid]``), so
+    every branch leaving one goes untagged and ``mirror_from_monee`` drops it
+    (``if not tag: continue``). Resolving by context here = fall back to the
+    other endpoint.
+
+    Measured on simbench_lv_el_dependent: the 26 ``GenericTransferBranch``
+    stubs carrying each CHP's electrical output into its bus were tagged "",
+    so every CHP control node sat in the GAS component alone — sector-scoped
+    electricity reach from a CHP was 1 node (itself). The 47-CP fleet split
+    into a 21-CP electricity+heat round and a 26-CP gas-ONLY round, and a
+    single-sector CP round has no coupling to optimise, so ``minimize_usage``
+    pinned all 26 CHPs at r=0 under every kernel realisation. With the
+    fallback the CHP reaches 413 nodes across all three sectors and the fleet
+    forms one 47-CP round. Only el_dependent changes: every other grid already
+    has a P2G/P2H *branch* bridging the same pair.
+
+    Deliberately not folded into :func:`_branch_sector_str` — its other callers
+    ask "is this an electricity power line" to hang a line-loading monitor, a
+    reconfiguration cut or a relief actuator on it, and a CHP's transfer stub
+    is none of those.
+    """
+    if branch.model.is_cp():
+        return "cp"
+    for end in (branch.id[0], branch.id[1]):
+        try:
+            sec = sector_from_grid(monee_net.node_by_id(end).grid)
+        except Exception:  # noqa: BLE001
+            continue
+        if sec:
+            return sec.value
+    return ""
+
+
 def _heat_component_by_node(monee_net: Any) -> dict[Any, int]:
     """Build-time connected components of the water/heat network (component
     index per node id). Scopes the heat priority waterfall to peers that share
@@ -680,6 +718,7 @@ def _populate_children(
                     enable_multihop_constraint=config.enable_multihop_constraint,
                     enable_heat_frontier=config.enable_heat_frontier,
                     enable_heat_priority_waterfall=config.enable_heat_priority_waterfall,
+                    heat_sensitivity_seed_k_per_mw=config.heat_sensitivity_seed_k_per_mw,
                     heat_component_id=(
                         heat_component_by_node.get(child.node_id)
                         if sector == Sector.HEAT
@@ -806,7 +845,13 @@ def _populate_nodes(
             if config.enable_cp_heat_outlet_guard:
                 outlet_aid = _heat_outlet_aid_for_node(node, monee_net)
                 if outlet_aid is not None:
-                    roles.append(CPHeatOutletGuard(behavior, outlet_aid=outlet_aid))
+                    roles.append(
+                        CPHeatOutletGuard(
+                            behavior,
+                            outlet_aid=outlet_aid,
+                            plant_tracking=config.enable_cp_heat_guard_plant_tracking,
+                        )
+                    )
 
         _register_agent(
             world, behavior, aid, roles, monee_id=node.id, monee_type="node"
@@ -868,7 +913,11 @@ def _populate_branches(
             "powertoheat" in branch_type or "gastoheat" in branch_type
         ):
             roles.append(
-                CPHeatOutletGuard(behavior, outlet_aid=_node_aid(branch.id[1]))
+                CPHeatOutletGuard(
+                    behavior,
+                    outlet_aid=_node_aid(branch.id[1]),
+                    plant_tracking=config.enable_cp_heat_guard_plant_tracking,
+                )
             )
 
         # Line-loading monitor on electricity power lines;
@@ -982,6 +1031,7 @@ def _make_balance_role(
         max_hops=config.gossip_max_hops,
         enable_qp_gossip=config.enable_qp_gossip,
         enable_l2_generator_ramp=config.enable_l2_generator_ramp,
+        enable_heat_discrete_tier_dispatch=config.enable_heat_discrete_tier_dispatch,
         enable_change_only_dispatch=config.enable_change_only_dispatch,
         enable_l2_priority_floor=config.enable_l2_priority_floor,
         enable_actuated_ledger_writeback=config.enable_actuated_ledger_writeback,
@@ -1143,6 +1193,11 @@ def _attach_cp_priority_admm_role(
             heat_supply_from_deficit=config.enable_heat_cp_supply,
             demand_union=config.enable_cp_demand_union,
             gossip_warm_start=config.enable_cp_gossip_warm_start,
+            slack_headroom=config.enable_cp_slack_headroom,
+            own_supply_netting=config.enable_cp_own_supply_netting,
+            gossip_round_timeout_s=config.cp_gossip_round_timeout_s,
+            gossip_iter_timeout_s=config.cp_gossip_iter_timeout_s,
+            gossip_tier_fair_deadline=config.enable_cp_gossip_tier_fair_deadline,
             watchdog_s=config.holon_watchdog_s,
         )
     )
@@ -1582,9 +1637,14 @@ def _build_topologies(
 
     # Central grid mirror shared by the L2/L3 dynamic roles; only
     # ``set_on_branch_failure`` (below) mutates it.
+    _mirror_tag = (
+        _mirror_sector_str
+        if config.enable_mirror_multigrid_edges
+        else _branch_sector_str
+    )
     mirror = mirror_from_monee(
         monee_net,
-        branch_sector_resolver=lambda b: _branch_sector_str(b, monee_net),
+        branch_sector_resolver=lambda b: _mirror_tag(b, monee_net),
     )
     behavior._scare_topology_mirror = mirror
 

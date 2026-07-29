@@ -1,0 +1,112 @@
+{
+  "$comment": [
+    "Paired A/B for enable_heat_discrete_tier_dispatch: spend each heat tier allocated MW at the CORNERS (serve a chosen subset in full, shed the rest) instead of running every load in the tier at one uniform fraction.",
+    "EVIDENCE: on eval_full_v2_20260728-202054 cold_day_stress (90 tasks/variant) the share of heat loads at a corner (0 or 100%) is oracle 84.1%, component_level 82.8%, single_level 82.8% -- all 0/90 t_k violations -- against SCARE 54.5% with 46/90. The oracle sheds MORE loads outright (19.1% vs 16.5%) yet serves MORE heat (+0.115 paired), and at the 86 junctions where SCARE violates it serves the load at a MEDIAN of 100%.",
+    "MECHANISM: a DHS junction is held above its t_k floor by mass flow THROUGH it. Uniform per-tier modulation thins flow network-wide and drags every junction toward the floor; serving a chosen subset in full keeps full flow, and therefore temperature, on every path still served. Heat is the one sector where proportional fair-sharing is physically self-defeating. The uniform fraction is applied at L2DispatchHandler._dispatch_service_fractions (holon_component: the negotiator applies the fraction to every community member).",
+    "The change redistributes each tier MW without altering the total, so the tier ladder and PWSF accounting are unchanged; one boundary load per tier absorbs the remainder, which is also why the oracle own shape is 84% corners not 100%.",
+    "ARMS: {} is CONTROL (uniform fraction, the shipped default -- left as default so this is inert for concurrently running campaigns); enable_heat_discrete_tier_dispatch=true is TREATMENT. Seeds depend only on (experiment, grid, run_idx) so arms are paired on the same failure draw.",
+    "SUPERSEDES ab_heat_sensitivity_seed, whose hypothesis (frontier-controller gain) was REFUTED: seed 3500 cut frontier-move saturation 99.3%->69.4% and reversals 0.815->0.624 per load but moved compliance 13/24 -> 11/24 fails, McNemar p=0.754.",
+    "JUDGE ON, paired by (grid, scenario, seed): claims__constraint_compliance__passed and by_variable__temperature__n_violations; the CORNER SHARE of per-load heat served fractions (the mechanism check -- must move toward ~84%); heat served fraction and PWSF (must not fall: the oracle gets compliance AND more heat, so a compliance win bought by shedding is a failure)."
+  ],
+  "name": "ab_heat_corner_dispatch",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": true,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 30,
+    "failure_lambda": 1.5,
+    "max_failures": 4
+  },
+  "experiments": [
+    {
+      "name": "cold_day_stress",
+      "grids": [
+        "simbench_lv"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "component_level"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_heat_discrete_tier_dispatch": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5
+        },
+        {
+          "heat_load_scale": 1.5,
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5,
+          "supply_t_k": 343.15
+        },
+        {
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "heat_load_scale": 1.5,
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.5,
+          "supply_t_k": 343.15
+        }
+      ]
+    },
+    {
+      "name": "cold_day_stress_cp_heavy",
+      "grids": [
+        "simbench_lv_cp_heavy"
+      ],
+      "n_seeds": 15,
+      "variants": [
+        "scare",
+        "component_level"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_heat_discrete_tier_dispatch": true
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55
+        },
+        {
+          "heat_load_scale": 1.5,
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55,
+          "supply_t_k": 343.15
+        },
+        {
+          "failure_type": "mixed",
+          "generator_share": 0.5,
+          "heat_load_scale": 1.5,
+          "kind": "cold_day",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.55,
+          "supply_t_k": 343.15
+        }
+      ]
+    }
+  ]
+}

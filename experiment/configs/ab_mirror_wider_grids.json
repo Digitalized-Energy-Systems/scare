@@ -1,0 +1,48 @@
+{
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 2400.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": {
+    "runs_per_grid": 8,
+    "failure_lambda": 0.5,
+    "max_failures": 1
+  },
+  "name": "ab_mirror_wider_grids",
+  "$comment": [
+    "Safety check for the mirror fix on the grids where it changes the graph but NOT the CP component count. Every dropped branch is a CHP GenericTransferBranch stub; the fix adds exactly the CHP count to each grid's ELECTRICITY component (simbench_lv 129->135, cp_heavy 129->138, mvlv 257->274) while the cross-sector component was already one piece.",
+    "The gas_dependent negative control was bit-identical but that grid had ZERO dropped branches, so it did not test this. These three did lose branches and must be checked for behavioural drift: the sector-scoped electricity reach feeds L2 dynamic-holon partitioning and DynamicConnectorRole.",
+    "Judge on: PWSF, served_by_sector, n_active - a benign result is 'no significant change'."
+  ],
+  "experiments": [
+    {
+      "name": "mirror_wider",
+      "grids": [
+        "simbench_lv",
+        "simbench_lv_cp_heavy",
+        "simbench_mvlv"
+      ],
+      "n_seeds": 6,
+      "variants": [
+        "scare"
+      ],
+      "ablations": [
+        {},
+        {
+          "enable_mirror_multigrid_edges": false
+        }
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        }
+      ]
+    }
+  ]
+}

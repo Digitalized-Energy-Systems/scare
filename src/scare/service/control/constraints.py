@@ -68,9 +68,13 @@ class SensitivityEstimator:
     """EMA of |dV/dP| for the sector's primary constraint variable, seeded with a
     sector-typical prior. Behavior/aid for the obs lookups are passed per update."""
 
-    def __init__(self, sector: Sector) -> None:
+    def __init__(self, sector: Sector, seed: float | None = None) -> None:
         self._sector = sector
-        self._value: float = _SENSITIVITY_DEFAULT.get(sector, 1e-3)
+        self._value: float = (
+            float(seed)
+            if seed is not None and seed > 0.0
+            else _SENSITIVITY_DEFAULT.get(sector, 1e-3)
+        )
         self._last_p: float | None = None
         self._last_v: float | None = None
 
@@ -129,6 +133,7 @@ class GridConstraintMonitor(Role):
         enable_multihop_constraint: bool = True,
         enable_heat_frontier: bool = True,
         enable_heat_priority_waterfall: bool = True,
+        heat_sensitivity_seed_k_per_mw: float | None = None,
         heat_component_id: Any = None,
         enable_qv_auction_coordination: bool = False,
         enable_qv_feeder_gate: bool = True,
@@ -188,7 +193,12 @@ class GridConstraintMonitor(Role):
 
         # Local power-flow sensitivity: EMA of |dV/dP| from own (P, V) history,
         # letting the auction bid agents near the violation more aggressively.
-        self._sens = SensitivityEstimator(sector)
+        self._sens = SensitivityEstimator(
+            sector,
+            seed=(
+                heat_sensitivity_seed_k_per_mw if sector is Sector.HEAT else None
+            ),
+        )
 
         poll_s = SECTOR_TIMESCALE.get(sector, {}).get("poll_period_s", 1.0)
         self._propagator = StatePropagator(

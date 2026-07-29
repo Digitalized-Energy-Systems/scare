@@ -38,6 +38,22 @@ _SENSITIVITY_DEFAULT: dict[Sector, float] = {
     Sector.HEAT: 10.0,  # K per MW (samples are dT/dP_MW; ≡ 1e-5 K/W)
 }
 
+# Measured replacement for the HEAT seed, reachable via
+# ``SimulationConfig.heat_sensitivity_seed_k_per_mw``. NOT the default until the
+# A/B lands: flipping it moves every heat load in every run.
+#
+# 10.0 makes ``HeatFrontierController`` structurally bang-bang — ``sensitivity *
+# cap`` is 0.075 K per unit regulation for a 7.5 kW load against ~27 K measured,
+# so on eval_full_v2_20260728-202054 99.4% of all 67 719 frontier moves saturated
+# at ±MAX_STEP and the proportional term never engaged. 3500.0 is the median
+# |dT_k/dP| over that campaign's 53 423 consecutive frontier poll pairs: 3022
+# K/MW under SCARE, 3556 under both baselines (25-75%: 1067-6044 / 1600-6000).
+# Three variants agreeing says this is a property of the DHS, not of the
+# controller. The seed also gates the EMA, whose ``min(sample, 10*value+1)``
+# clamp needs ~6 accepted samples to climb from 10 to 3000 — more than a 30 s
+# run affords.
+_SENSITIVITY_HEAT_MEASURED: float = 3500.0
+
 # Bounds on the auction willingness sensitivity multiplier; a within-tier
 # tiebreaker kept far below the tier step so priority stays lexicographic.
 _SENS_MULT_MIN: float = 0.25

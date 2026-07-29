@@ -8,7 +8,19 @@ This role is the missing high-side controller. Per heat-producing CP it polls
 the outlet junction's ``t_k`` and maintains a regulation CEILING via AIMD:
 multiplicative decrease while the outlet is (nearly) over-temperature,
 slow additive recovery once it has cooled well clear, hysteresis hold in
-between. The ceiling is published to a freshness-stamped behavior store and
+between.
+
+The additive step also tracks the plant: the ceiling may run at most one
+``_RECOVER_STEP`` ahead of the CP's STANDING regulation. The guard only ever
+writes DOWN, so while another writer parks the CP below the ceiling the outlet
+cools for reasons the ceiling did not cause; crediting that cooling to the
+ceiling let it accumulate untested headroom that the next L3 commit then spent
+in a single tick (measured 370 K -> 407 K, then a halving, on a ~6 s period).
+Tracking closes the loop — the CP walks up in ``_RECOVER_STEP`` increments and
+each one's thermal response is observed before the next. The hysteresis band
+cannot substitute: it damps drift across the bound, not a step in the
+manipulated variable that jumps the whole band. The ceiling is published to a
+freshness-stamped behavior store and
 enforced centrally in ``apply_regulate`` for every ``sector="cp"`` write, so
 the kernel's deficit-driven re-commits cannot overwrite the wind-down. The
 guard also self-actuates when the CP's standing regulation exceeds the
@@ -46,8 +58,11 @@ _GUARD_PERIOD_S: float = 1.0
 # tolerates only 1 K past the bound).
 _HI_MARGIN_K: float = 5.0
 
-# Recovery engages only below ``hi - _RECOVER_BAND_K``; the 10 K gap between
-# the two bands is the hysteresis that prevents a shed/restore limit cycle.
+# Recovery engages only below ``hi - _RECOVER_BAND_K``. The 10 K gap between the
+# two bands damps DRIFT across the bound; it does not damp a step in the
+# manipulated variable, which jumps the whole band in one poll (measured 372 K ->
+# 407 K). Plant tracking on the additive step, not this band, is what holds the
+# shed/restore loop closed.
 _RECOVER_BAND_K: float = 15.0
 
 # Multiplicative wind-down per poll while hot. Geometric: clears any born-hot
@@ -78,6 +93,9 @@ class CPHeatOutletGuard(Role):
             CPs (P2H/G2H inject at the to-node), the ``SubHG`` child's node
             for CHP-HG compounds, the CP's own aid for HX control nodes
             (their model carries its own ``t_k``).
+        plant_tracking: bound the additive recovery to one step above the CP's
+            standing regulation (``enable_cp_heat_guard_plant_tracking``).
+            False restores the open-loop ramp.
     """
 
     def __init__(
@@ -85,10 +103,12 @@ class CPHeatOutletGuard(Role):
         behavior: RestorationEnvironmentBehavior,
         *,
         outlet_aid: str,
+        plant_tracking: bool = True,
     ) -> None:
         super().__init__()
         self.behavior = behavior
         self.outlet_aid = str(outlet_aid)
+        self.plant_tracking = bool(plant_tracking)
         _lo, hi = SECTOR_CONSTRAINTS.get(Sector.HEAT, {}).get("t_k", (313.15, 403.15))
         self._hi = float(hi)
         self._ceiling: float = 1.0
@@ -98,6 +118,14 @@ class CPHeatOutletGuard(Role):
 
     def _safe_observe(self, aid: str) -> dict[str, Any] | None:
         return safe_observe(self.behavior, aid, exc=Exception, empty_to_none=True)
+
+    def _standing_regulation(self) -> float | None:
+        """The CP's own current regulation factor, or None when unreadable."""
+        own = self._safe_observe(self.context.aid) or {}
+        try:
+            return float(own.get("regulation"))
+        except (TypeError, ValueError):
+            return None
 
     def _outlet_t_k(self) -> float | None:
         """Outlet junction temperature, or None when unavailable or the junction
@@ -124,12 +152,20 @@ class CPHeatOutletGuard(Role):
             return
 
         prev = self._ceiling
+        reg = self._standing_regulation()
         if t > self._hi - _HI_MARGIN_K:
             ceiling = prev * _DECREASE_FACTOR
             if ceiling < _CEILING_FLOOR:
                 ceiling = 0.0
         elif t < self._hi - _RECOVER_BAND_K:
             ceiling = min(1.0, prev + _RECOVER_STEP)
+            # Only credit the cooling to the ceiling once the plant has actually
+            # reached it; otherwise the release runs open-loop and the next
+            # commit spends every accumulated step at once. See module docstring.
+            if self.plant_tracking and reg is not None:
+                # Never TIGHTENS — a plant parked low degrades recovery to a
+                # hold, it does not become a second wind-down path.
+                ceiling = max(prev, min(ceiling, reg + _RECOVER_STEP))
         else:
             ceiling = prev
 
@@ -157,12 +193,6 @@ class CPHeatOutletGuard(Role):
         # receives a commit (born r=1.0, empty demand sets) has no write to
         # clamp — the guard is its only actuator.
         if ceiling < 1.0:
-            own = self._safe_observe(self.context.aid) or {}
-            reg = own.get("regulation")
-            try:
-                reg = float(reg)
-            except (TypeError, ValueError):
-                reg = None
             if reg is not None and reg > ceiling + _ACTUATE_TOL:
                 apply_regulate(
                     self.behavior,

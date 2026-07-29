@@ -1,0 +1,64 @@
+{
+  "$comment": [
+    "Paired flag A/B for the two L3 base-supply defects found on eval_full_v2_20260728-202054, where SCARE's CP fleet delivered 4-30% of component_level's output on every grid and exactly 0.0000 MW of CP gas on 5 of 10.",
+    "enable_cp_slack_headroom (LEVEL): the input-sector base supply was 'Sum served + the whole slack budget', but served is a flow already drawing on that budget. Task 004610 published served=0.2378 slack=0.2763 against demand=0.4456 - a 47% shed read as a +0.068 MW SURPLUS - and on mvlv the budget alone (71.7) was 1.6x demand (44.4). A zero waterfall marginal plus cp_admm_scale_free's minimize_usage ridge pulls every r to 0: all 46 CPs on gas_dependent were commanded to 0.0000 at t=1.758 while L2 was shedding gas tiers 3 and 4.",
+    "enable_cp_own_supply_netting (DYNAMICS): base_supply for a produced sector is Sum served, which already contains the fleet's own delivery, and the kernel adds it back as Sum r_i*c_i. The round-to-round map is r_{k+1} = R - r_k, gain exactly -1. Fingerprint: lag-1 autocorrelation of the fleet-mean factor negative in 22/25 sampled tasks (median -0.74, four below -0.97) with a near-constant consecutive-pair sum; el_dependent ends 27 CPs at exactly 0.0 and 20 at exactly 1.0.",
+    "Arms are 2x2 so the two can be separated: gas_dependent is where the LEVEL defect fires first (gas is the P2G fleet's OUTPUT sector yet is treated as a CP-input sector), el_dependent is where the heat signal was already correct and the fleet oscillated anyway, so it isolates DYNAMICS.",
+    "Judge on: outcomes__cp_generation n_active/gas_mw/heat_mw (and its SPREAD across seeds - std 7.26 vs component_level's 0.18 is the limit-cycle fingerprint, not noise), served_by_sector gas/heat/electricity fraction, PWSF, claims__constraint_compliance temperature n_violations (SCARE's only violated variable on these grids) and legacy_metrics__avg_t_k__min (327.6 K vs 342.4 K for the baselines = cold DHS from an off P2H fleet)."
+  ],
+  "name": "ab_cp_l3_supply_signal",
+  "out_root": "experiment/_runs/eval",
+  "simulation_duration_s": 30.0,
+  "task_timeout_s": 1800.0,
+  "failure_delay_s_max": 2.0,
+  "write_timeseries": false,
+  "write_trajectories": false,
+  "timestamp_dir": true,
+  "defaults": { "runs_per_grid": 8, "failure_lambda": 0.5, "max_failures": 1 },
+  "experiments": [
+    {
+      "name": "cp_supply_signal",
+      "grids": ["simbench_lv_gas_dependent", "simbench_lv_el_dependent"],
+      "n_seeds": 8,
+      "variants": ["scare"],
+      "ablations": [
+        {
+          "enable_cp_slack_headroom": false,
+          "enable_cp_own_supply_netting": false
+        },
+        {
+          "enable_cp_slack_headroom": true,
+          "enable_cp_own_supply_netting": false
+        },
+        {
+          "enable_cp_slack_headroom": false,
+          "enable_cp_own_supply_netting": true
+        },
+        {}
+      ],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        }
+      ]
+    },
+    {
+      "name": "cp_supply_signal_reference",
+      "grids": ["simbench_lv_gas_dependent", "simbench_lv_el_dependent"],
+      "n_seeds": 8,
+      "variants": ["component_level"],
+      "ablations": [{}],
+      "scenarios": [
+        {
+          "kind": "clean",
+          "max_failures": 3,
+          "priority_assignment": "skewed",
+          "slack_budget_pct": 0.4
+        }
+      ]
+    }
+  ]
+}
