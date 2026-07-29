@@ -351,6 +351,11 @@ class RestorationConfiguration:
     # tier-1 0.09), slack 126%. Formers are free-Var with no MAS dispatch lever so
     # serving gas draws the slack >1x — wind-down is correct enforcement; closing
     # the oracle gap needs former/P2G dispatch, not a slack lever.
+    # CAVEAT: every number above was measured while promotion silently shrank the
+    # gas budget 25% (apply_slack_budget's isinstance scan missed GridForming*,
+    # fixed 2026-07-29). B is now the clean arm's budget, so the ~61%-of-B
+    # settling point and both refutations want re-measuring before they are
+    # quoted; the free-Var/no-dispatch-lever mechanism itself is unaffected.
 
     # Heat-only curtailment-auction lock. When a heat load is curtailed for a
     # live temperature violation, the L2 dispatch must DEFER rather than claw it

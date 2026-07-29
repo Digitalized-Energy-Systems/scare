@@ -19,6 +19,23 @@ from monee.model.extension import (
 
 _SLACK_LP_HEADROOM_FACTOR: float = 10.0
 
+# Pre-promotion injection magnitude stamped on a promoted GridForming* model.
+# ``apply_slack_budget`` sizes the operator budget off the sector's physical
+# throughput, but ``GridForming*`` is NOT a subclass of ``PowerGenerator`` /
+# ``Source``, so its isinstance scan silently drops every promoted unit — the
+# microgrid arm of the islanding A/B came out with a 39 % smaller electricity
+# and 25 % smaller gas budget than its clean twin on an otherwise identical
+# grid. Reading the promoted model's *rating* instead would confound the other
+# way (``grid_former_headroom`` inflates it 4x), so record the magnitude the
+# clean arm would have seen.
+_PRE_PROMOTION_MW_ATTR = "_scare_pre_promotion_mw"
+_PRE_PROMOTION_KGS_ATTR = "_scare_pre_promotion_kgs"
+
+
+def _stamp_pre_promotion(model: "object", unit: str, value: "float | None") -> None:
+    attr = _PRE_PROMOTION_MW_ATTR if unit == "mw" else _PRE_PROMOTION_KGS_ATTR
+    setattr(model, attr, abs(float(value or 0.0)))
+
 
 def apply_microgrid_islanding(
     mes: "object",
@@ -116,6 +133,7 @@ def apply_microgrid_islanding(
                 q_mvar_max=q_max,
                 vm_pu=1.0,
             )
+            _stamp_pre_promotion(child.model, "mw", getattr(m, "p_mw", 0.0))
             counters["electricity"] += 1
         elif isinstance(m, Source):
             # Sources live on both gas and water nodes; route by parent
@@ -126,12 +144,18 @@ def apply_microgrid_islanding(
                     pressure_pu=1.0,
                     mass_flow_max_kgs=mass_max,
                 )
+                _stamp_pre_promotion(
+                    child.model, "kgs", getattr(m, "mass_flow_kgs", 0.0)
+                )
                 counters["gas"] += 1
             elif "water" in grid_name and "water" in carrier_set:
                 child.model = GridFormingSource(
                     pressure_pu=1.0,
                     t_k=356.0,
                     mass_flow_max_kgs=mass_max,
+                )
+                _stamp_pre_promotion(
+                    child.model, "kgs", getattr(m, "mass_flow_kgs", 0.0)
                 )
                 counters["water"] += 1
 
@@ -264,7 +288,12 @@ def apply_slack_budget(
             total_p_mw += abs(getattr(m, "p_mw", 0.0))
         elif isinstance(m, PowerGenerator):
             total_p_gen_mw += abs(getattr(m, "p_mw", 0.0))
-        elif isinstance(m, (Sink, Source)):
+        elif isinstance(m, GridFormingGenerator):
+            # Promoted by apply_microgrid_islanding — same physical unit, new
+            # class. Count the pre-promotion magnitude so the budget matches
+            # the clean arm (see _PRE_PROMOTION_MW_ATTR).
+            total_p_gen_mw += float(getattr(m, _PRE_PROMOTION_MW_ATTR, 0.0))
+        elif isinstance(m, (Sink, Source, GridFormingSource)):
             try:
                 grid_name = str(
                     getattr(mes.node_by_id(child.node_id).grid, "name", "")
@@ -274,6 +303,10 @@ def apply_slack_budget(
             if "gas" in grid_name:
                 if isinstance(m, Sink):
                     total_gas_mass_kgs += abs(getattr(m, "mass_flow_kgs", 0.0))
+                elif isinstance(m, GridFormingSource):
+                    total_gas_source_kgs += float(
+                        getattr(m, _PRE_PROMOTION_KGS_ATTR, 0.0)
+                    )
                 else:
                     total_gas_source_kgs += abs(getattr(m, "mass_flow_kgs", 0.0))
     # Gas-drawing cross-sector converters (CHP) are modeled at node level

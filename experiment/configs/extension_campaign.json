@@ -69,7 +69,8 @@
   "name": "extension_campaign",
   "out_root": "experiment/_runs/eval",
   "simulation_duration_s": 30.0,
-  "task_timeout_s": 5400.0,
+  "$timeout_comment": "task_timeout_s 5400 -> 9000 and slurm 02:00:00 -> 03:00:00, forced by extension_islanding's oracle_time_limit_s=1800 (see that experiment's $oracle_budget_comment). The key forwards to the pre-failure baseline LP, and _compute_baseline runs for EVERY task, not just the oracle — so a scare microgrid task's baseline cap goes 300 s -> 1800 s. 5400 was already too low for that arm on 20260728-143126 (seed 1 timed out at 5716 s, seeds 0/2 ran 4282/4240 s), and +1500 s of baseline would have taken the rest over too. slurm time must stay ABOVE task_timeout_s, else Slurm kills the task before its own timeout can write status.json.",
+  "task_timeout_s": 9000.0,
   "failure_delay_s_max": 2.0,
   "write_timeseries": true,
   "write_trajectories": true,
@@ -97,6 +98,7 @@
       "sweeps": [
         {}
       ],
+      "$oracle_budget_comment": "oracle_time_limit_s=1800 on BOTH rows. Set explicitly for three reasons. (1) The arms were not convergence-matched: kind=microgrid picks up the 900 s _ORACLE_HARD_PRESET automatically while kind=clean fell back to the 300 s default, so the paired A/B compared a 300 s oracle against a 900 s one — on 20260728-143126 that left the clean arm 3/5 time-limited at gaps up to 0.076 while certification read 50% overall. (2) Once the slack-budget promotion bug was fixed (apply_slack_budget was blind to GridForming*, costing the microgrid arm 39% of its electricity budget), the MILP got materially harder: seed 2 went from OPTIMAL in 14 s to TIME_LIMIT at 900 s with a 0.38% gap. (3) The key also forwards to the pre-failure baseline LP (see runner._baseline_served), which otherwise keeps its own 300 s default — so it additionally closes the ratio asymmetry of dividing a 900 s post state by a 300 s baseline. The budget is spent TWICE per oracle task (baseline + post-failure), so worst case is 2*1800 + overhead ~= 3700 s; task_timeout_s and the slurm walltime were raised to cover that AND the scare arm's longer baseline (see the top-level $timeout_comment). Raising this key further means raising both of those again.",
       "scenarios": [
         {
           "kind": "clean",
@@ -104,7 +106,8 @@
           "failure_type": "island",
           "n_failures": 5,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.45,
+          "oracle_time_limit_s": 1800.0
         },
         {
           "kind": "microgrid",
@@ -117,7 +120,8 @@
           ],
           "promote_all_generators": true,
           "priority_assignment": "skewed",
-          "slack_budget_pct": 0.45
+          "slack_budget_pct": 0.45,
+          "oracle_time_limit_s": 1800.0
         }
       ]
     },
@@ -182,7 +186,7 @@
   ],
   "slurm": {
     "partition": "rosa_express.p",
-    "time": "02:00:00",
+    "time": "03:00:00",
     "mem": "16G",
     "cpus": 1,
     "max_concurrent": 64,

@@ -64,6 +64,7 @@ from experiment.scenarios import (
     apply_pv_peak,
     apply_slack_budget,
 )
+from scare.base.util import islanding_config_of
 
 logger = logging.getLogger(__name__)
 
@@ -1344,7 +1345,7 @@ def compose_oracle_result(
     extension_outcomes: dict[str, Any] = {}
     if "temporal" in out:
         extension_outcomes["oracle_temporal"] = out["temporal"]
-    if getattr(monee_net, "islanding_config", None) is not None:
+    if islanding_config_of(monee_net) is not None:
         # Count both static pruning (.ignored) and MILP e=0 decisions — the
         # latter never sets .ignored (see metrics._is_deenergised).
         extension_outcomes["oracle_islanding"] = {

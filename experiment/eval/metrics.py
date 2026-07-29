@@ -40,6 +40,7 @@ from scare.base.model import (
 from scare.base.util import (
     constraint_allowed_fraction,
     constraint_utilization,
+    islanding_config_of,
     obs_capacity,
     obs_priority,
     obs_setpoint,
@@ -77,9 +78,7 @@ def _disconnected_node_ids(monee_net: Any) -> set[int]:
     without it would zero exactly the load the islanding extension restores.
     """
     try:
-        return set(
-            find_ignored_nodes(monee_net, getattr(monee_net, "islanding_config", None))
-        )
+        return set(find_ignored_nodes(monee_net, islanding_config_of(monee_net)))
     except Exception:
         return set()
 

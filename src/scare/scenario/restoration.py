@@ -73,6 +73,7 @@ from scare.base.topology.community import (
 from scare.base.topology.topology_mirror import mirror_from_monee
 from scare.base.util import (
     first_role,
+    islanding_config_of,
     kgps_to_mw,
     lookup_slack,
     lookup_slack_pressure,
@@ -2533,7 +2534,7 @@ def _register_recordings(
         record_world(world, "ltc_junction_t_mean_k", _junction_t_mean_k)
         record_world(world, "ltc_junction_t_min_k", _junction_t_min_k)
 
-    if getattr(monee_net, "islanding_config", None) is not None:
+    if islanding_config_of(monee_net) is not None:
 
         def _node_deenergised(n: Any) -> bool:
             # Two channels: static pre-solve pruning (.ignored) AND the

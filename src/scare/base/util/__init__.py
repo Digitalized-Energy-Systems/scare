@@ -55,6 +55,7 @@ from scare.base.util.blackboard import (
     has_line_curtail_lock,
     heat_last_sink_floor,
     is_grid_former_child,
+    islanding_config_of,
     l2_effective_floor,
     last_actuated_factor,
     line_congestion_ceiling,

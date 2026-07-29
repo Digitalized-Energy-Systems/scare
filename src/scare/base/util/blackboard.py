@@ -10,7 +10,11 @@ from __future__ import annotations
 from typing import Any
 
 from monee.model.child import ExtHydrGrid, ExtPowerGrid, Sink
-from monee.model.extension import GridFormingGenerator, GridFormingSource
+from monee.model.extension import (
+    GridFormingGenerator,
+    GridFormingSource,
+    NetworkIslandingConfig,
+)
 
 from scare.base.addressing import is_child_aid
 from scare.base.config import cfg_value
@@ -570,6 +574,31 @@ def is_grid_former_child(behavior: Any, aid: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return isinstance(child.model, (GridFormingGenerator, GridFormingSource))
+
+
+def islanding_config_of(monee_net: Any) -> Any:
+    """The net's ``NetworkIslandingConfig``, or None.
+
+    ``enable_islanding`` attaches the config twice — as ``net.islanding_config``
+    and as an extension — but a net handed back by a solver is a
+    ``Network.copy()``, and older monee revisions dropped the attribute in
+    ``__deepcopy__`` while keeping the extension. Resolving from the extension
+    list (what monee's own ``prepare_solve_network`` does) keeps grading and
+    reporting in agreement with the solve whichever net a caller holds; reading
+    the attribute alone made the oracle grade an islanded net as un-islanded and
+    zero exactly the load the extension had restored.
+    """
+    cfg = getattr(monee_net, "islanding_config", None)
+    if cfg is not None:
+        return cfg
+    return next(
+        (
+            e
+            for e in getattr(monee_net, "extensions", ()) or ()
+            if isinstance(e, NetworkIslandingConfig)
+        ),
+        None,
+    )
 
 
 def _is_heat_side_mass_flow_sink(behavior: Any, aid: str) -> bool:
