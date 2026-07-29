@@ -499,14 +499,30 @@ class RestorationConfiguration:
     # both baselines sit at 82.8-84.1% corner allocations with 0/90 temperature
     # violations; SCARE sits at 54.5% with 46/90. Same MW per tier — this only
     # redistributes it — so the tier ladder and PWSF accounting are unchanged.
-    # Opt-in until A/B-validated: it moves every heat load in every run.
+    # VALIDATED-NEGATIVE 2026-07-29 (ab_heat_corner_pinned, 16 paired seeds,
+    # cold_day on simbench_lv + _cp_heavy, run from a frozen source snapshot).
+    # The shape moves as designed -- corner share +10.0 pp (paired, p=4.3e-4) --
+    # but heat served falls -0.0115 (p=7.1e-3) and compliance does not move
+    # (7/16 -> 5/16 fails, 3 fixed / 1 broken, McNemar p=0.625). The motivating
+    # statistic was misread: the oracle's 84.1% corner share comes from
+    # optimising against a hard t_k bound, but component_level's and
+    # single_level's 82.8% comes from INACTION (only 43 of 105 heat loads are
+    # ever regulated; the rest sit untouched at 1.0). Forcing the shape
+    # reproduces neither cause. Keep OFF.
     enable_heat_discrete_tier_dispatch: bool = False
 
     # Seed for the heat |dT_k/dP| estimator (K per MW) that HeatFrontierController
     # sizes its step with. None = ``_SENSITIVITY_DEFAULT[HEAT]`` (10.0), which is
     # ~350x below the measured gain and leaves the controller bang-bang; set
     # ``_SENSITIVITY_HEAT_MEASURED`` (3500.0) to engage the proportional term.
-    # Opt-in until A/B-validated: it moves every heat load in every run.
+    # VALIDATED-NEGATIVE for compliance 2026-07-29 (ab_heat_sensitivity_seed,
+    # 24 paired seeds): 3500.0 cuts frontier-move saturation 99.3% -> 69.4% and
+    # direction reversals 0.815 -> 0.624 per load, so the limit cycle is real
+    # and this damps it -- but constraint compliance does not follow (13/24 ->
+    # 11/24 fails, McNemar p=0.754). The only significant effect is heat served
+    # +0.013 (p=1.8e-5), on ONE scenario family with 10 of 24 pairs confounded
+    # by a concurrent source edit. Not a compliance lever; do not enable on that
+    # basis. Re-test on its own merits if the heat gain is wanted.
     heat_sensitivity_seed_k_per_mw: float | None = None
 
     # Priority waterfall for the heat frontier controller. True: a cold heat

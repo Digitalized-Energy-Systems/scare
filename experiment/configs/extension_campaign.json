@@ -186,7 +186,7 @@
   ],
   "slurm": {
     "partition": "rosa_express.p",
-    "time": "03:00:00",
+    "time": "02:00:00",
     "mem": "16G",
     "cpus": 2,
     "max_concurrent": 64,
