@@ -1271,7 +1271,10 @@ class L2DispatchHandler:
             cap = obs_capacity(obs, behavior=self._role.behavior, aid=aid)
             if cap <= 0:
                 continue
-            if obs_sector(obs, behavior=self._role.behavior, aid=aid) is not Sector.HEAT:
+            if (
+                obs_sector(obs, behavior=self._role.behavior, aid=aid)
+                is not Sector.HEAT
+            ):
                 continue
             prio = obs_priority(obs, behavior=self._role.behavior, aid=aid)
             by_tier.setdefault(int(prio), []).append((float(cap), str(aid)))

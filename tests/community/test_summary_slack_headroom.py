@@ -127,6 +127,8 @@ def test_headroom_never_exceeds_the_budget_it_is_derived_from(
         asyncio.run(pub._publish(force=True))
         s = pub._role.context.sent[-1]
         sec = Sector.ELECTRICITY.value
-        assert 0.0 <= s.slack_headroom_by_sector.get(
-            sec, 0.0
-        ) <= s.slack_budget_by_sector.get(sec, 0.0)
+        assert (
+            0.0
+            <= s.slack_headroom_by_sector.get(sec, 0.0)
+            <= s.slack_budget_by_sector.get(sec, 0.0)
+        )

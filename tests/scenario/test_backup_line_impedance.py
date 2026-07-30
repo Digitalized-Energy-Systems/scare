@@ -18,7 +18,6 @@ spanning the whole network minus the slack bus.
 from statistics import median
 
 import pytest
-
 from monee.model.node import Bus
 
 from experiment.scenarios import GRIDS
@@ -31,7 +30,8 @@ _MIN_DT_H = 1e-9
 
 def _el_branches(net):
     return [
-        b for b in net.branches
+        b
+        for b in net.branches
         if isinstance(net.node_by_id(b.from_node_id).model, Bus)
         and isinstance(net.node_by_id(b.to_node_id).model, Bus)
     ]
@@ -126,7 +126,8 @@ def test_gas_and_heat_ties_keep_their_native_median():
     net = GRIDS[GRID]()
     for sector in ("gas", "water"):
         ids = {
-            n.id for n in net.nodes
+            n.id
+            for n in net.nodes
             if sector in str(getattr(n.grid, "name", "") or "").lower()
         }
         pipes = [b for b in net.branches if b.id[0] in ids and b.id[1] in ids]

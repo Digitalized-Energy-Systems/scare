@@ -236,9 +236,7 @@ class ReactivePowerDroopRole(Role):
         self._q_target = q_cmd
         # A sign flip counts as attack too: the support direction reversed, so
         # it is fresh demand rather than a release of the old one.
-        rising = (
-            abs(q_cmd) > abs(self._q_filt) or q_cmd * self._q_filt < 0.0
-        )
+        rising = abs(q_cmd) > abs(self._q_filt) or q_cmd * self._q_filt < 0.0
         tau = (
             self.attack_tau_s
             if rising and self.attack_tau_s is not None

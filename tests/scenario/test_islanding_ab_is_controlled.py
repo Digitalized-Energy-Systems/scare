@@ -99,10 +99,10 @@ def test_a_promoted_gas_former_cannot_absorb_gas():
     net = GRIDS["simbench_lv"]()
     apply_microgrid_islanding(net, carriers=_CARRIERS, promote_all_generators=True)
 
-    formers = [
-        c for c in net.childs if type(c.model).__name__ == "GridFormingSource"
+    formers = [c for c in net.childs if type(c.model).__name__ == "GridFormingSource"]
+    gas = [
+        c for c in formers if "gas" in str(net.node_by_id(c.node_id).grid.name).lower()
     ]
-    gas = [c for c in formers if "gas" in str(net.node_by_id(c.node_id).grid.name).lower()]
     assert gas, "nothing promoted on the gas grid — test is vacuous"
     for child in gas:
         var = child.model.mass_flow_kgs

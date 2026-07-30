@@ -42,11 +42,13 @@ from scare.scenario.restoration import (
     start_restoration_simulation,
 )
 
+
 async def main():
     net = fetch_example_net()
     world = create_restoration_scenario_world(net)
     failures = [Failure(delay_s=2.0, branch_ids=[(3, 4)])]
     await start_restoration_simulation(world, failures, simulation_duration_s=30.0)
+
 
 asyncio.run(main())
 ```

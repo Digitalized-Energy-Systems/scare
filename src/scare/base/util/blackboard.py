@@ -715,9 +715,7 @@ def apply_regulate(
             _step = float(cfg_value(_cfg, "cp_regulate_slew_step"))
             _prev = _last_regulate_store(behavior).get(str(aid))
             if _prev is not None and _step > 0.0:
-                _slewed = min(
-                    float(_prev) + _step, max(float(_prev) - _step, factor)
-                )
+                _slewed = min(float(_prev) + _step, max(float(_prev) - _step, factor))
                 if abs(_slewed - factor) > tolerance:
                     record_event(
                         t=float(timestamp),

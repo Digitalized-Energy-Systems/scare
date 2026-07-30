@@ -195,9 +195,7 @@ class GridConstraintMonitor(Role):
         # letting the auction bid agents near the violation more aggressively.
         self._sens = SensitivityEstimator(
             sector,
-            seed=(
-                heat_sensitivity_seed_k_per_mw if sector is Sector.HEAT else None
-            ),
+            seed=(heat_sensitivity_seed_k_per_mw if sector is Sector.HEAT else None),
         )
 
         poll_s = SECTOR_TIMESCALE.get(sector, {}).get("poll_period_s", 1.0)

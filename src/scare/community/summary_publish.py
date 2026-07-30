@@ -107,9 +107,7 @@ class SummaryPublisher:
                     # obs_setpoint on a slack is its LP-chosen operating point,
                     # i.e. how much of ``budget`` is already flowing and hence
                     # already counted in some community's ``per_tier_served``.
-                    used = abs(
-                        obs_setpoint(obs, behavior=self._role.behavior, aid=aid)
-                    )
+                    used = abs(obs_setpoint(obs, behavior=self._role.behavior, aid=aid))
                     slack_headroom_total += max(0.0, budget - used)
                 else:
                     supply_total += abs(cap)
@@ -142,7 +140,10 @@ class SummaryPublisher:
                 slack_headroom_total,
                 {t: round(v, 8) for t, v in sorted(per_tier_demand.items())},
                 {t: round(v, 8) for t, v in sorted(per_tier_served.items())},
-                {t: round(v, 8) for t, v in sorted(self._last_published_served.items())},
+                {
+                    t: round(v, 8)
+                    for t, v in sorted(self._last_published_served.items())
+                },
                 self._role.inversion_tol,
             )
         if gated:

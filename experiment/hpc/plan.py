@@ -132,9 +132,7 @@ def _validate_config_overrides(cfg: CampaignConfig) -> None:
                     continue
                 if d.get(_ALLOW_DEFAULT_VALUED_ARM):
                     continue
-                restated = {
-                    k: v for k, v in overrides.items() if spec[k].default == v
-                }
+                restated = {k: v for k, v in overrides.items() if spec[k].default == v}
                 if len(restated) == len(overrides):
                     raise ValueError(
                         f"experiment {exp.name!r}: ablation arm restates the "

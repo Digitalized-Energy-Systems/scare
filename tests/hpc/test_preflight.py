@@ -18,8 +18,12 @@ from experiment.hpc.preflight import (
 
 def _task(task_id, grid, scenario, variant="scare"):
     return TaskSpec(
-        task_id=task_id, grid=grid, seed=task_id, n_failures=1,
-        variant=variant, scenario=scenario,
+        task_id=task_id,
+        grid=grid,
+        seed=task_id,
+        n_failures=1,
+        variant=variant,
+        scenario=scenario,
     )
 
 
@@ -50,7 +54,10 @@ def test_seeds_do_not_multiply_the_work():
 @pytest.mark.parametrize(
     "member,expected",
     [
-        ("branch_12_42_0__current_pu_squared [LB]", "branch_*__current_pu_squared [LB]"),
+        (
+            "branch_12_42_0__current_pu_squared [LB]",
+            "branch_*__current_pu_squared [LB]",
+        ),
         ("node_47__el_mw [UB]", "node_*__el_mw [UB]"),
         ("child_118__p_mw [LB]", "child_*__p_mw [LB]"),
         ("node_388_eq_35", "node_*_eq_35"),
@@ -64,7 +71,10 @@ def test_signature_normalisation_collapses_ids(member, expected):
 def test_iis_capture_reads_the_monee_block():
     capture = _IISCapture()
     record = logging.LogRecord(
-        "monee.solver.gurobipy", logging.ERROR, __file__, 0,
+        "monee.solver.gurobipy",
+        logging.ERROR,
+        __file__,
+        0,
         "Gurobi solve infeasible (status=3).  Diagnostic report:\n"
         "Irreducible Inconsistent Subsystem (Gurobi IIS):\n"
         "  Variable bounds in IIS (1):\n"
@@ -72,10 +82,15 @@ def test_iis_capture_reads_the_monee_block():
         "  Constraints in IIS (2):\n"
         "    node_2_eq_0\n"
         "    branch_1_5_0_eq_4\n",
-        None, None,
+        None,
+        None,
     )
     capture.emit(record)
-    assert capture.members == ["node_47__el_mw [UB]", "node_2_eq_0", "branch_1_5_0_eq_4"]
+    assert capture.members == [
+        "node_47__el_mw [UB]",
+        "node_2_eq_0",
+        "branch_1_5_0_eq_4",
+    ]
 
 
 def test_clean_preflight_returns_results(monkeypatch):
@@ -89,7 +104,9 @@ def test_clean_preflight_returns_results(monkeypatch):
 def test_infeasible_pair_aborts_submission(monkeypatch):
     bad = [
         PreflightResult("g1", {"kind": "clean"}, True),
-        PreflightResult("simbench_lv_small", {"kind": "pv_peak"}, False, "IIS: node_*__el_mw [UB]"),
+        PreflightResult(
+            "simbench_lv_small", {"kind": "pv_peak"}, False, "IIS: node_*__el_mw [UB]"
+        ),
     ]
     monkeypatch.setattr(
         "experiment.hpc.preflight.preflight_scenarios", lambda *a, **k: bad
@@ -126,10 +143,12 @@ def test_failure_is_reported_per_pair(monkeypatch):
 
 
 def test_tight_pair_solves_but_is_flagged():
-    loaded = PreflightResult("simbench_lv_small", {"kind": "pv_peak"}, True,
-                             max_loading_pct=300.0)
-    roomy = PreflightResult("simbench_lv", {"kind": "clean"}, True,
-                            max_loading_pct=81.0)
+    loaded = PreflightResult(
+        "simbench_lv_small", {"kind": "pv_peak"}, True, max_loading_pct=300.0
+    )
+    roomy = PreflightResult(
+        "simbench_lv", {"kind": "clean"}, True, max_loading_pct=81.0
+    )
     assert loaded.tight and not roomy.tight
     assert "300.0%" in loaded.margin_detail
 
@@ -141,8 +160,12 @@ def test_missing_loading_is_not_treated_as_tight():
 
 def test_kill_switch_is_reported_in_margin_detail():
     res = PreflightResult(
-        "simbench_lv_small", {"kind": "clean"}, True,
-        max_loading_pct=90.0, kill_switches=[[37, 36, 0]], n_contingencies_scanned=47,
+        "simbench_lv_small",
+        {"kind": "clean"},
+        True,
+        max_loading_pct=90.0,
+        kill_switches=[[37, 36, 0]],
+        n_contingencies_scanned=47,
     )
     assert res.tight is False  # loading alone is fine ...
     assert "1/47 single-branch contingencies infeasible" in res.margin_detail
@@ -151,9 +174,14 @@ def test_kill_switch_is_reported_in_margin_detail():
 
 def test_tight_and_kill_switches_warn_but_do_not_abort(monkeypatch, caplog):
     risky = [
-        PreflightResult("simbench_lv_small", {"kind": "pv_peak"}, True,
-                        max_loading_pct=300.0, kill_switches=[[37, 36, 0]],
-                        n_contingencies_scanned=47),
+        PreflightResult(
+            "simbench_lv_small",
+            {"kind": "pv_peak"},
+            True,
+            max_loading_pct=300.0,
+            kill_switches=[[37, 36, 0]],
+            n_contingencies_scanned=47,
+        ),
     ]
     monkeypatch.setattr(
         "experiment.hpc.preflight.preflight_scenarios", lambda *a, **k: risky
@@ -196,8 +224,11 @@ def test_contingency_scan_respects_the_limit(monkeypatch):
             self.id, self.active = bid, True
 
     monkeypatch.setattr(
-        pf, "_build_net",
-        lambda task: SimpleNamespace(branches=[_Branch((i, i + 1, 0)) for i in range(9)]),
+        pf,
+        "_build_net",
+        lambda task: SimpleNamespace(
+            branches=[_Branch((i, i + 1, 0)) for i in range(9)]
+        ),
     )
     monkeypatch.setattr(pf, "_solve_step0", lambda net, _l: (False, "", []))
 

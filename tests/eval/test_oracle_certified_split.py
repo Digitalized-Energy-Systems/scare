@@ -70,7 +70,9 @@ def test_certified_columns_exclude_time_limited_oracle_wins():
     )
     out = "\n".join(_paired_vs_oracle_section(df))
     assert "n_certified" in out and "variant>oracle (certified)" in out
-    body = [ln for ln in out.splitlines() if ln.startswith("| S") or "scare" in ln.lower()]
+    body = [
+        ln for ln in out.splitlines() if ln.startswith("| S") or "scare" in ln.lower()
+    ]
     line = next(ln for ln in body if "|" in ln and "grid" not in ln)
     # 2 of 3 pairs won overall; only 1 of the 2 certified pairs won.
     assert "2/3" in line, line

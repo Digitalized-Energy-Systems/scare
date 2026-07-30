@@ -33,8 +33,11 @@ def test_transformer_detected_by_voltage_level():
 
 def test_uprate_scales_only_transformers():
     stock = GRIDS["simbench_lv_small"]()
-    ratings = {tuple(b.id): float(b.model.max_i_ka) for b in stock.branches
-               if hasattr(b.model, "max_i_ka")}
+    ratings = {
+        tuple(b.id): float(b.model.max_i_ka)
+        for b in stock.branches
+        if hasattr(b.model, "max_i_ka")
+    }
 
     net = GRIDS["simbench_lv_small"]()
     apply_pv_peak(net, trafo_ampacity_scale=2.0)
@@ -47,8 +50,11 @@ def test_uprate_scales_only_transformers():
 
 def test_scale_one_is_a_no_op_on_ratings():
     stock = GRIDS["simbench_lv_small"]()
-    ratings = {tuple(b.id): float(b.model.max_i_ka) for b in stock.branches
-               if hasattr(b.model, "max_i_ka")}
+    ratings = {
+        tuple(b.id): float(b.model.max_i_ka)
+        for b in stock.branches
+        if hasattr(b.model, "max_i_ka")
+    }
     net = GRIDS["simbench_lv_small"]()
     apply_pv_peak(net, trafo_ampacity_scale=1.0)
     for b in net.branches:

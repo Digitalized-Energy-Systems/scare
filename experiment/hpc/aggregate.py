@@ -304,6 +304,7 @@ def _as_bool(value: object) -> bool:
     except (TypeError, ValueError):
         return False
 
+
 # Short labels for the justification table; fall back to the last two
 # ``__``-segments for anything not listed.
 _METRIC_ALIAS = {
@@ -1059,9 +1060,7 @@ def _format_eval_sections(
         # variant's rate reads as "equally correct" when the oracle is not in
         # the comparison at all — so count the rows that actually had a diary.
         diary_counters = [
-            c
-            for c in df.columns
-            if c.startswith("diary__") and c != inv_col
+            c for c in df.columns if c.startswith("diary__") and c != inv_col
         ]
         rows = []
         for variant, g in df.groupby("variant"):

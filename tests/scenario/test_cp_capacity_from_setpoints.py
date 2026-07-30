@@ -71,7 +71,9 @@ def test_zero_setpoint_yields_no_capacity():
     )
 
 
-@pytest.mark.parametrize("grid", ["simbench_lv_gas_dependent", "simbench_lv_el_dependent"])
+@pytest.mark.parametrize(
+    "grid", ["simbench_lv_gas_dependent", "simbench_lv_el_dependent"]
+)
 def test_fleet_capacity_reconciles_with_deliverable_output(grid):
     """End-to-end on the real grids: summed signed PRODUCTION capacity must
     match what the fleet can actually deliver at regulation 1."""
@@ -86,13 +88,22 @@ def test_fleet_capacity_reconciles_with_deliverable_output(grid):
     for branch in net.branches:
         bt = _model_type_name(branch).lower()
         ct = next(
-            (c for k, c in (("powertogas", "p2g"), ("gastopower", "g2p"),
-                            ("powertoheat", "p2h")) if k in bt),
+            (
+                c
+                for k, c in (
+                    ("powertogas", "p2g"),
+                    ("gastopower", "g2p"),
+                    ("powertoheat", "p2h"),
+                )
+                if k in bt
+            ),
             None,
         )
         if ct is None:
             continue
-        for k, v in _cp_signed_capacity_by_sector(ct, dict(branch.model.values)).items():
+        for k, v in _cp_signed_capacity_by_sector(
+            ct, dict(branch.model.values)
+        ).items():
             agg[k] = agg.get(k, 0.0) + v
     for node in net.nodes:
         ct = _detect_cp_type_for_node(node, net)

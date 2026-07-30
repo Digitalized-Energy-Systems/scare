@@ -413,14 +413,14 @@ def _adapter_observe(monee_net: Any) -> Any:
     child_by_aid = {f"child-{c.id}": c for c in monee_net.childs}
 
     class _OracleBehavior:
-    # NOTE (grading asymmetry, documented 2026-07-20): this obs carries CHILD
-    # model values only — node-level constraint vars (vm_pu, loading_percent,
-    # pressure_pu, t_k) are absent, so metrics' constraint_allowed_fraction
-    # reads 1.0 for every oracle row and the throttle-exclusion / tier1_immune
-    # grading is a no-op on the oracle arm. Merging node values here (mirror
-    # multi_energy_monee._install_child.observer) would fix it but also
-    # activates temp_infeasible on oracle rows — a substantive oracle-grading
-    # change needing its own A/B before adoption.
+        # NOTE (grading asymmetry, documented 2026-07-20): this obs carries CHILD
+        # model values only — node-level constraint vars (vm_pu, loading_percent,
+        # pressure_pu, t_k) are absent, so metrics' constraint_allowed_fraction
+        # reads 1.0 for every oracle row and the throttle-exclusion / tier1_immune
+        # grading is a no-op on the oracle arm. Merging node values here (mirror
+        # multi_energy_monee._install_child.observer) would fix it but also
+        # activates temp_infeasible on oracle rows — a substantive oracle-grading
+        # change needing its own A/B before adoption.
 
         def observe(self, aid: str) -> dict | None:
             child = child_by_aid.get(aid)
@@ -1097,9 +1097,7 @@ def compute_baseline_served(
                 carriers=carriers,
                 promote_all_generators=promote_all,
                 grid_former_aids=former_aids,
-                grid_former_headroom=float(
-                    scenario.get("grid_former_headroom", 4.0)
-                ),
+                grid_former_headroom=float(scenario.get("grid_former_headroom", 4.0)),
             )
         slack_budget_pct = scenario.get("slack_budget_pct")
         if slack_budget_pct is not None:

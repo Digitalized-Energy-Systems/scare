@@ -97,9 +97,7 @@ class PreflightResult:
     @property
     def label(self) -> str:
         kind = (self.scenario or {}).get("kind", "clean")
-        extras = {
-            k: v for k, v in (self.scenario or {}).items() if k not in ("kind",)
-        }
+        extras = {k: v for k, v in (self.scenario or {}).items() if k not in ("kind",)}
         return f"{self.grid} / kind={kind} {extras or ''}".rstrip()
 
     @property

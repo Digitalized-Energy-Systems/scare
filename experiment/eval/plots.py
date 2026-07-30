@@ -874,6 +874,7 @@ def _compliance_category(df: pd.DataFrame) -> pd.Series:
     dropped them, and the two halves of the same figure would disagree about
     what compliant means.
     """
+
     def flag(col: str) -> pd.Series:
         # Absent on campaigns recorded before the claim existed; treat as
         # passing so the panel degrades to what it can see instead of raising
@@ -1348,9 +1349,7 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
             hovertemplate="grid: %{x}<br>gap (single run pair): %{y:.4f}<extra></extra>",
         )
     fig.add_hline(y=0, line=dict(color="#BBBBBB", dash="dash", width=1))
-    fig.update_yaxes(
-        title="relative gap to oracle", tickformat=".2f", zeroline=False
-    )
+    fig.update_yaxes(title="relative gap to oracle", tickformat=".2f", zeroline=False)
     fig.update_xaxes(title="grid")
     fig.update_layout(showlegend=False, boxgap=0.45, boxgroupgap=0.2)
     return _save(
@@ -2962,9 +2961,7 @@ def cp_influence_bar(
     df: pd.DataFrame,
     out_path: Path,
     *,
-    title: str = (
-        "Coupling-point optimization — activity and restored load, by grid"
-    ),
+    title: str = ("Coupling-point optimization — activity and restored load, by grid"),
     subtitle: str | None = None,
 ) -> Path:
     """Two panels, shared grid axis, over whatever population the caller passes.
