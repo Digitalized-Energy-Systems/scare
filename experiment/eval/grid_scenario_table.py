@@ -40,13 +40,13 @@ logger = logging.getLogger(__name__)
 # the next free ``S<n>`` in first-appearance order.
 _GRID_ID: dict[str, str] = {
     "simbench_lv": "S1",
-    "simbench_lv_cp_heavy_dependent": "S2",
-    "simbench_lv_cp_heavy": "S3",
-    "simbench_lv_reconfig": "S4",
-    "simbench_lv_small": "S5",
-    "simbench_lv_medium": "S6",
-    "simbench_lv_cp_dependent": "S7",
-    "simbench_mvlv": "S8",
+    "simbench_lv_small": "S2",
+    "simbench_lv_medium": "S3",
+    "simbench_mvlv": "S4",
+    "simbench_lv_cp_dependent": "S5",
+    "simbench_lv_cp_heavy_dependent": "S6",
+    "simbench_lv_cp_heavy": "S7",
+    "simbench_lv_reconfig": "S8",
     "simbench_lv_gas_dependent": "S9",
     "simbench_lv_el_dependent": "S10",
 }

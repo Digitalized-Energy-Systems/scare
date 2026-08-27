@@ -656,6 +656,7 @@ from experiment.eval.aliases import (  # noqa: E402
     alias_ablation,
     alias_grid,
     alias_variant,
+    sort_grids,
 )
 
 
@@ -687,7 +688,7 @@ def variant_comparison_bar(
     grouped_c = compliant.groupby(["grid", "variant"])[metric_col].apply(list)
     # Full counts so the hover can report ``n_compliant/n_total``.
     grouped_full = df.groupby(["grid", "variant"])[metric_col].apply(list)
-    grids = sorted({k[0] for k in grouped_full.index})
+    grids = sort_grids({k[0] for k in grouped_full.index})
     variants = sorted({k[1] for k in grouped_full.index})
     grids_lbl = _grids_display(grids)
 
@@ -740,7 +741,7 @@ def variant_comparison_bar(
     fig.update_xaxes(
         range=[0, 1.05], title="priority-weighted served fraction", tickformat=".2f"
     )
-    fig.update_yaxes(title="grid")
+    fig.update_yaxes(title="grid", autorange="reversed")
     if height is None:
         height = _hbar_height(len(grids), len(variants))
     return _save(
@@ -1028,20 +1029,24 @@ def variant_pwsf_compliance_bar(
             )
 
     fig.update_layout(barmode="relative", bargap=0.28, bargroupgap=0.06)
+    fig.update_yaxes(autorange="reversed")
     fig.update_xaxes(range=[0, 1.05], title="PWSF", tickformat=".2f", row=1, col=1)
     fig.update_xaxes(
         range=[0, 1.001], title="share of runs", tickformat=".0%", row=1, col=2
     )
     fig.update_yaxes(title=group_label, row=1, col=1)
 
-    base_h = _hbar_height(len(labels), len(variants))
-    height = base_h + 90  # top room for title + one shared legend row
-    width = 1400  # wide enough for both legends side by side on one row
-    themed = _apply_theme(fig, title=title, height=height, width=width, font_bump=2)
     lf = _LEGEND_FONT_SIZE
-    # Two legends on the SAME horizontal row: variants left-anchored, compliance
-    # categories right-anchored, no legend titles.
+    legend_row = lf + 18
+    base_h = _hbar_height(len(labels), len(variants))
+    height = base_h + 90 + legend_row  # title + two stacked legend rows
+    width = 1400
+    themed = _apply_theme(fig, title=title, height=height, width=width, font_bump=2)
+    # Two legends on separate rows (variants above, compliance categories
+    # below) — packing both into one row overlaps once the campaign carries
+    # more than a few compliance categories.
     legend_y = 1.0 - 62 / height
+    legend2_y = legend_y - legend_row / height
     themed.update_layout(
         title=dict(
             text=title,
@@ -1068,13 +1073,13 @@ def variant_pwsf_compliance_bar(
             orientation="h",
             yref="container",
             xref="container",
-            y=legend_y,
-            x=0.99,
-            xanchor="right",
+            y=legend2_y,
+            x=0.01,
+            xanchor="left",
             yanchor="top",
             font=dict(size=lf),
         ),
-        margin=dict(l=90, r=40, t=130, b=80),
+        margin=dict(l=90, r=40, t=130 + legend_row, b=80),
     )
     return _save(themed, out_path)
 
@@ -1241,7 +1246,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
             hoverinfo="skip",
         )
     )
-    grids = sorted(pivot.index.get_level_values("grid").unique())
+    grids = sort_grids(pivot.index.get_level_values("grid").unique())
     for i, grid in enumerate(grids):
         sub = pivot.xs(grid, level="grid")
         fig.add_trace(
@@ -1251,7 +1256,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
                 mode="markers",
                 name=alias_grid(grid),
                 marker=dict(
-                    size=_MARKER_SIZE,
+                    size=_MARKER_SIZE + 5,
                     color=_QUAL_PALETTE[i % len(_QUAL_PALETTE)],
                     line=dict(width=1, color="white"),
                     opacity=0.9,
@@ -1312,7 +1317,7 @@ def optimality_gap_scatter(df: pd.DataFrame, out_path: Path) -> Path:
     fig.update_yaxes(
         title="SCARE priority-weighted served", range=[0, 1.05], tickformat=".2f"
     )
-    return _save(_apply_theme(fig, title=title, font_bump=4), out_path)
+    return _save(_apply_theme(fig, title=title, height=640, font_bump=7), out_path)
 
 
 def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
@@ -1338,7 +1343,7 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
         return _save(_empty_fig("no positive-oracle rows", title), out_path)
 
     fig = go.Figure()
-    grids = sorted(pivot.index.get_level_values("grid").unique())
+    grids = sort_grids(pivot.index.get_level_values("grid").unique())
     for i, grid in enumerate(grids):
         gaps = pivot.xs(grid, level="grid")["gap"].values
         _add_box(
@@ -1352,14 +1357,17 @@ def optimality_gap_box(df: pd.DataFrame, out_path: Path) -> Path:
     fig.update_yaxes(title="relative gap to oracle", tickformat=".2f", zeroline=False)
     fig.update_xaxes(title="grid")
     fig.update_layout(showlegend=False, boxgap=0.45, boxgroupgap=0.2)
+    # Tall canvas: the gap distributions live within a few percent of zero,
+    # so the vertical axis needs the room for the boxes to be readable at
+    # the half-text-width slot the chapter gives this panel.
     return _save(
         _apply_theme(
             fig,
             title=title,
-            height=440,
+            height=1320,
             width=_box_fig_width(len(grids)),
             no_legend=True,
-            font_bump=6,
+            font_bump=12,
         ),
         out_path,
     )
@@ -1884,7 +1892,7 @@ def sweep_curve_dual(
         tickformat=".2f",
     )
     fig.update_xaxes(title=x_label)
-    themed = _apply_theme(fig, title=title, font_bump=4, legend_top=True)
+    themed = _apply_theme(fig, title=title, font_bump=7, legend_top=True)
     # ``legend_top`` reclaims the right margin, but this figure keeps a
     # right-hand secondary axis (wallclock), so give that axis its room back.
     themed.update_layout(margin_r=150)
@@ -2130,9 +2138,8 @@ def restoration_vs_baseline_bar(
         agg_spec["raw_ratio"] = (raw_col, "mean")
     if pwsf_col in sub.columns:
         agg_spec["pwsf_ratio"] = (pwsf_col, "mean")
-    grouped = (
-        sub.groupby("grid").agg(**agg_spec).sort_values("baseline_mw", ascending=False)
-    )
+    grouped = sub.groupby("grid").agg(**agg_spec)
+    grouped = grouped.reindex(sort_grids(grouped.index))
     grids = grouped.index.tolist()
     grids_lbl = _grids_display(grids)
 
@@ -2270,12 +2277,14 @@ def restoration_by_tier_bar(
     grouped = sub.groupby("grid")[[tier_cols[t] for t in tiers]].mean()
     if grouped.empty:
         return _save(_empty_fig("empty per-tier table", title), out_path)
+    grouped = grouped.reindex(sort_grids(grouped.index))
     grids = grouped.index.tolist()
     grids_lbl = _grids_display(grids)
 
-    # Kept vertical: a 10-tier grouped bar laid horizontally would stack 10
-    # bars per grid block and run very tall. Tiers are encoded by a CVD-safe
-    # luminance ramp (see ``_tier_ramp_color``) instead of hatches.
+    # Horizontal like the per-sector panel it sits next to: the long value-
+    # axis title reads along the bottom instead of being clipped on the left,
+    # and the grid labels get a full text line each. Tiers are encoded by a
+    # CVD-safe luminance ramp (see ``_tier_ramp_color``) instead of hatches.
     n_tiers = len(tiers)
     fig = go.Figure()
     for tier in tiers:
@@ -2283,23 +2292,31 @@ def restoration_by_tier_bar(
         fig.add_trace(
             go.Bar(
                 name=f"tier {tier}",
-                x=grids_lbl,
-                y=grouped[col].values,
+                y=grids_lbl,
+                x=grouped[col].values,
+                orientation="h",
                 marker=_bar_marker(_tier_ramp_color(tier, n_tiers)),
-                hovertemplate=f"<b>tier {tier}</b><br>grid: %{{x}}<br>served: %{{y:.3f}}<extra></extra>",
+                hovertemplate=f"<b>tier {tier}</b><br>grid: %{{y}}<br>served: %{{x:.3f}}<extra></extra>",
             )
         )
-    fig.add_hline(y=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
+    fig.add_vline(x=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
     fig.update_layout(barmode="group", bargap=0.28, bargroupgap=0.08)
-    fig.update_yaxes(
+    fig.update_xaxes(
         title=y_title,
         range=[0, 1.05],
         tickformat=".2f",
     )
-    fig.update_xaxes(title="grid")
+    fig.update_yaxes(title="grid", autorange="reversed")
     return _save(
         _apply_theme(
-            fig, title=title, height=480, width=_BAR_FIG_WIDTH, legend_top=True
+            fig,
+            title=title,
+            # Half of ``_hbar_height``'s allowance: four thin bars per grid
+            # read fine, and the full allowance towers over the neighbour
+            # panel at the chapter's half-text-width slot.
+            height=int(_hbar_height(len(grids), n_tiers) * 0.5),
+            width=_BAR_FIG_WIDTH,
+            legend_top=True,
         ),
         out_path,
     )
@@ -2462,11 +2479,12 @@ def agent_only_ratio_by_tier_bar(
     grouped = sub.groupby("grid")[[tier_cols[t] for t in tiers]].mean()
     if grouped.empty:
         return _save(_empty_fig("empty per-tier table", title), out_path)
+    grouped = grouped.reindex(sort_grids(grouped.index))
     grids = grouped.index.tolist()
     grids_lbl = _grids_display(grids)
 
-    # Vertical for the same reason as ``restoration_by_tier_bar``; CVD-safe
-    # tier luminance ramp instead of per-series hatches.
+    # Vertical (the overlay axis argument does not apply here, but the tier
+    # count does); CVD-safe tier luminance ramp instead of per-series hatches.
     n_tiers = len(tiers)
     fig = go.Figure()
     for tier in tiers:
@@ -2518,6 +2536,7 @@ def restoration_ratio_by_variant_bar(
     if grouped.empty:
         return _save(_empty_fig("empty grouping", title), out_path)
 
+    grouped = grouped.reindex(sort_grids(grouped.index))
     grids = grouped.index.tolist()
     grids_lbl = _grids_display(grids)
     variants = sorted(grouped.columns)
@@ -2547,7 +2566,7 @@ def restoration_ratio_by_variant_bar(
     # for a grid·variant mean, observed up to ~1.06); cap above 1.1 so such bars
     # are not silently clipped at the frame edge.
     fig.update_xaxes(title="raw restoration ratio", range=[0, 1.15], tickformat=".2f")
-    fig.update_yaxes(title="grid")
+    fig.update_yaxes(title="grid", autorange="reversed")
     height = _hbar_height(len(grids), len(variants))
     return _save(
         _apply_theme(
@@ -2588,9 +2607,8 @@ def absolute_load_lost_bar(
     }
     if has_base:
         agg_spec["baseline_mw"] = (base_col, "mean")
-    grouped = (
-        sub.groupby("grid").agg(**agg_spec).sort_values("dropped_mw", ascending=False)
-    )
+    grouped = sub.groupby("grid").agg(**agg_spec)
+    grouped = grouped.reindex(sort_grids(grouped.index))
 
     if has_base:
         pct = (grouped["dropped_mw"] / grouped["baseline_mw"]).where(
@@ -2702,7 +2720,9 @@ def diary_outcomes_bar(df: pd.DataFrame, out_path: Path) -> Path:
     fig.update_layout(barmode="stack", bargap=0.42)
     fig.update_yaxes(title="variant")
     fig.update_xaxes(title="negotiations per task", rangemode="tozero")
-    height = _hbar_height(len(variants_lbl)) + 30
+    # Compact rows (~half of ``_hbar_height``'s allowance): three stacked
+    # bars carry little detail, so thick bars just read as blocks of ink.
+    height = 190 + 50 * len(variants_lbl)
     # Seven outcome labels: use the wide canvas + a trimmed legend font so the
     # horizontal legend packs several entries per row (multi-row strip) rather
     # than degenerating into a one-per-row vertical column.
@@ -3045,7 +3065,7 @@ def cp_influence_bar(
         pwsf_vals = comp.groupby(["grid", "variant"])[pwsf_col].apply(
             lambda s: list(s.dropna())
         )
-    grids = sorted({k[0] for k in cp_vals.index})
+    grids = sort_grids({k[0] for k in cp_vals.index})
     variants = sorted({k[1] for k in cp_vals.index})
     grids_lbl = _grids_display(grids)
 
@@ -3232,6 +3252,7 @@ def cp_influence_bar(
                 # In MW mode the left panel's bars are carrier-stacked and carry
                 # no legend, so the variant key is sourced here.
                 showlegend=use_mw,
+                legend="legend",
                 y=grids_lbl,
                 x=p_means,
                 orientation="h",
@@ -3257,11 +3278,15 @@ def cp_influence_bar(
     if use_mw:
         # Carrier key for the stacked left panel (grey swatches, hatch = carrier).
         # Purely informational — real bars stay grouped by method for toggling.
+        # Lives in its own legend so the variant key and the carrier key can
+        # anchor to opposite ends of the strip instead of packing into one
+        # (overlap-prone) row.
         for c, _mk in carrier_stack:
             fig.add_trace(
                 go.Bar(
-                    name=f"{carrier_label[c]} (fill)",
+                    name=carrier_label[c],
                     legendgroup="__carrier__",
+                    legend="legend2",
                     y=[None],
                     x=[None],
                     orientation="h",
@@ -3296,18 +3321,56 @@ def cp_influence_bar(
         col=2,
     )
     fig.update_yaxes(title_text="grid", row=1, col=1)
+    fig.update_yaxes(autorange="reversed")
     height = _hbar_height(len(grids), len(variants)) + 30
-    return _save(
-        _apply_theme(
-            fig,
-            title=_with_subtitle(title, subtitle),
-            height=height,
-            width=int(_BAR_FIG_WIDTH * 1.55),
-            font_bump=2,
-            legend_top=True,
-        ),
-        out_path,
+    width = int(_BAR_FIG_WIDTH * 1.7)
+    themed = _apply_theme(
+        fig,
+        title=_with_subtitle(title, subtitle),
+        height=height,
+        width=width,
+        font_bump=2,
+        legend_top=True,
     )
+    # Two legends on one horizontal row: variant key left-anchored, carrier
+    # key right-anchored (``legend_top`` styles only the first legend).
+    lf = _LEGEND_FONT_SIZE
+    legend_y = 1.0 - 62 / height
+    themed.update_layout(
+        title=dict(
+            text=_with_subtitle(title, subtitle),
+            yref="container",
+            yanchor="top",
+            y=0.99,
+            x=0.5,
+            xanchor="center",
+            font=dict(
+                family=_TITLE_FONT_FAMILY, size=_TITLE_FONT_SIZE + 2, color=_AXIS_COLOR
+            ),
+        ),
+        legend=dict(
+            orientation="h",
+            yref="container",
+            xref="container",
+            y=legend_y,
+            x=0.01,
+            xanchor="left",
+            yanchor="top",
+            font=dict(size=lf),
+        ),
+        legend2=dict(
+            orientation="h",
+            yref="container",
+            xref="container",
+            y=legend_y,
+            x=0.99,
+            xanchor="right",
+            yanchor="top",
+            font=dict(size=lf),
+        ),
+        margin=dict(l=90, r=40, t=140, b=90),
+    )
+    return _save(themed, out_path)
 
 
 # Per-sector restoration ratio (mirrors restoration_by_tier_bar)
@@ -3344,6 +3407,7 @@ def restoration_by_sector_bar(
     grouped = sub.groupby("grid")[[sector_cols[s] for s in sectors]].mean()
     if grouped.empty:
         return _save(_empty_fig("empty per-sector table", title), out_path)
+    grouped = grouped.reindex(sort_grids(grouped.index))
     grids = grouped.index.tolist()
     grids_lbl = _grids_display(grids)
 
@@ -3366,11 +3430,11 @@ def restoration_by_sector_bar(
     fig.add_vline(x=1.0, line=dict(color="#BBBBBB", dash="dash", width=1))
     fig.update_layout(barmode="group", bargap=0.32, bargroupgap=0.12)
     fig.update_xaxes(
-        title="restoration ratio (post / baseline served)",
+        title="restoration ratio",
         range=[0, 1.05],
         tickformat=".2f",
     )
-    fig.update_yaxes(title="grid")
+    fig.update_yaxes(title="grid", autorange="reversed")
     height = int(
         _hbar_height(len(grids), len(sectors)) * 0.7
     )  # -30%: compact next to the taller vertical panels
@@ -3824,7 +3888,9 @@ def constraint_envelope_trajectory(
                 col=1,
             )
 
-        fig.update_yaxes(title=y_label, row=row_idx, col=1)
+        # No rotated y-axis title: the subplot title already names the panel,
+        # and a rotated title is taller than its ~200px row, so the three
+        # titles overprint each other down the left edge.
 
     # Sentinel scatters for the event-kind legend.
     for kind in sorted(seen_kinds):
@@ -4951,15 +5017,29 @@ def _extension_ab_bar(
         return _save(_empty_fig("no complete scare A/B pairs", title), out_path)
 
     multi_grid = pivot.index.get_level_values("grid").nunique() > 1
+    seeds = [str(s) for _, s in pivot.index]
+    # Campaign seeds share a long numeric prefix (e.g. 3600000000..04);
+    # drop it so the tick labels carry only the distinguishing tail.
+    prefix_len = 0
+    if len(seeds) > 1:
+        shortest = min(len(s) for s in seeds)
+        while prefix_len < shortest - 1 and len({s[: prefix_len + 1] for s in seeds}) == 1:
+            prefix_len += 1
+    short = [s[prefix_len:] for s in seeds]
+    if len(set(short)) != len(short):
+        short = seeds
     x = [
-        f"{alias_grid(g)} · s{s}" if multi_grid else f"seed {s}" for g, s in pivot.index
+        f"{alias_grid(g)} · s{t}" if multi_grid else f"s{t}"
+        for (g, _), t in zip(pivot.index, short)
     ]
     delta = pivot["B"] - pivot["A"]
 
     fig = go.Figure()
-    for arm, name, color in (
-        ("A", label_a, "#7F7F7F"),
-        ("B", label_b, _VARIANT_COLOR["scare"]),
+    # Same-hue light/dark pair (validated CVD-safe): the hatched control arm
+    # recedes, the solid dark treatment arm carries the SCARE blue.
+    for arm, name, color, hatch in (
+        ("A", label_a, "#4A7FC1", "/"),
+        ("B", label_b, _VARIANT_COLOR["scare"], ""),
     ):
         hover = [
             f"<b>{name}</b><br>{lbl}<br>PWSF: {v:.4f}<br>Δ (B−A): {dl:+.4f}"
@@ -4970,7 +5050,7 @@ def _extension_ab_bar(
                 name=name,
                 x=x,
                 y=pivot[arm].values,
-                marker=_bar_marker(color),
+                marker=_bar_marker(color, pattern_shape=hatch),
                 customdata=hover,
                 hovertemplate="%{customdata}<extra></extra>",
             )
@@ -5011,23 +5091,6 @@ def _extension_ab_bar(
                 )
             )
 
-    mean_delta = float(delta.mean())
-    fig.add_annotation(
-        xref="paper",
-        yref="paper",
-        x=0.97,
-        y=0.97,
-        xanchor="right",
-        yanchor="top",
-        showarrow=False,
-        align="right",
-        bgcolor="rgba(255,255,255,0.85)",
-        bordercolor="#CCCCCC",
-        borderwidth=0.6,
-        borderpad=5,
-        text=(f"<b>mean Δ (B−A)</b> {mean_delta:+.4f}  ·  <b>n</b>={len(pivot)} pairs"),
-        font=dict(family=_FONT_FAMILY, size=_ANNOTATION_FONT_SIZE, color=_AXIS_COLOR),
-    )
     fig.update_layout(barmode="group", bargap=0.3, bargroupgap=0.1)
     fig.update_xaxes(title="paired run (same grid + seed)")
     fig.update_yaxes(
@@ -5454,7 +5517,12 @@ def extension_islanding_recovery(
         return _save(_empty_fig("no clean/microgrid scare rows", title), out_path)
 
     fig = go.Figure()
-    for arm, color in (("clean", "#7F7F7F"), ("microgrid", _VARIANT_COLOR["scare"])):
+    # Same arm styling as the paired A/B panel next to it (light hatched
+    # control, solid dark treatment).
+    for arm, color, hatch in (
+        ("clean", "#4A7FC1", "/"),
+        ("microgrid", _VARIANT_COLOR["scare"], ""),
+    ):
         sub = d[d["arm"] == arm]
         if sub.empty:
             continue
@@ -5464,7 +5532,7 @@ def extension_islanding_recovery(
                 name=arm,
                 x=[s for s in present],
                 y=means,
-                marker=_bar_marker(color),
+                marker=_bar_marker(color, pattern_shape=hatch),
                 hovertemplate=(
                     f"<b>{arm}</b><br>%{{x}}: %{{y:.3f}} served<extra></extra>"
                 ),

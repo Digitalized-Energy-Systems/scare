@@ -144,9 +144,9 @@ def _stress_comparison(campaign: CampaignData, out_dir: Path) -> list[str]:
 
 _VC_GRID_ORDER = (
     "simbench_lv",
-    "simbench_lv_cp_heavy_dependent",
-    "simbench_lv_medium",
     "simbench_lv_small",
+    "simbench_lv_medium",
+    "simbench_lv_cp_heavy_dependent",
 )
 
 
@@ -205,18 +205,10 @@ def _cp_influence(campaign: CampaignData, out_dir: Path) -> list[str]:
     bars incomparable: SCARE's rows were 56% deliberately-degraded arms against
     an oracle with none.
     """
-    done, prov = matched_frame(_completed_sims(campaign.summary))
+    done, _ = matched_frame(_completed_sims(campaign.summary))
     if done.empty:
         return []
-    return [
-        str(
-            plots.cp_influence_bar(
-                done,
-                out_dir / "cp_influence.png",
-                subtitle=population_note(prov),
-            )
-        )
-    ]
+    return [str(plots.cp_influence_bar(done, out_dir / "cp_influence.png"))]
 
 
 def _restoration_time(campaign: CampaignData, out_dir: Path) -> list[str]:

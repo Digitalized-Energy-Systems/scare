@@ -3,7 +3,7 @@
 The runtime pipeline keeps canonical identifiers (e.g. ``simbench_lv_small``,
 ``enable_holonic=False``); only the figure / markdown layer translates to the
 display names in ``experiment/configs/display_aliases.json``, which follow the
-dissertation's naming (grid IDs ``S1``..``S8``, chapter prose names for the
+dissertation's naming (grid IDs ``S1``..``S10``, chapter prose names for the
 experiments, ``SCARE`` / ``Oracle`` / ``Single-level`` / ``Component-level``
 variants). Missing entries pass through unchanged.
 
@@ -17,9 +17,10 @@ without a config entry per combination.
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 _DEFAULT_CONFIG = (
     Path(__file__).resolve().parent.parent / "configs" / "display_aliases.json"
@@ -44,6 +45,23 @@ def alias_grid(name: str, *, config_path: str | None = None) -> str:
     if not isinstance(name, str):
         return str(name)
     return _load(config_path)["grids"].get(name, name)
+
+
+_S_ID = re.compile(r"^S(\d+)\b")
+
+
+def sort_grids(grids: Iterable[str], *, config_path: str | None = None) -> list[str]:
+    """Canonical display order for grid families: ascending by the numeric
+    ``S<n>`` ID of their display alias (S1, S2, ..., S10 — not lexicographic,
+    which would put S10 before S2); grids without an S-ID follow, ordered by
+    label."""
+
+    def key(g: str) -> tuple[int, int, str]:
+        lbl = alias_grid(g, config_path=config_path)
+        m = _S_ID.match(lbl)
+        return (0, int(m.group(1)), lbl) if m else (1, 0, lbl)
+
+    return sorted(grids, key=key)
 
 
 def alias_experiment(name: str, *, config_path: str | None = None) -> str:
@@ -211,4 +229,5 @@ __all__ = [
     "alias_ablation",
     "alias_sweep",
     "alias_scenario",
+    "sort_grids",
 ]
